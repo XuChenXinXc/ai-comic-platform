@@ -1,0 +1,29 @@
+from app.models.tables import (
+    ALL_TABLES,
+    api_provider,
+    asset,
+    asset_image,
+    job,
+    keyframe_version,
+    metadata,
+    novel_analysis,
+    project,
+    screenplay,
+    shot,
+    video_version,
+)
+
+__all__ = [
+    "ALL_TABLES",
+    "api_provider",
+    "asset",
+    "asset_image",
+    "job",
+    "keyframe_version",
+    "metadata",
+    "novel_analysis",
+    "project",
+    "screenplay",
+    "shot",
+    "video_version",
+]

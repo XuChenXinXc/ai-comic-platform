@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+from alembic.config import Config
+from pydantic import TypeAdapter, ValidationError
+from sqlalchemy import func, insert, inspect, select, text
+from sqlalchemy.exc import IntegrityError
+
+from alembic import command
+from app.config import BACKEND_DIR, PROJECT_ROOT, Settings
+from app.db import Database, init_db, migrate_schema, utc_now
+from app.models.tables import ALL_TABLES, api_provider, job, project
+from app.schemas import NovelAnalysisOutput, ReferenceBinding
+
+
+def _insert_project(database: Database, project_id: str = "project-1") -> None:
+    now = utc_now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(project).values(
+                id=project_id,
+                name="测试项目",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
+def test_settings_with_relative_workspace_resolves_from_project_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_WORKSPACE", "relative-workspace")
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.workspace_dir == (PROJECT_ROOT / "relative-workspace").resolve()
+    assert settings.database_url == (
+        f"sqlite:///{(PROJECT_ROOT / 'relative-workspace' / 'platform.db').as_posix()}"
+    )
+
+
+def test_database_initialize_creates_ten_tables_and_three_mock_providers(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite:///{(tmp_path / 'platform.db').as_posix()}")
+    database.initialize()
+    database.initialize()
+
+    assert set(inspect(database.engine).get_table_names()) == {table.name for table in ALL_TABLES}
+    with database.engine.connect() as connection:
+        assert connection.scalar(text("PRAGMA journal_mode")) == "wal"
+        assert connection.scalar(text("PRAGMA foreign_keys")) == 1
+        assert connection.scalar(text("PRAGMA busy_timeout")) == 5000
+        assert connection.scalar(select(func.count()).select_from(api_provider)) == 3
+        defaults = connection.execute(
+            select(api_provider.c.kind).where(api_provider.c.is_default == 1)
+        ).scalars()
+        assert set(defaults) == {"text", "image", "video"}
+    database.dispose()
+
+
+def test_init_db_with_fresh_database_migrates_to_head_and_seeds_mock_providers(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite:///{(tmp_path / 'startup.db').as_posix()}")
+
+    init_db(database=database)
+
+    assert set(inspect(database.engine).get_table_names()) == {
+        "alembic_version",
+        *(table.name for table in ALL_TABLES),
+    }
+    with database.engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "20260728_0001"
+        )
+        assert connection.scalar(select(func.count()).select_from(api_provider)) == 3
+    database.dispose()
+
+
+def test_database_with_invalid_foreign_key_rejects_insert(tmp_path: Path) -> None:
+    database = Database(f"sqlite:///{(tmp_path / 'platform.db').as_posix()}")
+    database.create_all()
+    now = utc_now()
+
+    with pytest.raises(IntegrityError):
+        with database.engine.begin() as connection:
+            connection.execute(
+                insert(job).values(
+                    id="job-invalid",
+                    project_id="missing-project",
+                    job_type="analyze_novel",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+    database.dispose()
+
+
+def test_database_with_concurrent_short_transactions_writes_all_rows(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite:///{(tmp_path / 'platform.db').as_posix()}")
+    database.create_all()
+    _insert_project(database)
+
+    def write_job(index: int) -> None:
+        now = utc_now()
+        with database.engine.begin() as connection:
+            connection.execute(
+                insert(job).values(
+                    id=f"job-{index}",
+                    project_id="project-1",
+                    job_type="analyze_novel",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(write_job, range(40)))
+
+    with database.engine.connect() as connection:
+        assert connection.scalar(select(func.count()).select_from(job)) == 40
+    database.dispose()
+
+
+def test_novel_analysis_output_with_missing_required_field_rejects_value() -> None:
+    with pytest.raises(ValidationError):
+        NovelAnalysisOutput.model_validate({"summary": "只有摘要"})
+
+
+def test_reference_binding_with_unknown_role_rejects_value() -> None:
+    adapter = TypeAdapter(ReferenceBinding)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"role": "unknown", "asset_id": "asset-1"})
+
+
+def test_alembic_initial_migration_upgrades_to_ten_tables(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "migration.db"
+    database = Database(f"sqlite:///{database_path.as_posix()}")
+
+    migrate_schema(database)
+
+    with sqlite3.connect(database_path) as connection:
+        names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'alembic_%'"
+            )
+        }
+    assert names == {table.name for table in ALL_TABLES}
+
+    alembic_config = Config()
+    alembic_config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    alembic_config.set_main_option("prepend_sys_path", str(BACKEND_DIR))
+    alembic_config.set_main_option("path_separator", "os")
+    with database.engine.begin() as connection:
+        alembic_config.attributes["connection"] = connection
+        command.downgrade(alembic_config, "base")
+    with sqlite3.connect(database_path) as connection:
+        remaining = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'alembic_%'"
+            )
+        }
+    assert remaining == set()
+    database.dispose()

@@ -1,0 +1,639 @@
+from __future__ import annotations
+
+from typing import Any
+
+from sqlalchemy import and_, delete, func, insert, or_, select, update
+from sqlalchemy.exc import IntegrityError
+
+from app.db import Database, db
+from app.models.tables import asset, asset_image, job, project, shot
+from app.prompts import load_prompt
+from app.schemas import AssetExtractionOutput, AssetPromptOutput
+from app.services.errors import bad_request, conflict, not_found
+from app.services.file_service import file_service
+from app.services.job_service import JobService
+from app.services.provider_service import ProviderService
+from app.services.signature_service import (
+    SHOT_SIGNATURE_FIELDS,
+    asset_signature,
+    shot_signature,
+)
+from app.services.utils import (
+    json_dumps,
+    json_loads,
+    new_id,
+    row_dict,
+    utc_now,
+)
+
+_EXTRACTION_KEYS = {
+    "character": "characters",
+    "scene": "scenes",
+    "prop": "props",
+}
+
+_ACTIVE_JOB_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+_SHOT_JSON_FIELDS = {
+    "character_ids": "character_ids_json",
+    "prop_ids": "prop_ids_json",
+    "positions": "positions_json",
+    "expressions": "expressions_json",
+    "dialogue": "dialogue_json",
+    "reference_bindings": "reference_bindings_json",
+}
+
+
+class AssetService:
+    def __init__(
+        self,
+        database: Database | None = None,
+        jobs: JobService | None = None,
+    ) -> None:
+        self.database = database or db
+        self.jobs = jobs or JobService(self.database)
+        self.providers = ProviderService(self.database)
+
+    def _project(self, project_id: str) -> dict[str, Any]:
+        with self.database.engine.connect() as connection:
+            record = row_dict(
+                connection.execute(select(project).where(project.c.id == project_id)).first()
+            )
+        if record is None:
+            raise not_found("项目")
+        return record
+
+    @staticmethod
+    def _decode(record: dict[str, Any]) -> dict[str, Any]:
+        result = dict(record)
+        profile = json_loads(result["profile_json"], {})
+        consistency = json_loads(result["consistency_json"], [])
+        result["profile_json"] = profile
+        result["profile"] = profile
+        result["consistency_json"] = consistency
+        result["consistency_keywords"] = consistency
+        return result
+
+    def _current_image(
+        self, connection: Any, asset_id: str, project_id: str
+    ) -> dict[str, Any] | None:
+        record = row_dict(
+            connection.execute(
+                select(asset_image).where(
+                    asset_image.c.asset_id == asset_id,
+                    asset_image.c.is_current.is_(True),
+                )
+            ).first()
+        )
+        if record and record.get("file_path"):
+            record["file_url"] = f"/media/{project_id}/{record['file_path']}"
+            record["media_url"] = record["file_url"]
+        if record:
+            record["is_current"] = bool(record["is_current"])
+        return record
+
+    def list(self, project_id: str, asset_type: str | None = None) -> list[dict[str, Any]]:
+        current_project = self._project(project_id)
+        statement = select(asset).where(asset.c.project_id == project_id)
+        if asset_type:
+            statement = statement.where(asset.c.asset_type == asset_type)
+        statement = statement.order_by(asset.c.asset_type, asset.c.name)
+        with self.database.engine.connect() as connection:
+            records = []
+            for row in connection.execute(statement):
+                record = self._decode(dict(row._mapping))
+                record["is_stale"] = bool(
+                    record["source_signature"]
+                    and record["source_signature"] != current_project["source_signature"]
+                )
+                record["current_image"] = self._current_image(connection, record["id"], project_id)
+                records.append(record)
+        return records
+
+    def get(self, asset_id: str) -> dict[str, Any]:
+        with self.database.engine.connect() as connection:
+            record = row_dict(
+                connection.execute(select(asset).where(asset.c.id == asset_id)).first()
+            )
+        if record is None:
+            raise not_found("素材")
+        result = self._decode(record)
+        current_project = self._project(result["project_id"])
+        result["is_stale"] = bool(
+            result["source_signature"]
+            and result["source_signature"] != current_project["source_signature"]
+        )
+        with self.database.engine.connect() as connection:
+            result["current_image"] = self._current_image(
+                connection, asset_id, result["project_id"]
+            )
+        return result
+
+    def _signature(
+        self,
+        project_record: dict[str, Any],
+        *,
+        profile: dict[str, Any],
+        prompt: str,
+        negative_prompt: str,
+    ) -> str:
+        return asset_signature(
+            profile,
+            prompt,
+            negative_prompt,
+            project_record["style_prompt"],
+        )
+
+    def create(self, project_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        current_project = self._project(project_id)
+        now = utc_now()
+        record = {
+            "id": new_id("asset"),
+            "project_id": project_id,
+            "asset_type": values["asset_type"],
+            "name": values["name"].strip(),
+            "profile_json": json_dumps(values.get("profile", {})),
+            "prompt": values.get("prompt", ""),
+            "negative_prompt": values.get("negative_prompt", ""),
+            "consistency_json": json_dumps(values.get("consistency_keywords", [])),
+            "composition": values.get("composition", ""),
+            "importance": values.get("importance", "normal"),
+            "status": values.get("status", "draft"),
+            "source_signature": current_project["source_signature"],
+            "own_signature": self._signature(
+                current_project,
+                profile=values.get("profile", {}),
+                prompt=values.get("prompt", ""),
+                negative_prompt=values.get("negative_prompt", ""),
+            ),
+            "revision": 1,
+            "created_at": now,
+            "updated_at": now,
+        }
+        try:
+            with self.database.engine.begin() as connection:
+                connection.execute(insert(asset).values(**record))
+        except IntegrityError as exc:
+            raise conflict("同类型同名素材已存在") from exc
+        return self.get(record["id"])
+
+    def update(self, asset_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        current = self.get(asset_id)
+        current_project = self._project(current["project_id"])
+        changes: dict[str, Any] = {}
+        field_map = {
+            "profile": "profile_json",
+            "consistency_keywords": "consistency_json",
+        }
+        for key, value in values.items():
+            target = field_map.get(key, key)
+            changes[target] = (
+                json_dumps(value) if target in {"profile_json", "consistency_json"} else value
+            )
+        semantic_fields = {
+            "name",
+            "profile_json",
+            "prompt",
+            "negative_prompt",
+            "consistency_json",
+            "composition",
+            "importance",
+        }
+        if semantic_fields.intersection(changes):
+            profile = json_loads(changes.get("profile_json", json_dumps(current["profile"])), {})
+            changes["own_signature"] = self._signature(
+                current_project,
+                profile=profile,
+                prompt=changes.get("prompt", current["prompt"]),
+                negative_prompt=changes.get("negative_prompt", current["negative_prompt"]),
+            )
+            changes["revision"] = current["revision"] + 1
+            if "status" not in changes:
+                changes["status"] = "ready"
+        if not changes:
+            return current
+        changes["updated_at"] = utc_now()
+        try:
+            with self.database.engine.begin() as connection:
+                connection.execute(update(asset).where(asset.c.id == asset_id).values(**changes))
+        except IntegrityError as exc:
+            raise conflict("同类型同名素材已存在") from exc
+        return self.get(asset_id)
+
+    @staticmethod
+    def _ensure_no_active_jobs(
+        connection: Any,
+        asset_ids: set[str],
+        image_ids: set[str],
+    ) -> None:
+        active_job = connection.execute(
+            select(job.c.id).where(
+                job.c.status.in_(_ACTIVE_JOB_STATUSES),
+                or_(
+                    and_(
+                        job.c.target_type == "asset",
+                        job.c.target_id.in_(asset_ids),
+                    ),
+                    and_(
+                        job.c.target_type == "asset_image",
+                        job.c.target_id.in_(image_ids),
+                    ),
+                ),
+            )
+        ).first()
+        if active_job:
+            raise conflict("素材仍有进行中的任务，不能删除或合并")
+
+    @staticmethod
+    def _update_shot_asset_references(
+        connection: Any,
+        *,
+        project_id: str,
+        source_ids: set[str],
+        image_ids: set[str],
+        target_id: str | None,
+    ) -> None:
+        rows = connection.execute(select(shot).where(shot.c.project_id == project_id)).all()
+        for row in rows:
+            decoded = dict(row._mapping)
+            for alias, column in _SHOT_JSON_FIELDS.items():
+                decoded[alias] = json_loads(decoded[column], [])
+            characters = decoded["character_ids"]
+            props = decoded["prop_ids"]
+            bindings = decoded["reference_bindings"]
+            characters = characters if isinstance(characters, list) else []
+            props = props if isinstance(props, list) else []
+            bindings = bindings if isinstance(bindings, list) else []
+            changes: dict[str, Any] = {}
+            if target_id is None:
+                remapped_characters = [item for item in characters if item not in source_ids]
+                remapped_props = [item for item in props if item not in source_ids]
+                remapped_bindings = [
+                    binding
+                    for binding in bindings
+                    if not (
+                        isinstance(binding, dict)
+                        and (
+                            binding.get("asset_id") in source_ids
+                            or binding.get("asset_image_id") in image_ids
+                        )
+                    )
+                ]
+                scene_asset_id = None if row.scene_asset_id in source_ids else row.scene_asset_id
+            else:
+                remapped_characters = list(
+                    dict.fromkeys(target_id if item in source_ids else item for item in characters)
+                )
+                remapped_props = list(
+                    dict.fromkeys(target_id if item in source_ids else item for item in props)
+                )
+                remapped_bindings = []
+                for binding in bindings:
+                    if not isinstance(binding, dict):
+                        remapped_bindings.append(binding)
+                        continue
+                    remapped = dict(binding)
+                    if (
+                        remapped.get("asset_id") in source_ids
+                        or remapped.get("asset_image_id") in image_ids
+                    ):
+                        remapped["asset_id"] = target_id
+                    remapped_bindings.append(remapped)
+                scene_asset_id = (
+                    target_id if row.scene_asset_id in source_ids else row.scene_asset_id
+                )
+            if scene_asset_id != row.scene_asset_id:
+                changes["scene_asset_id"] = scene_asset_id
+            if remapped_characters != characters:
+                changes["character_ids_json"] = json_dumps(remapped_characters)
+            if remapped_props != props:
+                changes["prop_ids_json"] = json_dumps(remapped_props)
+            if remapped_bindings != bindings:
+                changes["reference_bindings_json"] = json_dumps(remapped_bindings)
+            if changes:
+                decoded["scene_asset_id"] = scene_asset_id
+                decoded["character_ids"] = remapped_characters
+                decoded["prop_ids"] = remapped_props
+                decoded["reference_bindings"] = remapped_bindings
+                semantic = {
+                    name: decoded[name]
+                    for name in SHOT_SIGNATURE_FIELDS
+                    if not name.endswith("_json") and name in decoded
+                }
+                changes["own_signature"] = shot_signature(semantic)
+                changes["revision"] = decoded["revision"] + 1
+                changes["updated_at"] = utc_now()
+                connection.execute(update(shot).where(shot.c.id == row.id).values(**changes))
+
+    def delete(self, asset_id: str) -> None:
+        current = self.get(asset_id)
+        with self.database.engine.begin() as connection:
+            image_rows = connection.execute(
+                select(asset_image.c.id, asset_image.c.file_path).where(
+                    asset_image.c.asset_id == asset_id
+                )
+            ).all()
+            image_ids = {row.id for row in image_rows}
+            self._ensure_no_active_jobs(connection, {asset_id}, image_ids)
+            self._update_shot_asset_references(
+                connection,
+                project_id=current["project_id"],
+                source_ids={asset_id},
+                image_ids=image_ids,
+                target_id=None,
+            )
+            paths = [row.file_path for row in image_rows if row.file_path]
+            connection.execute(delete(asset).where(asset.c.id == asset_id))
+        for path in paths:
+            file_service.delete_file(current["project_id"], path)
+
+    @staticmethod
+    def _merge_profile(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+        result = dict(target)
+        for key, value in source.items():
+            if not result.get(key):
+                result[key] = value
+            elif isinstance(result[key], list) and isinstance(value, list):
+                result[key] = list(dict.fromkeys([*result[key], *value]))
+        return result
+
+    def merge(self, target_id: str, source_ids: list[str]) -> dict[str, Any]:
+        source_ids = [item for item in source_ids if item != target_id]
+        if not source_ids:
+            return self.get(target_id)
+        target = self.get(target_id)
+        sources = [self.get(item) for item in source_ids]
+        if any(
+            item["project_id"] != target["project_id"] or item["asset_type"] != target["asset_type"]
+            for item in sources
+        ):
+            raise bad_request("只能合并同一项目、同一类型的素材")
+        current_project = self._project(target["project_id"])
+        merged_profile = dict(target["profile"])
+        consistency = list(target["consistency_keywords"])
+        prompt_parts = [target["prompt"]]
+        negative_parts = [target["negative_prompt"]]
+        importance = target["importance"]
+        for source in sources:
+            merged_profile = self._merge_profile(merged_profile, source["profile"])
+            consistency.extend(source["consistency_keywords"])
+            prompt_parts.append(source["prompt"])
+            negative_parts.append(source["negative_prompt"])
+            if source["importance"] == "core":
+                importance = "core"
+        consistency = list(dict.fromkeys(item for item in consistency if item))
+        prompt = "\n".join(dict.fromkeys(item for item in prompt_parts if item))
+        negative_prompt = "\n".join(dict.fromkeys(item for item in negative_parts if item))
+        now = utc_now()
+        with self.database.engine.begin() as connection:
+            all_asset_ids = {target_id, *source_ids}
+            all_image_rows = connection.execute(
+                select(asset_image.c.id).where(asset_image.c.asset_id.in_(all_asset_ids))
+            ).all()
+            all_image_ids = {row.id for row in all_image_rows}
+            source_image_ids = {
+                row.id
+                for row in connection.execute(
+                    select(asset_image.c.id).where(asset_image.c.asset_id.in_(source_ids))
+                )
+            }
+            self._ensure_no_active_jobs(connection, all_asset_ids, all_image_ids)
+            next_version = (
+                connection.execute(
+                    select(func.max(asset_image.c.version_no)).where(
+                        asset_image.c.asset_id == target_id
+                    )
+                ).scalar()
+                or 0
+            )
+            source_images = connection.execute(
+                select(asset_image)
+                .where(asset_image.c.asset_id.in_(source_ids))
+                .order_by(asset_image.c.created_at)
+            ).all()
+            for image in source_images:
+                next_version += 1
+                connection.execute(
+                    update(asset_image)
+                    .where(asset_image.c.id == image._mapping["id"])
+                    .values(
+                        asset_id=target_id,
+                        version_no=next_version,
+                        is_current=False,
+                    )
+                )
+            self._update_shot_asset_references(
+                connection,
+                project_id=target["project_id"],
+                source_ids=set(source_ids),
+                image_ids=source_image_ids,
+                target_id=target_id,
+            )
+            connection.execute(
+                update(asset)
+                .where(asset.c.id == target_id)
+                .values(
+                    profile_json=json_dumps(merged_profile),
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    consistency_json=json_dumps(consistency),
+                    importance=importance,
+                    status="ready",
+                    own_signature=self._signature(
+                        current_project,
+                        profile=merged_profile,
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                    ),
+                    revision=target["revision"] + 1,
+                    updated_at=now,
+                )
+            )
+            connection.execute(delete(asset).where(asset.c.id.in_(source_ids)))
+        return self.get(target_id)
+
+    def merge_many(self, project_id: str, ids: list[str]) -> dict[str, Any]:
+        if len(ids) < 2:
+            raise bad_request("至少选择两个素材")
+        target = self.get(ids[0])
+        if target["project_id"] != project_id:
+            raise bad_request("素材不属于当前项目")
+        return self.merge(ids[0], ids[1:])
+
+    def queue_extract(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
+        current_project = self._project(project_id)
+        return self.jobs.create(
+            project_id=project_id,
+            job_type="extract_assets",
+            target_type="project",
+            target_id=project_id,
+            provider_kind="text",
+            provider_id=options.get("provider_id") or current_project["default_text_provider_id"],
+            input_data={
+                "asset_types": options.get("asset_types", ["character", "scene", "prop"]),
+                "params": options.get("params", {}),
+            },
+        )
+
+    def queue_prompt(self, asset_id: str, options: dict[str, Any]) -> dict[str, Any]:
+        current = self.get(asset_id)
+        current_project = self._project(current["project_id"])
+        return self.jobs.create(
+            project_id=current["project_id"],
+            job_type="generate_asset_prompt",
+            target_type="asset",
+            target_id=asset_id,
+            provider_kind="text",
+            provider_id=options.get("provider_id") or current_project["default_text_provider_id"],
+            input_data={"params": options.get("params", {})},
+        )
+
+    def queue_prompt_batch(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
+        current_project = self._project(project_id)
+        statement = select(asset.c.id).where(asset.c.project_id == project_id)
+        if options.get("ids"):
+            statement = statement.where(asset.c.id.in_(options["ids"]))
+        if options.get("asset_type"):
+            statement = statement.where(asset.c.asset_type == options["asset_type"])
+        if options.get("only_missing"):
+            statement = statement.where(asset.c.prompt == "")
+        with self.database.engine.connect() as connection:
+            ids = list(connection.execute(statement).scalars())
+        items = [
+            {
+                "project_id": project_id,
+                "job_type": "generate_asset_prompt",
+                "target_type": "asset",
+                "target_id": asset_id,
+                "provider_kind": "text",
+                "provider_id": options.get("provider_id")
+                or current_project["default_text_provider_id"],
+                "input_data": {"params": options.get("params", {})},
+            }
+            for asset_id in ids
+        ]
+        return self.jobs.create_batch(items)
+
+    async def handle_extract(self, job: dict[str, Any]) -> dict[str, Any]:
+        current_project = self._project(job["project_id"])
+        input_data = json_loads(job.get("input_json"), {})
+        provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
+        output = await provider.generate_json(
+            system_prompt=load_prompt("asset_extract"),
+            user_prompt=f"小说正文：\n{current_project['source_text']}",
+            schema=AssetExtractionOutput,
+            params={**config["params"], **input_data.get("params", {})},
+        )
+        payload = output.model_dump(mode="json")
+        selected_types = set(input_data["asset_types"])
+        saved_ids: list[str] = []
+        for asset_type, key in _EXTRACTION_KEYS.items():
+            if asset_type not in selected_types:
+                continue
+            for extracted in payload[key]:
+                saved_ids.append(self._upsert_extracted(current_project, asset_type, extracted))
+        return {"asset_ids": saved_ids, "count": len(saved_ids)}
+
+    def _upsert_extracted(
+        self,
+        current_project: dict[str, Any],
+        asset_type: str,
+        extracted: dict[str, Any],
+    ) -> str:
+        name = extracted["name"].strip()
+        profile = dict(extracted)
+        profile.pop("name", None)
+        importance = profile.pop("importance", "normal")
+        now = utc_now()
+        with self.database.engine.begin() as connection:
+            existing = row_dict(
+                connection.execute(
+                    select(asset).where(
+                        asset.c.project_id == current_project["id"],
+                        asset.c.asset_type == asset_type,
+                        asset.c.name == name,
+                    )
+                ).first()
+            )
+            if existing:
+                merged_profile = self._merge_profile(
+                    json_loads(existing["profile_json"], {}), profile
+                )
+                connection.execute(
+                    update(asset)
+                    .where(asset.c.id == existing["id"])
+                    .values(
+                        profile_json=json_dumps(merged_profile),
+                        importance=(
+                            "core"
+                            if existing["importance"] == "core" or importance == "core"
+                            else "normal"
+                        ),
+                        status="ready",
+                        source_signature=current_project["source_signature"],
+                        own_signature=self._signature(
+                            current_project,
+                            profile=merged_profile,
+                            prompt=existing["prompt"],
+                            negative_prompt=existing["negative_prompt"],
+                        ),
+                        revision=existing["revision"] + 1,
+                        updated_at=now,
+                    )
+                )
+                return existing["id"]
+            asset_id = new_id("asset")
+            connection.execute(
+                insert(asset).values(
+                    id=asset_id,
+                    project_id=current_project["id"],
+                    asset_type=asset_type,
+                    name=name,
+                    profile_json=json_dumps(profile),
+                    prompt="",
+                    negative_prompt="",
+                    consistency_json="[]",
+                    composition="",
+                    importance=importance,
+                    status="ready",
+                    source_signature=current_project["source_signature"],
+                    own_signature=self._signature(
+                        current_project,
+                        profile=profile,
+                        prompt="",
+                        negative_prompt="",
+                    ),
+                    revision=1,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            return asset_id
+
+    async def handle_prompt(self, job: dict[str, Any]) -> dict[str, Any]:
+        current = self.get(job["target_id"])
+        current_project = self._project(current["project_id"])
+        input_data = json_loads(job.get("input_json"), {})
+        provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
+        output = await provider.generate_json(
+            system_prompt=load_prompt("asset_prompt"),
+            user_prompt=(
+                f"项目统一画风：{current_project['style_prompt']}\n"
+                f"素材类型：{current['asset_type']}\n"
+                f"素材名称：{current['name']}\n"
+                f"素材资料：{json_dumps(current['profile'])}"
+            ),
+            schema=AssetPromptOutput,
+            params={**config["params"], **input_data.get("params", {})},
+        )
+        generated = output.model_dump(mode="json")
+        updated = self.update(
+            current["id"],
+            {
+                "prompt": generated["prompt"],
+                "negative_prompt": generated["negative_prompt"],
+                "consistency_keywords": generated["consistency_keywords"],
+                "composition": generated["composition"],
+                "status": "ready",
+            },
+        )
+        return {"asset_id": updated["id"], "prompt": generated}

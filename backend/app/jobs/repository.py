@@ -1,0 +1,405 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping, Sequence
+from typing import Any
+from uuid import uuid4
+
+from sqlalchemy import Engine, insert, select, update
+
+from app.db import Database, db, utc_now
+from app.models.tables import job
+from app.schemas import BatchSummary, JobCreate
+from app.services.utils import sanitize_error_message
+
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
+NON_TERMINAL_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+
+
+class JobRepositoryError(RuntimeError):
+    pass
+
+
+class JobNotFoundError(JobRepositoryError):
+    pass
+
+
+class JobStateError(JobRepositoryError):
+    pass
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _json_loads(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def has_download_source(record: Mapping[str, Any]) -> bool:
+    candidates = (record.get("result_data") or {}, record.get("input_data") or {})
+    for value in candidates:
+        if not isinstance(value, Mapping):
+            continue
+        if any(
+            value.get(key) for key in ("result_url", "content_base64", "local_file", "download_url")
+        ):
+            return True
+        data = value.get("data")
+        if isinstance(data, Mapping) and data.get("local_file"):
+            return True
+    return False
+
+
+class JobRepository:
+    def __init__(self, database: Database | Engine | None = None) -> None:
+        if database is None:
+            self.engine = db.engine
+        elif isinstance(database, Database):
+            self.engine = database.engine
+        else:
+            self.engine = database
+
+    @staticmethod
+    def _decode(row: Any) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        record = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
+        record["input_data"] = _json_loads(record.get("input_json"))
+        record["result_data"] = _json_loads(record.get("result_json"))
+        return record
+
+    def create_job(
+        self,
+        data: JobCreate | Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        source: dict[str, Any] = {}
+        if isinstance(data, JobCreate):
+            source.update(data.model_dump())
+        elif data is not None:
+            source.update(dict(data))
+        source.update(kwargs)
+        if "input_data" not in source and "input_json" in source:
+            source["input_data"] = _json_loads(source.pop("input_json"))
+        parsed = JobCreate.model_validate(source)
+        now = utc_now()
+        values = {
+            "id": parsed.id or f"job-{uuid4().hex}",
+            "project_id": parsed.project_id,
+            "job_type": parsed.job_type,
+            "target_type": parsed.target_type,
+            "target_id": parsed.target_id,
+            "batch_id": parsed.batch_id,
+            "provider_kind": parsed.provider_kind,
+            "provider_id": parsed.provider_id,
+            "provider_task_id": "",
+            "status": "queued",
+            "progress_current": 0,
+            "progress_total": parsed.progress_total,
+            "message": "",
+            "input_json": _json_dumps(parsed.input_data),
+            "result_json": "{}",
+            "error": "",
+            "retry_count": 0,
+            "created_at": now,
+            "updated_at": now,
+            "started_at": None,
+            "finished_at": None,
+        }
+        with self.engine.begin() as connection:
+            connection.execute(insert(job).values(**values))
+        created = self.get(values["id"])
+        if created is None:
+            raise JobRepositoryError("任务创建后无法读取")
+        return created
+
+    def get(self, job_id: str) -> dict[str, Any] | None:
+        with self.engine.connect() as connection:
+            row = connection.execute(select(job).where(job.c.id == job_id)).first()
+        return self._decode(row)
+
+    def require(self, job_id: str) -> dict[str, Any]:
+        record = self.get(job_id)
+        if record is None:
+            raise JobNotFoundError(f"任务不存在：{job_id}")
+        return record
+
+    def list(
+        self,
+        *,
+        project_id: str | None = None,
+        status: str | Sequence[str] | None = None,
+        job_type: str | None = None,
+        batch_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        statement = select(job)
+        if project_id is not None:
+            statement = statement.where(job.c.project_id == project_id)
+        if isinstance(status, str):
+            statement = statement.where(job.c.status == status)
+        elif status:
+            statement = statement.where(job.c.status.in_(status))
+        if job_type is not None:
+            statement = statement.where(job.c.job_type == job_type)
+        if batch_id is not None:
+            statement = statement.where(job.c.batch_id == batch_id)
+        statement = statement.order_by(job.c.created_at.desc()).limit(limit).offset(offset)
+        with self.engine.connect() as connection:
+            rows = connection.execute(statement).all()
+        return [record for row in rows if (record := self._decode(row)) is not None]
+
+    def list_batch(self, batch_id: str) -> list[dict[str, Any]]:
+        statement = (
+            select(job).where(job.c.batch_id == batch_id).order_by(job.c.created_at, job.c.id)
+        )
+        with self.engine.connect() as connection:
+            rows = connection.execute(statement).all()
+        return [record for row in rows if (record := self._decode(row)) is not None]
+
+    def batch_summary(self, batch_id: str) -> BatchSummary:
+        records = self.list_batch(batch_id)
+        counts = {status: 0 for status in {*NON_TERMINAL_STATUSES, *TERMINAL_STATUSES}}
+        for record in records:
+            counts[record["status"]] = counts.get(record["status"], 0) + 1
+        return BatchSummary(batch_id=batch_id, total=len(records), **counts)
+
+    def update(self, job_id: str, **changes: Any) -> dict[str, Any]:
+        self.require(job_id)
+        values = dict(changes)
+        if "input_data" in values:
+            values["input_json"] = _json_dumps(values.pop("input_data"))
+        if "result_data" in values:
+            values["result_json"] = _json_dumps(values.pop("result_data"))
+        if "error" in values:
+            values["error"] = sanitize_error_message(values["error"])
+        values["updated_at"] = utc_now()
+        with self.engine.begin() as connection:
+            connection.execute(update(job).where(job.c.id == job_id).values(**values))
+        return self.require(job_id)
+
+    def set_status(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        message: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        values: dict[str, Any] = {"status": status}
+        if message is not None:
+            values["message"] = message
+        if error is not None:
+            values["error"] = error
+        if status == "running":
+            values["started_at"] = utc_now()
+            values["finished_at"] = None
+        elif status in TERMINAL_STATUSES:
+            values["finished_at"] = utc_now()
+        return self.update(job_id, **values)
+
+    def claim(
+        self,
+        job_id: str,
+        *,
+        expected_status: str = "queued",
+    ) -> dict[str, Any] | None:
+        now = utc_now()
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(job)
+                .where(job.c.id == job_id, job.c.status == expected_status)
+                .values(
+                    status="running",
+                    error="",
+                    message="任务执行中",
+                    started_at=now,
+                    finished_at=None,
+                    updated_at=now,
+                )
+            )
+        if result.rowcount != 1:
+            return None
+        return self.get(job_id)
+
+    def requeue_for_recovery(
+        self,
+        job_id: str,
+        *,
+        expected_status: str,
+        message: str,
+    ) -> bool:
+        now = utc_now()
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(job)
+                .where(job.c.id == job_id, job.c.status == expected_status)
+                .values(
+                    status="queued",
+                    message=message,
+                    error="",
+                    started_at=None,
+                    finished_at=None,
+                    updated_at=now,
+                )
+            )
+        return result.rowcount == 1
+
+    def set_provider_task(
+        self,
+        job_id: str,
+        provider_task_id: str,
+        *,
+        status: str = "waiting_provider",
+        result_data: Mapping[str, Any] | None = None,
+        message: str = "",
+    ) -> dict[str, Any]:
+        if not provider_task_id:
+            raise JobStateError("provider_task_id 不能为空")
+        changes: dict[str, Any] = {
+            "provider_task_id": provider_task_id,
+            "status": status,
+            "message": message,
+        }
+        if result_data is not None:
+            changes["result_data"] = dict(result_data)
+        return self.update(job_id, **changes)
+
+    def update_progress(
+        self,
+        job_id: str,
+        current: int,
+        *,
+        total: int | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        changes: dict[str, Any] = {"progress_current": current}
+        if total is not None:
+            changes["progress_total"] = total
+        if message is not None:
+            changes["message"] = message
+        return self.update(job_id, **changes)
+
+    def save_result(
+        self,
+        job_id: str,
+        result_data: Mapping[str, Any],
+        *,
+        merge: bool = False,
+    ) -> dict[str, Any]:
+        value = dict(result_data)
+        if merge:
+            current = self.require(job_id)["result_data"]
+            value = {**current, **value}
+        return self.update(job_id, result_data=value)
+
+    def complete(
+        self,
+        job_id: str,
+        result_data: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = self.require(job_id)
+        values: dict[str, Any] = {
+            "status": "completed",
+            "progress_current": current["progress_total"],
+            "message": "任务完成",
+            "error": "",
+            "finished_at": utc_now(),
+        }
+        if result_data is not None:
+            values["result_data"] = dict(result_data)
+        return self.update(job_id, **values)
+
+    mark_completed = complete
+
+    def fail(self, job_id: str, error: str) -> dict[str, Any]:
+        return self.update(
+            job_id,
+            status="failed",
+            error=error,
+            message="任务失败",
+            finished_at=utc_now(),
+        )
+
+    mark_failed = fail
+
+    def interrupt(self, job_id: str, message: str) -> dict[str, Any]:
+        return self.update(
+            job_id,
+            status="interrupted",
+            error=message,
+            message="任务因服务重启中断",
+            finished_at=utc_now(),
+        )
+
+    mark_interrupted = interrupt
+
+    def retry(self, job_id: str) -> dict[str, Any]:
+        current = self.require(job_id)
+        if current["status"] not in {"failed", "interrupted"}:
+            raise JobStateError("只有失败或中断的任务可以重试")
+        if current["provider_task_id"]:
+            next_status = (
+                "downloading"
+                if current["provider_kind"] == "video" and has_download_source(current)
+                else "waiting_provider"
+            )
+        else:
+            next_status = "queued"
+        return self.update(
+            job_id,
+            status=next_status,
+            error="",
+            message="任务已重新入队",
+            retry_count=current["retry_count"] + 1,
+            started_at=None,
+            finished_at=None,
+        )
+
+    def cancel(
+        self,
+        job_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> dict[str, Any]:
+        if connection is None:
+            with self.engine.begin() as owned_connection:
+                return self.cancel(job_id, connection=owned_connection)
+
+        now = utc_now()
+        result = connection.execute(
+            update(job)
+            .where(job.c.id == job_id, job.c.status == "queued")
+            .values(
+                status="cancelled",
+                message="任务已取消",
+                finished_at=now,
+                updated_at=now,
+            )
+        )
+        current = self._decode(
+            connection.execute(select(job).where(job.c.id == job_id)).first()
+        )
+        if result.rowcount != 1:
+            if current is None:
+                raise JobNotFoundError(f"任务不存在：{job_id}")
+            raise JobStateError("只有排队中的任务可以取消")
+        if current is None:
+            raise JobNotFoundError(f"任务不存在：{job_id}")
+        return current
+
+    def list_non_terminal(self) -> list[dict[str, Any]]:
+        return self.list(status=sorted(NON_TERMINAL_STATUSES), limit=100_000)
+
+
+job_repository = JobRepository()
