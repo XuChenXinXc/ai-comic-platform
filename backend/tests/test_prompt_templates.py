@@ -2,12 +2,29 @@ from __future__ import annotations
 
 import pytest
 
+from app.prompts import load_prompt
 from app.services.prompt_service import (
     compile_asset_prompt,
     compile_keyframe_prompt,
     compile_video_prompt,
     shot_template_context,
 )
+
+
+def test_asset_extraction_prompt_requires_independent_key_props() -> None:
+    prompt = load_prompt("asset_extract")
+
+    assert "值得单独生成素材参考图" in prompt
+    assert "普通钥匙、手机、纸袋、杯子、文件、清洁工具" in prompt
+    assert "物品的 `importance` 必须为 `core`" in prompt
+
+
+def test_shot_extraction_prompt_keeps_generic_items_out_of_asset_bindings() -> None:
+    prompt = load_prompt("shot_extract")
+
+    assert "普通物件即使出现在动作或画面中" in prompt
+    assert "保留在 `action`、`frame_description`" in prompt
+    assert "不得写入 `prop_names` 或 `prop_asset_ids`" in prompt
 
 
 def _shot_context_with_positions_and_expressions() -> dict[str, object]:

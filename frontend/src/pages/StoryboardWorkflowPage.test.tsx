@@ -1,11 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "../api/client";
-import type { Shot } from "../types/api";
+import type { Asset, Shot } from "../types/api";
 import { KeyframesPage } from "./KeyframesPage";
 import { ShotsPage } from "./ShotsPage";
 import { VideosPage } from "./VideosPage";
@@ -78,6 +78,47 @@ const shot: Shot = {
   created_at: "2026-07-29T00:00:00Z",
   updated_at: "2026-07-29T00:00:00Z",
 };
+
+function assetWithImage(
+  id: string,
+  name: string,
+  assetType: Asset["asset_type"],
+  imageId: string,
+): Asset {
+  return {
+    id,
+    project_id: "project-1",
+    asset_type: assetType,
+    name,
+    profile_json: {},
+    prompt: `${name}提示词`,
+    compiled_prompt: `${name}最终提示词`,
+    negative_prompt: "",
+    consistency_json: [],
+    composition: "",
+    importance: "core",
+    status: "ready",
+    source_signature: "source-1",
+    own_signature: `${id}-signature`,
+    revision: 1,
+    current_image: {
+      id: imageId,
+      asset_id: id,
+      version_no: 1,
+      file_url: `/media/${imageId}.png`,
+      prompt_snapshot: `${name}参考图`,
+      negative_prompt_snapshot: "",
+      model: "image-model",
+      status: "completed",
+      is_current: true,
+      input_signature: `${imageId}-signature`,
+      source: "generated",
+      created_at: "2026-07-29T00:00:00Z",
+    },
+    created_at: "2026-07-29T00:00:00Z",
+    updated_at: "2026-07-29T00:00:00Z",
+  };
+}
 
 function renderShotsPage() {
   const queryClient = new QueryClient({
@@ -200,6 +241,132 @@ describe("分镜视频统一页面", () => {
     expect(document.body).toHaveTextContent("看向小红");
     expect(document.body).toHaveTextContent("紧张警觉");
     expect(document.body).toHaveTextContent("压低声音");
+  });
+
+  test("test_shot_card_with_bound_assets_displays_only_bound_images", async () => {
+    vi.mocked(api.assets.list).mockResolvedValue([
+      assetWithImage("scene-1", "青石巷", "scene", "scene-image-1"),
+      assetWithImage("character-1", "林舟", "character", "character-image-1"),
+      assetWithImage("prop-1", "银色怀表", "prop", "prop-image-1"),
+      assetWithImage("character-2", "未出场角色", "character", "character-image-2"),
+    ]);
+    vi.mocked(api.shots.list).mockResolvedValue([
+      {
+        ...shot,
+        scene_asset_id: "scene-1",
+        character_ids_json: ["character-1"],
+        prop_ids_json: ["prop-1"],
+        reference_bindings_json: [
+          {
+            role: "scene_layout",
+            asset_id: "scene-1",
+            asset_image_id: "scene-image-1",
+          },
+          {
+            role: "character_identity",
+            asset_id: "character-1",
+            asset_image_id: "character-image-1",
+          },
+          {
+            role: "prop_identity",
+            asset_id: "prop-1",
+            asset_image_id: "prop-image-1",
+          },
+        ],
+      },
+    ]);
+
+    renderShotsPage();
+
+    const boundAssets = await screen.findByRole("region", {
+      name: "分镜 1 已绑定素材",
+    });
+    expect(
+      within(boundAssets).getByRole("button", { name: "放大青石巷场景参考图" }),
+    ).toBeInTheDocument();
+    expect(
+      within(boundAssets).getByRole("button", { name: "放大林舟角色参考图" }),
+    ).toBeInTheDocument();
+    expect(
+      within(boundAssets).getByRole("button", { name: "放大银色怀表物品参考图" }),
+    ).toBeInTheDocument();
+    expect(within(boundAssets).queryByText("未出场角色")).not.toBeInTheDocument();
+  });
+
+  test("test_shot_card_without_reference_images_displays_semantic_asset_bindings", async () => {
+    vi.mocked(api.assets.list).mockResolvedValue([
+      assetWithImage("scene-1", "青石巷", "scene", "scene-image-1"),
+      assetWithImage("character-1", "林舟", "character", "character-image-1"),
+      assetWithImage("prop-1", "银色怀表", "prop", "prop-image-1"),
+      assetWithImage("character-2", "未出场角色", "character", "character-image-2"),
+    ]);
+    vi.mocked(api.shots.list).mockResolvedValue([
+      {
+        ...shot,
+        scene_asset_id: "scene-1",
+        character_ids_json: ["character-1"],
+        prop_ids_json: ["prop-1"],
+        reference_bindings_json: [
+          {
+            role: "character_identity",
+            asset_id: "character-2",
+            asset_image_id: "character-image-2",
+          },
+        ],
+      },
+    ]);
+
+    renderShotsPage();
+
+    const assetTags = await screen.findByRole("group", {
+      name: "分镜 1 素材标签",
+    });
+    const sceneTag = within(assetTags).getByText("场景 · 青石巷");
+    const characterTag = within(assetTags).getByText("角色 · 林舟");
+    const propTag = within(assetTags).getByText("物品 · 银色怀表");
+    expect(sceneTag.className).toBe(characterTag.className);
+    expect(propTag.className).toBe(characterTag.className);
+
+    const boundAssets = screen.getByRole("region", {
+      name: "分镜 1 已绑定素材",
+    });
+    expect(within(boundAssets).getByText("青石巷")).toBeInTheDocument();
+    expect(within(boundAssets).getByText("林舟")).toBeInTheDocument();
+    expect(within(boundAssets).getByText("银色怀表")).toBeInTheDocument();
+    expect(within(boundAssets).getAllByText("尚无绑定图")).toHaveLength(3);
+    expect(within(boundAssets).queryByRole("button")).not.toBeInTheDocument();
+    expect(within(boundAssets).queryByText("未出场角色")).not.toBeInTheDocument();
+  });
+
+  test("test_shot_card_with_mismatched_bound_image_does_not_display_current_image", async () => {
+    vi.mocked(api.assets.list).mockResolvedValue([
+      assetWithImage("scene-1", "青石巷", "scene", "scene-image-current"),
+    ]);
+    vi.mocked(api.shots.list).mockResolvedValue([
+      {
+        ...shot,
+        scene_asset_id: "scene-1",
+        reference_bindings_json: [
+          {
+            role: "scene_layout",
+            asset_id: "scene-1",
+            asset_image_id: "scene-image-bound",
+          },
+        ],
+      },
+    ]);
+
+    renderShotsPage();
+
+    const boundAssets = await screen.findByRole("region", {
+      name: "分镜 1 已绑定素材",
+    });
+    expect(within(boundAssets).getByText("绑定图不可用")).toBeInTheDocument();
+    expect(
+      within(boundAssets).queryByRole("button", {
+        name: "放大青石巷场景参考图",
+      }),
+    ).not.toBeInTheDocument();
   });
 
   test.each([

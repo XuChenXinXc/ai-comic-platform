@@ -12,6 +12,10 @@ JSON Schema 的对象，不要输出 Markdown 或额外说明。
    - `scene_asset_id` 必须填写当前场景对应的场景素材 ID；
    - `character_asset_ids` 与 `prop_asset_ids` 只能填写目录中实际出现的 ID；
    - `scene_name`、`character_names`、`prop_names` 保留对应素材的准确名称；
+   - 普通物件即使出现在动作或画面中，只要不在素材目录，就只保留在 `action`、`frame_description`、
+     `image_prompt` 或 `video_prompt` 的文字描述中，
+     不得写入 `prop_names` 或 `prop_asset_ids`，也不得要求为其补建素材；
+   - 每个分镜只绑定目录中存在且当前镜真实涉及的关键物品，不绑定其他镜头的物品；
    - 不得编造目录中不存在的素材 ID。
 7. `duration_sec` 必须填写大于 0 的整数秒，并由本镜动作、对白和镜头调度决定。
 8. 每个分镜必须在同一次提取中补齐 `image_prompt`、`video_prompt` 和

@@ -7,6 +7,7 @@ import {
   Copy,
   Film,
   GripVertical,
+  ImageOff,
   Images,
   Merge,
   Pencil,
@@ -18,7 +19,8 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { toast } from "sonner";
-import { api, queryKeys } from "../api/client";
+import { api, mediaUrl, queryKeys } from "../api/client";
+import { ImagePreview } from "../components/image-preview";
 import { JsonEditor } from "../components/json-editor";
 import { ProjectRequired } from "../components/project-required";
 import { ShotMediaCard } from "../components/shot-media-card";
@@ -596,6 +598,57 @@ export function ShotsPage() {
           {shots.map((shot, index) => {
             const characterIds = idList(shot.character_ids_json);
             const propIds = idList(shot.prop_ids_json);
+            const referenceBindings = parseJson<ReferenceBinding[]>(
+              shot.reference_bindings_json,
+              [],
+            );
+            const boundAssets = [
+              ...(shot.scene_asset_id
+                ? [
+                    {
+                      role: "scene_layout" as const,
+                      assetId: shot.scene_asset_id,
+                    },
+                  ]
+                : []),
+              ...characterIds.map((assetId) => ({
+                role: "character_identity" as const,
+                assetId,
+              })),
+              ...propIds.map((assetId) => ({
+                role: "prop_identity" as const,
+                assetId,
+              })),
+            ]
+              .filter(
+                (item, itemIndex, items) =>
+                  items.findIndex(
+                    (candidate) =>
+                      candidate.role === item.role &&
+                      candidate.assetId === item.assetId,
+                  ) === itemIndex,
+              )
+              .map(({ role, assetId }) => {
+                const asset = assetMap.get(assetId);
+                const typeLabel =
+                  role === "scene_layout"
+                    ? "场景"
+                    : role === "character_identity"
+                      ? "角色"
+                      : "物品";
+                return {
+                  asset,
+                  assetId,
+                  assetName:
+                    asset?.name || `未知${typeLabel} ${assetId.slice(0, 6)}`,
+                  binding: referenceBindings.find(
+                    (binding) =>
+                      binding.role === role && binding.asset_id === assetId,
+                  ),
+                  role,
+                  typeLabel,
+                };
+              });
             const dialogue = jsonList<DialogueLine>(shot.dialogue_json);
             const positions = jsonList<ShotPosition>(shot.positions_json)
               .map(formatPosition)
@@ -663,18 +716,21 @@ export function ShotsPage() {
                         <p className="mt-2 text-sm font-semibold leading-6 text-[#3f423d]">
                           {shot.action || shot.frame_description || "尚未填写镜头动作"}
                         </p>
-                        <div className="mt-2 flex flex-wrap gap-1.5">
-                          {characterIds.map((id) => (
-                            <Badge key={id}>
-                              {assetMap.get(id)?.name || `未知角色 ${id.slice(0, 6)}`}
-                            </Badge>
-                          ))}
-                          {propIds.map((id) => (
-                            <Badge key={id} className="bg-[#f3f0e8]">
-                              {assetMap.get(id)?.name || `未知物品 ${id.slice(0, 6)}`}
-                            </Badge>
-                          ))}
-                        </div>
+                        {boundAssets.length ? (
+                          <div
+                            className="mt-2 flex flex-wrap gap-1.5"
+                            role="group"
+                            aria-label={`分镜 ${shot.shot_no} 素材标签`}
+                          >
+                            {boundAssets.map(
+                              ({ assetId, assetName, role, typeLabel }) => (
+                                <Badge key={`${role}-${assetId}`}>
+                                  {typeLabel} · {assetName}
+                                </Badge>
+                              ),
+                            )}
+                          </div>
+                        ) : null}
                       </div>
                       <div className="flex shrink-0 flex-wrap gap-1">
                         <Button
@@ -707,6 +763,84 @@ export function ShotsPage() {
                         </Button>
                       </div>
                     </div>
+
+                    <section
+                      className="border-b border-line bg-[#f7f4ed] px-5 py-4"
+                      aria-label={`分镜 ${shot.shot_no} 已绑定素材`}
+                    >
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
+                          已绑定素材
+                        </p>
+                        <span className="text-[11px] text-muted">
+                          {boundAssets.length} 项
+                        </span>
+                      </div>
+                      {boundAssets.length ? (
+                        <div className="flex gap-3 overflow-x-auto pb-1">
+                          {boundAssets.map(
+                            ({
+                              asset,
+                              assetId,
+                              assetName,
+                              binding,
+                              role,
+                              typeLabel,
+                            }) => {
+                            const currentImage = asset?.current_image;
+                            const imageUrl =
+                              binding &&
+                              currentImage &&
+                              currentImage.id === binding.asset_image_id &&
+                              currentImage.status === "completed"
+                                ? mediaUrl(currentImage)
+                                : "";
+                            const previewAlt = `${assetName}${typeLabel}参考图`;
+                            const unavailableLabel = binding?.asset_image_id
+                              ? "绑定图不可用"
+                              : "尚无绑定图";
+
+                            return (
+                              <div
+                                key={`${role}-${assetId}`}
+                                className="w-28 shrink-0"
+                              >
+                                <div className="aspect-[4/3] overflow-hidden rounded-md border border-line bg-[#252925]">
+                                  {imageUrl ? (
+                                    <ImagePreview
+                                      src={imageUrl}
+                                      alt={previewAlt}
+                                      buttonClassName="h-full"
+                                      imageClassName="h-full w-full object-cover"
+                                      loading="lazy"
+                                    />
+                                  ) : (
+                                    <div
+                                      className="flex h-full flex-col items-center justify-center gap-1 px-2 text-center text-white/55"
+                                      title={unavailableLabel}
+                                    >
+                                      <ImageOff className="h-5 w-5" />
+                                      <span className="text-[10px]">
+                                        {unavailableLabel}
+                                      </span>
+                                    </div>
+                                  )}
+                                </div>
+                                <p className="mt-2 truncate text-xs font-semibold text-[#3f423d]" title={assetName}>
+                                  {assetName}
+                                </p>
+                                <p className="mt-0.5 text-[10px] text-muted">{typeLabel}</p>
+                              </div>
+                            );
+                            },
+                          )}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-muted">
+                          当前分镜尚未绑定场景、角色或物品素材。
+                        </p>
+                      )}
+                    </section>
 
                     <div className="grid gap-4 px-5 py-5 xl:grid-cols-[0.75fr_1fr_1fr]">
                       <div className="space-y-3">
