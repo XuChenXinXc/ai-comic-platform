@@ -1,10 +1,8 @@
 import {
   BookOpenText,
   Boxes,
-  Clapperboard,
   Film,
-  Frame,
-  Image,
+  FolderCog,
   ListChecks,
   Settings2,
   Sparkles,
@@ -14,15 +12,13 @@ import { formatError } from "../lib/utils";
 import { useJobPolling, isJobActive } from "../hooks/use-job-polling";
 import { useProject } from "../hooks/use-project";
 import { Badge, Select } from "./ui";
+import { TaskLoadingBar } from "./task-loading-bar";
 
 const productionSteps = [
   { to: "/project", label: "项目小说", short: "项目", icon: BookOpenText },
-  { to: "/writing", label: "小说分析与剧本", short: "文稿", icon: Sparkles },
-  { to: "/assets", label: "素材与提示词", short: "素材", icon: Boxes },
-  { to: "/asset-images", label: "素材图片", short: "素材图", icon: Image },
-  { to: "/shots", label: "分镜与提示词", short: "分镜", icon: Clapperboard },
-  { to: "/keyframes", label: "分镜关键帧", short: "关键帧", icon: Frame },
-  { to: "/videos", label: "分镜视频", short: "视频", icon: Film },
+  { to: "/writing", label: "剧本生成", short: "剧本", icon: Sparkles },
+  { to: "/assets", label: "素材库", short: "素材库", icon: Boxes },
+  { to: "/shots", label: "分镜视频", short: "分镜视频", icon: Film },
 ];
 
 export function AppShell() {
@@ -55,6 +51,13 @@ export function AppShell() {
             </div>
           </div>
           <div className="flex gap-2 lg:hidden">
+            <NavLink
+              to="/settings"
+              className="rounded-md border border-white/10 p-2.5 text-white/70 hover:bg-white/10 hover:text-white"
+              aria-label="平台设置"
+            >
+              <FolderCog className="h-5 w-5" />
+            </NavLink>
             <NavLink
               to="/providers"
               className="rounded-md border border-white/10 p-2.5 text-white/70 hover:bg-white/10 hover:text-white"
@@ -115,7 +118,7 @@ export function AppShell() {
 
         <nav
           className="flex gap-2 overflow-x-auto px-4 py-3 lg:block lg:space-y-1 lg:px-4 lg:py-5"
-          aria-label="七步生产轨道"
+          aria-label="四步生产轨道"
         >
           {productionSteps.map((item, index) => {
             const Icon = item.icon;
@@ -145,9 +148,22 @@ export function AppShell() {
 
         <div className="hidden border-t border-white/10 px-4 py-4 lg:block">
           <NavLink
-            to="/providers"
+            to="/settings"
             className={({ isActive }) =>
               `flex items-center gap-3 rounded-md px-3 py-2.5 text-sm font-semibold ${
+                isActive
+                  ? "bg-white/12 text-white"
+                  : "text-white/58 hover:bg-white/[0.07] hover:text-white"
+              }`
+            }
+          >
+            <FolderCog className="h-4 w-4" />
+            平台设置
+          </NavLink>
+          <NavLink
+            to="/providers"
+            className={({ isActive }) =>
+              `mt-1 flex items-center gap-3 rounded-md px-3 py-2.5 text-sm font-semibold ${
                 isActive
                   ? "bg-white/12 text-white"
                   : "text-white/58 hover:bg-white/[0.07] hover:text-white"
@@ -180,6 +196,7 @@ export function AppShell() {
 
       <main className="min-w-0">
         <div className="mx-auto w-full max-w-[1680px] px-4 py-6 sm:px-6 lg:px-9 lg:py-9 xl:px-12">
+          <TaskLoadingBar jobs={jobsQuery.data || []} />
           <Outlet />
         </div>
       </main>

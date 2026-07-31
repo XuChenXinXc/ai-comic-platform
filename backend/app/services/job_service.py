@@ -196,41 +196,50 @@ class JobService:
             return
 
         if record["job_type"] == "analyze_novel":
-            table = novel_analysis
-            related_job_types = ("analyze_novel",)
-        elif record["job_type"] in {
-            "generate_screenplay",
-            "generate_screenplay_scene",
-        }:
-            table = screenplay
-            related_job_types = (
-                "generate_screenplay",
-                "generate_screenplay_scene",
-            )
+            targets = [(novel_analysis, ("analyze_novel", "generate_screenplay"))]
+        elif record["job_type"] == "generate_screenplay":
+            targets = [
+                (
+                    screenplay,
+                    ("generate_screenplay", "generate_screenplay_scene"),
+                ),
+                (
+                    novel_analysis,
+                    ("analyze_novel", "generate_screenplay"),
+                ),
+            ]
+        elif record["job_type"] == "generate_screenplay_scene":
+            targets = [
+                (
+                    screenplay,
+                    ("generate_screenplay", "generate_screenplay_scene"),
+                )
+            ]
         else:
             return
 
-        other_active = connection.execute(
-            select(job.c.id)
-            .where(
-                job.c.id != record["id"],
-                job.c.project_id == record["project_id"],
-                job.c.job_type.in_(related_job_types),
-                job.c.status.in_(NON_TERMINAL_STATUSES),
+        for table, related_job_types in targets:
+            other_active = connection.execute(
+                select(job.c.id)
+                .where(
+                    job.c.id != record["id"],
+                    job.c.project_id == record["project_id"],
+                    job.c.job_type.in_(related_job_types),
+                    job.c.status.in_(NON_TERMINAL_STATUSES),
+                )
+                .limit(1)
+            ).first()
+            if other_active:
+                continue
+            connection.execute(
+                update(table)
+                .where(
+                    table.c.project_id == record["project_id"],
+                    table.c.status == "generating",
+                )
+                .values(
+                    status="failed",
+                    error=_CANCELLED_TARGET_ERROR,
+                    updated_at=utc_now(),
+                )
             )
-            .limit(1)
-        ).first()
-        if other_active:
-            return
-        connection.execute(
-            update(table)
-            .where(
-                table.c.project_id == record["project_id"],
-                table.c.status == "generating",
-            )
-            .values(
-                status="failed",
-                error=_CANCELLED_TARGET_ERROR,
-                updated_at=utc_now(),
-            )
-        )

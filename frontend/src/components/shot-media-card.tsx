@@ -26,12 +26,16 @@ export function ShotMediaCard({
   assetMap,
   selected,
   onToggle,
+  embedded = false,
+  anchorId,
 }: {
   shot: Shot;
   kind: "keyframe" | "video";
   assetMap: Map<string, Asset>;
   selected: boolean;
   onToggle: (checked: boolean) => void;
+  embedded?: boolean;
+  anchorId?: string;
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -39,6 +43,10 @@ export function ShotMediaCard({
   const [prompt, setPrompt] = useState(
     kind === "keyframe" ? shot.image_prompt : shot.video_prompt,
   );
+  const compiledPrompt =
+    kind === "keyframe"
+      ? shot.compiled_image_prompt
+      : shot.compiled_video_prompt;
   const queryKey =
     kind === "keyframe"
       ? queryKeys.keyframes(shot.id)
@@ -60,7 +68,20 @@ export function ShotMediaCard({
     setPrompt(kind === "keyframe" ? shot.image_prompt : shot.video_prompt);
   }, [kind, shot.image_prompt, shot.video_prompt]);
 
-  const invalidate = () => queryClient.invalidateQueries({ queryKey });
+  const invalidate = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey }),
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.shots(shot.project_id),
+      }),
+      ...(kind === "keyframe"
+        ? [
+            queryClient.invalidateQueries({
+              queryKey: queryKeys.videos(shot.id),
+            }),
+          ]
+        : []),
+    ]);
 
   const generateMutation = useMutation({
     mutationFn: () =>
@@ -85,11 +106,6 @@ export function ShotMediaCard({
         : api.shots.videos.upload(shot.id, file),
     onSuccess: async () => {
       await invalidate();
-      if (kind === "keyframe") {
-        await queryClient.invalidateQueries({
-          queryKey: queryKeys.keyframes(shot.id),
-        });
-      }
       toast.success("文件已上传并设为当前版本");
     },
     onError: (error) => toast.error(formatError(error)),
@@ -125,15 +141,15 @@ export function ShotMediaCard({
         [kind === "keyframe" ? "image_prompt" : "video_prompt"]: prompt,
       }),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: queryKeys.shots(shot.project_id),
-      });
+      await invalidate();
       toast.success("提示词已保存，旧媒体会显示来源变化");
     },
     onError: (error) => toast.error(formatError(error)),
   });
 
-  const characterNames = parseJson<string[]>(shot.character_ids_json, [])
+  const characterIds = parseJson<string[]>(shot.character_ids_json, []);
+  const propIds = parseJson<string[]>(shot.prop_ids_json, []);
+  const characterNames = characterIds
     .map((id) => assetMap.get(id)?.name)
     .filter(Boolean);
   const sceneName = shot.scene_asset_id
@@ -143,42 +159,77 @@ export function ShotMediaCard({
     shot.reference_bindings_json,
     [],
   );
+  const selectedAssetIds = [
+    ...(shot.scene_asset_id ? [shot.scene_asset_id] : []),
+    ...characterIds,
+    ...propIds,
+  ];
+  const boundAssetIds = new Set(
+    bindings.flatMap((binding) =>
+      binding.asset_id && binding.asset_image_id ? [binding.asset_id] : [],
+    ),
+  );
+  const missingSceneAsset = !shot.scene_asset_id;
+  const missingAssetReference =
+    selectedAssetIds.length === 0 ||
+    selectedAssetIds.some((assetId) => !boundAssetIds.has(assetId));
+  const assetBindingNotice = missingSceneAsset
+    ? "尚未绑定场景素材，图片和视频生成暂不可用；请先到分镜编辑中绑定场景素材。"
+    : missingAssetReference
+      ? "素材参考图未就绪，图片和视频生成暂不可用；请先到分镜编辑中绑定素材，并确保素材已有当前图片。"
+      : "";
   const currentKeyframe = (keyframesQuery.data || []).find(
     (version) => version.is_current && version.status === "completed",
-  );
-  const promptMissing = !prompt.trim();
+  ) || shot.current_keyframe;
+  const promptMissing =
+    kind === "keyframe"
+      ? !shot.image_prompt.trim()
+      : !shot.video_prompt.trim();
   const videoMissingKeyframe = kind === "video" && !currentKeyframe;
 
   return (
-    <Card className="overflow-hidden">
+    <Card id={anchorId} className="overflow-hidden shadow-none">
       <div className="flex flex-col gap-3 border-b border-line px-5 py-4 sm:flex-row sm:items-start sm:justify-between">
-        <div className="flex min-w-0 items-start gap-3">
-          <label className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded bg-sidebar text-xs font-bold text-white">
-            <input
-              type="checkbox"
-              className="sr-only"
-              checked={selected}
-              onChange={(event) => onToggle(event.target.checked)}
-              aria-label={`选择分镜 ${shot.shot_no}`}
-            />
-            {String(shot.shot_no).padStart(2, "0")}
-          </label>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 className="truncate font-bold">{sceneName || "未绑定场景"}</h2>
-              <StatusBadge status={shot.status} />
-              <Badge>{shot.duration_sec}s</Badge>
-            </div>
-            <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted">
-              {shot.action || shot.frame_description}
+        {embedded ? (
+          <div>
+            <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-vermilion">
+              {kind === "keyframe" ? "Stage 02" : "Stage 03"}
             </p>
-            {characterNames.length ? (
-              <p className="mt-1 truncate text-[11px] text-muted">
-                {characterNames.join(" · ")}
-              </p>
-            ) : null}
+            <h3 className="mt-1 font-bold">
+              {kind === "keyframe" ? "分镜关键帧" : "分镜视频"}
+            </h3>
           </div>
-        </div>
+        ) : (
+          <div className="flex min-w-0 items-start gap-3">
+            <label className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded bg-sidebar text-xs font-bold text-white">
+              <input
+                type="checkbox"
+                className="sr-only"
+                checked={selected}
+                onChange={(event) => onToggle(event.target.checked)}
+                aria-label={`选择分镜 ${shot.shot_no}`}
+              />
+              {String(shot.shot_no).padStart(2, "0")}
+            </label>
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="truncate font-bold">
+                  {sceneName || "未绑定场景"}
+                </h2>
+                <StatusBadge status={shot.status} />
+                <Badge>{shot.duration_sec}s</Badge>
+              </div>
+              <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted">
+                {shot.action || shot.frame_description}
+              </p>
+              {characterNames.length ? (
+                <p className="mt-1 truncate text-[11px] text-muted">
+                  {characterNames.join(" · ")}
+                </p>
+              ) : null}
+            </div>
+          </div>
+        )}
         <div className="flex shrink-0 flex-wrap gap-2">
           <input
             ref={fileRef}
@@ -207,7 +258,12 @@ export function ShotMediaCard({
             size="sm"
             variant="primary"
             busy={generateMutation.isPending}
-            disabled={promptMissing || videoMissingKeyframe}
+            disabled={
+              promptMissing ||
+              videoMissingKeyframe ||
+              missingSceneAsset ||
+              missingAssetReference
+            }
             onClick={() => generateMutation.mutate()}
           >
             <WandSparkles className="h-4 w-4" />
@@ -216,12 +272,32 @@ export function ShotMediaCard({
         </div>
       </div>
 
-      <div className="grid xl:grid-cols-[minmax(280px,0.82fr)_minmax(0,1.35fr)]">
-        <div className="space-y-4 border-b border-line p-5 xl:border-b-0 xl:border-r">
+      <div
+        className={
+          embedded
+            ? "grid"
+            : "grid xl:grid-cols-[minmax(280px,0.82fr)_minmax(0,1.35fr)]"
+        }
+      >
+        <div
+          className={`space-y-4 border-b border-line p-5 ${
+            embedded ? "" : "xl:border-b-0 xl:border-r"
+          }`}
+        >
           <div>
+            <div className="mb-4 rounded-md border border-line bg-white/55 p-3">
+              <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
+                {kind === "keyframe"
+                  ? "最终 V2 关键帧提示词"
+                  : "最终 V2 视频提示词"}
+              </p>
+              <p className="mt-2 max-h-56 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+                {compiledPrompt || prompt}
+              </p>
+            </div>
             <div className="mb-2 flex items-center justify-between gap-2">
               <Label className="mb-0">
-                {kind === "keyframe" ? "关键帧图片提示词" : "视频执行提示词"}
+                导演补充（可选）
               </Label>
               <Button
                 size="sm"
@@ -238,12 +314,12 @@ export function ShotMediaCard({
               </Button>
             </div>
             <Textarea
-              rows={kind === "keyframe" ? 9 : 12}
+              rows={kind === "keyframe" ? 4 : 6}
               value={prompt}
               placeholder={
                 kind === "keyframe"
-                  ? "先在分镜页生成提示词，或直接在这里编辑…"
-                  : "按时间段描述动作、镜头、环境动态与禁止事项…"
+                  ? "可补充本镜构图、灯光或环境细节；留空时按分镜结构自动编译。"
+                  : "可补充本镜动作时间轴、表演或镜头变化；留空时按分镜结构自动编译。"
               }
               onChange={(event) => setPrompt(event.target.value)}
             />
@@ -258,11 +334,8 @@ export function ShotMediaCard({
               </p>
             </div>
           ) : null}
-          {kind === "keyframe" && bindings.length === 0 ? (
-            <StaleNotice
-              compact
-              reason="尚未绑定素材参考图，将以纯文字降级生成；可到分镜编辑中补充明确版本绑定。"
-            />
+          {assetBindingNotice ? (
+            <StaleNotice compact reason={assetBindingNotice} />
           ) : null}
           {videoMissingKeyframe && !keyframesQuery.isLoading ? (
             <div>
@@ -273,7 +346,7 @@ export function ShotMediaCard({
               <Button
                 className="mt-2"
                 size="sm"
-                onClick={() => navigate("/keyframes")}
+                onClick={() => navigate("/shots?stage=keyframes")}
               >
                 前往生成关键帧
               </Button>

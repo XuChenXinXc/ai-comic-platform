@@ -26,6 +26,7 @@ from app.schemas import (
     ShotExtractionOutput,
     ShotImagePromptOutput,
     ShotVideoPromptOutput,
+    VisualStyleOutput,
 )
 from app.services.file_service import atomic_copy, atomic_write_bytes
 
@@ -73,6 +74,8 @@ class MockTextProvider:
                 "hard_to_visualize": ["内心独白"],
                 "production_risks": [],
             }
+        if schema is VisualStyleOutput:
+            return {"style_prompt": "冷峻悬疑二维国漫，利落轮廓，低饱和冷色，分层暗光"}
         if schema is ScreenplayOutput:
             return {
                 "title": "Mock 漫剧",
@@ -98,10 +101,22 @@ class MockTextProvider:
                     {
                         "name": "主角",
                         "identity": "故事主角",
+                        "concept": "谨慎的线索追寻者",
+                        "worldview": "当代现实世界",
                         "appearance": "清晰的面部轮廓",
                         "hair": "黑色短发",
+                        "eyes": "深棕色眼睛",
+                        "normal_expression": "谨慎而专注",
                         "costume": "深色外套",
+                        "main_color": "深灰色",
+                        "accent_color": "暗红色",
+                        "costume_material": "哑光棉质",
                         "immutable_features": ["黑色短发", "深色外套"],
+                        "expression_group": ["谨慎", "惊讶", "坚定"],
+                        "prompt": "清晰面部轮廓，黑色短发，深色外套，谨慎而专注",
+                        "negative_prompt": "多人，身份漂移，服装变化，文字，水印",
+                        "consistency_keywords": ["黑色短发", "深色外套"],
+                        "composition": "纯白背景横向角色设定面板",
                         "importance": "core",
                     }
                 ],
@@ -109,8 +124,15 @@ class MockTextProvider:
                     {
                         "name": "主要场景",
                         "indoor_outdoor": "室内",
+                        "worldview": "当代现实世界",
+                        "plot_function": "承载主角发现线索的剧情",
                         "lighting": "柔和侧光",
                         "layout": "前景入口，中景人物，远景窗户",
+                        "furnishings": ["旧木桌", "高窗"],
+                        "prompt": "入口、旧木桌和高窗位置固定，柔和侧光从高窗进入",
+                        "negative_prompt": "人物，空间结构矛盾，家具漂移，文字，水印",
+                        "consistency_keywords": ["入口位置", "旧木桌", "高窗"],
+                        "composition": "主透视图、双向全景、俯视平面图和细节区",
                         "importance": "core",
                     }
                 ],
@@ -118,7 +140,19 @@ class MockTextProvider:
                     {
                         "name": "关键物品",
                         "description": "推动剧情的随身物品",
+                        "worldview": "当代现实世界",
+                        "category": "线索道具",
+                        "owner": "主角",
+                        "silhouette": "小型圆形轮廓",
+                        "dimensions": "掌心大小",
                         "plot_function": "提供线索",
+                        "material": "做旧金属",
+                        "color": "暗金色",
+                        "special_features": ["表面刻纹"],
+                        "prompt": "掌心大小的暗金色圆形物品，做旧金属表面带固定刻纹",
+                        "negative_prompt": "完整人物，多件物品，结构错误，文字，水印",
+                        "consistency_keywords": ["圆形轮廓", "暗金色", "固定刻纹"],
+                        "composition": "纯白背景横向道具设定面板",
                         "importance": "normal",
                     }
                 ],
@@ -129,9 +163,39 @@ class MockTextProvider:
                 "negative_prompt": "模糊，畸形，多余肢体，文字，水印",
                 "consistency_keywords": ["固定轮廓", "固定配色", "固定服装"],
                 "composition": "居中全身，纯净背景",
-                "recommended_size": "1024x1024",
             }
         if schema is ShotExtractionOutput:
+            catalog: list[dict[str, Any]] = []
+            marker = "当前项目可用素材目录：\n"
+            if marker in user_prompt:
+                catalog_text = user_prompt.split(marker, 1)[1].split("\n来源内容：", 1)[0]
+                try:
+                    parsed_catalog = json.loads(catalog_text)
+                    if isinstance(parsed_catalog, list):
+                        catalog = [item for item in parsed_catalog if isinstance(item, dict)]
+                except json.JSONDecodeError:
+                    catalog = []
+
+            def catalog_id(asset_type: str, name: str, fallback: str) -> str:
+                candidate = next(
+                    (
+                        item
+                        for item in catalog
+                        if item.get("asset_type") == asset_type
+                        and (
+                            item.get("name") == name
+                            or name
+                            in (
+                                item.get("aliases", [])
+                                if isinstance(item.get("aliases"), list)
+                                else []
+                            )
+                        )
+                    ),
+                    None,
+                )
+                return str(candidate.get("id")) if candidate and candidate.get("id") else fallback
+
             return {
                 "shots": [
                     {
@@ -139,8 +203,13 @@ class MockTextProvider:
                         "scene_no": 1,
                         "source_ref": "开场",
                         "scene_name": "主要场景",
+                        "scene_asset_id": catalog_id("scene", "主要场景", "mock-scene-id"),
                         "character_names": ["主角"],
+                        "character_asset_ids": [
+                            catalog_id("character", "主角", "mock-character-id")
+                        ],
                         "prop_names": [],
+                        "prop_asset_ids": [],
                         "positions": [{"character": "主角", "position": "画面左侧"}],
                         "start_state": "主角站在入口",
                         "action": "主角向前走两步并停下观察。",
@@ -154,6 +223,19 @@ class MockTextProvider:
                         "end_state": "主角停在画面中央",
                         "next_hook": "视线转向画外",
                         "frame_description": "主角位于场景中央，侧光勾勒轮廓。",
+                        "image_prompt": (
+                            "中景平视，主角站在入口，动作发生前的稳定起始状态，"
+                            "侧光勾勒轮廓，前方留出移动空间。"
+                        ),
+                        "video_prompt": (
+                            "0-2秒：主角向前走两步，镜头缓慢推进；"
+                            "2-5秒：主角停下谨慎观察；"
+                            "5-6秒：主角视线转向画外，末0.5秒保持稳定。"
+                        ),
+                        "negative_prompt": (
+                            "身份漂移，服装变化，新增人物，左右位置交换，"
+                            "肢体畸形，镜头抖动，文字，水印"
+                        ),
                     }
                 ]
             }

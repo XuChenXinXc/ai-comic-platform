@@ -140,6 +140,25 @@ def _create_project(client: TestClient) -> dict[str, Any]:
     return response.json()
 
 
+def _create_ready_scene(client: TestClient, project_id: str) -> dict[str, Any]:
+    response = client.post(
+        f"/api/projects/{project_id}/assets",
+        json={
+            "asset_type": "scene",
+            "name": "测试场景",
+            "prompt": "固定场景设定",
+        },
+    )
+    assert response.status_code == 201
+    scene = response.json()
+    upload = client.post(
+        f"/api/assets/{scene['id']}/images/upload",
+        files={"file": ("scene.png", _PNG, "image/png")},
+    )
+    assert upload.status_code == 201
+    return scene
+
+
 def _create_text_provider(client: TestClient, name: str) -> dict[str, Any]:
     response = client.post(
         "/api/providers",
@@ -153,6 +172,29 @@ def _create_text_provider(client: TestClient, name: str) -> dict[str, Any]:
     )
     assert response.status_code == 201
     return response.json()
+
+
+def test_screenplay_generation_updates_style_for_future_asset_prompts(
+    api_client: TestClient,
+) -> None:
+    project = _create_project(api_client)
+    project_id = project["id"]
+
+    screenplay_job = api_client.post(f"/api/projects/{project_id}/screenplay/generate", json={})
+    assert screenplay_job.status_code == 202
+    assert _wait_job(api_client, screenplay_job.json()["id"])["status"] == "completed"
+    expected_style_prompt = "冷峻悬疑二维国漫，利落轮廓，低饱和冷色，分层暗光"
+    updated_project = api_client.get(f"/api/projects/{project_id}")
+    assert updated_project.status_code == 200
+    assert updated_project.json()["style_prompt"] == expected_style_prompt
+
+    extract_job = api_client.post(f"/api/projects/{project_id}/assets/extract", json={})
+    assert extract_job.status_code == 202
+    assert _wait_job(api_client, extract_job.json()["id"])["status"] == "completed"
+    extracted_assets = api_client.get(f"/api/projects/{project_id}/assets").json()
+    assert len(extracted_assets) == 3
+    for current_asset in extracted_assets:
+        assert expected_style_prompt in current_asset["compiled_prompt"]
 
 
 def test_mock_provider_full_workflow_returns_current_media_and_zip(
@@ -170,13 +212,31 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     assert _wait_job(api_client, extract_job.json()["id"])["status"] == "completed"
     extracted_assets = api_client.get(f"/api/projects/{project_id}/assets").json()
     assert len(extracted_assets) == 3
-
-    prompt_batch = api_client.post(f"/api/projects/{project_id}/assets/prompts/batch", json={})
-    assert prompt_batch.status_code == 202
-    _wait_batch(api_client, prompt_batch.json())
     image_batch = api_client.post(f"/api/projects/{project_id}/assets/images/batch", json={})
     assert image_batch.status_code == 202
     _wait_batch(api_client, image_batch.json())
+    template_markers = {
+        "character": "横向角色设定面板",
+        "scene": "横向专业场景设定面板",
+        "prop": "横向专业道具设定面板",
+    }
+    storage_folders = {
+        "character": "角色/",
+        "scene": "场景/",
+        "prop": "物品/",
+    }
+    for current_asset in extracted_assets:
+        assert current_asset["prompt"]
+        assert current_asset["negative_prompt"]
+        assert current_asset["consistency_keywords"]
+        assert current_asset["composition"]
+        assert template_markers[current_asset["asset_type"]] in current_asset["compiled_prompt"]
+        versions = api_client.get(f"/api/assets/{current_asset['id']}/images")
+        assert versions.status_code == 200
+        assert versions.json()[0]["prompt_snapshot"] == current_asset["compiled_prompt"]
+        assert versions.json()[0]["file_path"].startswith(
+            storage_folders[current_asset["asset_type"]]
+        )
 
     shot_job = api_client.post(
         f"/api/projects/{project_id}/shots/extract",
@@ -187,10 +247,12 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     current_shots = api_client.get(f"/api/projects/{project_id}/shots").json()
     assert len(current_shots) == 1
     shot_id = current_shots[0]["id"]
-
-    shot_prompt_batch = api_client.post(f"/api/projects/{project_id}/shots/prompts/batch", json={})
-    assert shot_prompt_batch.status_code == 202
-    _wait_batch(api_client, shot_prompt_batch.json())
+    assert current_shots[0]["image_prompt"]
+    assert current_shots[0]["video_prompt"]
+    assert current_shots[0]["negative_prompt"]
+    assert "【当前分镜素材参考图】" in current_shots[0]["compiled_image_prompt"]
+    assert "【镜头与声音】" in current_shots[0]["compiled_video_prompt"]
+    assert current_shots[0]["reference_bindings"]
     keyframe_job = api_client.post(f"/api/shots/{shot_id}/keyframes/generate", json={})
     assert keyframe_job.status_code == 202
     assert _wait_job(api_client, keyframe_job.json()["id"])["status"] == "completed"
@@ -198,6 +260,10 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     assert len(keyframes) == 1
     assert keyframes[0]["is_current"] is True
     assert keyframes[0]["is_stale"] is False
+    assert "【当前分镜素材参考图】" in keyframes[0]["prompt_snapshot"]
+    assert "negative prompt:" in keyframes[0]["prompt_snapshot"]
+    assert keyframes[0]["prompt_snapshot"] == current_shots[0]["compiled_image_prompt"]
+    assert keyframes[0]["file_path"].startswith("分镜关键帧/")
 
     video_job = api_client.post(f"/api/shots/{shot_id}/videos/generate", json={})
     assert video_job.status_code == 202
@@ -205,6 +271,9 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     videos = api_client.get(f"/api/shots/{shot_id}/videos").json()
     assert len(videos) == 1
     assert videos[0]["is_current"] is True
+    assert "【镜头与声音】" in videos[0]["prompt_snapshot"]
+    assert "补充禁止事项：" in videos[0]["prompt_snapshot"]
+    assert videos[0]["file_path"].startswith("分镜视频/")
     assert api_client.get(f"/api/videos/{videos[0]['id']}/download").status_code == 200
     exported = api_client.get(f"/api/projects/{project_id}/videos/export")
     assert exported.status_code == 200
@@ -301,11 +370,11 @@ def test_shot_split_copy_merge_and_reorder_preserve_contiguous_numbers(
     project = _create_project(api_client)
     first = api_client.post(
         f"/api/projects/{project['id']}/shots",
-        json={"action": "主角走入房间，然后停下观察。"},
+        json={"action": "主角走入房间，然后停下观察。", "duration_sec": 4},
     ).json()
     second = api_client.post(
         f"/api/projects/{project['id']}/shots",
-        json={"action": "主角拿起戒指。"},
+        json={"action": "主角拿起戒指。", "duration_sec": 3},
     ).json()
     reordered = api_client.post(
         f"/api/projects/{project['id']}/shots/reorder",
@@ -329,17 +398,123 @@ def test_shot_split_copy_merge_and_reorder_preserve_contiguous_numbers(
     assert [item["shot_no"] for item in final_shots] == list(range(1, len(final_shots) + 1))
 
 
+def test_shot_create_requires_duration_and_forces_screenplay_source(
+    api_client: TestClient,
+) -> None:
+    project = _create_project(api_client)
+
+    missing_duration = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={"action": "主角进入房间。"},
+    )
+    created = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={
+            "source_type": "novel",
+            "action": "主角进入房间。",
+            "duration_sec": 3,
+        },
+    )
+
+    assert missing_duration.status_code == 422
+    assert created.status_code == 201
+    assert created.json()["source_type"] == "screenplay"
+    assert created.json()["duration_sec"] == 3
+
+
+def test_shot_create_with_legacy_nested_fields_normalizes_aliases(
+    api_client: TestClient,
+) -> None:
+    project = _create_project(api_client)
+
+    created = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={
+            "duration_sec": 3,
+            "positions": [
+                {
+                    "character_id": "char-1",
+                    "side": "画面左侧",
+                    "legacy_note": "旧版站位备注",
+                }
+            ],
+            "expressions": [
+                {
+                    "character_name": "小明",
+                    "emotion": "紧张",
+                    "legacy_note": "旧版表情备注",
+                }
+            ],
+            "dialogue": [
+                {
+                    "name": "小明",
+                    "line": "快走。",
+                    "legacy_note": "旧版对白备注",
+                }
+            ],
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json()["positions"] == [
+        {
+            "character": "char-1",
+            "position": "画面左侧",
+            "facing": None,
+            "gaze": None,
+            "action_direction": None,
+        }
+    ]
+    assert created.json()["expressions"] == [{"character": "小明", "expression": "紧张"}]
+    assert created.json()["dialogue"] == [{"speaker": "小明", "text": "快走。"}]
+
+
+def test_shot_update_with_legacy_nested_fields_updates_duration(
+    api_client: TestClient,
+) -> None:
+    project = _create_project(api_client)
+    created = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={"duration_sec": 3},
+    )
+    assert created.status_code == 201
+
+    updated = api_client.put(
+        f"/api/shots/{created.json()['id']}",
+        json={
+            "duration_sec": 5,
+            "positions": [{"name": "小明", "location": "门边", "legacy_note": "保留"}],
+            "expressions": [{"character_id": "char-1", "mood": "警惕"}],
+            "dialogue": [{"character": "小明", "content": "别出声。"}],
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["duration_sec"] == 5
+
+
 def test_video_batch_keeps_valid_item_when_another_shot_lacks_keyframe(
     api_client: TestClient,
 ) -> None:
     project = _create_project(api_client)
+    scene = _create_ready_scene(api_client, project["id"])
     first = api_client.post(
         f"/api/projects/{project['id']}/shots",
-        json={"action": "第一镜", "video_prompt": "0-6秒：主角前进。"},
+        json={
+            "scene_asset_id": scene["id"],
+            "action": "第一镜",
+            "video_prompt": "0-6秒：主角前进。",
+            "duration_sec": 6,
+        },
     ).json()
     second = api_client.post(
         f"/api/projects/{project['id']}/shots",
-        json={"action": "第二镜", "video_prompt": "0-6秒：主角停下。"},
+        json={
+            "scene_asset_id": scene["id"],
+            "action": "第二镜",
+            "video_prompt": "0-6秒：主角停下。",
+            "duration_sec": 6,
+        },
     ).json()
     upload = api_client.post(
         f"/api/shots/{first['id']}/keyframes/upload",
@@ -357,11 +532,114 @@ def test_video_batch_keeps_valid_item_when_another_shot_lacks_keyframe(
     assert _wait_job(api_client, payload["jobs"][0]["id"], attempts=1500)["status"] == "completed"
 
 
+def test_keyframe_without_image_prompt_returns_400_even_with_frame_description(
+    api_client: TestClient,
+) -> None:
+    project = _create_project(api_client)
+    created = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={
+            "action": "主角推开房门。",
+            "frame_description": "主角站在旧屋门口，右手按住木门。",
+            "duration_sec": 3,
+        },
+    )
+    assert created.status_code == 201
+    current_shot = created.json()
+
+    response = api_client.post(
+        f"/api/shots/{current_shot['id']}/keyframes/generate",
+        json={},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "分镜缺少明确的关键帧提示词"
+    assert api_client.get(f"/api/shots/{current_shot['id']}/keyframes").json() == []
+
+
+def test_keyframe_without_visual_description_returns_400(
+    api_client: TestClient,
+) -> None:
+    project = _create_project(api_client)
+    created = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={"action": "主角推开房门。", "duration_sec": 3},
+    )
+    assert created.status_code == 201
+
+    response = api_client.post(
+        f"/api/shots/{created.json()['id']}/keyframes/generate",
+        json={},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "分镜缺少明确的关键帧提示词"
+
+
+def test_video_without_video_prompt_returns_400_even_with_shot_action(
+    api_client: TestClient,
+) -> None:
+    project = _create_project(api_client)
+    created = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={
+            "start_state": "主角站在门外。",
+            "action": "主角推开房门并向屋内迈出一步。",
+            "end_state": "主角进入旧屋。",
+            "camera_move": "缓慢跟随",
+            "duration_sec": 4,
+        },
+    )
+    assert created.status_code == 201
+    current_shot = created.json()
+    uploaded = api_client.post(
+        f"/api/shots/{current_shot['id']}/keyframes/upload",
+        files={"file": ("frame.png", _PNG, "image/png")},
+    )
+    assert uploaded.status_code == 201
+
+    response = api_client.post(
+        f"/api/shots/{current_shot['id']}/videos/generate",
+        json={},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "分镜缺少明确的视频提示词"
+    assert api_client.get(f"/api/shots/{current_shot['id']}/videos").json() == []
+
+
+def test_video_without_action_description_returns_400(
+    api_client: TestClient,
+) -> None:
+    project = _create_project(api_client)
+    created = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={"frame_description": "主角站在旧屋门口。", "duration_sec": 3},
+    )
+    assert created.status_code == 201
+    current_shot = created.json()
+    uploaded = api_client.post(
+        f"/api/shots/{current_shot['id']}/keyframes/upload",
+        files={"file": ("frame.png", _PNG, "image/png")},
+    )
+    assert uploaded.status_code == 201
+
+    response = api_client.post(
+        f"/api/shots/{current_shot['id']}/videos/generate",
+        json={},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "分镜缺少明确的视频提示词"
+
+
 def test_video_upload_with_undecodable_mp4_returns_400(api_client: TestClient) -> None:
     project = _create_project(api_client)
     current_shot = api_client.post(
         f"/api/projects/{project['id']}/shots",
-        json={"action": "主角向前走。", "video_prompt": "0-6秒：镜头跟随主角。"},
+        json={
+            "action": "主角向前走。",
+            "video_prompt": "0-6秒：镜头跟随主角。",
+            "duration_sec": 6,
+        },
     ).json()
 
     response = api_client.post(
@@ -377,9 +655,15 @@ def test_video_generation_with_undecodable_result_marks_job_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project = _create_project(api_client)
+    scene = _create_ready_scene(api_client, project["id"])
     current_shot = api_client.post(
         f"/api/projects/{project['id']}/shots",
-        json={"action": "主角向前走。", "video_prompt": "0-6秒：镜头跟随主角。"},
+        json={
+            "scene_asset_id": scene["id"],
+            "action": "主角向前走。",
+            "video_prompt": "0-6秒：镜头跟随主角。",
+            "duration_sec": 6,
+        },
     ).json()
     keyframe = api_client.post(
         f"/api/shots/{current_shot['id']}/keyframes/upload",

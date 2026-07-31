@@ -1,23 +1,27 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Archive,
   Check,
   ChevronDown,
   ChevronUp,
   Copy,
+  Film,
   GripVertical,
+  Images,
   Merge,
   Pencil,
   Plus,
   Scissors,
-  Sparkles,
   Trash2,
   WandSparkles,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { toast } from "sonner";
 import { api, queryKeys } from "../api/client";
 import { JsonEditor } from "../components/json-editor";
 import { ProjectRequired } from "../components/project-required";
+import { ShotMediaCard } from "../components/shot-media-card";
 import {
   EmptyState,
   ErrorState,
@@ -37,15 +41,22 @@ import {
   Textarea,
 } from "../components/ui";
 import { useProject } from "../hooks/use-project";
-import { formatError, parseJson } from "../lib/utils";
-import type { ReferenceBinding, Shot } from "../types/api";
+import { formatError, makeDownloadName, parseJson } from "../lib/utils";
+import type {
+  BatchResponse,
+  DialogueLine,
+  ReferenceBinding,
+  Shot,
+  ShotExpression,
+  ShotPosition,
+} from "../types/api";
 
-function blankShot(projectId: string, sourceType: "novel" | "screenplay"): Partial<Shot> {
+function blankShot(projectId: string): Partial<Shot> {
   return {
     project_id: projectId,
     shot_no: 1,
     shot_order: 1,
-    source_type: sourceType,
+    source_type: "screenplay",
     source_ref: "",
     scene_asset_id: null,
     character_ids_json: [],
@@ -59,7 +70,7 @@ function blankShot(projectId: string, sourceType: "novel" | "screenplay"): Parti
     shot_type: "中景",
     camera_angle: "平视",
     camera_move: "固定",
-    duration_sec: 6,
+    duration_sec: 0,
     end_state: "",
     next_hook: "",
     frame_description: "",
@@ -75,20 +86,67 @@ function idList(value: string[] | string | undefined) {
   return parseJson<string[]>(value, []);
 }
 
-function jsonList(
-  value: Array<Record<string, unknown>> | string | undefined,
+function jsonList<T extends Record<string, unknown>>(
+  value: T[] | string | undefined,
 ) {
-  return parseJson<Array<Record<string, unknown>>>(value, []);
+  return parseJson<T[]>(value, []);
+}
+
+function firstText(item: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = String(item[key] ?? "").trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+function formatDialogue(item: DialogueLine) {
+  const speaker = firstText(item, ["speaker", "character", "name"]);
+  const text = firstText(item, ["text", "content", "line"]);
+  if (!text) return "";
+  return speaker ? `${speaker}：${text}` : text;
+}
+
+function formatPosition(item: ShotPosition) {
+  const character = firstText(item, [
+    "character",
+    "name",
+    "speaker",
+    "character_name",
+  ]);
+  const details = [
+    firstText(item, ["position", "location", "side", "placement"]),
+    firstText(item, ["facing", "direction"]),
+    firstText(item, ["gaze", "look", "eye_line"]),
+    firstText(item, ["action_direction"]),
+  ].filter(Boolean);
+  if (!details.length) return "";
+  return character ? `${character}：${details.join(" · ")}` : details.join(" · ");
+}
+
+function formatExpression(item: ShotExpression) {
+  const character = firstText(item, [
+    "character",
+    "name",
+    "speaker",
+    "character_name",
+  ]);
+  const expression = firstText(item, ["expression", "emotion", "mood"]);
+  if (!expression) return "";
+  return character ? `${character}：${expression}` : expression;
 }
 
 export function ShotsPage() {
   const queryClient = useQueryClient();
+  const location = useLocation();
   const { activeProject, activeProjectId } = useProject();
-  const [sourceType, setSourceType] = useState<"novel" | "screenplay">("novel");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [scope, setScope] = useState<"all" | "scene">("all");
+  const [sceneNo, setSceneNo] = useState("");
+  const [exporting, setExporting] = useState(false);
   const [editing, setEditing] = useState<Shot | "new" | null>(null);
   const [form, setForm] = useState<Partial<Shot>>(
-    blankShot(activeProjectId, "novel"),
+    blankShot(activeProjectId),
   );
   const [jsonValidity, setJsonValidity] = useState<Record<string, boolean>>({});
   const [draggedId, setDraggedId] = useState("");
@@ -109,81 +167,115 @@ export function ShotsPage() {
     () => new Map(assets.map((asset) => [asset.id, asset])),
     [assets],
   );
+  const batchIds = useMemo(() => {
+    if (selected.size) return [...selected];
+    if (scope !== "scene" || !sceneNo) return undefined;
+    return shots
+      .filter((shot) => shot.scene_no === Number(sceneNo))
+      .map((shot) => shot.id);
+  }, [sceneNo, scope, selected, shots]);
+  const batchDisabled =
+    !shots.length ||
+    (!selected.size &&
+      scope === "scene" &&
+      (!sceneNo || batchIds?.length === 0));
 
   useEffect(() => {
     setSelected(new Set());
+    setSceneNo("");
   }, [activeProjectId]);
+
+  useEffect(() => {
+    const stage = new URLSearchParams(location.search).get("stage");
+    if (!shots.length || !["keyframes", "videos"].includes(stage || "")) return;
+    document
+      .getElementById(`stage-${stage}`)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [location.search, shots.length]);
 
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey: queryKeys.shots(activeProjectId) });
+
+  const showBatchFeedback = (
+    result: BatchResponse,
+    noun: "关键帧" | "视频",
+  ) => {
+    const failures = result.preflight_failures ?? [];
+    if (failures.length) {
+      const description = failures
+        .map(({ target_id, error }) => {
+          const shot = shots.find((item) => item.id === target_id);
+          return `分镜 ${shot?.shot_no ?? target_id}：${error}`;
+        })
+        .join("；");
+      toast.warning(
+        `已入队 ${result.jobs.length} 个${noun}任务，跳过 ${failures.length} 项`,
+        { description },
+      );
+      return;
+    }
+    toast.success(`已入队 ${result.jobs.length} 个${noun}任务`);
+  };
 
   const taskMutation = useMutation({
     mutationFn: async ({
       action,
       shot,
     }: {
-      action:
-        | "extract"
-        | "extractScene"
-        | "imagePrompt"
-        | "videoPrompt"
-        | "batchPrompts";
+      action: "extract" | "extractScene";
       shot?: Shot;
     }) => {
       if (action === "extract") {
         return api.shots.extract(activeProjectId, {
-          source_type: sourceType,
           scope: "all",
         });
       }
       if (action === "extractScene" && shot) {
         return api.shots.extract(activeProjectId, {
-          source_type: shot.source_type,
           scope: "scene",
           scene_no: shot.scene_no || undefined,
         });
       }
-      if (action === "imagePrompt" && shot) {
-        return api.shots.generateImagePrompt(shot.id);
-      }
-      if (action === "videoPrompt" && shot) {
-        return api.shots.generateVideoPrompt(shot.id);
-      }
-      return api.shots.batchPrompts(activeProjectId, {
-        ids: selected.size ? [...selected] : undefined,
-        prompt_types: ["image", "video"],
-      });
+      throw new Error("缺少待提取的分镜");
     },
-    onSuccess: async (result, variables) => {
+    onSuccess: async () => {
       await queryClient.invalidateQueries({
         queryKey: queryKeys.jobs(activeProjectId),
       });
-      if (
-        variables.action === "batchPrompts" &&
-        result &&
-        "jobs" in result
-      ) {
-        const failures = result.preflight_failures ?? [];
-        if (failures.length) {
-          const description = failures
-            .map(({ target_id, error }) => {
-              const shot = shots.find((item) => item.id === target_id);
-              return `分镜 ${shot?.shot_no ?? target_id}：${error}`;
-            })
-            .join("；");
-          toast.warning(
-            `已入队 ${result.jobs.length} 个分镜提示词任务，跳过 ${failures.length} 项`,
-            { description },
-          );
-          return;
-        }
-        toast.success(`已入队 ${result.jobs.length} 个分镜提示词任务`);
-        return;
-      }
       toast.success("分镜任务已进入队列");
     },
     onError: (error) => toast.error(formatError(error)),
   });
+
+  const mediaBatchMutation = useMutation({
+    mutationFn: (kind: "keyframe" | "video") =>
+      kind === "keyframe"
+        ? api.shots.keyframes.batch(activeProjectId, { ids: batchIds })
+        : api.shots.videos.batch(activeProjectId, { ids: batchIds }),
+    onSuccess: async (result, kind) => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      showBatchFeedback(result, kind === "keyframe" ? "关键帧" : "视频");
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
+  const exportZip = async () => {
+    if (!activeProject) return;
+    setExporting(true);
+    try {
+      await api.projects.exportVideos(
+        activeProject.id,
+        makeDownloadName(`${activeProject.name}-分镜视频`, "zip"),
+      );
+      toast.success("ZIP 导出已开始下载");
+    } catch (error) {
+      toast.error(formatError(error));
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const saveMutation = useMutation({
     mutationFn: () =>
@@ -280,10 +372,9 @@ export function ShotsPage() {
 
   const openNew = () => {
     setForm({
-      ...blankShot(activeProjectId, sourceType),
+      ...blankShot(activeProjectId),
       shot_no: shots.length + 1,
       shot_order: shots.length + 1,
-      duration_sec: activeProject?.default_duration_sec || 6,
     });
     setJsonValidity({});
     setEditing("new");
@@ -314,8 +405,8 @@ export function ShotsPage() {
       <div>
         <PageHeader
           eyebrow="Step 05 / Storyboard"
-          title="分镜与提示词"
-          description="每个镜头只承载一个主要动作，并明确站位、起止状态与连续性钩子。卡片可拖动，也可用按钮精确排序。"
+          title="分镜视频"
+          description="提取时自动补齐 V2 关键帧与视频提示词，并在同一条流水线中完成关键帧和单镜视频生成。"
           actions={
             <>
               <Button onClick={openNew}>
@@ -332,80 +423,146 @@ export function ShotsPage() {
                 <WandSparkles className="h-4 w-4" />
                 {shots.length ? "重新提取全部" : "提取分镜"}
               </Button>
-              <Button
-                variant="primary"
-                busy={
-                  taskMutation.isPending &&
-                  taskMutation.variables?.action === "batchPrompts"
-                }
-                disabled={!shots.length}
-                onClick={() => taskMutation.mutate({ action: "batchPrompts" })}
-              >
-                <Sparkles className="h-4 w-4" />
-                {selected.size
-                  ? `生成所选提示词（${selected.size}）`
-                  : "批量补齐提示词"}
+              <Button busy={exporting} onClick={() => void exportZip()}>
+                <Archive className="h-4 w-4" />
+                导出当前版本 ZIP
               </Button>
             </>
           }
         />
 
-        <Card className="mb-5 flex flex-col justify-between gap-4 p-4 sm:flex-row sm:items-center">
-          <div>
-            <p className="text-xs font-bold text-muted">分镜来源</p>
-            <div className="mt-2 flex gap-2">
-              {(["novel", "screenplay"] as const).map((value) => (
-                <button
-                  type="button"
-                  key={value}
-                  onClick={() => setSourceType(value)}
-                  className={`rounded-md border px-3 py-2 text-sm font-semibold ${
-                    sourceType === value
-                      ? "border-vermilion bg-[#fff1eb] text-[#9a3d21]"
-                      : "border-line bg-white text-muted"
-                  }`}
+        <Card className="mb-5 overflow-hidden">
+          <div className="grid gap-4 p-4 lg:grid-cols-[minmax(280px,1fr)_auto] lg:items-end">
+            <div className="flex flex-wrap items-end gap-3">
+              <div>
+                <Label htmlFor="shot-batch-scope">批量范围</Label>
+                <Select
+                  id="shot-batch-scope"
+                  value={scope}
+                  className="w-40"
+                  onChange={(event) =>
+                    setScope(event.target.value as "all" | "scene")
+                  }
                 >
-                  {value === "novel" ? "从小说提取" : "从当前剧本提取"}
-                </button>
-              ))}
+                  <option value="all">全部分镜</option>
+                  <option value="scene">指定场次</option>
+                </Select>
+              </div>
+              {scope === "scene" && !selected.size ? (
+                <div>
+                  <Label htmlFor="shot-batch-scene">场次编号</Label>
+                  <Input
+                    id="shot-batch-scene"
+                    type="number"
+                    min={1}
+                    className="w-32"
+                    value={sceneNo}
+                    onChange={(event) => setSceneNo(event.target.value)}
+                  />
+                </div>
+              ) : null}
+            </div>
+            <div className="flex flex-wrap items-center justify-start gap-2 lg:justify-end">
+              {selected.size >= 2 ? (
+                <Button
+                  size="sm"
+                  busy={mergeMutation.isPending}
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        `确认合并所选 ${selected.size} 个分镜吗？请确保它们在叙事上连续。`,
+                      )
+                    ) {
+                      mergeMutation.mutate();
+                    }
+                  }}
+                >
+                  <Merge className="h-4 w-4" />
+                  合并所选
+                </Button>
+              ) : null}
+              {shots.length ? (
+                <label className="flex items-center gap-2 px-2 text-xs font-semibold text-muted">
+                  <input
+                    type="checkbox"
+                    className="accent-vermilion"
+                    checked={shots.every((shot) => selected.has(shot.id))}
+                    onChange={(event) =>
+                      setSelected(
+                        event.target.checked
+                          ? new Set(shots.map((shot) => shot.id))
+                          : new Set(),
+                      )
+                    }
+                  />
+                  全选
+                </label>
+              ) : null}
             </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            {selected.size >= 2 ? (
+
+          <div className="flex flex-col gap-4 border-t border-line bg-white/40 p-4 xl:flex-row xl:items-center xl:justify-between">
+            <div className="flex flex-wrap gap-2 text-xs text-muted">
+              <Badge>{shots.length} 个分镜</Badge>
+              <Badge>
+                {
+                  shots.filter(
+                    (shot) =>
+                      shot.image_prompt.trim() && shot.video_prompt.trim(),
+                  ).length
+                }{" "}
+                个已自动补齐提示词
+              </Badge>
+              <Badge>
+                {
+                  shots.filter(
+                    (shot) => shot.current_keyframe?.status === "completed",
+                  ).length
+                }{" "}
+                个当前关键帧
+              </Badge>
+              <Badge>
+                {
+                  shots.filter(
+                    (shot) => shot.current_video?.status === "completed",
+                  ).length
+                }{" "}
+                个当前视频
+              </Badge>
+            </div>
+            <div className="flex flex-wrap gap-2">
               <Button
-                size="sm"
-                busy={mergeMutation.isPending}
-                onClick={() => {
-                  if (
-                    window.confirm(
-                      `确认合并所选 ${selected.size} 个分镜吗？请确保它们在叙事上连续。`,
-                    )
-                  ) {
-                    mergeMutation.mutate();
-                  }
-                }}
+                busy={
+                  mediaBatchMutation.isPending &&
+                  mediaBatchMutation.variables === "keyframe"
+                }
+                disabled={batchDisabled}
+                onClick={() => mediaBatchMutation.mutate("keyframe")}
               >
-                <Merge className="h-4 w-4" />
-                合并所选
+                <Images className="h-4 w-4" />
+                {selected.size
+                  ? `生成所选关键帧（${selected.size}）`
+                  : scope === "scene"
+                    ? "生成当前场次关键帧"
+                    : "生成全部关键帧"}
               </Button>
-            ) : null}
-            {shots.length ? (
-              <label className="flex items-center gap-2 px-2 text-xs font-semibold text-muted">
-                <input
-                  type="checkbox"
-                  className="accent-vermilion"
-                  checked={shots.every((shot) => selected.has(shot.id))}
-                  onChange={(event) =>
-                    setSelected(
-                      event.target.checked
-                        ? new Set(shots.map((shot) => shot.id))
-                        : new Set(),
-                    )
-                  }
-                />
-                全选
-              </label>
-            ) : null}
+              <Button
+                variant="primary"
+                busy={
+                  mediaBatchMutation.isPending &&
+                  mediaBatchMutation.variables === "video"
+                }
+                disabled={batchDisabled}
+                onClick={() => mediaBatchMutation.mutate("video")}
+              >
+                <Film className="h-4 w-4" />
+                {selected.size
+                  ? `生成所选视频（${selected.size}）`
+                  : scope === "scene"
+                    ? "生成当前场次视频"
+                    : "生成全部视频"}
+              </Button>
+            </div>
           </div>
         </Card>
 
@@ -419,7 +576,7 @@ export function ShotsPage() {
         {!query.isLoading && !query.error && !shots.length ? (
           <EmptyState
             title="还没有分镜"
-            description="选择小说或当前剧本作为来源，然后启动提取；也可以手工建立第一镜。"
+            description="先生成剧本并提取场景素材，然后启动分镜提取；也可以手工建立第一镜。"
             action={
               <div className="flex flex-wrap justify-center gap-2">
                 <Button
@@ -439,7 +596,13 @@ export function ShotsPage() {
           {shots.map((shot, index) => {
             const characterIds = idList(shot.character_ids_json);
             const propIds = idList(shot.prop_ids_json);
-            const dialogue = jsonList(shot.dialogue_json);
+            const dialogue = jsonList<DialogueLine>(shot.dialogue_json);
+            const positions = jsonList<ShotPosition>(shot.positions_json)
+              .map(formatPosition)
+              .filter(Boolean);
+            const expressions = jsonList<ShotExpression>(shot.expressions_json)
+              .map(formatExpression)
+              .filter(Boolean);
             const scene = shot.scene_asset_id
               ? assetMap.get(shot.scene_asset_id)
               : undefined;
@@ -556,18 +719,33 @@ export function ShotsPage() {
                             {shot.camera_move || "未定运镜"}
                           </p>
                         </div>
+                        {positions.length ? (
+                          <div>
+                            <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
+                              站位 / 视线
+                            </p>
+                            <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+                              {positions.join("\n")}
+                            </p>
+                          </div>
+                        ) : null}
+                        {expressions.length ? (
+                          <div>
+                            <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
+                              人物表情
+                            </p>
+                            <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+                              {expressions.join("\n")}
+                            </p>
+                          </div>
+                        ) : null}
                         <div>
                           <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
                             对白 / 旁白
                           </p>
                           <p className="mt-2 line-clamp-4 whitespace-pre-wrap text-xs leading-5 text-[#454842]">
                             {dialogue
-                              .map((item) =>
-                                `${String(item.speaker || "")}：${String(item.text || item.content || "")}`.replace(
-                                  /^：/,
-                                  "",
-                                ),
-                              )
+                              .map(formatDialogue)
                               .filter(Boolean)
                               .join("\n") ||
                               shot.narration ||
@@ -576,59 +754,19 @@ export function ShotsPage() {
                         </div>
                       </div>
                       <div className="rounded-md border border-line bg-white/55 p-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
-                            关键帧提示词
-                          </p>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            busy={
-                              taskMutation.isPending &&
-                              taskMutation.variables?.action === "imagePrompt" &&
-                              taskMutation.variables.shot?.id === shot.id
-                            }
-                            onClick={() =>
-                              taskMutation.mutate({
-                                action: "imagePrompt",
-                                shot,
-                              })
-                            }
-                          >
-                            <Sparkles className="h-3.5 w-3.5" />
-                            生成
-                          </Button>
-                        </div>
-                        <p className="mt-2 line-clamp-5 text-xs leading-5 text-[#454842]">
-                          {shot.image_prompt || "尚未生成"}
+                        <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
+                          最终关键帧提示词
+                        </p>
+                        <p className="mt-2 max-h-36 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+                          {shot.compiled_image_prompt || shot.image_prompt}
                         </p>
                       </div>
                       <div className="rounded-md border border-line bg-white/55 p-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
-                            视频执行提示词
-                          </p>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            busy={
-                              taskMutation.isPending &&
-                              taskMutation.variables?.action === "videoPrompt" &&
-                              taskMutation.variables.shot?.id === shot.id
-                            }
-                            onClick={() =>
-                              taskMutation.mutate({
-                                action: "videoPrompt",
-                                shot,
-                              })
-                            }
-                          >
-                            <Sparkles className="h-3.5 w-3.5" />
-                            生成
-                          </Button>
-                        </div>
-                        <p className="mt-2 line-clamp-5 text-xs leading-5 text-[#454842]">
-                          {shot.video_prompt || "尚未生成"}
+                        <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
+                          最终视频执行提示词
+                        </p>
+                        <p className="mt-2 max-h-36 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+                          {shot.compiled_video_prompt || shot.video_prompt}
                         </p>
                       </div>
                     </div>
@@ -747,6 +885,41 @@ export function ShotsPage() {
                         </Button>
                       </div>
                     </div>
+
+                    <div className="grid gap-4 border-t border-line bg-[#f7f4ed] p-4 2xl:grid-cols-2">
+                      <ShotMediaCard
+                        shot={shot}
+                        kind="keyframe"
+                        assetMap={assetMap}
+                        selected={selected.has(shot.id)}
+                        onToggle={(checked) =>
+                          setSelected((current) => {
+                            const next = new Set(current);
+                            if (checked) next.add(shot.id);
+                            else next.delete(shot.id);
+                            return next;
+                          })
+                        }
+                        embedded
+                        anchorId={index === 0 ? "stage-keyframes" : undefined}
+                      />
+                      <ShotMediaCard
+                        shot={shot}
+                        kind="video"
+                        assetMap={assetMap}
+                        selected={selected.has(shot.id)}
+                        onToggle={(checked) =>
+                          setSelected((current) => {
+                            const next = new Set(current);
+                            if (checked) next.add(shot.id);
+                            else next.delete(shot.id);
+                            return next;
+                          })
+                        }
+                        embedded
+                        anchorId={index === 0 ? "stage-videos" : undefined}
+                      />
+                    </div>
                   </div>
                 </div>
               </Card>
@@ -766,7 +939,12 @@ export function ShotsPage() {
               <Button
                 variant="primary"
                 busy={saveMutation.isPending}
-                disabled={!form.action?.trim() || !jsonValid}
+                disabled={
+                  !form.action?.trim() ||
+                  !form.duration_sec ||
+                  form.duration_sec <= 0 ||
+                  !jsonValid
+                }
                 onClick={() => saveMutation.mutate()}
               >
                 保存分镜
@@ -775,7 +953,7 @@ export function ShotsPage() {
           }
         >
           <div className="space-y-6">
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               <div>
                 <Label>分镜编号</Label>
                 <Input
@@ -806,22 +984,6 @@ export function ShotsPage() {
                     }))
                   }
                 />
-              </div>
-              <div>
-                <Label>来源</Label>
-                <Select
-                  disabled={editing !== "new"}
-                  value={form.source_type || sourceType}
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      source_type: event.target.value as Shot["source_type"],
-                    }))
-                  }
-                >
-                  <option value="novel">小说</option>
-                  <option value="screenplay">剧本</option>
-                </Select>
               </div>
               <div>
                 <Label>场景素材</Label>
@@ -1021,9 +1183,9 @@ export function ShotsPage() {
                 <Label>时长（秒）</Label>
                 <Input
                   type="number"
-                  min={0.5}
-                  step={0.5}
-                  value={form.duration_sec || 0}
+                  min={1}
+                  step={1}
+                  value={form.duration_sec || ""}
                   onChange={(event) =>
                     setForm((current) => ({
                       ...current,

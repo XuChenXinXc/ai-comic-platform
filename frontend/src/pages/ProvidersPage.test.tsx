@@ -20,27 +20,20 @@ function renderPage() {
   );
 }
 
-describe("Provider 密钥环境变量提示", () => {
+describe("Provider 直接 API Key", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.spyOn(api.providers, "list").mockResolvedValue([]);
   });
 
-  test("test_new_provider_key_placeholder_follows_provider_kind", async () => {
+  test("test_new_provider_form_accepts_direct_api_key", async () => {
     const user = userEvent.setup();
     renderPage();
 
     await user.click(await screen.findByRole("button", { name: "添加接口" }));
-    const keyInput = screen.getByRole("textbox", {
-      name: "API Key 环境变量名",
-    });
-    expect(keyInput).toHaveAttribute("placeholder", "TEXT_API_KEY");
-
-    await user.selectOptions(
-      screen.getByRole("combobox", { name: "接口类型" }),
-      "image",
-    );
-
-    expect(keyInput).toHaveAttribute("placeholder", "IMAGE_API_KEY");
+    const keyInput = screen.getByLabelText("API Key");
+    expect(keyInput).toHaveAttribute("type", "password");
+    await user.type(keyInput, "direct-provider-secret");
+    expect(keyInput).toHaveValue("direct-provider-secret");
   });
 });

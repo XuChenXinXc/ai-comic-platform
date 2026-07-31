@@ -162,15 +162,19 @@ def video_signature(
     provider: str,
     model: str,
     params: Mapping[str, Any],
+    reference_bindings: Sequence[Mapping[str, Any]] = (),
 ) -> str:
-    return calculate_signature(
+    parts: list[Any] = [
         keyframe_version_id,
         video_prompt,
         duration_sec,
         provider,
         model,
         params,
-    )
+    ]
+    if reference_bindings:
+        parts.append(reference_bindings)
+    return calculate_signature(*parts)
 
 
 def is_stale(saved_signature: str, current_signature: str) -> bool:

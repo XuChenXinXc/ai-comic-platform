@@ -1,17 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Check,
+  ImagePlus,
   ImageOff,
   Merge,
   Pencil,
   Plus,
-  Sparkles,
   Trash2,
   WandSparkles,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { api, mediaUrl, queryKeys } from "../api/client";
+import { AssetImagePanel } from "./AssetImagesPage";
+import { ImagePreview } from "../components/image-preview";
 import { JsonEditor } from "../components/json-editor";
 import { ProjectRequired } from "../components/project-required";
 import {
@@ -36,6 +38,15 @@ import {
 import { useProject } from "../hooks/use-project";
 import { formatError, parseJson } from "../lib/utils";
 import type { Asset, AssetType } from "../types/api";
+
+function profileSummaryValues(value: unknown): string[] {
+  if (typeof value === "string") return value.trim() ? [value.trim()] : [];
+  if (Array.isArray(value)) return value.flatMap(profileSummaryValues);
+  if (value && typeof value === "object") {
+    return Object.values(value).flatMap(profileSummaryValues);
+  }
+  return [];
+}
 
 const labels: Record<AssetType, { name: string; single: string; description: string }> =
   {
@@ -103,48 +114,46 @@ export function AssetsPage() {
   const taskMutation = useMutation({
     mutationFn: async ({
       action,
-      id,
     }: {
-      action: "extractCurrent" | "extractAll" | "promptOne" | "promptBatch";
-      id?: string;
+      action: "extractCurrent" | "extractAll";
     }) => {
       if (action === "extractAll") return api.assets.extract(activeProjectId);
-      if (action === "extractCurrent") {
-        return api.assets.extract(activeProjectId, { asset_types: [type] });
-      }
-      if (action === "promptOne" && id) return api.assets.generatePrompt(id);
-      return api.assets.batchPrompts(activeProjectId, {
-        ids: selected.size ? [...selected] : undefined,
-        asset_type: selected.size ? undefined : type,
-      });
+      return api.assets.extract(activeProjectId, { asset_types: [type] });
     },
-    onSuccess: async (result, variables) => {
+    onSuccess: async () => {
       await queryClient.invalidateQueries({
         queryKey: queryKeys.jobs(activeProjectId),
       });
-      if (
-        variables.action === "promptBatch" &&
-        result &&
-        "jobs" in result
-      ) {
-        const failures = result.preflight_failures ?? [];
-        if (failures.length) {
-          const description = failures
-            .map(({ target_id, error }) => {
-              const asset = allAssets.find((item) => item.id === target_id);
-              return `素材 ${asset?.name ?? target_id}：${error}`;
-            })
-            .join("；");
-          toast.warning(
-            `已入队 ${result.jobs.length} 个素材提示词任务，跳过 ${failures.length} 项`,
-            { description },
-          );
-          return;
-        }
-        toast.success(`已入队 ${result.jobs.length} 个素材提示词任务`);
+      toast.success("任务已进入队列，可在任务中心查看进度");
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
+  const imageBatchMutation = useMutation({
+    mutationFn: () =>
+      api.assets.images.batch(activeProjectId, {
+        ids: selected.size ? [...selected] : undefined,
+        asset_type: selected.size ? undefined : type,
+      }),
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      const failures = result.preflight_failures ?? [];
+      if (failures.length) {
+        const description = failures
+          .map(({ target_id, error }) => {
+            const asset = allAssets.find((item) => item.id === target_id);
+            return `素材 ${asset?.name ?? target_id}：${error}`;
+          })
+          .join("；");
+        toast.warning(
+          `已入队 ${result.jobs.length} 个素材图片任务，跳过 ${failures.length} 项`,
+          { description },
+        );
         return;
       }
-      toast.success("任务已进入队列，可在任务中心查看进度");
+      toast.success(`已入队 ${result.jobs.length} 个素材图片任务`);
     },
     onError: (error) => toast.error(formatError(error)),
   });
@@ -218,9 +227,9 @@ export function AssetsPage() {
     <ProjectRequired>
       <div>
         <PageHeader
-          eyebrow="Step 03 / Asset bible"
-          title="素材与提示词"
-          description="只保留小说真正涉及的角色、场景与剧情物品；每项都可人工校正、单独生成提示词并确认。"
+          eyebrow="Step 03 / Asset library"
+          title="素材库"
+          description="提取小说中的角色、场景与物品后自动补齐最终提示词，并在同一页面管理素材图片和历史版本。"
           actions={
             <>
               <Button onClick={openNew}>
@@ -241,17 +250,14 @@ export function AssetsPage() {
               </Button>
               <Button
                 variant="primary"
-                busy={
-                  taskMutation.isPending &&
-                  taskMutation.variables?.action === "promptBatch"
-                }
+                busy={imageBatchMutation.isPending}
                 disabled={!filtered.length}
-                onClick={() => taskMutation.mutate({ action: "promptBatch" })}
+                onClick={() => imageBatchMutation.mutate()}
               >
-                <Sparkles className="h-4 w-4" />
+                <ImagePlus className="h-4 w-4" />
                 {selected.size
-                  ? `生成所选提示词（${selected.size}）`
-                  : "批量补齐提示词"}
+                  ? `生成所选素材图（${selected.size}）`
+                  : `批量生成${labels[type].name}图`}
               </Button>
             </>
           }
@@ -337,7 +343,7 @@ export function AssetsPage() {
               {},
             );
             const description = Object.values(profile)
-              .filter((value) => typeof value === "string" && value)
+              .flatMap(profileSummaryValues)
               .slice(0, 3)
               .join(" · ");
             const stale =
@@ -349,17 +355,18 @@ export function AssetsPage() {
                 <div className="grid sm:grid-cols-[150px_minmax(0,1fr)]">
                   <div className="relative min-h-40 border-b border-line bg-[#252925] sm:border-b-0 sm:border-r">
                     {asset.current_image && mediaUrl(asset.current_image) ? (
-                      <img
+                      <ImagePreview
                         src={mediaUrl(asset.current_image)}
-                        alt={`${asset.name} 当前参考图`}
-                        className="h-full min-h-40 w-full object-cover"
+                        alt={`${asset.name}当前参考图`}
+                        buttonClassName="h-full"
+                        imageClassName="h-full min-h-40 w-full object-cover"
                       />
                     ) : (
                       <div className="flex h-full min-h-40 items-center justify-center text-white/35">
                         <ImageOff className="h-7 w-7" />
                       </div>
                     )}
-                    <label className="absolute left-3 top-3 flex h-7 w-7 cursor-pointer items-center justify-center rounded border border-white/20 bg-black/55">
+                    <label className="absolute left-3 top-3 z-10 flex h-7 w-7 cursor-pointer items-center justify-center rounded border border-white/20 bg-black/55">
                       <input
                         type="checkbox"
                         className="accent-vermilion"
@@ -413,29 +420,13 @@ export function AssetsPage() {
 
                     <div className="mt-4 rounded-md border border-line bg-white/60 p-3">
                       <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
-                        图片提示词
+                        最终提示词
                       </p>
-                      <p className="mt-2 line-clamp-3 text-xs leading-5 text-[#454842]">
-                        {asset.prompt || "尚未生成提示词"}
+                      <p className="mt-2 max-h-44 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+                        {asset.compiled_prompt || asset.prompt}
                       </p>
                     </div>
                     <div className="mt-4 flex flex-wrap gap-2">
-                      <Button
-                        size="sm"
-                        busy={
-                          taskMutation.isPending &&
-                          taskMutation.variables?.id === asset.id
-                        }
-                        onClick={() =>
-                          taskMutation.mutate({
-                            action: "promptOne",
-                            id: asset.id,
-                          })
-                        }
-                      >
-                        <Sparkles className="h-4 w-4" />
-                        {asset.prompt ? "重生成提示词" : "生成提示词"}
-                      </Button>
                       {asset.status !== "confirmed" ? (
                         <Button
                           size="sm"
@@ -458,6 +449,7 @@ export function AssetsPage() {
                     </div>
                   </div>
                 </div>
+                <AssetImagePanel asset={asset} />
               </Card>
             );
           })}
@@ -467,7 +459,7 @@ export function AssetsPage() {
           open={Boolean(editing)}
           onClose={() => setEditing(null)}
           title={editing === "new" ? `新增${labels[type].single}` : "编辑素材"}
-          description="完整描述与提示词会参与素材图片和分镜一致性编译。"
+          description="保存档案和视觉细节后，最终提示词会自动按固定模板更新。"
           wide
           footer={
             <>
@@ -555,7 +547,7 @@ export function AssetsPage() {
             </div>
             <div className="space-y-4">
               <div>
-                <Label htmlFor="asset-prompt">主提示词</Label>
+                <Label htmlFor="asset-prompt">视觉细节补充</Label>
                 <Textarea
                   id="asset-prompt"
                   rows={7}

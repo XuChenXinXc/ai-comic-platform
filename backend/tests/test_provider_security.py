@@ -10,6 +10,7 @@ from app.db import Database
 from app.jobs.repository import JobRepository
 from app.models.tables import api_provider, job
 from app.services.errors import ServiceError
+from app.services.file_service import FileService
 from app.services.project_service import ProjectService
 from app.services.provider_service import ProviderService
 from app.services.utils import json_dumps, new_id, utc_now
@@ -123,6 +124,76 @@ def test_provider_create_with_matching_kind_api_key_env_succeeds(
     )
 
     assert provider["api_key_env"] == api_key_env
+
+
+def test_provider_create_with_direct_api_key_persists_only_configuration_status(
+    provider_database: Database,
+) -> None:
+    service = ProviderService(provider_database)
+
+    provider = _create_provider(
+        service,
+        name="直接密钥 Provider",
+        api_key_env="",
+        api_key="direct-provider-secret",
+    )
+
+    assert provider["api_key_configured"] is True
+    assert provider["api_key_source"] == "direct"
+    assert "api_key" not in provider
+    assert "direct-provider-secret" not in str(provider)
+    with provider_database.engine.connect() as connection:
+        ciphertext = connection.execute(
+            select(api_provider.c.api_key_ciphertext).where(api_provider.c.id == provider["id"])
+        ).scalar_one()
+    assert ciphertext
+    assert ciphertext != "direct-provider-secret"
+
+
+def test_provider_blank_update_preserves_direct_api_key(
+    provider_database: Database,
+) -> None:
+    service = ProviderService(provider_database)
+    provider = _create_provider(
+        service,
+        name="保留密钥 Provider",
+        api_key_env="",
+        api_key="direct-provider-secret",
+    )
+
+    updated = service.update(provider["id"], {"name": "更新名称", "api_key": ""})
+
+    assert updated["api_key_configured"] is True
+    assert updated["api_key_source"] == "direct"
+
+
+def test_provider_resolve_uses_direct_api_key_without_returning_it(
+    provider_database: Database,
+) -> None:
+    service = ProviderService(provider_database)
+    provider = _create_provider(
+        service,
+        name="运行时直接密钥 Provider",
+        api_key_env="",
+        api_key="direct-provider-secret",
+    )
+
+    runtime_provider, config = service.resolve(kind="text", provider_id=provider["id"])
+
+    assert runtime_provider.config.api_key == "direct-provider-secret"
+    assert "api_key" not in config
+    assert "_api_key_ciphertext" not in config
+    assert "direct-provider-secret" not in str(config)
+
+
+def test_provider_resolve_without_id_uses_default_provider(
+    provider_database: Database,
+) -> None:
+    service = ProviderService(provider_database)
+
+    _runtime_provider, config = service.resolve(kind="text")
+
+    assert config["id"] == "mock-text"
 
 
 @pytest.mark.parametrize(
@@ -247,11 +318,14 @@ def test_provider_get_with_legacy_sensitive_base_url_redacts_and_resolve_rejects
 )
 def test_provider_update_with_active_job_returns_409(
     provider_database: Database,
+    tmp_path: Path,
     status: str,
 ) -> None:
     service = ProviderService(provider_database)
     provider = _create_provider(service)
-    project = ProjectService(provider_database).create({"name": "任务引用项目", "source_text": ""})
+    project = ProjectService(provider_database, FileService(tmp_path)).create(
+        {"name": "任务引用项目", "source_text": ""}
+    )
     repository = JobRepository(provider_database)
     record = repository.create_job(
         project_id=project["id"],

@@ -35,6 +35,26 @@ const versions: MediaVersion[] = [
 ];
 
 describe("媒体版本组件", () => {
+  test("test_click_current_image_opens_large_preview", async () => {
+    const user = userEvent.setup();
+    render(
+      <MediaVersions
+        versions={versions}
+        mediaKind="image"
+        alt="关键帧"
+        onSelect={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "放大关键帧" }));
+
+    expect(
+      screen.getByRole("dialog", { name: "关键帧" }),
+    ).toBeInTheDocument();
+    expect(screen.getByAltText("关键帧大图")).toBeInTheDocument();
+  });
+
   test("test_media_versions_with_current_version_disables_current_delete", () => {
     render(
       <MediaVersions

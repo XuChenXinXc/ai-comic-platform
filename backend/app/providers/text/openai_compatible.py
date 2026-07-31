@@ -22,39 +22,60 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
         schema: type[BaseModel],
         params: dict[str, Any],
     ) -> BaseModel:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    f"{system_prompt}\n\n"
-                    "只返回一个符合下列 JSON Schema 的 JSON 对象，不要输出 Markdown：\n"
-                    f"{json.dumps(schema.model_json_schema(), ensure_ascii=False)}"
-                ),
-            },
-            {"role": "user", "content": user_prompt},
-        ]
-        raw = await self._complete(messages, schema, params)
+        plain_text_field = getattr(schema, "plain_text_output_field", None)
+        if isinstance(plain_text_field, str):
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            repair_instruction = (
+                "上一次输出无法通过校验。请只返回修复后的一句纯文本，"
+                "不要输出 JSON、Markdown、标题或解释。"
+            )
+        else:
+            plain_text_field = None
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        f"{system_prompt}\n\n"
+                        "只返回一个符合下列 JSON Schema 的 JSON 对象，不要输出 Markdown：\n"
+                        f"{json.dumps(schema.model_json_schema(), ensure_ascii=False)}"
+                    ),
+                },
+                {"role": "user", "content": user_prompt},
+            ]
+            repair_instruction = "上一次输出无法通过校验。请只返回修复后的完整 JSON 对象。"
+        raw = await self._complete(
+            messages,
+            schema,
+            params,
+            json_response=plain_text_field is None,
+        )
         try:
-            return schema.model_validate(self._parse_json(raw))
+            return self._validate_output(schema, raw, plain_text_field)
         except (ValidationError, ValueError, json.JSONDecodeError) as first_error:
             repair_messages = [
                 *messages,
                 {"role": "assistant", "content": raw},
                 {
                     "role": "user",
-                    "content": (
-                        "上一次输出无法通过校验。请只返回修复后的完整 JSON 对象。\n"
-                        f"校验错误：{first_error}"
-                    ),
+                    "content": f"{repair_instruction}\n校验错误：{first_error}",
                 },
             ]
-            repaired = await self._complete(repair_messages, schema, params)
+            repaired = await self._complete(
+                repair_messages,
+                schema,
+                params,
+                json_response=plain_text_field is None,
+            )
             try:
-                return schema.model_validate(self._parse_json(repaired))
+                return self._validate_output(schema, repaired, plain_text_field)
             except (ValidationError, ValueError, json.JSONDecodeError) as exc:
                 summary = repaired.strip().replace("\n", " ")[:500]
+                output_type = "纯文本" if plain_text_field else "结构化"
                 raise ProviderError(
-                    f"文字 Provider 的结构化输出修复失败：{exc}；响应摘要：{summary}"
+                    f"文字 Provider 的{output_type}输出修复失败：{exc}；响应摘要：{summary}"
                 ) from exc
 
     async def _complete(
@@ -62,6 +83,8 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
         messages: list[dict[str, str]],
         schema: type[BaseModel],
         params: dict[str, Any],
+        *,
+        json_response: bool = True,
     ) -> str:
         options = {**self.config.params, **params}
         chat_path = str(options.pop("chat_path", "chat/completions"))
@@ -71,12 +94,10 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
         response_format = options.pop("response_format", {"type": "json_object"})
         for internal_key in ("headers", "verify_ssl"):
             options.pop(internal_key, None)
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "response_format": response_format,
-            **options,
-        }
+        payload: dict[str, Any] = {"model": model, "messages": messages, **options}
+        if json_response:
+            payload["response_format"] = response_format
+        payload["reasoning_effort"] = "high"
         response = await self._request_json(
             "POST",
             chat_path,
@@ -88,6 +109,39 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
         if not content.strip():
             raise ProviderError("文字 Provider 返回空内容")
         return content
+
+    @classmethod
+    def _validate_output(
+        cls,
+        schema: type[BaseModel],
+        raw: str,
+        plain_text_field: str | None,
+    ) -> BaseModel:
+        if plain_text_field is not None:
+            value = {plain_text_field: cls._parse_plain_text(raw, plain_text_field)}
+        else:
+            value = cls._parse_json(raw)
+        return schema.model_validate(value)
+
+    @staticmethod
+    def _parse_plain_text(raw: str, field_name: str) -> str:
+        text = raw.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+        if isinstance(parsed, str):
+            return parsed.strip()
+        if isinstance(parsed, dict) and isinstance(parsed.get(field_name), str):
+            return parsed[field_name].strip()
+        return text
 
     @staticmethod
     def _extract_content(response: dict[str, Any]) -> str:

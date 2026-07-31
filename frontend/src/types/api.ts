@@ -21,6 +21,7 @@ export type JobStatus =
 export interface Project {
   id: string;
   name: string;
+  storage_path: string;
   source_text: string;
   source_signature: string;
   source_revision: number;
@@ -55,6 +56,17 @@ export type ProjectInput = Pick<
     >
   >;
 
+export type ProjectStorageSource = "database" | "environment" | "default";
+
+export interface ProjectStorageSetting {
+  path: string;
+  source: ProjectStorageSource;
+}
+
+export interface ProjectStorageSelection extends ProjectStorageSetting {
+  selected: boolean;
+}
+
 export interface ContentRecord<T = Record<string, unknown>> {
   project_id: string;
   content_json: T | string;
@@ -76,11 +88,47 @@ export interface ScreenplayScene {
   characters?: string[];
   objective?: string;
   action?: string;
-  dialogue?: Array<Record<string, unknown>>;
+  dialogue?: DialogueLine[];
   narration?: string[];
   emotion?: string;
   transition_to_next?: string;
 }
+
+export type DialogueLine = Record<string, unknown> & {
+  speaker?: string;
+  character?: string;
+  name?: string;
+  text?: string;
+  content?: string;
+  line?: string;
+};
+
+export type ShotPosition = Record<string, unknown> & {
+  character?: string;
+  name?: string;
+  speaker?: string;
+  character_name?: string;
+  position?: string;
+  location?: string;
+  side?: string;
+  placement?: string;
+  facing?: string;
+  direction?: string;
+  gaze?: string;
+  look?: string;
+  eye_line?: string;
+  action_direction?: string;
+};
+
+export type ShotExpression = Record<string, unknown> & {
+  character?: string;
+  name?: string;
+  speaker?: string;
+  character_name?: string;
+  expression?: string;
+  emotion?: string;
+  mood?: string;
+};
 
 export interface ScreenplayContent {
   title?: string;
@@ -97,6 +145,7 @@ export interface Asset {
   profile_json: Record<string, unknown> | string;
   profile?: Record<string, unknown>;
   prompt: string;
+  compiled_prompt: string;
   negative_prompt: string;
   consistency_json: string[] | string;
   consistency_keywords?: string[];
@@ -138,14 +187,14 @@ export interface Shot {
   character_ids?: string[];
   prop_ids_json: string[] | string;
   prop_ids?: string[];
-  positions_json: Array<Record<string, unknown>> | string;
-  positions?: Array<Record<string, unknown>>;
+  positions_json: ShotPosition[] | string;
+  positions?: ShotPosition[];
   start_state: string;
   action: string;
-  expressions_json: Array<Record<string, unknown>> | string;
-  expressions?: Array<Record<string, unknown>>;
-  dialogue_json: Array<Record<string, unknown>> | string;
-  dialogue?: Array<Record<string, unknown>>;
+  expressions_json: ShotExpression[] | string;
+  expressions?: ShotExpression[];
+  dialogue_json: DialogueLine[] | string;
+  dialogue?: DialogueLine[];
   narration: string;
   shot_type: string;
   camera_angle: string;
@@ -155,7 +204,9 @@ export interface Shot {
   next_hook: string;
   frame_description: string;
   image_prompt: string;
+  compiled_image_prompt: string;
   video_prompt: string;
+  compiled_video_prompt: string;
   negative_prompt: string;
   reference_bindings_json: ReferenceBinding[] | string;
   reference_bindings?: ReferenceBinding[];
@@ -203,6 +254,8 @@ export interface ApiProvider {
   adapter: string;
   base_url: string;
   api_key_env: string;
+  api_key_configured: boolean;
+  api_key_source: "direct" | "env" | "none";
   model: string;
   params: Record<string, unknown> | string;
   params_json?: Record<string, unknown> | string;
@@ -218,8 +271,16 @@ export interface ApiProvider {
 
 export type ProviderInput = Omit<
   ApiProvider,
-  "id" | "created_at" | "updated_at" | "last_test_ok" | "last_test_message"
->;
+  | "id"
+  | "created_at"
+  | "updated_at"
+  | "last_test_ok"
+  | "last_test_message"
+  | "api_key_configured"
+  | "api_key_source"
+> & {
+  api_key?: string;
+};
 
 export interface Job {
   id: string;

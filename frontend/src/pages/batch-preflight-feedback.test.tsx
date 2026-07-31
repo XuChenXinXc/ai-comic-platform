@@ -2,14 +2,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "../api/client";
 import type { Asset, Job, Shot } from "../types/api";
-import { AssetImagesPage } from "./AssetImagesPage";
 import { AssetsPage } from "./AssetsPage";
-import { KeyframesPage } from "./KeyframesPage";
 import { ShotsPage } from "./ShotsPage";
-import { VideosPage } from "./VideosPage";
 
 const toastMock = vi.hoisted(() => ({
   error: vi.fn(),
@@ -37,12 +35,14 @@ const shots = [
     project_id: "project-1",
     shot_no: 1,
     shot_order: 1,
+    image_prompt: "",
   },
   {
     id: "shot-2",
     project_id: "project-1",
     shot_no: 2,
     shot_order: 2,
+    image_prompt: "",
   },
 ] as Shot[];
 
@@ -68,6 +68,7 @@ const assets = [
     asset_type: "character",
     name: "林昭",
     prompt: "角色定妆图",
+    compiled_prompt: "角色完整设定模板",
   },
   {
     id: "asset-2",
@@ -75,6 +76,7 @@ const assets = [
     asset_type: "character",
     name: "顾临",
     prompt: "",
+    compiled_prompt: "角色完整设定模板",
   },
 ] as Asset[];
 
@@ -86,7 +88,9 @@ function renderPage(page: ReactNode) {
     },
   });
   return render(
-    <QueryClientProvider client={queryClient}>{page}</QueryClientProvider>,
+    <MemoryRouter>
+      <QueryClientProvider client={queryClient}>{page}</QueryClientProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -109,7 +113,7 @@ describe("批量生成预检反馈", () => {
         { target_id: "shot-2", error: "关键帧提示词为空" },
       ],
     });
-    renderPage(<KeyframesPage />);
+    renderPage(<ShotsPage />);
 
     await userEvent.click(
       await screen.findByRole("button", { name: "生成全部关键帧" }),
@@ -131,7 +135,7 @@ describe("批量生成预检反馈", () => {
         { target_id: "shot-2", error: "请先生成或上传关键帧" },
       ],
     });
-    renderPage(<VideosPage />);
+    renderPage(<ShotsPage />);
 
     await userEvent.click(
       await screen.findByRole("button", { name: "生成全部视频" }),
@@ -154,7 +158,7 @@ describe("批量生成预检反馈", () => {
         { target_id: "asset-2", error: "图片提示词为空" },
       ],
     });
-    renderPage(<AssetImagesPage />);
+    renderPage(<AssetsPage />);
 
     await userEvent.click(
       await screen.findByRole("button", { name: "批量生成角色图" }),
@@ -168,48 +172,4 @@ describe("批量生成预检反馈", () => {
     });
   });
 
-  test("test_asset_prompt_batch_with_preflight_failure_shows_queued_count_and_reason", async () => {
-    vi.mocked(api.assets.list).mockResolvedValue(assets);
-    vi.spyOn(api.assets, "batchPrompts").mockResolvedValue({
-      batch_id: "batch-4",
-      jobs: [queuedJob],
-      preflight_failures: [
-        { target_id: "asset-2", error: "素材档案不完整" },
-      ],
-    });
-    renderPage(<AssetsPage />);
-
-    await userEvent.click(
-      await screen.findByRole("button", { name: "批量补齐提示词" }),
-    );
-
-    await waitFor(() => {
-      expect(toastMock.warning).toHaveBeenCalledWith(
-        "已入队 1 个素材提示词任务，跳过 1 项",
-        { description: "素材 顾临：素材档案不完整" },
-      );
-    });
-  });
-
-  test("test_shot_prompt_batch_with_preflight_failure_shows_queued_count_and_reason", async () => {
-    vi.spyOn(api.shots, "batchPrompts").mockResolvedValue({
-      batch_id: "batch-5",
-      jobs: [queuedJob],
-      preflight_failures: [
-        { target_id: "shot-2", error: "分镜动作为空" },
-      ],
-    });
-    renderPage(<ShotsPage />);
-
-    await userEvent.click(
-      await screen.findByRole("button", { name: "批量补齐提示词" }),
-    );
-
-    await waitFor(() => {
-      expect(toastMock.warning).toHaveBeenCalledWith(
-        "已入队 1 个分镜提示词任务，跳过 1 项",
-        { description: "分镜 2：分镜动作为空" },
-      );
-    });
-  });
 });

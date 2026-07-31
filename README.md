@@ -79,11 +79,28 @@ npm.cmd run test:e2e
 ## 数据与密钥
 
 - 结构化数据：`workspace/platform.db`
-- 项目媒体：`workspace/projects/<project_id>/`
-- 密钥：项目根目录 `.env`
-- 数据库只保存密钥对应的环境变量名，不保存密钥正文
-- Provider 密钥变量名必须以类型开头并以 `_API_KEY` 结尾，例如
-  `TEXT_API_KEY`、`IMAGE_OPENAI_API_KEY`、`VIDEO_VOLC_API_KEY`
-- 修改 `.env` 后需要重启平台；密钥不要填写到 Provider 参数或自定义请求头中
+- 项目媒体根目录：在“平台设置”页选择，默认 `workspace/projects/`
+- 新建项目：`<项目媒体根目录>/<项目名>/`，同名时自动追加 ` (2)`、` (3)`
+- API Key 推荐在“接口配置”页直接填写，平台使用 Windows DPAPI 加密保存，重启后仍可用
+- 数据库只保存 API Key 密文，不保存明文；接口列表和详情不会返回明文
+- 已有旧 Provider 仍兼容从项目 `.env` 读取 `TEXT_API_KEY`、`IMAGE_OPENAI_API_KEY`、
+  `VIDEO_VOLC_API_KEY` 等环境变量
+- 修改旧 Provider 的 `.env` 后需要重启平台；密钥不要填写到 Provider 参数或自定义请求头中
+
+如需改到其他磁盘，可在“平台设置”页点击“选择目录”，无需重启平台；也可在尚未通过
+页面保存设置时使用 `.env` 中的 `APP_PROJECTS_DIR=D:/AIComicProjects` 作为默认值。
+请使用专用且较短的项目目录，不要指向磁盘根目录、平台源码或已有资料目录。
+新目录只影响之后创建的项目，已有项目继续使用各自原目录，平台不会自动迁移历史素材。
+
+新建“项目1”后会自动创建并分类保存媒体：
+
+```text
+workspace/projects/项目1/
+├── 角色/
+├── 物品/
+├── 场景/
+├── 分镜关键帧/
+└── 分镜视频/
+```
 # ai-comic-platform
 # ai-comic-platform

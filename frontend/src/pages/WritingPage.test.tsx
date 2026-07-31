@@ -15,6 +15,7 @@ const projectContext = vi.hoisted(() => ({
     id: "project-1",
     name: "验收项目",
     source_text: "测试小说原文",
+    style_prompt: "二维国风漫剧",
     source_revision: 1,
     source_signature: "source-1",
   },
@@ -30,20 +31,6 @@ vi.mock("../hooks/use-project", () => ({
 vi.mock("../components/project-required", () => ({
   ProjectRequired: ({ children }: { children: ReactNode }) => children,
 }));
-
-function analysisRecord(
-  revision: number,
-  summary: string,
-): ContentRecord<Record<string, unknown>> {
-  return {
-    project_id: "project-1",
-    content_json: { summary },
-    status: "ready",
-    source_signature: "source-1",
-    revision,
-    updated_at: `2026-07-28T10:00:0${revision}Z`,
-  };
-}
 
 function screenplayRecord(
   revision: number,
@@ -74,6 +61,7 @@ describe("文字工作台服务端版本冲突", () => {
       id: "project-1",
       name: "验收项目",
       source_text: "测试小说原文",
+      style_prompt: "二维国风漫剧",
       source_revision: 1,
       source_signature: "source-1",
     };
@@ -86,9 +74,10 @@ describe("文字工作台服务端版本冲突", () => {
     );
   });
 
-  test("test_server_revision_while_analysis_dirty_preserves_local_until_user_loads_server", async () => {
-    let serverRecord = analysisRecord(1, "服务端旧稿");
-    vi.spyOn(api.analysis, "get").mockImplementation(async () => serverRecord);
+  test("test_writing_page_only_shows_screenplay_without_analysis_tab", async () => {
+    vi.mocked(api.screenplay.get).mockResolvedValue(
+      screenplayRecord(1, "唯一剧本"),
+    );
     const queryClient = new QueryClient({
       defaultOptions: {
         queries: { retry: false },
@@ -101,43 +90,107 @@ describe("文字工作台服务端版本冲突", () => {
       </QueryClientProvider>,
     );
 
-    const editor = await screen.findByRole("textbox");
-    fireEvent.change(editor, {
-      target: { value: '{"summary":"本地未保存"}' },
-    });
+    expect(await screen.findByLabelText("剧本标题")).toHaveValue("唯一剧本");
+    expect(screen.queryByRole("tab", { name: "小说分析" })).not.toBeInTheDocument();
+    expect(screen.queryByText("小说分析")).not.toBeInTheDocument();
+    expect(api.analysis.get).not.toHaveBeenCalled();
+  });
 
-    serverRecord = analysisRecord(2, "服务端新稿");
-    await queryClient.invalidateQueries({
-      queryKey: queryKeys.analysis("project-1"),
+  test("test_style_prompt_is_above_screenplay_metadata", async () => {
+    vi.mocked(api.screenplay.get).mockResolvedValue(
+      screenplayRecord(1, "唯一剧本"),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
     });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <WritingPage />
+      </QueryClientProvider>,
+    );
+
+    const stylePrompt = await screen.findByLabelText("统一画风 STYLE_ANCHOR");
+    const titleInput = await screen.findByLabelText("剧本标题");
+
+    expect(stylePrompt).toHaveValue("二维国风漫剧");
+    expect(
+      stylePrompt.compareDocumentPosition(titleInput) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  test("test_saving_screenplay_persists_style_prompt", async () => {
+    vi.mocked(api.screenplay.get).mockResolvedValue(
+      screenplayRecord(1, "唯一剧本"),
+    );
+    const updateProject = vi
+      .spyOn(api.projects, "update")
+      .mockResolvedValue({
+        ...projectContext.activeProject,
+        style_prompt: "新画风",
+      } as never);
+    vi.spyOn(api.screenplay, "update").mockResolvedValue(
+      screenplayRecord(2, "唯一剧本"),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <WritingPage />
+      </QueryClientProvider>,
+    );
+
+    const stylePrompt = await screen.findByLabelText("统一画风 STYLE_ANCHOR");
+    await userEvent.clear(stylePrompt);
+    await userEvent.type(stylePrompt, "新画风");
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => {
+      expect(updateProject).toHaveBeenCalledWith("project-1", {
+        style_prompt: "新画风",
+      });
+    });
+  });
+
+  test("test_screenplay_dialogue_with_line_field_displays_dialogue_text", async () => {
+    vi.mocked(api.screenplay.get).mockResolvedValue({
+      ...screenplayRecord(1, "对白兼容剧本"),
+      content_json: {
+        title: "对白兼容剧本",
+        logline: "",
+        scenes: [
+          {
+            scene_no: 1,
+            scene_name: "门口",
+            characters: ["小明"],
+            dialogue: [{ speaker: "小明", line: "你终于来了。" }],
+            narration: [],
+          },
+        ],
+      },
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <WritingPage />
+      </QueryClientProvider>,
+    );
 
     expect(
-      await screen.findByText("服务端已有新版本"),
+      await screen.findByDisplayValue("小明：你终于来了。"),
     ).toBeInTheDocument();
-    expect((editor as HTMLTextAreaElement).value).toContain("本地未保存");
-
-    await userEvent.click(
-      screen.getByRole("button", { name: "保留本地编辑" }),
-    );
-    await waitFor(() => {
-      expect(
-        screen.queryByText("服务端已有新版本"),
-      ).not.toBeInTheDocument();
-    });
-    expect((editor as HTMLTextAreaElement).value).toContain("本地未保存");
-
-    serverRecord = analysisRecord(3, "服务端更新稿");
-    await queryClient.invalidateQueries({
-      queryKey: queryKeys.analysis("project-1"),
-    });
-    await userEvent.click(
-      await screen.findByRole("button", { name: "载入服务端版本" }),
-    );
-
-    await waitFor(() => {
-      expect((editor as HTMLTextAreaElement).value).toContain("服务端更新稿");
-    });
-    expect((editor as HTMLTextAreaElement).value).not.toContain("本地未保存");
   });
 
   test("test_server_revision_while_screenplay_dirty_preserves_local_until_user_loads_server", async () => {
@@ -188,6 +241,7 @@ describe("文字工作台延迟保存", () => {
       id: "project-1",
       name: "验收项目",
       source_text: "测试小说原文",
+      style_prompt: "二维国风漫剧",
       source_revision: 1,
       source_signature: "source-1",
     };
@@ -197,11 +251,11 @@ describe("文字工作台延迟保存", () => {
     );
   });
 
-  test("test_edit_after_save_started_preserves_newer_local_analysis", async () => {
-    let serverRecord = analysisRecord(1, "服务端旧稿");
-    vi.spyOn(api.analysis, "get").mockImplementation(async () => serverRecord);
-    const pendingSave = deferred<ContentRecord<Record<string, unknown>>>();
-    vi.spyOn(api.analysis, "update").mockImplementation(
+  test("test_edit_after_save_started_preserves_newer_local_screenplay", async () => {
+    let serverRecord = screenplayRecord(1, "服务端旧剧本");
+    vi.mocked(api.screenplay.get).mockImplementation(async () => serverRecord);
+    const pendingSave = deferred<ContentRecord<ScreenplayContent>>();
+    vi.spyOn(api.screenplay, "update").mockImplementation(
       async () => pendingSave.promise,
     );
     const queryClient = new QueryClient({
@@ -215,19 +269,19 @@ describe("文字工作台延迟保存", () => {
         <WritingPage />
       </QueryClientProvider>,
     );
-    const editor = await screen.findByRole("textbox");
-    fireEvent.change(editor, {
-      target: { value: '{"summary":"提交版本"}' },
+    const titleInput = await screen.findByLabelText("剧本标题");
+    fireEvent.change(titleInput, {
+      target: { value: "提交版本" },
     });
     await userEvent.click(screen.getByRole("button", { name: "保存" }));
     expect(
       screen.getByRole("button", { name: "确认当前内容" }),
     ).toBeDisabled();
-    fireEvent.change(editor, {
-      target: { value: '{"summary":"保存期间的新编辑"}' },
+    fireEvent.change(titleInput, {
+      target: { value: "保存期间的新编辑" },
     });
 
-    serverRecord = analysisRecord(2, "提交版本");
+    serverRecord = screenplayRecord(2, "提交版本");
     pendingSave.resolve(serverRecord);
 
     await waitFor(() => {
@@ -236,29 +290,27 @@ describe("文字工作台延迟保存", () => {
     expect(
       screen.getByRole("button", { name: "确认当前内容" }),
     ).not.toBeDisabled();
-    expect(api.analysis.update).toHaveBeenCalledWith("project-1", {
-      content_json: { summary: "提交版本" },
+    expect(api.screenplay.update).toHaveBeenCalledWith("project-1", {
+      content_json: { title: "提交版本", logline: "", scenes: [] },
       status: "ready",
     });
-    expect(editor).toHaveValue(
-      JSON.stringify({ summary: "保存期间的新编辑" }, null, 2),
-    );
+    expect(titleInput).toHaveValue("保存期间的新编辑");
   });
 
   test("test_save_from_previous_project_does_not_overwrite_current_project", async () => {
     const records = {
-      "project-1": analysisRecord(1, "项目 A 服务端稿"),
+      "project-1": screenplayRecord(1, "项目 A 服务端剧本"),
       "project-2": {
-        ...analysisRecord(1, "项目 B 服务端稿"),
+        ...screenplayRecord(1, "项目 B 服务端剧本"),
         project_id: "project-2",
         source_signature: "source-2",
       },
     };
-    vi.spyOn(api.analysis, "get").mockImplementation(
+    vi.mocked(api.screenplay.get).mockImplementation(
       async (projectId) => records[projectId as keyof typeof records],
     );
-    const pendingSave = deferred<ContentRecord<Record<string, unknown>>>();
-    vi.spyOn(api.analysis, "update").mockImplementation(
+    const pendingSave = deferred<ContentRecord<ScreenplayContent>>();
+    vi.spyOn(api.screenplay, "update").mockImplementation(
       async () => pendingSave.promise,
     );
     const queryClient = new QueryClient({
@@ -272,9 +324,9 @@ describe("文字工作台延迟保存", () => {
         <WritingPage />
       </QueryClientProvider>,
     );
-    const editor = await screen.findByRole("textbox");
-    fireEvent.change(editor, {
-      target: { value: '{"summary":"项目 A 提交稿"}' },
+    const titleInput = await screen.findByLabelText("剧本标题");
+    fireEvent.change(titleInput, {
+      target: { value: "项目 A 提交剧本" },
     });
     await userEvent.click(screen.getByRole("button", { name: "保存" }));
 
@@ -282,6 +334,7 @@ describe("文字工作台延迟保存", () => {
       id: "project-2",
       name: "项目 B",
       source_text: "项目 B 小说",
+      style_prompt: "项目 B 画风",
       source_revision: 1,
       source_signature: "source-2",
     };
@@ -291,27 +344,23 @@ describe("文字工作台延迟保存", () => {
         <WritingPage />
       </QueryClientProvider>,
     );
-    const projectBEditor = await screen.findByRole("textbox");
+    const projectBTitle = await screen.findByLabelText("剧本标题");
     await waitFor(() => {
-      expect(projectBEditor).toHaveValue(
-        JSON.stringify({ summary: "项目 B 服务端稿" }, null, 2),
-      );
+      expect(projectBTitle).toHaveValue("项目 B 服务端剧本");
     });
-    fireEvent.change(projectBEditor, {
-      target: { value: '{"summary":"项目 B 本地编辑"}' },
+    fireEvent.change(projectBTitle, {
+      target: { value: "项目 B 本地编辑" },
     });
 
-    pendingSave.resolve(analysisRecord(2, "项目 A 提交稿"));
+    pendingSave.resolve(screenplayRecord(2, "项目 A 提交剧本"));
 
     await waitFor(() => {
       expect(queryClient.isMutating()).toBe(0);
     });
-    expect(api.analysis.update).toHaveBeenCalledWith("project-1", {
-      content_json: { summary: "项目 A 提交稿" },
+    expect(api.screenplay.update).toHaveBeenCalledWith("project-1", {
+      content_json: { title: "项目 A 提交剧本", logline: "", scenes: [] },
       status: "ready",
     });
-    expect(projectBEditor).toHaveValue(
-      JSON.stringify({ summary: "项目 B 本地编辑" }, null, 2),
-    );
+    expect(projectBTitle).toHaveValue("项目 B 本地编辑");
   });
 });

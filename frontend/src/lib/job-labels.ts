@@ -1,0 +1,17 @@
+export const JOB_TYPE_LABELS: Record<string, string> = {
+  analyze_novel: "小说分析",
+  generate_screenplay: "剧本生成",
+  generate_screenplay_scene: "剧本场次生成",
+  extract_assets: "素材提取",
+  generate_asset_prompt: "素材提示词",
+  generate_asset_image: "素材图片",
+  extract_shots: "分镜提取",
+  generate_shot_image_prompt: "分镜图片提示词",
+  generate_shot_video_prompt: "分镜视频提示词",
+  generate_keyframe: "关键帧生成",
+  generate_video: "分镜视频生成",
+};
+
+export function jobTypeLabel(jobType: string) {
+  return JOB_TYPE_LABELS[jobType] || jobType;
+}

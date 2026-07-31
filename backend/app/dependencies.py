@@ -8,6 +8,7 @@ from app.services.job_service import JobService
 from app.services.media_service import MediaService
 from app.services.project_service import ProjectService
 from app.services.provider_service import ProviderService
+from app.services.setting_service import SettingService
 from app.services.shot_service import ShotService
 from app.services.writing_service import WritingService
 
@@ -52,3 +53,9 @@ def get_provider_service(
     database: Annotated[Database, Depends(get_database)],
 ) -> ProviderService:
     return ProviderService(database)
+
+
+def get_setting_service(
+    database: Annotated[Database, Depends(get_database)],
+) -> SettingService:
+    return SettingService(database)

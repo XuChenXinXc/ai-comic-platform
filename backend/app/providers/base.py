@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from app.schemas import ProviderConfig, ProviderPollResult, ProviderSubmission
 from app.services.file_service import atomic_write_bytes, download_url_atomic
+from app.services.utils import sanitize_error_message
 
 
 class ProviderError(RuntimeError):
@@ -267,6 +268,8 @@ class HttpProviderBase:
         self.config = config
 
     def _api_key(self) -> str:
+        if self.config.api_key:
+            return self.config.api_key
         if not self.config.api_key_env:
             return ""
         validate_api_key_env(self.config.kind, self.config.api_key_env)
@@ -294,7 +297,13 @@ class HttpProviderBase:
         **kwargs: Any,
     ) -> requests.Response:
         last_error: Exception | None = None
-        for attempt in range(self.config.max_retries + 1):
+        last_http_failure = ""
+        method_name = method.strip().upper()
+        retry_unsafe_methods = bool(options.get("retry_unsafe_methods", True))
+        attempts = self.config.max_retries + 1
+        if method_name not in {"GET", "HEAD", "OPTIONS"} and not retry_unsafe_methods:
+            attempts = 1
+        for attempt in range(attempts):
             try:
                 response = requests.request(
                     method,
@@ -305,12 +314,42 @@ class HttpProviderBase:
                 )
                 response.raise_for_status()
                 return response
-            except requests.RequestException as exc:
+            except requests.HTTPError as exc:
                 last_error = exc
-                if attempt >= self.config.max_retries:
+                last_http_failure = self._http_failure_message(exc.response)
+                if attempt >= attempts - 1:
                     break
                 time.sleep(min(2**attempt * 0.25, 2))
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt >= attempts - 1:
+                    break
+                time.sleep(min(2**attempt * 0.25, 2))
+        if last_http_failure:
+            raise ProviderError(last_http_failure) from last_error
         raise ProviderError(f"Provider 请求失败：{last_error}") from last_error
+
+    @staticmethod
+    def _http_failure_message(response: requests.Response | None) -> str:
+        if response is None:
+            return ""
+        provider_message = ""
+        try:
+            payload = response.json()
+        except requests.JSONDecodeError:
+            payload = None
+        if isinstance(payload, Mapping):
+            error = payload.get("error")
+            if isinstance(error, Mapping):
+                provider_message = str(error.get("message") or error.get("detail") or "")
+            elif isinstance(error, str):
+                provider_message = error
+            if not provider_message:
+                provider_message = str(payload.get("message") or payload.get("detail") or "")
+        prefix = f"Provider 请求失败（HTTP {response.status_code}）"
+        if not provider_message:
+            return prefix
+        return f"{prefix}：{sanitize_error_message(provider_message)}"
 
     async def _request_json(
         self,

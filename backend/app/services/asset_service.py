@@ -10,8 +10,9 @@ from app.models.tables import asset, asset_image, job, project, shot
 from app.prompts import load_prompt
 from app.schemas import AssetExtractionOutput, AssetPromptOutput
 from app.services.errors import bad_request, conflict, not_found
-from app.services.file_service import file_service
+from app.services.file_service import file_service, project_media_url
 from app.services.job_service import JobService
+from app.services.prompt_service import compile_asset_prompt, resolve_asset_negative_prompt
 from app.services.provider_service import ProviderService
 from app.services.signature_service import (
     SHOT_SIGNATURE_FIELDS,
@@ -73,6 +74,23 @@ class AssetService:
         result["consistency_keywords"] = consistency
         return result
 
+    @staticmethod
+    def _compiled_prompt(
+        current_project: dict[str, Any],
+        current: dict[str, Any],
+    ) -> str:
+        return compile_asset_prompt(
+            style_prompt=current_project["style_prompt"],
+            aspect_ratio=current_project["aspect_ratio"],
+            asset_type=current["asset_type"],
+            asset_name=current["name"],
+            profile=current["profile"],
+            prompt=current["prompt"],
+            negative_prompt=current["negative_prompt"],
+            consistency_keywords=current["consistency_keywords"],
+            composition=current["composition"],
+        )
+
     def _current_image(
         self, connection: Any, asset_id: str, project_id: str
     ) -> dict[str, Any] | None:
@@ -85,7 +103,7 @@ class AssetService:
             ).first()
         )
         if record and record.get("file_path"):
-            record["file_url"] = f"/media/{project_id}/{record['file_path']}"
+            record["file_url"] = project_media_url(project_id, record["file_path"])
             record["media_url"] = record["file_url"]
         if record:
             record["is_current"] = bool(record["is_current"])
@@ -105,6 +123,7 @@ class AssetService:
                     record["source_signature"]
                     and record["source_signature"] != current_project["source_signature"]
                 )
+                record["compiled_prompt"] = self._compiled_prompt(current_project, record)
                 record["current_image"] = self._current_image(connection, record["id"], project_id)
                 records.append(record)
         return records
@@ -122,6 +141,7 @@ class AssetService:
             result["source_signature"]
             and result["source_signature"] != current_project["source_signature"]
         )
+        result["compiled_prompt"] = self._compiled_prompt(current_project, result)
         with self.database.engine.connect() as connection:
             result["current_image"] = self._current_image(
                 connection, asset_id, result["project_id"]
@@ -516,6 +536,7 @@ class AssetService:
     async def handle_extract(self, job: dict[str, Any]) -> dict[str, Any]:
         current_project = self._project(job["project_id"])
         input_data = json_loads(job.get("input_json"), {})
+        selected_types = set(input_data["asset_types"])
         provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
         output = await provider.generate_json(
             system_prompt=load_prompt("asset_extract"),
@@ -524,7 +545,6 @@ class AssetService:
             params={**config["params"], **input_data.get("params", {})},
         )
         payload = output.model_dump(mode="json")
-        selected_types = set(input_data["asset_types"])
         saved_ids: list[str] = []
         for asset_type, key in _EXTRACTION_KEYS.items():
             if asset_type not in selected_types:
@@ -543,6 +563,17 @@ class AssetService:
         profile = dict(extracted)
         profile.pop("name", None)
         importance = profile.pop("importance", "normal")
+        prompt = str(profile.pop("prompt", "")).strip()
+        negative_prompt = resolve_asset_negative_prompt(
+            asset_type,
+            str(profile.pop("negative_prompt", "")).strip(),
+        )
+        consistency_keywords = [
+            str(item).strip()
+            for item in profile.pop("consistency_keywords", [])
+            if str(item).strip()
+        ]
+        composition = str(profile.pop("composition", "")).strip()
         now = utc_now()
         with self.database.engine.begin() as connection:
             existing = row_dict(
@@ -555,14 +586,24 @@ class AssetService:
                 ).first()
             )
             if existing:
-                merged_profile = self._merge_profile(
-                    json_loads(existing["profile_json"], {}), profile
+                if existing["status"] == "confirmed":
+                    return existing["id"]
+                merged_profile = profile
+                saved_prompt = prompt or existing["prompt"]
+                saved_negative_prompt = negative_prompt or existing["negative_prompt"]
+                saved_consistency = consistency_keywords or json_loads(
+                    existing["consistency_json"], []
                 )
+                saved_composition = composition or existing["composition"]
                 connection.execute(
                     update(asset)
                     .where(asset.c.id == existing["id"])
                     .values(
                         profile_json=json_dumps(merged_profile),
+                        prompt=saved_prompt,
+                        negative_prompt=saved_negative_prompt,
+                        consistency_json=json_dumps(saved_consistency),
+                        composition=saved_composition,
                         importance=(
                             "core"
                             if existing["importance"] == "core" or importance == "core"
@@ -573,8 +614,8 @@ class AssetService:
                         own_signature=self._signature(
                             current_project,
                             profile=merged_profile,
-                            prompt=existing["prompt"],
-                            negative_prompt=existing["negative_prompt"],
+                            prompt=saved_prompt,
+                            negative_prompt=saved_negative_prompt,
                         ),
                         revision=existing["revision"] + 1,
                         updated_at=now,
@@ -589,18 +630,18 @@ class AssetService:
                     asset_type=asset_type,
                     name=name,
                     profile_json=json_dumps(profile),
-                    prompt="",
-                    negative_prompt="",
-                    consistency_json="[]",
-                    composition="",
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    consistency_json=json_dumps(consistency_keywords),
+                    composition=composition,
                     importance=importance,
                     status="ready",
                     source_signature=current_project["source_signature"],
                     own_signature=self._signature(
                         current_project,
                         profile=profile,
-                        prompt="",
-                        negative_prompt="",
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
                     ),
                     revision=1,
                     created_at=now,

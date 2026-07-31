@@ -5,7 +5,12 @@ from sqlalchemy import insert, select, update
 from app.db import Database, db
 from app.models.tables import novel_analysis, project, screenplay
 from app.prompts import load_prompt
-from app.schemas import NovelAnalysisOutput, ScreenplayOutput, ScreenplayScene
+from app.schemas import (
+    NovelAnalysisOutput,
+    ScreenplayOutput,
+    ScreenplayScene,
+    VisualStyleOutput,
+)
 from app.services.errors import bad_request, not_found
 from app.services.job_service import JobService
 from app.services.provider_service import ProviderService
@@ -264,6 +269,12 @@ class WritingService:
 
     def queue_screenplay(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
         project_record = self._project(project_id)
+        expected_analysis_revision = self._set_status(
+            novel_analysis,
+            project_id,
+            "generating",
+        )
+        assert expected_analysis_revision is not None
         expected_revision = self._set_status(screenplay, project_id, "generating")
         assert expected_revision is not None
         return self.jobs.create(
@@ -274,7 +285,11 @@ class WritingService:
             provider_kind="text",
             provider_id=options.get("provider_id") or project_record["default_text_provider_id"],
             input_data={
+                "expected_analysis_revision": expected_analysis_revision,
                 "expected_revision": expected_revision,
+                "expected_project_updated_at": project_record["updated_at"],
+                "expected_source_signature": project_record["source_signature"],
+                "expected_style_prompt": project_record["style_prompt"],
                 "params": options.get("params", {}),
             },
         )
@@ -306,6 +321,63 @@ class WritingService:
     def _provider(self, provider_id: str | None) -> tuple[Any, dict[str, Any]]:
         return self.providers.resolve(kind="text", provider_id=provider_id)
 
+    async def _generate_analysis(
+        self,
+        *,
+        provider: Any,
+        config: dict[str, Any],
+        project_record: dict[str, Any],
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        output = await provider.generate_json(
+            system_prompt=load_prompt("novel_analysis"),
+            user_prompt=f"小说正文：\n{project_record['source_text']}",
+            schema=NovelAnalysisOutput,
+            params={**config["params"], **params},
+        )
+        return output.model_dump(mode="json")
+
+    async def _generate_visual_style(
+        self,
+        *,
+        provider: Any,
+        config: dict[str, Any],
+        project_record: dict[str, Any],
+        params: dict[str, Any],
+    ) -> str:
+        output = await provider.generate_json(
+            system_prompt=load_prompt("visual_style"),
+            user_prompt=load_prompt("visual_style_user").replace(
+                "{{在这里粘贴小说正文、剧本、故事梗概、项目设定或原始画风描述}}",
+                project_record["source_text"],
+            ),
+            schema=VisualStyleOutput,
+            params={**config["params"], **params},
+        )
+        return output.style_prompt
+
+    def _update_style_prompt_if_unchanged(
+        self,
+        project_id: str,
+        *,
+        expected_project_updated_at: str,
+        expected_source_signature: str,
+        expected_style_prompt: str,
+        style_prompt: str,
+    ) -> bool:
+        with self.database.engine.begin() as connection:
+            result = connection.execute(
+                update(project)
+                .where(
+                    project.c.id == project_id,
+                    project.c.updated_at == expected_project_updated_at,
+                    project.c.source_signature == expected_source_signature,
+                    project.c.style_prompt == expected_style_prompt,
+                )
+                .values(style_prompt=style_prompt, updated_at=utc_now())
+            )
+        return result.rowcount == 1
+
     async def handle_analysis(self, job: dict[str, Any]) -> dict[str, Any]:
         project_id = job["project_id"]
         input_data = json_loads(job.get("input_json"), {})
@@ -317,13 +389,12 @@ class WritingService:
                 return self._skipped_result({})
             project_record = self._project(project_id)
             provider, config = self._provider(job.get("provider_id"))
-            output = await provider.generate_json(
-                system_prompt=load_prompt("novel_analysis"),
-                user_prompt=f"小说正文：\n{project_record['source_text']}",
-                schema=NovelAnalysisOutput,
-                params={**config["params"], **input_data.get("params", {})},
+            result = await self._generate_analysis(
+                provider=provider,
+                config=config,
+                project_record=project_record,
+                params=input_data.get("params", {}),
             )
-            result = output.model_dump(mode="json")
             saved = (
                 self._save_content(
                     table=novel_analysis,
@@ -354,17 +425,80 @@ class WritingService:
         project_id = job["project_id"]
         input_data = json_loads(job.get("input_json"), {})
         expected_revision: int | None = None
+        expected_analysis_revision: int | None = None
+        raw_analysis_revision = input_data.get("expected_analysis_revision")
+        if type(raw_analysis_revision) is int and raw_analysis_revision >= 0:
+            expected_analysis_revision = raw_analysis_revision
         try:
             current = self.get_screenplay(project_id)
             expected_revision = self._expected_revision(input_data, current)
             if expected_revision is None or current["revision"] != expected_revision:
+                if expected_analysis_revision is not None:
+                    analysis = self.get_analysis(project_id)
+                    self._set_status(
+                        novel_analysis,
+                        project_id,
+                        "ready" if analysis["content"] else "draft",
+                        expected_revision=expected_analysis_revision,
+                    )
                 return self._skipped_result({})
             project_record = self._project(project_id)
             provider, config = self._provider(job.get("provider_id"))
-            analysis_record = self.get_analysis(project_id)
+            if expected_analysis_revision is None:
+                expected_analysis_revision = self._set_status(
+                    novel_analysis,
+                    project_id,
+                    "generating",
+                )
+            analysis_result = await self._generate_analysis(
+                provider=provider,
+                config=config,
+                project_record=project_record,
+                params=input_data.get("params", {}),
+            )
+            saved_analysis = self._save_content(
+                table=novel_analysis,
+                project_record=project_record,
+                content=analysis_result,
+                status="ready",
+                generated_by=config["id"],
+                expected_revision=expected_analysis_revision,
+            )
+            analysis_content = (
+                saved_analysis["content"]
+                if saved_analysis is not None
+                else self.get_analysis(project_id)["content"]
+            )
+            expected_project_updated_at = input_data.get("expected_project_updated_at")
+            expected_source_signature = input_data.get("expected_source_signature")
+            expected_style_prompt = input_data.get("expected_style_prompt")
+            style_prompt = ""
+            style_prompt_updated = False
+            style_prompt_error = ""
+            try:
+                style_prompt = await self._generate_visual_style(
+                    provider=provider,
+                    config=config,
+                    project_record=project_record,
+                    params=input_data.get("params", {}),
+                )
+                if (
+                    isinstance(expected_project_updated_at, str)
+                    and isinstance(expected_source_signature, str)
+                    and isinstance(expected_style_prompt, str)
+                ):
+                    style_prompt_updated = self._update_style_prompt_if_unchanged(
+                        project_id,
+                        expected_project_updated_at=expected_project_updated_at,
+                        expected_source_signature=expected_source_signature,
+                        expected_style_prompt=expected_style_prompt,
+                        style_prompt=style_prompt,
+                    )
+            except Exception as exc:
+                style_prompt_error = sanitize_error_message(str(exc))
             user_prompt = (
                 f"小说正文：\n{project_record['source_text']}\n\n"
-                f"可选小说分析：\n{json_dumps(analysis_record['content'])}"
+                f"本次小说分析：\n{json_dumps(analysis_content)}"
             )
             output = await provider.generate_json(
                 system_prompt=load_prompt("screenplay"),
@@ -387,8 +521,22 @@ class WritingService:
             )
             if saved is None:
                 return self._skipped_result(result)
-            return {"content": result}
+            return {
+                "analysis": analysis_result,
+                "style_prompt": style_prompt,
+                "style_prompt_updated": style_prompt_updated,
+                "style_prompt_error": style_prompt_error,
+                "content": result,
+            }
         except Exception as exc:
+            if expected_analysis_revision is not None:
+                self._set_status(
+                    novel_analysis,
+                    project_id,
+                    "failed",
+                    str(exc),
+                    expected_revision=expected_analysis_revision,
+                )
             if expected_revision is not None:
                 self._set_status(
                     screenplay,

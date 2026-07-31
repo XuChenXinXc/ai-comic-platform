@@ -20,6 +20,7 @@ from app.providers.base import (
 )
 from app.providers.registry import provider_registry
 from app.services.errors import bad_request, conflict, not_found
+from app.services.secret_service import SecretServiceError, decrypt_secret, encrypt_secret
 from app.services.utils import (
     json_dumps,
     json_loads,
@@ -39,11 +40,20 @@ class ProviderService:
         record: dict[str, Any],
         *,
         redact_base_url: bool = True,
+        include_secret: bool = False,
     ) -> dict[str, Any]:
         result = dict(record)
+        ciphertext = result.pop("api_key_ciphertext", None) or ""
         params = ProviderService._redact_params(json_loads(result["params_json"], {}))
         result["params_json"] = params
         result["params"] = params
+        has_env_key = bool(result.get("api_key_env") and os.getenv(result["api_key_env"]))
+        result["api_key_configured"] = bool(ciphertext) or has_env_key
+        result["api_key_source"] = (
+            "direct" if ciphertext else "env" if result.get("api_key_env") else "none"
+        )
+        if include_secret:
+            result["_api_key_ciphertext"] = ciphertext
         if redact_base_url and result.get("base_url"):
             try:
                 validate_provider_base_url(str(result["base_url"]))
@@ -173,6 +183,7 @@ class ProviderService:
         provider_id: str,
         *,
         redact_base_url: bool,
+        include_secret: bool = False,
     ) -> dict[str, Any]:
         with self.database.engine.connect() as connection:
             record = row_dict(
@@ -182,7 +193,11 @@ class ProviderService:
             )
         if record is None:
             raise not_found("Provider")
-        return self._decode(record, redact_base_url=redact_base_url)
+        return self._decode(
+            record,
+            redact_base_url=redact_base_url,
+            include_secret=include_secret,
+        )
 
     def get(self, provider_id: str) -> dict[str, Any]:
         return self._get_config(provider_id, redact_base_url=True)
@@ -191,16 +206,24 @@ class ProviderService:
         values = dict(values)
         now = utc_now()
         params = values.pop("params", {})
+        api_key = str(values.pop("api_key", "") or "")
+        try:
+            api_key_ciphertext = encrypt_secret(api_key) if api_key else ""
+        except SecretServiceError as exc:
+            raise bad_request(str(exc)) from exc
         record = {
             "id": new_id("provider"),
             **values,
+            "api_key_ciphertext": api_key_ciphertext or None,
             "params_json": json_dumps(params),
             "created_at": now,
             "updated_at": now,
         }
         self._validate_config({**record, "params": params})
         try:
-            provider_registry.create({**record, "params": params})
+            provider_registry.create(
+                self._runtime_config({**record, "params": params}, api_key=api_key)
+            )
         except ProviderConfigurationError as exc:
             raise bad_request(str(exc)) from exc
         with self.database.engine.begin() as connection:
@@ -214,11 +237,21 @@ class ProviderService:
         return self.get(record["id"])
 
     def update(self, provider_id: str, values: dict[str, Any]) -> dict[str, Any]:
-        current = self._get_config(provider_id, redact_base_url=False)
+        current = self._get_config(
+            provider_id,
+            redact_base_url=False,
+            include_secret=True,
+        )
         with self.database.engine.connect() as connection:
             if self._has_active_job(connection, provider_id):
                 raise conflict("Provider 存在进行中的任务，不能更新或停用")
         changes = dict(values)
+        api_key = changes.pop("api_key", None)
+        if api_key:
+            try:
+                changes["api_key_ciphertext"] = encrypt_secret(str(api_key))
+            except SecretServiceError as exc:
+                raise bad_request(str(exc)) from exc
         if "params" in changes:
             changes["params_json"] = json_dumps(changes.pop("params"))
         candidate = {**current, **changes}
@@ -227,7 +260,7 @@ class ProviderService:
         )
         self._validate_config(candidate)
         try:
-            provider_registry.create(candidate)
+            provider_registry.create(self._runtime_config(candidate))
         except ProviderConfigurationError as exc:
             raise bad_request(str(exc)) from exc
         changes["updated_at"] = utc_now()
@@ -278,7 +311,11 @@ class ProviderService:
         provider_id: str | None = None,
     ) -> tuple[Any, dict[str, Any]]:
         if provider_id:
-            config = self._get_config(provider_id, redact_base_url=False)
+            config = self._get_config(
+                provider_id,
+                redact_base_url=False,
+                include_secret=True,
+            )
         else:
             with self.database.engine.connect() as connection:
                 record = row_dict(
@@ -291,24 +328,36 @@ class ProviderService:
                 )
             if record is None:
                 raise bad_request(f"未配置默认{kind} Provider")
-            config = self._decode(record, redact_base_url=False)
+            config = self._decode(
+                record,
+                redact_base_url=False,
+                include_secret=True,
+            )
         if config["kind"] != kind or not config["enabled"]:
             raise bad_request(f"{kind} Provider 不存在或未启用")
         self._validate_config(config, reject_mock_runtime_paths=False)
         try:
-            return provider_registry.get(config), config
+            provider = provider_registry.get(self._runtime_config(config))
         except ProviderConfigurationError as exc:
             raise bad_request(str(exc)) from exc
+        resolved_config = dict(config)
+        resolved_config.pop("_api_key_ciphertext", None)
+        return provider, resolved_config
 
     def test(self, provider_id: str) -> dict[str, Any]:
-        config = self._get_config(provider_id, redact_base_url=False)
+        config = self._get_config(
+            provider_id,
+            redact_base_url=False,
+            include_secret=True,
+        )
         self._validate_config(config, reject_mock_runtime_paths=False)
+        runtime_config = self._runtime_config(config)
         try:
-            provider_registry.get(config)
+            provider_registry.get(runtime_config)
         except ProviderConfigurationError as exc:
             raise bad_request(str(exc)) from exc
         try:
-            ok, message = self._probe(config)
+            ok, message = self._probe(runtime_config)
         except ProviderConfigurationError as exc:
             raise bad_request(str(exc)) from exc
         now = utc_now()
@@ -330,10 +379,12 @@ class ProviderService:
             return True, "Mock Provider 可用"
         if not config["base_url"]:
             return False, "非 Mock Provider 必须配置 base_url"
-        validate_api_key_env(config["kind"], config["api_key_env"])
-        api_key = os.getenv(config["api_key_env"], "") if config["api_key_env"] else ""
-        if config["api_key_env"] and not api_key:
-            return False, f"环境变量 {config['api_key_env']} 未配置"
+        api_key = str(config.get("api_key") or "")
+        if not api_key and config["api_key_env"]:
+            validate_api_key_env(config["kind"], config["api_key_env"])
+            api_key = os.getenv(config["api_key_env"], "")
+        if not api_key:
+            return False, "请配置 API Key"
         params = config["params"]
         if config["adapter"] == "openai_compatible":
             path = str(params.get("test_path", "models"))
@@ -355,3 +406,26 @@ class ProviderService:
         except requests.RequestException as exc:
             return False, f"连接测试失败：{sanitize_error_message(exc)}"
         return True, f"连接测试通过（HTTP {response.status_code}）"
+
+    @staticmethod
+    def _runtime_config(
+        config: dict[str, Any],
+        *,
+        api_key: str | None = None,
+    ) -> dict[str, Any]:
+        runtime = dict(config)
+        ciphertext = runtime.pop("api_key_ciphertext", None)
+        if ciphertext is None:
+            ciphertext = runtime.pop("_api_key_ciphertext", None)
+        if api_key is not None:
+            runtime["api_key"] = api_key
+        elif ciphertext:
+            try:
+                runtime["api_key"] = decrypt_secret(str(ciphertext))
+            except SecretServiceError as exc:
+                raise bad_request(
+                    "Provider API Key 解密失败，请使用保存该配置的 Windows 用户运行平台"
+                ) from exc
+        else:
+            runtime["api_key"] = ""
+        return runtime

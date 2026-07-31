@@ -27,21 +27,9 @@ import {
 } from "../components/ui";
 import { isJobActive } from "../hooks/use-job-polling";
 import { useProject } from "../hooks/use-project";
+import { JOB_TYPE_LABELS } from "../lib/job-labels";
 import { formatDate, formatError, prettyJson } from "../lib/utils";
 import type { Job } from "../types/api";
-
-const jobTypeLabels: Record<string, string> = {
-  analyze_novel: "小说分析",
-  generate_screenplay: "剧本生成",
-  extract_assets: "素材提取",
-  generate_asset_prompt: "素材提示词",
-  generate_asset_image: "素材图片",
-  extract_shots: "分镜提取",
-  generate_shot_image_prompt: "分镜图片提示词",
-  generate_shot_video_prompt: "分镜视频提示词",
-  generate_keyframe: "关键帧生成",
-  generate_video: "分镜视频生成",
-};
 
 export function JobsPage() {
   const queryClient = useQueryClient();
@@ -161,7 +149,7 @@ export function JobsPage() {
             <option value="all">全部任务类型</option>
             {jobTypes.map((type) => (
               <option key={type} value={type}>
-                {jobTypeLabels[type] || type}
+                {JOB_TYPE_LABELS[type] || type}
               </option>
             ))}
           </Select>
@@ -227,7 +215,7 @@ export function JobsPage() {
                         {batchId.slice(0, 12)}
                       </p>
                       <h3 className="mt-1 text-sm font-bold">
-                        {jobTypeLabels[batchJobs[0].job_type] ||
+                        {JOB_TYPE_LABELS[batchJobs[0].job_type] ||
                           batchJobs[0].job_type}
                       </h3>
                     </div>
@@ -307,7 +295,7 @@ export function JobsPage() {
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <h2 className="truncate text-sm font-bold">
-                      {jobTypeLabels[job.job_type] || job.job_type}
+                      {JOB_TYPE_LABELS[job.job_type] || job.job_type}
                     </h2>
                     <StatusBadge status={job.status} />
                   </div>
@@ -392,7 +380,11 @@ export function JobsPage() {
         open={Boolean(detail)}
         onClose={() => setDetail(null)}
         title="任务诊断"
-        description={detail ? `${jobTypeLabels[detail.job_type] || detail.job_type} · ${detail.id}` : ""}
+        description={
+          detail
+            ? `${JOB_TYPE_LABELS[detail.job_type] || detail.job_type} · ${detail.id}`
+            : ""
+        }
         footer={<Button onClick={() => setDetail(null)}>关闭</Button>}
       >
         {detail ? (

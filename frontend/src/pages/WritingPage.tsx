@@ -90,11 +90,13 @@ function screenplayContent(
 export function WritingPage() {
   const queryClient = useQueryClient();
   const { activeProject, activeProjectId } = useProject();
-  const [tab, setTab] = useState<WritingTab>("analysis");
+  const [tab, setTab] = useState<WritingTab>("screenplay");
   const [analysis, setAnalysis] = useState<unknown>({});
   const [analysisValid, setAnalysisValid] = useState(true);
   const [screenplay, setScreenplay] =
     useState<ScreenplayContent>(emptyScreenplay);
+  const [stylePrompt, setStylePrompt] = useState("");
+  const [stylePromptDirty, setStylePromptDirty] = useState(false);
   const [dirty, setDirty] = useState<Record<WritingTab, boolean>>({
     analysis: false,
     screenplay: false,
@@ -120,7 +122,7 @@ export function WritingPage() {
   const analysisQuery = useQuery({
     queryKey: queryKeys.analysis(activeProjectId),
     queryFn: () => nullable(api.analysis.get(activeProjectId)),
-    enabled: Boolean(activeProjectId),
+    enabled: Boolean(activeProjectId && tab === "analysis"),
   });
   const screenplayQuery = useQuery({
     queryKey: queryKeys.screenplay(activeProjectId),
@@ -131,12 +133,20 @@ export function WritingPage() {
   useLayoutEffect(() => {
     setAnalysis({});
     setScreenplay(emptyScreenplay);
+    setStylePrompt("");
+    setStylePromptDirty(false);
     setDirty({ analysis: false, screenplay: false });
     setServerUpdateAvailable({ analysis: false, screenplay: false });
     setAnalysisValid(true);
     hydratedVersion.current = { analysis: "", screenplay: "" };
     editRevision.current = { analysis: 0, screenplay: 0 };
   }, [activeProjectId]);
+
+  useEffect(() => {
+    if (!stylePromptDirty) {
+      setStylePrompt(activeProject?.style_prompt || "");
+    }
+  }, [activeProject?.style_prompt, stylePromptDirty]);
 
   useEffect(() => {
     if (
@@ -212,6 +222,24 @@ export function WritingPage() {
         (currentRecord.source_signature &&
           currentRecord.source_signature !== activeProject?.source_signature)),
   );
+
+  const stylePromptMutation = useMutation({
+    mutationFn: ({
+      projectId,
+      value,
+    }: {
+      projectId: string;
+      value: string;
+    }) => api.projects.update(projectId, { style_prompt: value }),
+    onSuccess: async (project, { projectId }) => {
+      if (activeProjectIdRef.current === projectId) {
+        setStylePrompt(project.style_prompt);
+        setStylePromptDirty(false);
+      }
+      await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
 
   const generateMutation = useMutation({
     mutationFn: ({
@@ -328,9 +356,28 @@ export function WritingPage() {
     );
   };
 
-  const saveCurrent = (status: "ready" | "confirmed") => {
+  const persistStylePrompt = async () => {
+    if (!stylePromptDirty || stylePromptMutation.isPending) {
+      return !stylePromptMutation.isPending;
+    }
+    try {
+      await stylePromptMutation.mutateAsync({
+        projectId: activeProjectId,
+        value: stylePrompt,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const saveCurrent = async (status: "ready" | "confirmed") => {
     if (saveInFlight.current) return;
     saveInFlight.current = true;
+    if (!(await persistStylePrompt())) {
+      saveInFlight.current = false;
+      return;
+    }
     saveMutation.mutate({
       projectId: activeProjectId,
       status,
@@ -340,7 +387,8 @@ export function WritingPage() {
     });
   };
 
-  const generateCurrent = () => {
+  const generateCurrent = async () => {
+    if (!(await persistStylePrompt())) return;
     generateMutation.mutate({
       projectId: activeProjectId,
       contentType: tab,
@@ -415,17 +463,18 @@ export function WritingPage() {
       <div>
         <PageHeader
           eyebrow="Step 02 / Writing"
-          title="小说分析与剧本"
-          description="左侧固定核对原文，右侧独立生成、编辑和确认结构化分析与场次剧本；两者互不构成硬门禁。"
+          title="剧本生成"
+          description="生成剧本时会在后台自动完成小说分析，再使用本次分析结果生成结构化场次剧本。"
           actions={
             <>
               <Button
                 busy={
-                  generateMutation.isPending &&
-                  generateMutation.variables?.projectId === activeProjectId &&
-                  generateMutation.variables.contentType === tab
+                  stylePromptMutation.isPending ||
+                  (generateMutation.isPending &&
+                    generateMutation.variables?.projectId === activeProjectId &&
+                    generateMutation.variables.contentType === tab)
                 }
-                onClick={generateCurrent}
+                onClick={() => void generateCurrent()}
               >
                 {hasCurrentContent ? (
                   <RefreshCw className="h-4 w-4" />
@@ -436,16 +485,18 @@ export function WritingPage() {
               </Button>
               <Button
                 busy={
-                  saveMutation.isPending &&
-                  saveMutation.variables?.projectId === activeProjectId &&
-                  saveMutation.variables?.status === "ready" &&
-                  saveMutation.variables.contentType === tab
+                  stylePromptMutation.isPending ||
+                  (saveMutation.isPending &&
+                    saveMutation.variables?.projectId === activeProjectId &&
+                    saveMutation.variables?.status === "ready" &&
+                    saveMutation.variables.contentType === tab)
                 }
                 disabled={
                   saveMutation.isPending ||
+                  stylePromptMutation.isPending ||
                   (tab === "analysis" && !analysisValid)
                 }
-                onClick={() => saveCurrent("ready")}
+                onClick={() => void saveCurrent("ready")}
               >
                 <Save className="h-4 w-4" />
                 保存
@@ -453,16 +504,18 @@ export function WritingPage() {
               <Button
                 variant="primary"
                 busy={
-                  saveMutation.isPending &&
-                  saveMutation.variables?.projectId === activeProjectId &&
-                  saveMutation.variables?.status === "confirmed" &&
-                  saveMutation.variables.contentType === tab
+                  stylePromptMutation.isPending ||
+                  (saveMutation.isPending &&
+                    saveMutation.variables?.projectId === activeProjectId &&
+                    saveMutation.variables?.status === "confirmed" &&
+                    saveMutation.variables.contentType === tab)
                 }
                 disabled={
                   saveMutation.isPending ||
+                  stylePromptMutation.isPending ||
                   (tab === "analysis" && !analysisValid)
                 }
-                onClick={() => saveCurrent("confirmed")}
+                onClick={() => void saveCurrent("confirmed")}
               >
                 <Check className="h-4 w-4" />
                 确认当前内容
@@ -476,7 +529,6 @@ export function WritingPage() {
             value={tab}
             onChange={(value) => setTab(value as typeof tab)}
             items={[
-              { value: "analysis", label: "小说分析" },
               {
                 value: "screenplay",
                 label: "剧本生成",
@@ -567,12 +619,13 @@ export function WritingPage() {
                           <Button
                             variant="primary"
                             busy={
-                              generateMutation.isPending &&
-                              generateMutation.variables?.projectId ===
-                                activeProjectId &&
-                              generateMutation.variables.contentType === tab
+                              stylePromptMutation.isPending ||
+                              (generateMutation.isPending &&
+                                generateMutation.variables?.projectId ===
+                                  activeProjectId &&
+                                generateMutation.variables.contentType === tab)
                             }
-                            onClick={generateCurrent}
+                            onClick={() => void generateCurrent()}
                           >
                             生成小说分析
                           </Button>
@@ -615,32 +668,50 @@ export function WritingPage() {
                 ) : null}
                 {!screenplayQuery.isLoading && !screenplayQuery.error ? (
                   <div className="space-y-4">
-                    <Card className="grid gap-4 p-5 sm:grid-cols-2 sm:p-6">
+                    <Card className="space-y-5 p-5 sm:p-6">
                       <div>
-                        <Label htmlFor="screenplay-title">剧本标题</Label>
-                        <Input
-                          id="screenplay-title"
-                          value={screenplay.title || ""}
-                          onChange={(event) =>
-                            editScreenplay((current) => ({
-                              ...current,
-                              title: event.target.value,
-                            }))
-                          }
+                        <Label htmlFor="style-prompt">统一画风 STYLE_ANCHOR</Label>
+                        <Textarea
+                          id="style-prompt"
+                          value={stylePrompt}
+                          rows={4}
+                          placeholder="描述整个项目唯一且稳定的画面语言…"
+                          onChange={(event) => {
+                            setStylePrompt(event.target.value);
+                            setStylePromptDirty(true);
+                          }}
                         />
+                        <p className="mt-2 text-xs leading-5 text-muted">
+                          该画风会编译进所有素材图、关键帧和视频提示词。
+                        </p>
                       </div>
-                      <div>
-                        <Label htmlFor="screenplay-logline">一句话梗概</Label>
-                        <Input
-                          id="screenplay-logline"
-                          value={screenplay.logline || ""}
-                          onChange={(event) =>
-                            editScreenplay((current) => ({
-                              ...current,
-                              logline: event.target.value,
-                            }))
-                          }
-                        />
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <div>
+                          <Label htmlFor="screenplay-title">剧本标题</Label>
+                          <Input
+                            id="screenplay-title"
+                            value={screenplay.title || ""}
+                            onChange={(event) =>
+                              editScreenplay((current) => ({
+                                ...current,
+                                title: event.target.value,
+                              }))
+                            }
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="screenplay-logline">一句话梗概</Label>
+                          <Input
+                            id="screenplay-logline"
+                            value={screenplay.logline || ""}
+                            onChange={(event) =>
+                              editScreenplay((current) => ({
+                                ...current,
+                                logline: event.target.value,
+                              }))
+                            }
+                          />
+                        </div>
                       </div>
                     </Card>
 
@@ -653,12 +724,13 @@ export function WritingPage() {
                             <Button
                               variant="primary"
                               busy={
-                                generateMutation.isPending &&
-                                generateMutation.variables?.projectId ===
-                                  activeProjectId &&
-                                generateMutation.variables.contentType === tab
+                                stylePromptMutation.isPending ||
+                                (generateMutation.isPending &&
+                                  generateMutation.variables?.projectId ===
+                                    activeProjectId &&
+                                  generateMutation.variables.contentType === tab)
                               }
-                              onClick={generateCurrent}
+                              onClick={() => void generateCurrent()}
                             >
                               生成完整剧本
                             </Button>
@@ -794,7 +866,7 @@ export function WritingPage() {
                                     .map((item) =>
                                       typeof item === "string"
                                         ? item
-                                        : `${String(item.speaker || "")}：${String(item.text || item.content || "")}`,
+                                        : `${String(item.speaker || item.character || "")}：${String(item.text || item.content || item.line || "")}`,
                                     )
                                     .join("\n")}
                                   onChange={(event) =>

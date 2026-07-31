@@ -9,6 +9,7 @@ import {
 import type { MediaVersion } from "../types/api";
 import { mediaUrl } from "../api/client";
 import { cn, formatDate } from "../lib/utils";
+import { ImagePreview } from "./image-preview";
 import { EmptyState, StaleNotice, StatusBadge } from "./status";
 import { Badge, Button } from "./ui";
 
@@ -53,10 +54,10 @@ export function MediaVersions({
       <div className="relative overflow-hidden rounded-lg border border-[#cdc8bd] bg-[#222622]">
         {current && mediaUrl(current) ? (
           mediaKind === "image" ? (
-            <img
+            <ImagePreview
               src={mediaUrl(current)}
               alt={alt}
-              className="aspect-video w-full object-contain"
+              imageClassName="aspect-video w-full object-contain"
             />
           ) : (
             <video
@@ -99,6 +100,22 @@ export function MediaVersions({
           .sort((a, b) => b.version_no - a.version_no)
           .map((version) => {
             const url = mediaUrl(version);
+            const details = (
+              <div className="space-y-1 px-2 py-2">
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-xs font-bold">V{version.version_no}</span>
+                  {version.is_current ? (
+                    <Check className="h-3.5 w-3.5 text-vermilion" />
+                  ) : null}
+                </div>
+                <p className="truncate text-[10px] text-muted">
+                  {version.source === "uploaded" ? "本地上传" : version.model || "生成"}
+                </p>
+                <p className="text-[10px] text-muted">
+                  {formatDate(version.created_at)}
+                </p>
+              </div>
+            );
             return (
               <div
                 key={version.id}
@@ -109,21 +126,24 @@ export function MediaVersions({
                     : "border-line",
                 )}
               >
-                <button
-                  type="button"
-                  className="block w-full text-left"
-                  onClick={() => onSelect(version)}
-                  disabled={version.is_current || version.status !== "completed"}
-                  aria-label={`选择版本 ${version.version_no}`}
-                >
-                  {mediaKind === "image" && url ? (
-                    <img
+                {mediaKind === "image" && url ? (
+                  <>
+                    <ImagePreview
                       src={url}
                       alt={`${alt} 版本 ${version.version_no}`}
-                      className="aspect-video w-full bg-[#252925] object-cover"
+                      imageClassName="aspect-video w-full bg-[#252925] object-cover"
                       loading="lazy"
                     />
-                  ) : (
+                    {details}
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="block w-full text-left"
+                    onClick={() => onSelect(version)}
+                    disabled={version.is_current || version.status !== "completed"}
+                    aria-label={`选择版本 ${version.version_no}`}
+                  >
                     <div className="flex aspect-video items-center justify-center bg-[#252925] text-white/60">
                       {mediaKind === "video" ? (
                         <Film className="h-5 w-5" />
@@ -131,22 +151,9 @@ export function MediaVersions({
                         <ImageOff className="h-5 w-5" />
                       )}
                     </div>
-                  )}
-                  <div className="space-y-1 px-2 py-2">
-                    <div className="flex items-center justify-between gap-1">
-                      <span className="text-xs font-bold">V{version.version_no}</span>
-                      {version.is_current ? (
-                        <Check className="h-3.5 w-3.5 text-vermilion" />
-                      ) : null}
-                    </div>
-                    <p className="truncate text-[10px] text-muted">
-                      {version.source === "uploaded" ? "本地上传" : version.model || "生成"}
-                    </p>
-                    <p className="text-[10px] text-muted">
-                      {formatDate(version.created_at)}
-                    </p>
-                  </div>
-                </button>
+                    {details}
+                  </button>
+                )}
                 <div className="flex border-t border-line">
                   {!version.is_current ? (
                     <Button

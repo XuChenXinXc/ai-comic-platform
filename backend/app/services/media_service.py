@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import math
 import subprocess
 import zipfile
 from pathlib import Path
@@ -22,18 +23,28 @@ from app.models.tables import (
     video_version,
 )
 from app.schemas import ProviderPollResult
-from app.services.errors import bad_request, conflict, not_found
-from app.services.file_service import FileServiceError, atomic_copy, file_service
+from app.services.errors import ServiceError, bad_request, conflict, not_found
+from app.services.file_service import (
+    FileServiceError,
+    atomic_copy,
+    file_service,
+    project_media_url,
+)
 from app.services.job_service import JobService
 from app.services.prompt_service import (
+    VISUAL_PROMPT_TEMPLATE_VERSION,
     compile_asset_prompt,
     compile_keyframe_prompt,
     compile_video_prompt,
+    resolve_asset_negative_prompt,
+    resolve_video_description,
+    resolve_visual_aspect_ratio,
+    shot_template_context,
 )
 from app.services.provider_service import ProviderService
+from app.services.shot_service import ShotService
 from app.services.signature_service import (
     asset_image_signature,
-    asset_signature,
     calculate_signature,
     is_stale,
     keyframe_signature,
@@ -57,6 +68,42 @@ _MEDIA_TABLES = {
 }
 _DELETED_MEDIA_ERROR = "__deleted_by_user__"
 _ACTIVE_MEDIA_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+_GPT_IMAGE_2_SIZES = {
+    "character": "3840x2560",
+    "scene": "3840x2160",
+    "prop": "3840x2560",
+    "keyframe": "3840x2160",
+}
+_INTEGER_DURATION_VIDEO_MODELS = {
+    "grok-imagine-1.5-video-apimart",
+    "grok-imagine-1.5-video-ext",
+}
+_ASSET_VISUAL_PROFILE_FIELDS = {
+    "character": (
+        "appearance",
+        "face",
+        "hair",
+        "eyes",
+        "body",
+        "costume",
+        "immutable_features",
+    ),
+    "scene": (
+        "layout",
+        "architecture",
+        "space_keywords",
+        "regions",
+        "furnishings",
+        "main_view",
+    ),
+    "prop": (
+        "description",
+        "silhouette",
+        "front_structure",
+        "material",
+        "special_features",
+    ),
+}
 
 
 class MediaService:
@@ -69,6 +116,54 @@ class MediaService:
         self.jobs = jobs or JobService(self.database)
         self.providers = ProviderService(self.database)
 
+    @staticmethod
+    def _image_generation_params(
+        model: str,
+        target_type: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = dict(params)
+        if model.strip().lower() == "gpt-image-2":
+            size = _GPT_IMAGE_2_SIZES.get(target_type)
+            if size:
+                result["size"] = size
+        return result
+
+    @staticmethod
+    def _supports_multiple_video_inputs(provider: Any) -> bool:
+        capability = getattr(provider, "supports_multiple_input_images", False)
+        if callable(capability):
+            capability = capability()
+        return bool(capability) and callable(getattr(provider, "prepare_input_images", None))
+
+    @staticmethod
+    def _effective_video_duration(model: str, duration_sec: float) -> float | int:
+        if model.strip().lower() in _INTEGER_DURATION_VIDEO_MODELS:
+            return max(6, math.ceil(duration_sec))
+        return duration_sec
+
+    @staticmethod
+    def _has_visual_value(value: Any) -> bool:
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, dict):
+            return any(MediaService._has_visual_value(item) for item in value.values())
+        if isinstance(value, list):
+            return any(MediaService._has_visual_value(item) for item in value)
+        return value is not None
+
+    @classmethod
+    def _asset_has_generation_content(cls, current: dict[str, Any]) -> bool:
+        if cls._has_visual_value(current.get("prompt")):
+            return True
+        profile = current.get("profile", {})
+        if not isinstance(profile, dict):
+            return False
+        return any(
+            cls._has_visual_value(profile.get(field_name))
+            for field_name in _ASSET_VISUAL_PROFILE_FIELDS.get(current["asset_type"], ())
+        )
+
     def _project(self, project_id: str) -> dict[str, Any]:
         with self.database.engine.connect() as connection:
             record = row_dict(
@@ -77,6 +172,10 @@ class MediaService:
         if record is None:
             raise not_found("项目")
         return record
+
+    def _project_storage_name(self, project_id: str) -> str:
+        current = self._project(project_id)
+        return str(current.get("storage_name") or current["name"])
 
     def _asset(self, asset_id: str) -> dict[str, Any]:
         with self.database.engine.connect() as connection:
@@ -106,6 +205,205 @@ class MediaService:
         return record
 
     @staticmethod
+    def _reference_role_label(role: str, name: str) -> str:
+        labels = {
+            "character_identity": "锁定角色身份与服装",
+            "scene_layout": "锁定场景空间结构和光线",
+            "prop_identity": "锁定物品外观、材质和结构",
+            "previous_keyframe": "锁定上一镜构图与连续性",
+        }
+        return f"{name}，{labels.get(role, '锁定当前参考信息')}"
+
+    def _binding_reference_items(
+        self,
+        project_id: str,
+        bindings: list[dict[str, Any]],
+    ) -> list[tuple[Path, str]]:
+        items: list[tuple[Path, str]] = []
+        with self.database.engine.connect() as connection:
+            for binding in bindings:
+                role = str(binding.get("role", ""))
+                if binding.get("asset_image_id"):
+                    record = connection.execute(
+                        select(asset_image.c.file_path, asset.c.name)
+                        .join(asset, asset.c.id == asset_image.c.asset_id)
+                        .where(
+                            asset_image.c.id == binding["asset_image_id"],
+                            asset.c.project_id == project_id,
+                        )
+                    ).first()
+                    relative = record.file_path if record else ""
+                    name = str(record.name) if record else ""
+                elif binding.get("keyframe_id"):
+                    record = connection.execute(
+                        select(keyframe_version.c.file_path, shot.c.shot_no)
+                        .join(shot, shot.c.id == keyframe_version.c.shot_id)
+                        .where(
+                            keyframe_version.c.id == binding["keyframe_id"],
+                            shot.c.project_id == project_id,
+                        )
+                    ).first()
+                    relative = record.file_path if record else ""
+                    name = f"上一镜分镜 {record.shot_no}" if record else ""
+                else:
+                    relative = ""
+                    name = ""
+                if not relative:
+                    continue
+                path = file_service.resolve_project_path(project_id, relative)
+                if path.is_file() and path.stat().st_size > 0:
+                    items.append((path, self._reference_role_label(role, name)))
+        return items
+
+    def _resolve_shot_reference_bindings(
+        self,
+        current: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not current.get("scene_asset_id"):
+            raise conflict("分镜尚未绑定场景素材，请先在分镜编辑中绑定场景素材")
+        requested = [
+            (current.get("scene_asset_id"), "scene_layout"),
+            *((item, "character_identity") for item in current["character_ids"]),
+            *((item, "prop_identity") for item in current["prop_ids"]),
+        ]
+        requested_keys = {(role, asset_id) for asset_id, role in requested if asset_id}
+        for binding in current["reference_bindings"]:
+            role = str(binding.get("role", ""))
+            asset_id = binding.get("asset_id")
+            key = (role, asset_id)
+            if asset_id and role != "previous_keyframe" and key not in requested_keys:
+                requested.append((asset_id, role))
+                requested_keys.add(key)
+
+        refreshed: list[dict[str, Any]] = []
+        missing: list[str] = []
+        type_labels = {
+            "character_identity": "角色",
+            "scene_layout": "场景",
+            "prop_identity": "物品",
+        }
+        with self.database.engine.connect() as connection:
+            for asset_id, role in requested:
+                if not asset_id:
+                    continue
+                asset_record = connection.execute(
+                    select(asset.c.name).where(
+                        asset.c.id == asset_id,
+                        asset.c.project_id == current["project_id"],
+                    )
+                ).first()
+                image_record = connection.execute(
+                    select(asset_image.c.id, asset_image.c.file_path)
+                    .where(
+                        asset_image.c.asset_id == asset_id,
+                        asset_image.c.is_current.is_(True),
+                        asset_image.c.status == "completed",
+                    )
+                    .order_by(asset_image.c.version_no.desc())
+                ).first()
+                image_path = (
+                    file_service.resolve_project_path(
+                        current["project_id"],
+                        image_record.file_path,
+                    )
+                    if image_record and image_record.file_path
+                    else None
+                )
+                if (
+                    asset_record is None
+                    or image_record is None
+                    or image_path is None
+                    or not image_path.is_file()
+                    or image_path.stat().st_size <= 0
+                ):
+                    name = str(asset_record.name) if asset_record else str(asset_id)
+                    missing.append(f"{type_labels.get(role, '素材')}「{name}」")
+                    continue
+                refreshed.append(
+                    {
+                        "role": role,
+                        "asset_id": asset_id,
+                        "asset_image_id": image_record.id,
+                    }
+                )
+        if missing:
+            raise conflict(
+                f"以下分镜素材缺少已完成的当前图片：{'、'.join(missing)}。"
+                "请先在素材库生成或上传图片"
+            )
+
+        previous_bindings = [
+            binding
+            for binding in current["reference_bindings"]
+            if binding.get("role") == "previous_keyframe"
+        ]
+        with self.database.engine.connect() as connection:
+            for binding in previous_bindings:
+                record = connection.execute(
+                    select(keyframe_version.c.file_path)
+                    .join(shot, shot.c.id == keyframe_version.c.shot_id)
+                    .where(
+                        keyframe_version.c.id == binding.get("keyframe_id"),
+                        shot.c.project_id == current["project_id"],
+                    )
+                ).first()
+                path = (
+                    file_service.resolve_project_path(
+                        current["project_id"],
+                        record.file_path,
+                    )
+                    if record and record.file_path
+                    else None
+                )
+                if path is None or not path.is_file() or path.stat().st_size <= 0:
+                    raise conflict("上一镜关键帧参考图文件不存在或为空，请重新生成或上传关键帧")
+        refreshed.extend(previous_bindings)
+        return refreshed
+
+    def _refresh_shot_reference_bindings(self, current: dict[str, Any]) -> dict[str, Any]:
+        latest = current
+        for attempt in range(3):
+            refreshed = self._resolve_shot_reference_bindings(latest)
+            if refreshed == latest["reference_bindings"]:
+                confirmed = self._shot(latest["id"])
+                if confirmed["revision"] == latest["revision"]:
+                    return confirmed
+                latest = confirmed
+                continue
+            try:
+                return ShotService(self.database, self.jobs).update(
+                    latest["id"],
+                    {"reference_bindings": refreshed},
+                    expected_revision=latest["revision"],
+                )
+            except ServiceError as exc:
+                if exc.status_code != 409 or attempt == 2:
+                    raise
+                latest = self._shot(latest["id"])
+        raise conflict("分镜参考图绑定正在变化，请稍后重试")
+
+    def _shot_template_context(self, current: dict[str, Any]) -> dict[str, Any]:
+        asset_ids = [
+            item
+            for item in [
+                current.get("scene_asset_id"),
+                *current.get("character_ids", []),
+                *current.get("prop_ids", []),
+            ]
+            if item
+        ]
+        names: dict[str, str] = {}
+        if asset_ids:
+            with self.database.engine.connect() as connection:
+                names = {
+                    row.id: row.name
+                    for row in connection.execute(
+                        select(asset.c.id, asset.c.name).where(asset.c.id.in_(asset_ids))
+                    )
+                }
+        return shot_template_context(current, names)
+
+    @staticmethod
     def _decode_version(record: dict[str, Any], project_id: str) -> dict[str, Any]:
         result = dict(record)
         result["is_current"] = bool(result["is_current"])
@@ -116,7 +414,7 @@ class MediaService:
                 result[column] = json_loads(result[column], [])
                 result[column.removesuffix("_json")] = result[column]
         if result.get("file_path"):
-            result["file_url"] = f"/media/{project_id}/{result['file_path']}"
+            result["file_url"] = project_media_url(project_id, result["file_path"])
             result["media_url"] = result["file_url"]
         return result
 
@@ -179,38 +477,103 @@ class MediaService:
         )
         if project_record is None:
             raise not_found("项目")
+        raw_input = connection.execute(
+            select(job.c.input_json)
+            .where(job.c.target_id == record["id"])
+            .order_by(job.c.created_at.desc())
+            .limit(1)
+        ).scalar()
+        input_data = json_loads(raw_input, {})
+        reference_bindings = (
+            current["reference_bindings"]
+            if input_data.get("supports_multiple_input_images") is True
+            else []
+        )
+        effective_duration = self._effective_video_duration(
+            record["model"],
+            current["duration_sec"],
+        )
+        generation_current = {**current, "duration_sec": effective_duration}
         return video_signature(
             record["keyframe_version_id"] or "",
-            self._effective_video_prompt(current, project_record),
-            current["duration_sec"],
+            self._effective_video_prompt(
+                generation_current,
+                project_record,
+                reference_bindings=reference_bindings,
+            ),
+            effective_duration,
             record["provider_id"] or "uploaded",
             record["model"],
             params,
+            reference_bindings,
         )
 
     @staticmethod
     def _effective_asset_signature(current: dict[str, Any], project_record: dict[str, Any]) -> str:
-        return asset_signature(
+        return calculate_signature(
+            VISUAL_PROMPT_TEMPLATE_VERSION,
+            current["asset_type"],
+            current["name"],
             current["profile"],
             current["prompt"],
-            current["negative_prompt"],
+            resolve_asset_negative_prompt(current["asset_type"], current["negative_prompt"]),
+            current["consistency_keywords"],
+            current["composition"],
             project_record["style_prompt"],
+            resolve_visual_aspect_ratio(current["asset_type"], project_record["aspect_ratio"]),
         )
 
-    @staticmethod
-    def _effective_shot_signature(current: dict[str, Any], project_record: dict[str, Any]) -> str:
+    def _effective_shot_signature(
+        self,
+        current: dict[str, Any],
+        project_record: dict[str, Any],
+    ) -> str:
+        reference_labels = [
+            label
+            for _, label in self._binding_reference_items(
+                current["project_id"],
+                current["reference_bindings"],
+            )
+        ]
         return calculate_signature(
+            VISUAL_PROMPT_TEMPLATE_VERSION,
             current["own_signature"],
+            self._shot_template_context(current),
+            reference_labels,
             project_record["style_prompt"],
-            project_record["aspect_ratio"],
+            resolve_visual_aspect_ratio("keyframe", project_record["aspect_ratio"]),
         )
 
-    @staticmethod
-    def _effective_video_prompt(current: dict[str, Any], project_record: dict[str, Any]) -> str:
+    def _effective_video_prompt(
+        self,
+        current: dict[str, Any],
+        project_record: dict[str, Any],
+        *,
+        reference_bindings: list[dict[str, Any]] | None = None,
+    ) -> str:
+        video_prompt = resolve_video_description(
+            video_prompt=current["video_prompt"],
+            start_state=current["start_state"],
+            action=current["action"],
+            end_state=current["end_state"],
+            camera_move=current["camera_move"],
+            duration_sec=current["duration_sec"],
+        )
+        reference_labels = [
+            label
+            for _, label in self._binding_reference_items(
+                current["project_id"],
+                reference_bindings or [],
+            )
+        ]
         return calculate_signature(
-            current["video_prompt"],
+            VISUAL_PROMPT_TEMPLATE_VERSION,
+            video_prompt,
+            current["negative_prompt"],
+            self._shot_template_context(current),
+            reference_labels,
             project_record["style_prompt"],
-            project_record["aspect_ratio"],
+            resolve_visual_aspect_ratio("video", project_record["aspect_ratio"]),
         )
 
     def list_asset_images(self, asset_id: str) -> list[dict[str, Any]]:
@@ -310,17 +673,34 @@ class MediaService:
 
     def queue_asset_image(self, asset_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current = self._asset(asset_id)
+        if not str(current.get("name") or "").strip():
+            raise bad_request("素材名称不能为空")
+        if not self._asset_has_generation_content(current):
+            raise bad_request("素材缺少可用于生图的真实视觉描述")
         current_project = self._project(current["project_id"])
         _, config = self.providers.resolve(
             kind="image",
             provider_id=options.get("provider_id") or current_project["default_image_provider_id"],
         )
-        params = {**config["params"], **options.get("params", {})}
+        request_params = self._image_generation_params(
+            config["model"],
+            current["asset_type"],
+            options.get("params", {}),
+        )
+        params = {**config["params"], **request_params}
         references: list[str] = []
+        negative_prompt = resolve_asset_negative_prompt(
+            current["asset_type"],
+            current["negative_prompt"],
+        )
         prompt = compile_asset_prompt(
             style_prompt=current_project["style_prompt"],
             aspect_ratio=current_project["aspect_ratio"],
+            asset_type=current["asset_type"],
+            asset_name=current["name"],
+            profile=current["profile"],
             prompt=current["prompt"],
+            negative_prompt=negative_prompt,
             consistency_keywords=current["consistency_keywords"],
             composition=current["composition"],
         )
@@ -331,7 +711,7 @@ class MediaService:
             values={
                 "file_path": None,
                 "prompt_snapshot": prompt,
-                "negative_prompt_snapshot": current["negative_prompt"],
+                "negative_prompt_snapshot": negative_prompt,
                 "reference_files_json": json_dumps(references),
                 "provider_id": config["id"],
                 "model": config["model"],
@@ -356,7 +736,7 @@ class MediaService:
             target_id=version["id"],
             provider_kind="image",
             provider_id=config["id"],
-            input_data={"asset_id": asset_id, "params": options.get("params", {})},
+            input_data={"asset_id": asset_id, "params": request_params},
             batch_id=options.get("_batch_id"),
         )
 
@@ -406,12 +786,25 @@ class MediaService:
     def queue_keyframe(self, shot_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current = self._shot(shot_id)
         current_project = self._project(current["project_id"])
+        image_prompt = str(current["image_prompt"] or "").strip()
+        if not image_prompt:
+            raise bad_request("分镜缺少明确的关键帧提示词")
+        current = self._refresh_shot_reference_bindings(current)
+        bindings = current["reference_bindings"]
         _, config = self.providers.resolve(
             kind="image",
             provider_id=options.get("provider_id") or current_project["default_image_provider_id"],
         )
-        params = {**config["params"], **options.get("params", {})}
-        bindings = current["reference_bindings"]
+        request_params = self._image_generation_params(
+            config["model"],
+            "keyframe",
+            options.get("params", {}),
+        )
+        params = {**config["params"], **request_params}
+        reference_items = self._binding_reference_items(current["project_id"], bindings)
+        reference_anchors = [
+            f"@Image{index}：{label}。" for index, (_, label) in enumerate(reference_items, start=1)
+        ]
         version = self._insert_version(
             table=keyframe_version,
             parent_column="shot_id",
@@ -421,8 +814,10 @@ class MediaService:
                 "prompt_snapshot": compile_keyframe_prompt(
                     style_prompt=current_project["style_prompt"],
                     aspect_ratio=current_project["aspect_ratio"],
-                    image_prompt=current["image_prompt"],
-                    anchors=[],
+                    image_prompt=image_prompt,
+                    anchors=reference_anchors,
+                    shot_context=self._shot_template_context(current),
+                    negative_prompt=current["negative_prompt"],
                 ),
                 "negative_prompt_snapshot": current["negative_prompt"],
                 "reference_bindings_json": json_dumps(bindings),
@@ -449,7 +844,7 @@ class MediaService:
             target_id=version["id"],
             provider_kind="image",
             provider_id=config["id"],
-            input_data={"shot_id": shot_id, "params": options.get("params", {})},
+            input_data={"shot_id": shot_id, "params": request_params},
             batch_id=options.get("_batch_id"),
         )
 
@@ -459,6 +854,9 @@ class MediaService:
     def queue_video(self, shot_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current = self._shot(shot_id)
         current_project = self._project(current["project_id"])
+        video_prompt = str(current["video_prompt"] or "").strip()
+        if not video_prompt:
+            raise bad_request("分镜缺少明确的视频提示词")
         with self.database.engine.connect() as connection:
             keyframe = row_dict(
                 connection.execute(
@@ -471,16 +869,44 @@ class MediaService:
             )
         if keyframe is None or not keyframe.get("file_path"):
             raise conflict("分镜缺少已完成的当前关键帧")
-        _, config = self.providers.resolve(
+        keyframe_path = file_service.resolve_project_path(
+            current["project_id"],
+            keyframe["file_path"],
+        )
+        if not keyframe_path.is_file() or keyframe_path.stat().st_size <= 0:
+            raise conflict("当前分镜关键帧文件不存在或为空，请重新生成或上传关键帧")
+        current = self._refresh_shot_reference_bindings(current)
+        provider, config = self.providers.resolve(
             kind="video",
             provider_id=options.get("provider_id") or current_project["default_video_provider_id"],
         )
+        effective_duration = self._effective_video_duration(
+            config["model"],
+            current["duration_sec"],
+        )
         params = {**config["params"], **options.get("params", {})}
+        generation_current = {**current, "duration_sec": effective_duration}
+        supports_multiple_input_images = self._supports_multiple_video_inputs(provider)
+        reference_bindings = current["reference_bindings"] if supports_multiple_input_images else []
+        reference_items = self._binding_reference_items(
+            current["project_id"],
+            reference_bindings,
+        )
+        reference_anchors = [
+            "@Image1：当前分镜关键帧，锁定构图、人物左右关系和起始站位。",
+            *[
+                f"@Image{index}：{label}。"
+                for index, (_, label) in enumerate(reference_items, start=2)
+            ],
+        ]
         prompt = compile_video_prompt(
             style_prompt=current_project["style_prompt"],
             aspect_ratio=current_project["aspect_ratio"],
-            video_prompt=current["video_prompt"],
-            duration_sec=current["duration_sec"],
+            video_prompt=video_prompt,
+            duration_sec=effective_duration,
+            anchors=reference_anchors,
+            shot_context=self._shot_template_context(generation_current),
+            negative_prompt=current["negative_prompt"],
         )
         version = self._insert_version(
             table=video_version,
@@ -491,7 +917,7 @@ class MediaService:
                 "file_path": None,
                 "prompt_snapshot": prompt,
                 "negative_prompt_snapshot": current["negative_prompt"],
-                "requested_duration_sec": current["duration_sec"],
+                "requested_duration_sec": effective_duration,
                 "actual_duration_sec": None,
                 "provider_id": config["id"],
                 "model": config["model"],
@@ -500,11 +926,16 @@ class MediaService:
                 "is_current": False,
                 "input_signature": video_signature(
                     keyframe["id"],
-                    self._effective_video_prompt(current, current_project),
-                    current["duration_sec"],
+                    self._effective_video_prompt(
+                        generation_current,
+                        current_project,
+                        reference_bindings=reference_bindings,
+                    ),
+                    effective_duration,
                     config["id"],
                     config["model"],
                     params,
+                    reference_bindings,
                 ),
                 "source": "generated",
                 "cost_estimate": 0,
@@ -521,6 +952,8 @@ class MediaService:
             input_data={
                 "shot_id": shot_id,
                 "keyframe_version_id": keyframe["id"],
+                "reference_bindings": reference_bindings,
+                "supports_multiple_input_images": supports_multiple_input_images,
                 "params": options.get("params", {}),
             },
             batch_id=options.get("_batch_id"),
@@ -673,6 +1106,7 @@ class MediaService:
             asset_id,
             version["version_no"],
             suffix,
+            storage_name=self._project_storage_name(current["project_id"]),
         )
         return self._finish_upload(
             kind="asset_image",
@@ -719,7 +1153,11 @@ class MediaService:
             },
         )
         target = file_service.keyframe_path(
-            current["project_id"], shot_id, version["version_no"], suffix
+            current["project_id"],
+            shot_id,
+            version["version_no"],
+            suffix,
+            storage_name=self._project_storage_name(current["project_id"]),
         )
         return self._finish_upload(
             kind="keyframe",
@@ -778,7 +1216,11 @@ class MediaService:
             },
         )
         target = file_service.video_path(
-            current["project_id"], shot_id, version["version_no"], suffix
+            current["project_id"],
+            shot_id,
+            version["version_no"],
+            suffix,
+            storage_name=self._project_storage_name(current["project_id"]),
         )
         return self._finish_upload(
             kind="video",
@@ -799,6 +1241,7 @@ class MediaService:
     ) -> dict[str, Any]:
         table, parent_column = _MEDIA_TABLES[kind]
         relative = file_service.relative_project_path(project_id, target)
+        asset_id: str | None = None
         try:
             file_service.write_bytes_atomic(project_id, relative, data)
             actual_duration_sec = self._verify_video(target) if kind == "video" else None
@@ -808,6 +1251,8 @@ class MediaService:
                 )
                 if record is None:
                     raise not_found("媒体版本")
+                if table is asset_image:
+                    asset_id = record["asset_id"]
                 connection.execute(
                     update(table)
                     .where(table.c[parent_column] == record[parent_column])
@@ -831,6 +1276,8 @@ class MediaService:
             with self.database.engine.begin() as connection:
                 connection.execute(delete(table).where(table.c.id == version_id))
             raise
+        if asset_id:
+            ShotService(self.database, self.jobs).sync_asset_image_binding(asset_id, version_id)
         return self._get_version(kind, version_id)
 
     def _get_version(self, kind: MediaKind, version_id: str) -> dict[str, Any]:
@@ -855,6 +1302,7 @@ class MediaService:
 
     def set_current(self, kind: MediaKind, version_id: str) -> dict[str, Any]:
         table, parent_column = _MEDIA_TABLES[kind]
+        asset_id: str | None = None
         with self.database.engine.begin() as connection:
             record = row_dict(
                 connection.execute(select(table).where(table.c.id == version_id)).first()
@@ -863,6 +1311,8 @@ class MediaService:
                 raise not_found("媒体版本")
             if record["status"] != "completed" or not record.get("file_path"):
                 raise conflict("只有已完成且文件存在的版本可以设为当前版本")
+            if table is asset_image:
+                asset_id = record["asset_id"]
             connection.execute(
                 update(table)
                 .where(table.c[parent_column] == record[parent_column])
@@ -871,6 +1321,8 @@ class MediaService:
             connection.execute(
                 update(table).where(table.c.id == version_id).values(is_current=True)
             )
+        if asset_id:
+            ShotService(self.database, self.jobs).sync_asset_image_binding(asset_id, version_id)
         return self._get_version(kind, version_id)
 
     def unset_current(self, kind: MediaKind, version_id: str) -> dict[str, Any]:
@@ -1028,24 +1480,35 @@ class MediaService:
                     current["asset_type"],
                     current["id"],
                     version["version_no"],
+                    storage_name=self._project_storage_name(project_id),
                 )
             else:
                 current = self._shot(version["shot_id"])
                 project_id = current["project_id"]
-                references = self._resolve_binding_files(
-                    project_id,
-                    version["reference_bindings_json"],
-                )
+                references = [
+                    path
+                    for path, _ in self._binding_reference_items(
+                        project_id,
+                        version["reference_bindings_json"],
+                    )
+                ]
                 target = file_service.keyframe_path(
                     project_id,
                     current["id"],
                     version["version_no"],
+                    storage_name=self._project_storage_name(project_id),
                 )
             provider, config = self.providers.resolve(
                 kind="image",
                 provider_id=version["provider_id"],
             )
-            params = {**config["params"], **input_data.get("params", {})}
+            target_type = current["asset_type"] if kind == "asset_image" else "keyframe"
+            request_params = self._image_generation_params(
+                config["model"],
+                target_type,
+                input_data.get("params", {}),
+            )
+            params = {**config["params"], **request_params}
             self._set_media_status(table, version_id, "running")
             if self._has_saved_result(job_record):
                 result = ProviderPollResult.model_validate(job_record["result_data"])
@@ -1084,28 +1547,7 @@ class MediaService:
             raise
 
     def _resolve_binding_files(self, project_id: str, bindings: list[dict[str, Any]]) -> list[Path]:
-        paths: list[Path] = []
-        with self.database.engine.connect() as connection:
-            for binding in bindings:
-                if binding.get("asset_image_id"):
-                    relative = connection.execute(
-                        select(asset_image.c.file_path).where(
-                            asset_image.c.id == binding["asset_image_id"]
-                        )
-                    ).scalar()
-                elif binding.get("keyframe_id"):
-                    relative = connection.execute(
-                        select(keyframe_version.c.file_path).where(
-                            keyframe_version.c.id == binding["keyframe_id"]
-                        )
-                    ).scalar()
-                else:
-                    relative = None
-                if relative:
-                    path = file_service.resolve_project_path(project_id, relative)
-                    if path.is_file():
-                        paths.append(path)
-        return paths
+        return [path for path, _ in self._binding_reference_items(project_id, bindings)]
 
     async def handle_video(self, job_record: dict[str, Any]) -> dict[str, Any]:
         version_id = job_record["target_id"]
@@ -1127,6 +1569,7 @@ class MediaService:
                 project_id,
                 current["id"],
                 version["version_no"],
+                storage_name=self._project_storage_name(project_id),
             )
             self._set_media_status(video_version, version_id, "running")
             if self._has_saved_result(job_record):
@@ -1141,7 +1584,21 @@ class MediaService:
                     config["timeout_sec"],
                 )
             else:
-                prepared = await provider.prepare_input_image(keyframe_path)
+                supports_multiple_input_images = input_data.get("supports_multiple_input_images")
+                runtime_supports_multiple = self._supports_multiple_video_inputs(provider)
+                if supports_multiple_input_images is None:
+                    supports_multiple_input_images = runtime_supports_multiple
+                if supports_multiple_input_images and not runtime_supports_multiple:
+                    raise RuntimeError("视频 Provider 当前不支持任务所需的多参考图输入")
+                prepare_multiple = getattr(provider, "prepare_input_images", None)
+                if supports_multiple_input_images:
+                    bindings = input_data.get("reference_bindings")
+                    if not isinstance(bindings, list):
+                        bindings = current["reference_bindings"]
+                    reference_paths = self._resolve_binding_files(project_id, bindings)
+                    prepared = await prepare_multiple([keyframe_path, *reference_paths])
+                else:
+                    prepared = await provider.prepare_input_image(keyframe_path)
                 submission = await provider.submit(
                     prompt=version["prompt_snapshot"],
                     input_image=prepared,
@@ -1336,15 +1793,20 @@ class MediaService:
         }
         if table is video_version:
             values["actual_duration_sec"] = actual_duration_sec
+        asset_id: str | None = None
         with self.database.engine.begin() as connection:
             record = row_dict(
                 connection.execute(select(table).where(table.c.id == version_id)).first()
             )
             if record is None:
                 raise not_found("媒体版本")
+            if table is asset_image:
+                asset_id = record["asset_id"]
             connection.execute(
                 update(table)
                 .where(table.c[parent_column] == record[parent_column])
                 .values(is_current=False)
             )
             connection.execute(update(table).where(table.c.id == version_id).values(**values))
+        if asset_id:
+            ShotService(self.database, self.jobs).sync_asset_image_binding(asset_id, version_id)

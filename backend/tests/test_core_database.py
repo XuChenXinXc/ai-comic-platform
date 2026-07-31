@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -14,7 +15,7 @@ from alembic import command
 from app.config import BACKEND_DIR, PROJECT_ROOT, Settings
 from app.db import Database, init_db, migrate_schema, utc_now
 from app.models.tables import ALL_TABLES, api_provider, job, project
-from app.schemas import NovelAnalysisOutput, ReferenceBinding
+from app.schemas import NovelAnalysisOutput, ReferenceBinding, VisualStyleOutput
 
 
 def _insert_project(database: Database, project_id: str = "project-1") -> None:
@@ -42,6 +43,66 @@ def test_settings_with_relative_workspace_resolves_from_project_root(
     assert settings.database_url == (
         f"sqlite:///{(PROJECT_ROOT / 'relative-workspace' / 'platform.db').as_posix()}"
     )
+
+
+def test_settings_with_relative_projects_dir_resolves_from_project_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_PROJECTS_DIR", "comic-projects")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.projects_dir == (PROJECT_ROOT / "comic-projects").resolve()
+
+
+def test_settings_without_projects_dir_uses_workspace_projects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_WORKSPACE", "relative-workspace")
+    monkeypatch.delenv("APP_PROJECTS_DIR", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.projects_dir == (
+        PROJECT_ROOT / "relative-workspace" / "projects"
+    ).resolve()
+
+
+def test_settings_with_empty_projects_dir_uses_workspace_projects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_WORKSPACE", "relative-workspace")
+    monkeypatch.setenv("APP_PROJECTS_DIR", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.projects_dir == (
+        PROJECT_ROOT / "relative-workspace" / "projects"
+    ).resolve()
+
+
+@pytest.mark.parametrize(
+    "projects_dir",
+    [".", "C:/", "backend", "backend/app", "frontend", ".git"],
+)
+def test_settings_with_unsafe_projects_dir_rejects_value(
+    monkeypatch: pytest.MonkeyPatch,
+    projects_dir: str,
+) -> None:
+    monkeypatch.setenv("APP_PROJECTS_DIR", projects_dir)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="仅适用于 Windows 路径限制")
+def test_settings_with_projects_dir_too_deep_rejects_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_PROJECTS_DIR", str(PROJECT_ROOT / ("深" * 140)))
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
 
 
 def test_database_initialize_creates_ten_tables_and_three_mock_providers(
@@ -77,9 +138,42 @@ def test_init_db_with_fresh_database_migrates_to_head_and_seeds_mock_providers(
     }
     with database.engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "20260728_0001"
+            "20260730_0004"
         )
         assert connection.scalar(select(func.count()).select_from(api_provider)) == 3
+    database.dispose()
+
+
+def test_migrate_schema_from_legacy_revision_0003_adds_project_storage_name(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "legacy-0003.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE alembic_version (
+                version_num VARCHAR(32) NOT NULL PRIMARY KEY
+            );
+            INSERT INTO alembic_version (version_num) VALUES ('20260730_0003');
+            CREATE TABLE project (
+                id TEXT NOT NULL PRIMARY KEY,
+                name TEXT NOT NULL,
+                deleted_at TEXT
+            );
+            INSERT INTO project (id, name) VALUES ('project-1', '旧项目');
+            """
+        )
+    database = Database(f"sqlite:///{database_path.as_posix()}")
+
+    migrate_schema(database)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(project)")}
+        storage_name = connection.execute(
+            "SELECT storage_name FROM project WHERE id = 'project-1'"
+        ).fetchone()[0]
+    assert "storage_name" in columns
+    assert storage_name == "旧项目"
     database.dispose()
 
 
@@ -133,6 +227,24 @@ def test_database_with_concurrent_short_transactions_writes_all_rows(
 def test_novel_analysis_output_with_missing_required_field_rejects_value() -> None:
     with pytest.raises(ValidationError):
         NovelAnalysisOutput.model_validate({"summary": "只有摘要"})
+
+
+def test_visual_style_output_with_only_whitespace_rejects_value() -> None:
+    with pytest.raises(ValidationError):
+        VisualStyleOutput.model_validate({"style_prompt": " " * 20})
+
+
+@pytest.mark.parametrize("length", [18, 32])
+def test_visual_style_output_with_boundary_length_accepts_value(length: int) -> None:
+    output = VisualStyleOutput.model_validate({"style_prompt": "画" * length})
+
+    assert output.style_prompt == "画" * length
+
+
+@pytest.mark.parametrize("length", [17, 33])
+def test_visual_style_output_outside_length_limit_rejects_value(length: int) -> None:
+    with pytest.raises(ValidationError):
+        VisualStyleOutput.model_validate({"style_prompt": "画" * length})
 
 
 def test_reference_binding_with_unknown_role_rejects_value() -> None:

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Date** | 2026-07-28 |
+| **Date** | 2026-07-29 |
 | **App URL** | http://127.0.0.1:3000 |
 | **Session** | ai-comic-platform-qa |
 | **Scope** | 九个页面、七步 Mock 生产链、桌面与窄屏、控制台与网络错误 |
@@ -21,8 +21,8 @@
 
 ## 最终自动化证据
 
-- 后端：`134 passed`，ruff check 通过；本轮改动的 Python 文件通过 ruff format check。
-- 前端：`27 passed`，ESLint、TypeScript 与 Vite 生产构建通过。
+- 后端：`142 passed`，ruff check 通过；本轮改动的 Python 文件通过 ruff format check。
+- 前端：`29 passed`，ESLint、TypeScript 与 Vite 生产构建通过。
 - Playwright：`4 passed`，覆盖创建项目、结果自动刷新、390px 窄屏导航、
   九页无控制台错误，以及 Mock 素材图、关键帧、可播放视频、ZIP 导出的完整链路。
 - 生产单进程：`/api/health`、根路径、九个页面深链、favicon 与构建后静态资源
@@ -66,7 +66,8 @@
 | AUD-019 | 取消任务与目标状态同步分属两个事务，失败时会留下不一致状态 | Job 取消与目标同步共用一个数据库事务，新增回滚回归测试 |
 | AUD-020 | 写作后台结果可能覆盖人工保存，旧任务缺少 revision 时可能悬挂 | 新任务记录 expected revision；执行前短路过期任务，落库使用 CAS；旧任务仅在目标仍 generating 时兼容回退；准备阶段失败按 CAS 标记 failed |
 | AUD-021 | 媒体 Provider 解析或准备阶段失败时版本可能停在 queued | 图片、视频 handler 将准备阶段纳入统一失败同步范围，错误信息统一脱敏 |
-| AUD-022 | Provider 页面对所有类型显示 `VIDEO_API_KEY` 占位符，容易填写错误的 API Key 环境变量名 | 按 Provider 类型动态提示 `TEXT_API_KEY`、`IMAGE_API_KEY` 或 `VIDEO_API_KEY`，后端错误信息补充可用示例并新增前后端回归测试 |
+| AUD-022 | Provider 只能填写 `TEXT_*_API_KEY` 等环境变量名，不符合直接配置 Key 的使用预期 | Provider 页改为密码框直填 Key，后端使用当前 Windows 用户 DPAPI 加密且 SQLite 仅存密文；公共响应不返回 Key/密文，空白编辑保留旧 Key，并兼容旧环境变量配置 |
+| AUD-023 | 未显式指定 Provider 时，默认 Provider 解码语句误入异常分支，生成任务会触发 `UnboundLocalError` | 将默认 Provider 解码恢复到正常分支，新增不传 `provider_id` 的回归测试并完成失败/通过验证 |
 
 生产启动器专项验证：
 
@@ -84,7 +85,7 @@
 7. 临时移走前端生产入口后执行重启：旧实例先停止，命令返回非零且不创建新
    state/监听；恢复入口后立即再次启动成功，证明 Mutex 未泄漏。
 
-本轮复审后的最新验证：后端 134 条测试、前端 27 条测试、Playwright 4 条测试；
+本轮复审后的最新验证：后端 142 条测试、前端 29 条测试、Playwright 4 条测试；
 业务表清理为 0、Provider 保留 3 个、外键检查为空，最终无监听端口或运行状态文件。
 
 全仓 ruff format check 仍发现 4 个本轮之前已存在的未格式化文件，本轮未对无关文件做格式化修改。

@@ -24,8 +24,15 @@ from app.schemas import (
     ShotVideoPromptOutput,
 )
 from app.services.errors import bad_request, conflict, not_found
-from app.services.file_service import file_service
+from app.services.file_service import file_service, project_media_url
 from app.services.job_service import JobService
+from app.services.prompt_service import (
+    compile_keyframe_prompt,
+    compile_video_prompt,
+    resolve_keyframe_description,
+    resolve_video_description,
+    shot_template_context,
+)
 from app.services.provider_service import ProviderService
 from app.services.signature_service import shot_signature
 from app.services.utils import json_dumps, json_loads, new_id, row_dict, utc_now
@@ -117,11 +124,106 @@ class ShotService:
             ).first()
         )
         if record and record.get("file_path"):
-            record["file_url"] = f"/media/{project_id}/{record['file_path']}"
+            record["file_url"] = project_media_url(project_id, record["file_path"])
             record["media_url"] = record["file_url"]
         if record:
             record["is_current"] = bool(record["is_current"])
         return record
+
+    @staticmethod
+    def _asset_names(connection: Any, current: dict[str, Any]) -> dict[str, str]:
+        asset_ids = [
+            item
+            for item in [
+                current.get("scene_asset_id"),
+                *current.get("character_ids", []),
+                *current.get("prop_ids", []),
+            ]
+            if item
+        ]
+        if not asset_ids:
+            return {}
+        return {
+            row.id: row.name
+            for row in connection.execute(
+                select(asset.c.id, asset.c.name).where(asset.c.id.in_(asset_ids))
+            )
+        }
+
+    @staticmethod
+    def _reference_labels(
+        connection: Any,
+        bindings: list[dict[str, Any]],
+    ) -> list[str]:
+        labels = {
+            "character_identity": "锁定角色身份与服装",
+            "scene_layout": "锁定场景空间结构和光线",
+            "prop_identity": "锁定物品外观、材质和结构",
+            "previous_keyframe": "锁定上一镜构图与连续性",
+        }
+        result: list[str] = []
+        for binding in bindings:
+            role = str(binding.get("role", ""))
+            name = ""
+            if binding.get("asset_id"):
+                name = (
+                    connection.execute(
+                        select(asset.c.name).where(asset.c.id == binding["asset_id"])
+                    ).scalar()
+                    or ""
+                )
+            elif binding.get("keyframe_id"):
+                shot_no = connection.execute(
+                    select(shot.c.shot_no)
+                    .join(keyframe_version, keyframe_version.c.shot_id == shot.c.id)
+                    .where(keyframe_version.c.id == binding["keyframe_id"])
+                ).scalar()
+                if shot_no:
+                    name = f"上一镜分镜 {shot_no}"
+            if name:
+                result.append(f"{name}，{labels.get(role, '锁定当前参考信息')}")
+        return result
+
+    def _add_compiled_prompts(
+        self,
+        connection: Any,
+        current_project: dict[str, Any],
+        current: dict[str, Any],
+    ) -> None:
+        context = shot_template_context(current, self._asset_names(connection, current))
+        labels = self._reference_labels(connection, current["reference_bindings"])
+        image_prompt = resolve_keyframe_description(
+            current["image_prompt"],
+            current["frame_description"],
+        )
+        video_prompt = resolve_video_description(
+            video_prompt=current["video_prompt"],
+            start_state=current["start_state"],
+            action=current["action"],
+            end_state=current["end_state"],
+            camera_move=current["camera_move"],
+            duration_sec=current["duration_sec"],
+        )
+        current["compiled_image_prompt"] = compile_keyframe_prompt(
+            style_prompt=current_project["style_prompt"],
+            aspect_ratio=current_project["aspect_ratio"],
+            image_prompt=image_prompt,
+            anchors=[f"@Image{index}：{label}。" for index, label in enumerate(labels, start=1)],
+            shot_context=context,
+            negative_prompt=current["negative_prompt"],
+        )
+        current["compiled_video_prompt"] = compile_video_prompt(
+            style_prompt=current_project["style_prompt"],
+            aspect_ratio=current_project["aspect_ratio"],
+            video_prompt=video_prompt,
+            duration_sec=current["duration_sec"],
+            anchors=[
+                "@Image1：当前分镜关键帧，锁定构图、人物左右关系和起始站位。",
+                *[f"@Image{index}：{label}。" for index, label in enumerate(labels, start=2)],
+            ],
+            shot_context=context,
+            negative_prompt=current["negative_prompt"],
+        )
 
     def list(self, project_id: str) -> list[dict[str, Any]]:
         current_project = self._project(project_id)
@@ -146,15 +248,22 @@ class ShotService:
                 record["current_video"] = self._media_record(
                     connection, video_version, record["id"], project_id
                 )
+                self._add_compiled_prompts(connection, current_project, record)
                 records.append(record)
         return records
 
     def get(self, shot_id: str) -> dict[str, Any]:
         with self.database.engine.connect() as connection:
             record = row_dict(connection.execute(select(shot).where(shot.c.id == shot_id)).first())
-        if record is None:
-            raise not_found("分镜")
-        return self._decode(record)
+            if record is None:
+                raise not_found("分镜")
+            result = self._decode(record)
+            self._add_compiled_prompts(
+                connection,
+                self._project(result["project_id"]),
+                result,
+            )
+            return result
 
     def _current_source_signature(
         self,
@@ -268,8 +377,15 @@ class ShotService:
 
     def create(self, project_id: str, values: dict[str, Any]) -> dict[str, Any]:
         current_project = self._project(project_id)
-        source_type = values.get("source_type", "novel")
-        source_signature = self._source_signature(current_project, source_type)
+        if values.get("duration_sec") is None:
+            raise bad_request("必须提供分镜时长")
+        source_type = "screenplay"
+        with self.database.engine.connect() as connection:
+            source_signature = self._current_source_signature(
+                connection,
+                current_project,
+                source_type,
+            )
         self._validate_asset_ids(
             project_id,
             scene_asset_id=values.get("scene_asset_id"),
@@ -278,11 +394,21 @@ class ShotService:
         )
         self._validate_bindings(project_id, values.get("reference_bindings", []))
         now = utc_now()
+        semantic = {key: values.get(key) for key in _SIGNATURE_FIELDS if key in values}
+        semantic["source_type"] = source_type
+        semantic["duration_sec"] = values["duration_sec"]
+        if not values.get("reference_bindings"):
+            auto_bindings, _ = self._current_reference_bindings(
+                {
+                    "project_id": project_id,
+                    "scene_asset_id": semantic.get("scene_asset_id"),
+                    "character_ids": semantic.get("character_ids", []),
+                    "prop_ids": semantic.get("prop_ids", []),
+                }
+            )
+            semantic["reference_bindings"] = auto_bindings
         with self.database.engine.begin() as connection:
             next_no, next_order = self._next_numbers(connection, project_id)
-            semantic = {key: values.get(key) for key in _SIGNATURE_FIELDS if key in values}
-            semantic.setdefault("source_type", source_type)
-            semantic.setdefault("duration_sec", current_project["default_duration_sec"])
             record: dict[str, Any] = {
                 "id": new_id("shot"),
                 "project_id": project_id,
@@ -305,8 +431,77 @@ class ShotService:
                 raise conflict("分镜编号已存在") from exc
         return self.get(record["id"])
 
-    def update(self, shot_id: str, values: dict[str, Any]) -> dict[str, Any]:
+    def sync_asset_image_binding(self, asset_id: str, asset_image_id: str) -> None:
+        """素材图切换为当前版本后，回写所有引用该素材的分镜。"""
+        with self.database.engine.begin() as connection:
+            asset_record = connection.execute(
+                select(asset.c.project_id, asset.c.asset_type).where(asset.c.id == asset_id)
+            ).first()
+            if asset_record is None:
+                return
+            role = {
+                "character": "character_identity",
+                "scene": "scene_layout",
+                "prop": "prop_identity",
+            }.get(asset_record.asset_type)
+            if role is None:
+                return
+            rows = connection.execute(
+                select(shot).where(shot.c.project_id == asset_record.project_id)
+            ).all()
+            replacement = {
+                "role": role,
+                "asset_id": asset_id,
+                "asset_image_id": asset_image_id,
+            }
+            for row in rows:
+                current = self._decode(dict(row._mapping))
+                referenced = asset_id in {
+                    current.get("scene_asset_id"),
+                    *current.get("character_ids", []),
+                    *current.get("prop_ids", []),
+                }
+                if not referenced:
+                    continue
+                bindings = current["reference_bindings"]
+                next_bindings: list[dict[str, Any]] = []
+                replaced = False
+                for binding in bindings:
+                    if isinstance(binding, dict) and binding.get("asset_id") == asset_id:
+                        if not replaced:
+                            next_bindings.append(replacement)
+                            replaced = True
+                    else:
+                        next_bindings.append(binding)
+                if not replaced:
+                    next_bindings.append(replacement)
+                if next_bindings == bindings:
+                    continue
+                semantic = {
+                    key: next_bindings if key == "reference_bindings" else current.get(key)
+                    for key in _SIGNATURE_FIELDS
+                }
+                connection.execute(
+                    update(shot)
+                    .where(shot.c.id == current["id"])
+                    .values(
+                        reference_bindings_json=json_dumps(next_bindings),
+                        own_signature=self._signature(semantic),
+                        revision=current["revision"] + 1,
+                        updated_at=utc_now(),
+                    )
+                )
+
+    def update(
+        self,
+        shot_id: str,
+        values: dict[str, Any],
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
         current = self.get(shot_id)
+        if expected_revision is not None and current["revision"] != expected_revision:
+            raise conflict("分镜已被其他请求更新，请重试")
         self._validate_asset_ids(
             current["project_id"],
             scene_asset_id=values.get("scene_asset_id", current["scene_asset_id"]),
@@ -329,15 +524,34 @@ class ShotService:
                 changes["status"] = "ready"
             changes["updated_at"] = utc_now()
             with self.database.engine.begin() as connection:
-                connection.execute(update(shot).where(shot.c.id == shot_id).values(**changes))
+                statement = update(shot).where(shot.c.id == shot_id)
+                if expected_revision is not None:
+                    statement = statement.where(shot.c.revision == expected_revision)
+                result = connection.execute(statement.values(**changes))
+                if expected_revision is not None and result.rowcount != 1:
+                    raise conflict("分镜已被其他请求更新，请重试")
         return self.get(shot_id)
 
+    @staticmethod
+    def _temporary_number_start(connection: Any, project_id: str) -> int:
+        row = connection.execute(
+            select(
+                func.max(shot.c.shot_no),
+                func.max(shot.c.shot_order),
+            ).where(shot.c.project_id == project_id)
+        ).one()
+        return max(row[0] or 0, row[1] or 0) + 1
+
     def _renumber(self, connection: Any, project_id: str, ids: list[str]) -> None:
-        for index, shot_id in enumerate(ids, start=1):
+        temporary_start = self._temporary_number_start(connection, project_id)
+        for offset, shot_id in enumerate(ids):
             connection.execute(
                 update(shot)
                 .where(shot.c.id == shot_id)
-                .values(shot_no=100000 + index, shot_order=100000 + index)
+                .values(
+                    shot_no=temporary_start + offset,
+                    shot_order=temporary_start + offset,
+                )
             )
         for index, shot_id in enumerate(ids, start=1):
             connection.execute(
@@ -628,8 +842,19 @@ class ShotService:
 
     def queue_extract(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current_project = self._project(project_id)
-        source_type = options["source_type"]
+        source_type = "screenplay"
         self._source_signature(current_project, source_type)
+        with self.database.engine.connect() as connection:
+            scene_count = connection.execute(
+                select(func.count())
+                .select_from(asset)
+                .where(
+                    asset.c.project_id == project_id,
+                    asset.c.asset_type == "scene",
+                )
+            ).scalar_one()
+        if scene_count == 0:
+            raise conflict("请先提取场景素材，再提取分镜")
         return self.jobs.create(
             project_id=project_id,
             job_type="extract_shots",
@@ -697,19 +922,19 @@ class ShotService:
     async def handle_extract(self, job: dict[str, Any]) -> dict[str, Any]:
         current_project = self._project(job["project_id"])
         input_data = json_loads(job.get("input_json"), {})
-        source_type = input_data["source_type"]
-        if source_type == "novel":
-            source_content = current_project["source_text"]
-        else:
-            with self.database.engine.connect() as connection:
-                content_raw = connection.execute(
-                    select(screenplay.c.content_json).where(
-                        screenplay.c.project_id == current_project["id"]
-                    )
-                ).scalar()
-            if not content_raw:
-                raise conflict("当前项目还没有可用剧本")
-            source_content = content_raw
+        source_type = "screenplay"
+        with self.database.engine.connect() as connection:
+            content_raw = connection.execute(
+                select(screenplay.c.content_json).where(
+                    screenplay.c.project_id == current_project["id"]
+                )
+            ).scalar()
+        if not content_raw:
+            raise conflict("当前项目还没有可用剧本")
+        source_content = content_raw
+        asset_catalog = self._asset_catalog(current_project["id"])
+        if not any(item["asset_type"] == "scene" for item in asset_catalog):
+            raise conflict("请先提取场景素材，再提取分镜")
         provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
         output = await provider.generate_json(
             system_prompt=load_prompt("shot_extract"),
@@ -717,6 +942,7 @@ class ShotService:
                 f"来源类型：{source_type}\n"
                 f"范围：{input_data['scope']}\n"
                 f"目标场次：{input_data.get('scene_no') or '全部'}\n"
+                f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
                 f"来源内容：\n{source_content}"
             ),
             schema=ShotExtractionOutput,
@@ -729,16 +955,123 @@ class ShotService:
             output.model_dump(mode="json")["shots"],
         )
 
-    def _asset_name_maps(self, project_id: str) -> dict[str, dict[str, str]]:
-        result = {"character": {}, "scene": {}, "prop": {}}
+    def _asset_catalog(self, project_id: str) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
         with self.database.engine.connect() as connection:
             for row in connection.execute(
-                select(asset.c.id, asset.c.asset_type, asset.c.name).where(
-                    asset.c.project_id == project_id
-                )
+                select(
+                    asset.c.id,
+                    asset.c.asset_type,
+                    asset.c.name,
+                    asset.c.profile_json,
+                ).where(asset.c.project_id == project_id)
             ):
-                result[row.asset_type][row.name] = row.id
+                profile = json_loads(row.profile_json, {})
+                result.append(
+                    {
+                        "id": row.id,
+                        "asset_type": row.asset_type,
+                        "name": row.name,
+                        "concept": profile.get("concept", ""),
+                        "aliases": profile.get("aliases", []),
+                        "source_refs": profile.get("source_refs", []),
+                    }
+                )
         return result
+
+    @staticmethod
+    def _normalize_asset_label(value: str) -> str:
+        return re.sub(r"[\W_]+", "", value.casefold())
+
+    def _asset_lookup(self, project_id: str) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {
+            "character": {"ids": set(), "primary": {}, "exact": {}, "normalized": {}},
+            "scene": {"ids": set(), "primary": {}, "exact": {}, "normalized": {}},
+            "prop": {"ids": set(), "primary": {}, "exact": {}, "normalized": {}},
+        }
+        for current in self._asset_catalog(project_id):
+            lookup = result[current["asset_type"]]
+            lookup["ids"].add(current["id"])
+            lookup["primary"].setdefault(current["name"], set()).add(current["id"])
+            aliases = current.get("aliases", [])
+            labels = [
+                current["name"],
+                *(aliases if isinstance(aliases, list) else []),
+            ]
+            for label in labels:
+                if not isinstance(label, str) or not label.strip():
+                    continue
+                lookup["exact"].setdefault(label, set()).add(current["id"])
+                normalized = self._normalize_asset_label(label)
+                if normalized:
+                    lookup["normalized"].setdefault(normalized, set()).add(current["id"])
+        return result
+
+    def _resolve_asset_name(
+        self,
+        lookup: dict[str, Any],
+        name: str,
+    ) -> str | None:
+        primary = lookup["primary"].get(name, set())
+        if len(primary) == 1:
+            return next(iter(primary))
+        exact = lookup["exact"].get(name, set())
+        if len(exact) == 1:
+            return next(iter(exact))
+        normalized_name = self._normalize_asset_label(name)
+        normalized = lookup["normalized"].get(normalized_name, set())
+        if len(normalized) == 1:
+            return next(iter(normalized))
+        return None
+
+    def _resolve_asset_id(
+        self,
+        lookup: dict[str, Any],
+        *,
+        provided_id: str | None,
+        name: str,
+    ) -> str | None:
+        resolved_name = self._resolve_asset_name(lookup, name)
+        if provided_id:
+            if provided_id not in lookup["ids"]:
+                return None
+            if name and resolved_name != provided_id:
+                return None
+            return provided_id
+        return resolved_name
+
+    def _resolve_asset_ids(
+        self,
+        lookup: dict[str, Any],
+        *,
+        provided_ids: list[str],
+        names: list[str],
+    ) -> tuple[list[str], list[str]]:
+        unique_provided = list(dict.fromkeys(provided_ids))
+        resolved = [item for item in unique_provided if item in lookup["ids"]]
+        unmatched = [item for item in unique_provided if item not in lookup["ids"]]
+        resolved_names: list[tuple[str, str]] = []
+        for name in names:
+            asset_id = self._resolve_asset_name(lookup, name)
+            if asset_id:
+                resolved_names.append((name, asset_id))
+            elif name not in unmatched:
+                unmatched.append(name)
+        if provided_ids and names:
+            provided_set = set(resolved)
+            named_set = {asset_id for _, asset_id in resolved_names}
+            if provided_set != named_set:
+                for name, asset_id in resolved_names:
+                    mismatch = f"{name}（ID 与名称不一致）"
+                    if asset_id not in provided_set and mismatch not in unmatched:
+                        unmatched.append(mismatch)
+                for asset_id in resolved:
+                    mismatch = f"{asset_id}（ID 与名称不一致）"
+                    if asset_id not in named_set and mismatch not in unmatched:
+                        unmatched.append(mismatch)
+        elif names:
+            resolved = list(dict.fromkeys(asset_id for _, asset_id in resolved_names))
+        return resolved, unmatched
 
     def _save_extracted(
         self,
@@ -747,36 +1080,70 @@ class ShotService:
         input_data: dict[str, Any],
         extracted_shots: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        name_maps = self._asset_name_maps(current_project["id"])
+        asset_lookup = self._asset_lookup(current_project["id"])
         source_signature = self._source_signature(current_project, source_type)
         normalized: list[dict[str, Any]] = []
-        for item in extracted_shots:
+        binding_errors: list[str] = []
+        for extracted in extracted_shots:
+            item = dict(extracted)
             scene_no = item.pop("scene_no", None)
             source_ref = item.pop("source_ref", "")
             if scene_no:
                 source_ref = f"scene:{scene_no}|{source_ref}"
-            normalized.append(
-                {
-                    "source_type": source_type,
-                    "source_ref": source_ref,
-                    "scene_asset_id": name_maps["scene"].get(item.pop("scene_name", "")),
-                    "character_ids": [
-                        name_maps["character"][name]
-                        for name in item.pop("character_names", [])
-                        if name in name_maps["character"]
-                    ],
-                    "prop_ids": [
-                        name_maps["prop"][name]
-                        for name in item.pop("prop_names", [])
-                        if name in name_maps["prop"]
-                    ],
-                    **item,
-                    "image_prompt": "",
-                    "video_prompt": "",
-                    "negative_prompt": "",
-                    "reference_bindings": [],
-                    "status": "ready",
-                }
+            scene_name = item.pop("scene_name", "")
+            scene_asset_id = self._resolve_asset_id(
+                asset_lookup["scene"],
+                provided_id=item.pop("scene_asset_id", None),
+                name=scene_name,
+            )
+            character_names = item.pop("character_names", [])
+            provided_character_ids = item.pop("character_asset_ids", [])
+            character_ids, unmatched_characters = self._resolve_asset_ids(
+                asset_lookup["character"],
+                provided_ids=provided_character_ids,
+                names=character_names,
+            )
+            character_binding_errors = [
+                value
+                for value in unmatched_characters
+                if value in provided_character_ids or "（ID 与名称不一致）" in value
+            ]
+            prop_names = item.pop("prop_names", [])
+            prop_ids, unmatched_props = self._resolve_asset_ids(
+                asset_lookup["prop"],
+                provided_ids=item.pop("prop_asset_ids", []),
+                names=prop_names,
+            )
+            shot_label = item.get("shot_no", len(normalized) + 1)
+            if not scene_asset_id:
+                binding_errors.append(
+                    f"分镜 {shot_label} 未匹配到场景素材：{scene_name or '未提供场景名称'}"
+                )
+            if character_binding_errors:
+                binding_errors.append(
+                    f"分镜 {shot_label} 未匹配到角色素材：{', '.join(character_binding_errors)}"
+                )
+            if unmatched_props:
+                binding_errors.append(
+                    f"分镜 {shot_label} 未匹配到物品素材：{', '.join(unmatched_props)}"
+                )
+            semantic = {
+                "source_type": source_type,
+                "source_ref": source_ref,
+                "scene_asset_id": scene_asset_id,
+                "character_ids": character_ids,
+                "prop_ids": prop_ids,
+                **item,
+                "reference_bindings": [],
+                "status": "ready",
+            }
+            semantic["reference_bindings"], _ = self._current_reference_bindings(semantic)
+            normalized.append(semantic)
+        if binding_errors:
+            raise bad_request(
+                "分镜素材绑定失败："
+                + "；".join(binding_errors)
+                + "。请先补齐对应素材，或重新提取分镜。"
             )
         scope_scene = input_data.get("scene_no") if input_data.get("scope") == "scene" else None
         now = utc_now()
@@ -798,6 +1165,10 @@ class ShotService:
             self._ensure_no_active_jobs(
                 connection,
                 selected_ids,
+            )
+            temporary_start = self._temporary_number_start(
+                connection,
+                current_project["id"],
             )
             saved_ids: list[str] = []
             for index, semantic in enumerate(normalized):
@@ -827,8 +1198,8 @@ class ShotService:
                         insert(shot).values(
                             id=record_id,
                             project_id=current_project["id"],
-                            shot_no=100000 + index,
-                            shot_order=100000 + index,
+                            shot_no=temporary_start + index,
+                            shot_order=temporary_start + index,
                             revision=1,
                             created_at=now,
                             **values,
@@ -870,7 +1241,11 @@ class ShotService:
             self._renumber(connection, current_project["id"], ordered_ids)
         for path in obsolete_paths:
             file_service.delete_file(current_project["id"], path)
-        return {"shot_ids": saved_ids, "count": len(saved_ids)}
+        return {
+            "shot_ids": saved_ids,
+            "count": len(saved_ids),
+            "warnings": [],
+        }
 
     def _current_reference_bindings(
         self, current: dict[str, Any]

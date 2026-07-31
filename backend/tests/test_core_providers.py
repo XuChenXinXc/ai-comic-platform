@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import requests
 from PIL import Image
 
 from app.config import load_project_environment
@@ -17,6 +19,7 @@ from app.providers.image import HttpImageProvider
 from app.providers.mock import MockImageProvider, MockVideoProvider
 from app.providers.registry import provider_registry
 from app.providers.text import OpenAICompatibleTextProvider
+from app.providers.video import HttpVideoProvider
 from app.schemas import (
     AssetExtractionOutput,
     AssetPromptOutput,
@@ -27,10 +30,12 @@ from app.schemas import (
     ShotExtractionOutput,
     ShotImagePromptOutput,
     ShotVideoPromptOutput,
+    VisualStyleOutput,
 )
 
 OUTPUT_SCHEMAS = (
     NovelAnalysisOutput,
+    VisualStyleOutput,
     ScreenplayOutput,
     AssetExtractionOutput,
     AssetPromptOutput,
@@ -90,6 +95,19 @@ def test_provider_api_key_with_unrelated_environment_name_is_rejected(
         provider._api_key()
 
 
+def test_provider_direct_api_key_is_used_in_authorization_header() -> None:
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            api_key="direct-provider-secret",
+        )
+    )
+
+    assert provider._headers({})["Authorization"] == "Bearer direct-provider-secret"
+
+
 def test_http_provider_request_with_cross_origin_absolute_path_is_rejected() -> None:
     provider = OpenAICompatibleTextProvider(
         ProviderConfig(
@@ -102,6 +120,49 @@ def test_http_provider_request_with_cross_origin_absolute_path_is_rejected() -> 
 
     with pytest.raises(ProviderConfigurationError, match="同源"):
         provider._url("https://attacker.example/collect")
+
+
+def test_http_provider_with_json_http_error_preserves_provider_message_after_transport_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://provider.example/v1",
+            max_retries=1,
+        )
+    )
+    unavailable = requests.Response()
+    unavailable.status_code = 503
+    unavailable.url = "https://provider.example/v1/images/generations"
+    unavailable._content = (
+        b'{"error":{"message":"No available compatible accounts","type":"api_error"}}'
+    )
+    unavailable.headers["Content-Type"] = "application/json"
+    calls = 0
+
+    def fake_request(*_args: Any, **_kwargs: Any) -> requests.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return unavailable
+        raise requests.ConnectionError("connection reset")
+
+    monkeypatch.setattr(requests, "request", fake_request)
+
+    with pytest.raises(
+        ProviderError,
+        match=r"HTTP 503.*No available compatible accounts",
+    ):
+        provider._request(
+            "POST",
+            "https://provider.example/v1/images/generations",
+            options={},
+        )
+
+    assert calls == 2
 
 
 @pytest.mark.parametrize("header_name", ["Authorization", "X-Signature"])
@@ -183,6 +244,64 @@ def test_mock_text_with_each_output_schema_returns_valid_model(
     )
 
     assert isinstance(output, schema)
+
+
+def test_mock_shot_extraction_without_matching_catalog_name_keeps_unmatched_ids() -> None:
+    provider = provider_registry.get(_config("text", "mock"))
+    catalog = [
+        {"id": "scene-office", "asset_type": "scene", "name": "办公室"},
+        {"id": "character-xiaoming", "asset_type": "character", "name": "小明"},
+    ]
+
+    output = asyncio.run(
+        provider.generate_json(
+            system_prompt="提取分镜",
+            user_prompt=(
+                f"当前项目可用素材目录：\n{json.dumps(catalog, ensure_ascii=False)}\n"
+                "来源内容：\n测试剧本"
+            ),
+            schema=ShotExtractionOutput,
+            params={},
+        )
+    )
+
+    assert output.shots[0].scene_asset_id == "mock-scene-id"
+    assert output.shots[0].character_asset_ids == ["mock-character-id"]
+
+
+def test_mock_shot_extraction_with_catalog_aliases_uses_alias_matches() -> None:
+    provider = provider_registry.get(_config("text", "mock"))
+    catalog = [
+        {"id": "scene-office", "asset_type": "scene", "name": "办公室"},
+        {
+            "id": "scene-main",
+            "asset_type": "scene",
+            "name": "主场景内景",
+            "aliases": ["主要场景"],
+        },
+        {"id": "character-xiaoming", "asset_type": "character", "name": "小明"},
+        {
+            "id": "character-main",
+            "asset_type": "character",
+            "name": "故事主人公",
+            "aliases": ["主角"],
+        },
+    ]
+
+    output = asyncio.run(
+        provider.generate_json(
+            system_prompt="提取分镜",
+            user_prompt=(
+                f"当前项目可用素材目录：\n{json.dumps(catalog, ensure_ascii=False)}\n"
+                "来源内容：\n测试剧本"
+            ),
+            schema=ShotExtractionOutput,
+            params={},
+        )
+    )
+
+    assert output.shots[0].scene_asset_id == "scene-main"
+    assert output.shots[0].character_asset_ids == ["character-main"]
 
 
 def test_mock_image_submit_and_download_returns_decodable_png(tmp_path: Path) -> None:
@@ -285,7 +404,6 @@ def test_openai_compatible_with_invalid_first_response_repairs_once(
         "negative_prompt": "模糊",
         "consistency_keywords": ["固定服装"],
         "composition": "居中",
-        "recommended_size": "1024x1024",
     }
     responses = [
         {"choices": [{"message": {"content": "{}"}}]},
@@ -307,6 +425,187 @@ def test_openai_compatible_with_invalid_first_response_repairs_once(
 
     assert result.model_dump() == valid_payload
     assert responses == []
+
+
+def test_openai_compatible_text_request_forces_high_reasoning_after_param_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            params={"reasoning_effort": "low"},
+        )
+    )
+    payloads: list[dict[str, Any]] = []
+
+    async def fake_request(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        payloads.append(kwargs["json"])
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "prompt": "清晰主体",
+                                "negative_prompt": "模糊",
+                                "consistency_keywords": ["固定服装"],
+                                "composition": "居中",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    asyncio.run(
+        provider.generate_json(
+            system_prompt="输出素材提示词",
+            user_prompt="主角",
+            schema=AssetPromptOutput,
+            params={"reasoning_effort": "medium"},
+        )
+    )
+
+    assert [payload["reasoning_effort"] for payload in payloads] == ["high"]
+
+
+def test_openai_compatible_text_repair_request_keeps_high_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+        )
+    )
+    payloads: list[dict[str, Any]] = []
+    responses = [
+        {"choices": [{"message": {"content": "{}"}}]},
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "prompt": "清晰主体",
+                                "negative_prompt": "模糊",
+                                "consistency_keywords": ["固定服装"],
+                                "composition": "居中",
+                            }
+                        )
+                    }
+                }
+            ]
+        },
+    ]
+
+    async def fake_request(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        payloads.append(kwargs["json"])
+        return responses.pop(0)
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    asyncio.run(
+        provider.generate_json(
+            system_prompt="输出素材提示词",
+            user_prompt="主角",
+            schema=AssetPromptOutput,
+            params={"reasoning_effort": "low"},
+        )
+    )
+
+    assert [payload["reasoning_effort"] for payload in payloads] == ["high", "high"]
+
+
+def test_openai_compatible_visual_style_keeps_prompts_plain_and_parses_sentence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+        )
+    )
+    style_prompt = "冷峻悬疑二维国漫，利落轮廓，低饱和冷色，分层暗光"
+    payloads: list[dict[str, Any]] = []
+
+    async def fake_request(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        payloads.append(kwargs["json"])
+        return {"choices": [{"message": {"content": style_prompt}}]}
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    result = asyncio.run(
+        provider.generate_json(
+            system_prompt="完整系统提示词",
+            user_prompt="完整用户提示词\n\n小说正文",
+            schema=VisualStyleOutput,
+            params={"response_format": {"type": "json_object"}},
+        )
+    )
+
+    assert result.style_prompt == style_prompt
+    assert payloads == [
+        {
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "完整系统提示词"},
+                {"role": "user", "content": "完整用户提示词\n\n小说正文"},
+            ],
+            "reasoning_effort": "high",
+        }
+    ]
+
+
+def test_openai_compatible_visual_style_repairs_invalid_length_as_plain_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+        )
+    )
+    style_prompt = "都市温情二维国漫，克制线条，暖灰色调，柔和光影"
+    responses = ["画" * 33, style_prompt]
+    payloads: list[dict[str, Any]] = []
+
+    async def fake_request(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        payloads.append(kwargs["json"])
+        return {"choices": [{"message": {"content": responses.pop(0)}}]}
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    result = asyncio.run(
+        provider.generate_json(
+            system_prompt="完整系统提示词",
+            user_prompt="完整用户提示词\n\n小说正文",
+            schema=VisualStyleOutput,
+            params={"reasoning_effort": "low"},
+        )
+    )
+
+    assert result.style_prompt == style_prompt
+    assert [payload["reasoning_effort"] for payload in payloads] == ["high", "high"]
+    assert all("response_format" not in payload for payload in payloads)
+    assert payloads[1]["messages"][:2] == [
+        {"role": "system", "content": "完整系统提示词"},
+        {"role": "user", "content": "完整用户提示词\n\n小说正文"},
+    ]
+    assert payloads[1]["messages"][-1]["content"].startswith(
+        "上一次输出无法通过校验。请只返回修复后的一句纯文本"
+    )
 
 
 def test_http_image_with_custom_paths_maps_async_submission_and_poll(
@@ -358,6 +657,377 @@ def test_http_image_with_custom_paths_maps_async_submission_and_poll(
     assert submission.status == "waiting_provider"
     assert result.status == "completed"
     assert result.result_url == "https://example.invalid/result.png"
+
+
+def test_gpt_image_2_uses_apib_submission_and_poll_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-gpt",
+            kind="image",
+            adapter="http_image",
+            base_url="https://api.apib.ai/v1",
+            model="gpt-image-2",
+        )
+    )
+    calls: list[dict[str, Any]] = []
+    responses = [
+        {
+            "code": 200,
+            "data": [{"task_id": "task-1", "status": "submitted"}],
+        },
+        {
+            "code": 200,
+            "data": {
+                "id": "task-1",
+                "status": "completed",
+                "result": {
+                    "images": [
+                        {
+                            "url": ["https://cdn.example/result.png"],
+                        }
+                    ]
+                },
+            },
+        },
+    ]
+
+    async def fake_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"method": method, "path": path, **kwargs})
+        return responses.pop(0)
+
+    reference = tmp_path / "character.png"
+    reference.write_bytes(b"character-reference")
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="角色基础设定图",
+            negative_prompt="模糊",
+            reference_files=[reference],
+            params={"size": "3840x2560"},
+        )
+    )
+    result = asyncio.run(provider.poll(submission.task_id))
+
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["path"] == "images/generations"
+    assert calls[0]["json"] == {
+        "resolution": "4k",
+        "quality": "high",
+        "n": 1,
+        "size": "3840x2560",
+        "prompt": "角色基础设定图",
+        "image_urls": [
+            "data:image/png;base64," + base64.b64encode(b"character-reference").decode("ascii")
+        ],
+        "model": "gpt-image-2",
+    }
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["path"] == "tasks/task-1"
+    assert submission.task_id == "task-1"
+    assert submission.status == "waiting_provider"
+    assert result.status == "completed"
+    assert result.result_url == "https://cdn.example/result.png"
+
+
+def test_gpt_image_2_x5_without_references_uses_generation_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-gpt-x5",
+            kind="image",
+            adapter="http_image",
+            base_url="https://api.x5m5x.com/v1",
+            model="gpt-image-2",
+        )
+    )
+    calls: list[dict[str, Any]] = []
+
+    async def fake_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"method": method, "path": path, **kwargs})
+        return {"data": [{"url": "https://cdn.example/generated.png"}]}
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="角色基础设定图",
+            negative_prompt="模糊",
+            reference_files=[],
+            params={"size": "3840x2560"},
+        )
+    )
+
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["path"] == "images/generations"
+    assert calls[0]["json"] == {
+        "quality": "high",
+        "response_format": "url",
+        "size": "3840x2560",
+        "prompt": "角色基础设定图",
+        "model": "gpt-image-2",
+    }
+    assert submission.status == "completed"
+    assert submission.result["result_url"] == "https://cdn.example/generated.png"
+
+
+def test_gpt_image_2_x5_with_references_uses_multipart_image_edits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-gpt-x5",
+            kind="image",
+            adapter="http_image",
+            base_url="https://api.x5m5x.com/v1",
+            model="gpt-image-2",
+        )
+    )
+    first_reference = tmp_path / "character.png"
+    second_reference = tmp_path / "scene.webp"
+    first_reference.write_bytes(b"character-reference")
+    second_reference.write_bytes(b"scene-reference")
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> requests.Response:
+        captured["method"] = method
+        captured["url"] = url
+        captured["headers"] = kwargs["headers"]
+        captured["data"] = kwargs["data"]
+        captured["file_fields"] = [field for field, _ in kwargs["files"]]
+        captured["file_names"] = [value[0] for _, value in kwargs["files"]]
+        captured["file_contents"] = [
+            value[1].read() if hasattr(value[1], "read") else value[1]
+            for _, value in kwargs["files"]
+        ]
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(
+            {
+                "data": [
+                    {
+                        "b64_json": base64.b64encode(b"generated-image").decode("ascii"),
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        return response
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="林风站在山门石阶上",
+            negative_prompt="模糊",
+            reference_files=[first_reference, second_reference],
+            params={"size": "3840x2160"},
+        )
+    )
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://api.x5m5x.com/v1/images/edits"
+    assert "Content-Type" not in captured["headers"]
+    assert captured["data"] == {
+        "quality": "high",
+        "n": "1",
+        "size": "3840x2160",
+        "prompt": "林风站在山门石阶上",
+        "model": "gpt-image-2",
+    }
+    assert captured["file_fields"] == ["image[]", "image[]"]
+    assert captured["file_names"] == ["character.png", "scene.webp"]
+    assert captured["file_contents"] == [b"character-reference", b"scene-reference"]
+    assert submission.status == "completed"
+    assert submission.result["content_base64"] == base64.b64encode(b"generated-image").decode(
+        "ascii"
+    )
+
+
+def test_gpt_image_2_x5_multipart_retry_resends_complete_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-gpt-x5",
+            kind="image",
+            adapter="http_image",
+            base_url="https://api.x5m5x.com/v1",
+            model="gpt-image-2",
+            max_retries=1,
+        )
+    )
+    reference = tmp_path / "character.png"
+    reference.write_bytes(b"complete-reference")
+    sent_contents: list[bytes] = []
+
+    def fake_request(_method: str, _url: str, **kwargs: Any) -> requests.Response:
+        value = kwargs["files"][0][1][1]
+        sent_contents.append(value.read() if hasattr(value, "read") else value)
+        if len(sent_contents) == 1:
+            raise requests.ConnectionError("connection reset")
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b'{"data":[{"b64_json":"ZmFrZQ=="}]}'
+        return response
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    with pytest.raises(ProviderError, match="Provider 请求失败"):
+        asyncio.run(
+            provider.submit(
+                prompt="角色基础设定图",
+                negative_prompt="",
+                reference_files=[reference],
+                params={"size": "3840x2560"},
+            )
+        )
+
+    assert sent_contents == [b"complete-reference"]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "grok-imagine-1.5-video-apimart",
+        "grok-imagine-1.5-video-ext",
+    ],
+)
+def test_grok_video_models_upload_local_input_image_to_apib(
+    model: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-grok",
+            kind="video",
+            adapter="http_video",
+            base_url="https://api.apib.ai/v1",
+            model=model,
+        )
+    )
+    reference = tmp_path / "keyframe.png"
+    reference.write_bytes(b"keyframe")
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> requests.Response:
+        captured.update(method=method, url=url, kwargs=kwargs)
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b'{"url":"https://getapib.org/image/keyframe.png"}'
+        return response
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    prepared = asyncio.run(provider.prepare_input_image(reference))
+
+    assert prepared == {
+        "value": "https://getapib.org/image/keyframe.png",
+        "mode": "upload",
+        "raw": {"url": "https://getapib.org/image/keyframe.png"},
+    }
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://api.apib.ai/v1/uploads/images"
+    assert "file" in captured["kwargs"]["files"]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "grok-imagine-1.5-video-apimart",
+        "grok-imagine-1.5-video-ext",
+    ],
+)
+def test_grok_video_models_use_apib_submission_and_poll_contract(
+    model: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-grok",
+            kind="video",
+            adapter="http_video",
+            base_url="https://api.apib.ai/v1",
+            model=model,
+        )
+    )
+    calls: list[dict[str, Any]] = []
+    responses = [
+        {
+            "code": 200,
+            "data": [{"task_id": "task-1", "status": "submitted"}],
+        },
+        {
+            "code": 200,
+            "data": {
+                "id": "task-1",
+                "status": "completed",
+                "result": {
+                    "videos": [
+                        {
+                            "url": ["https://cdn.example/result.mp4"],
+                        }
+                    ]
+                },
+            },
+        },
+    ]
+
+    async def fake_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"method": method, "path": path, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="让画面动起来",
+            input_image={
+                "values": [
+                    "data:image/png;base64,AAAA",
+                    "data:image/png;base64,BBBB",
+                ]
+            },
+            duration_sec=3.0,
+            params={},
+        )
+    )
+    result = asyncio.run(provider.poll(submission.task_id))
+
+    assert provider.supports_multiple_input_images is True
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["path"] == "videos/generations"
+    assert calls[0]["json"] == {
+        "size": "16:9",
+        "quality": "720p",
+        "prompt": "让画面动起来",
+        "image_urls": [
+            "data:image/png;base64,AAAA",
+            "data:image/png;base64,BBBB",
+        ],
+        "duration": 6,
+        "model": model,
+    }
+    assert type(calls[0]["json"]["duration"]) is int
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["path"] == "tasks/task-1"
+    assert submission.status == "waiting_provider"
+    assert result.status == "completed"
+    assert result.result_url == "https://cdn.example/result.mp4"
+
+
+def test_generic_http_video_provider_defaults_to_single_input_image() -> None:
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-generic",
+            kind="video",
+            adapter="http_video",
+            base_url="https://provider.example/v1",
+            model="generic-video-model",
+        )
+    )
+
+    assert provider.supports_multiple_input_images is False
 
 
 def test_http_image_with_too_many_references_rejects_before_submission(

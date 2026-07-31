@@ -29,6 +29,9 @@ project = Table(
     metadata,
     Column("id", Text, primary_key=True),
     Column("name", Text, nullable=False),
+    Column("storage_name", Text, nullable=False, server_default=""),
+    Column("storage_root", Text, nullable=False, server_default=""),
+    Column("storage_layout", Text, nullable=False, server_default="prefixed"),
     Column("source_text", Text, nullable=False, server_default=""),
     Column("source_signature", Text, nullable=False, server_default=""),
     Column("source_revision", Integer, nullable=False, server_default="1"),
@@ -45,6 +48,15 @@ project = Table(
 )
 
 
+platform_setting = Table(
+    "platform_setting",
+    metadata,
+    Column("key", Text, primary_key=True),
+    Column("value", Text, nullable=False),
+    Column("updated_at", Text, nullable=False),
+)
+
+
 api_provider = Table(
     "api_provider",
     metadata,
@@ -54,6 +66,7 @@ api_provider = Table(
     Column("adapter", Text, nullable=False),
     Column("base_url", Text, nullable=False, server_default=""),
     Column("api_key_env", Text, nullable=False, server_default=""),
+    Column("api_key_ciphertext", Text),
     Column("model", Text, nullable=False, server_default=""),
     Column("params_json", Text, nullable=False, server_default="{}"),
     Column("timeout_sec", Integer, nullable=False, server_default="120"),
@@ -336,6 +349,7 @@ Index("idx_job_batch", job.c.batch_id)
 
 ALL_TABLES = (
     project,
+    platform_setting,
     api_provider,
     novel_analysis,
     screenplay,

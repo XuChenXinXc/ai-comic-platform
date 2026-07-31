@@ -96,4 +96,61 @@ describe("API 契约适配", () => {
     });
     expect(body).not.toHaveProperty("kind");
   });
+
+  test("test_provider_update_with_direct_api_key_sends_api_key", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: "provider-1" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.providers.update("provider-1", {
+      api_key: "direct-provider-secret",
+    });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body.api_key).toBe("direct-provider-secret");
+  });
+
+  test("test_provider_update_with_blank_api_key_omits_api_key", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: "provider-1" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.providers.update("provider-1", { api_key: "" });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body).not.toHaveProperty("api_key");
+  });
+
+  test("test_project_storage_get_requests_settings_endpoint", async () => {
+    const payload = {
+      path: "D:\\漫画项目",
+      source: "database" as const,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.settings.projectStorage.get();
+
+    expect(result).toEqual(payload);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/settings/project-storage",
+    );
+  });
+
+  test("test_project_storage_select_posts_without_body", async () => {
+    const payload = {
+      selected: false,
+      path: "D:\\漫画项目",
+      source: "database" as const,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.settings.projectStorage.select();
+
+    expect(result).toEqual(payload);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/settings/project-storage/select",
+    );
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: "POST" });
+    expect(fetchMock.mock.calls[0][1].body).toBeUndefined();
+  });
 });

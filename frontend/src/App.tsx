@@ -4,6 +4,7 @@ import { AssetImagesPage } from "./pages/AssetImagesPage";
 import { AssetsPage } from "./pages/AssetsPage";
 import { JobsPage } from "./pages/JobsPage";
 import { KeyframesPage } from "./pages/KeyframesPage";
+import { PlatformSettingsPage } from "./pages/PlatformSettingsPage";
 import { ProjectPage } from "./pages/ProjectPage";
 import { ProvidersPage } from "./pages/ProvidersPage";
 import { ShotsPage } from "./pages/ShotsPage";
@@ -24,6 +25,7 @@ export function App() {
         <Route path="/videos" element={<VideosPage />} />
         <Route path="/providers" element={<ProvidersPage />} />
         <Route path="/jobs" element={<JobsPage />} />
+        <Route path="/settings" element={<PlatformSettingsPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/project" replace />} />
     </Routes>

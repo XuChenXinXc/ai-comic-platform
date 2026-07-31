@@ -8,6 +8,8 @@ import type {
   MediaVersion,
   Project,
   ProjectInput,
+  ProjectStorageSelection,
+  ProjectStorageSetting,
   ProviderInput,
   ScreenplayContent,
   Shot,
@@ -161,6 +163,7 @@ function providerPayload(body: Partial<ProviderInput>, includeKind: boolean) {
     enabled: body.enabled,
     is_default: body.is_default,
   };
+  if (body.api_key) payload.api_key = body.api_key;
   if (includeKind) payload.kind = body.kind;
   return payload;
 }
@@ -210,10 +213,22 @@ export const queryKeys = {
   keyframes: (id: string) => ["keyframes", id] as const,
   videos: (id: string) => ["videos", id] as const,
   providers: ["providers"] as const,
+  projectStorage: ["settings", "project-storage"] as const,
   jobs: (projectId?: string) => ["jobs", projectId || "all"] as const,
 };
 
 export const api = {
+  settings: {
+    projectStorage: {
+      get: () =>
+        request<ProjectStorageSetting>("/settings/project-storage"),
+      select: () =>
+        request<ProjectStorageSelection>(
+          "/settings/project-storage/select",
+          json("POST"),
+        ),
+    },
+  },
   projects: {
     list: async () => asList(await request<Project[] | { items: Project[] }>("/projects")),
     get: (id: string) => request<Project>(`/projects/${id}`),
@@ -337,7 +352,6 @@ export const api = {
     extract: (
       projectId: string,
       body: {
-        source_type: "novel" | "screenplay";
         scope?: "all" | "scene";
         scene_no?: number;
       },

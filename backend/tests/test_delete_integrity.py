@@ -10,6 +10,7 @@ from app.jobs.repository import JobRepository
 from app.models.tables import asset_image, keyframe_version, shot, video_version
 from app.services.asset_service import AssetService
 from app.services.errors import ServiceError
+from app.services.file_service import FileService
 from app.services.media_service import MediaService
 from app.services.project_service import ProjectService
 from app.services.shot_service import ShotService
@@ -25,8 +26,8 @@ def database(tmp_path: Path) -> Database:
 
 
 @pytest.fixture
-def project_record(database: Database) -> dict[str, Any]:
-    return ProjectService(database).create(
+def project_record(database: Database, tmp_path: Path) -> dict[str, Any]:
+    return ProjectService(database, FileService(tmp_path)).create(
         {
             "name": "引用完整性测试",
             "source_text": "主角走进房间。",
@@ -159,18 +160,25 @@ def _create_shot(
     project_id: str,
     **overrides: Any,
 ) -> dict[str, Any]:
+    overrides.setdefault("duration_sec", 6)
     values = ShotCreate(**overrides).model_dump()
     return service.create(project_id, values)
 
 
-def _extracted_shot(action: str = "重新提取后的分镜") -> dict[str, Any]:
+def _extracted_shot(
+    scene_asset_id: str,
+    action: str = "重新提取后的分镜",
+) -> dict[str, Any]:
     return {
         "shot_no": 1,
         "scene_no": 1,
         "source_ref": "重新提取",
-        "scene_name": "",
+        "scene_name": "测试场景",
+        "scene_asset_id": scene_asset_id,
         "character_names": [],
+        "character_asset_ids": [],
         "prop_names": [],
+        "prop_asset_ids": [],
         "positions": [],
         "start_state": "角色准备行动",
         "action": action,
@@ -184,6 +192,9 @@ def _extracted_shot(action: str = "重新提取后的分镜") -> dict[str, Any]:
         "end_state": "角色完成行动",
         "next_hook": "",
         "frame_description": "角色位于画面中央",
+        "image_prompt": "中景平视，角色处于动作开始前的稳定状态。",
+        "video_prompt": "0-6秒：角色连续完成当前动作，末0.5秒保持稳定。",
+        "negative_prompt": "身份漂移，服装变化，新增人物，文字，水印",
     }
 
 
@@ -548,6 +559,7 @@ def test_reextract_shots_with_related_active_job_returns_conflict(
     project_record: dict[str, Any],
 ) -> None:
     service = ShotService(database)
+    scene = _create_asset(AssetService(database), project_record["id"], "scene", "测试场景")
     first = _create_shot(service, project_record["id"], action="原第一镜")
     obsolete = _create_shot(service, project_record["id"], action="原第二镜")
     video_id = "reextract-active-video"
@@ -559,13 +571,41 @@ def test_reextract_shots_with_related_active_job_returns_conflict(
             project_record,
             "novel",
             {"scope": "all"},
-            [_extracted_shot()],
+            [_extracted_shot(scene["id"])],
         )
 
     assert exc_info.value.status_code == 409
     assert [item["action"] for item in service.list(project_record["id"])] == [
         first["action"],
         obsolete["action"],
+    ]
+
+
+def test_reextract_more_shots_than_existing_renumbers_without_conflict(
+    database: Database,
+    project_record: dict[str, Any],
+) -> None:
+    service = ShotService(database)
+    scene = _create_asset(AssetService(database), project_record["id"], "scene", "测试场景")
+    _create_shot(service, project_record["id"], action="原第一镜")
+
+    result = service._save_extracted(
+        project_record,
+        "novel",
+        {"scope": "all"},
+        [
+            _extracted_shot(scene["id"], "重新提取第一镜"),
+            _extracted_shot(scene["id"], "重新提取第二镜"),
+        ],
+    )
+
+    assert result["count"] == 2
+    assert [
+        (item["shot_no"], item["shot_order"], item["action"])
+        for item in service.list(project_record["id"])
+    ] == [
+        (1, 1, "重新提取第一镜"),
+        (2, 2, "重新提取第二镜"),
     ]
 
 

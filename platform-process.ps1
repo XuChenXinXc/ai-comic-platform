@@ -240,6 +240,12 @@ function Test-SnapshotsMatch {
         ) -gt 1000) {
         return $false
     }
+    if ([string]::IsNullOrWhiteSpace([string]$Expected.Executable) -or
+        [string]::IsNullOrWhiteSpace([string]$Actual.Executable) -or
+        [string]::IsNullOrWhiteSpace([string]$Expected.Command) -or
+        [string]::IsNullOrWhiteSpace([string]$Actual.Command)) {
+        return $false
+    }
     if (-not [string]::Equals(
             (Get-NormalizedPath -Path $Expected.Executable),
             (Get-NormalizedPath -Path $Actual.Executable),

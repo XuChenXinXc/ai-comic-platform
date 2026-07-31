@@ -8,6 +8,7 @@ interface ProjectResponse {
 interface JobResponse {
   id: string;
   status: string;
+  error?: string;
 }
 
 interface BatchResponse {
@@ -36,6 +37,11 @@ const terminalJobStatuses = new Set([
   "cancelled",
   "interrupted",
 ]);
+const mockProviderDefaults = {
+  default_text_provider_id: "mock-text",
+  default_image_provider_id: "mock-image",
+  default_video_provider_id: "mock-video",
+};
 
 async function waitForJob(
   request: APIRequestContext,
@@ -62,9 +68,11 @@ async function waitForBatch(
   const jobs = await Promise.all(
     batch.jobs.map((job) => waitForJob(request, job.id)),
   );
-  expect(jobs.map((job) => job.status)).toEqual(
-    jobs.map(() => "completed"),
-  );
+  for (const job of jobs) {
+    expect(job.status, `${job.id}: ${job.error || "无错误信息"}`).toBe(
+      "completed",
+    );
+  }
 }
 
 async function cleanupProject(
@@ -105,6 +113,16 @@ test("test_create_project_and_open_writing_workspace", async ({
     await expect(
       page.getByRole("heading", { name: "项目小说" }),
     ).toBeVisible();
+    const projectsResponse = await request.get("/api/projects");
+    expect(projectsResponse.status()).toBe(200);
+    const projects = (await projectsResponse.json()) as ProjectResponse[];
+    const project = projects.find((item) => item.name === projectName);
+    expect(project).toBeDefined();
+    const providerResponse = await request.put(`/api/projects/${project!.id}`, {
+      data: mockProviderDefaults,
+    });
+    expect(providerResponse.status()).toBe(200);
+
     await page.getByRole("link", { name: "小说分析与剧本" }).click();
     await expect(
       page.getByRole("heading", { name: "小说分析与剧本" }),
@@ -120,17 +138,64 @@ test("test_create_project_and_open_writing_workspace", async ({
   }
 });
 
-test("test_narrow_viewport_exposes_provider_and_job_navigation", async ({
+test("test_narrow_viewport_exposes_settings_provider_and_job_navigation", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/project");
 
+  await expect(page.getByRole("link", { name: "平台设置" })).toBeVisible();
   await expect(page.getByRole("link", { name: "接口配置" })).toBeVisible();
   await expect(page.getByRole("link", { name: "任务中心" })).toBeVisible();
+  const productionNav = page.getByRole("navigation", {
+    name: "四步生产轨道",
+  });
+  await expect(productionNav.getByRole("link")).toHaveCount(4);
+  await expect(
+    productionNav.getByRole("link", { name: /分镜视频/ }),
+  ).toHaveCount(1);
 });
 
-test("test_all_nine_pages_render_without_console_errors", async ({
+test("test_active_job_status_persists_across_pages_and_hides_after_completion", async ({
+  page,
+  request,
+}) => {
+  const projectName = `E2E-任务状态-${Date.now()}`;
+
+  try {
+    const projectResponse = await request.post("/api/projects", {
+      data: {
+        name: projectName,
+        source_text: "林昭在雨夜推开旧剧院的门。",
+        ...mockProviderDefaults,
+      },
+    });
+    expect(projectResponse.status()).toBe(201);
+    const project = (await projectResponse.json()) as ProjectResponse;
+
+    await page.goto("/project");
+    await page.getByLabel("选择项目").selectOption(project.id);
+
+    const jobResponse = await request.post(
+      `/api/projects/${project.id}/analysis/generate`,
+      { data: { params: { delay_sec: 4 } } },
+    );
+    expect(jobResponse.status()).toBe(202);
+    const job = (await jobResponse.json()) as JobResponse;
+    await page.reload();
+    const taskStatus = page.getByRole("status").filter({ hasText: "小说分析" });
+
+    await expect(taskStatus).toBeVisible();
+    await page.goto("/assets");
+    await expect(taskStatus).toBeVisible();
+    expect((await waitForJob(request, job.id)).status).toBe("completed");
+    await expect(taskStatus).toHaveCount(0, { timeout: 5_000 });
+  } finally {
+    await cleanupProject(request, projectName);
+  }
+});
+
+test("test_all_ten_pages_render_without_console_errors", async ({
   page,
   request,
 }) => {
@@ -151,18 +216,20 @@ test("test_all_nine_pages_render_without_console_errors", async ({
         image_size: "1920x1080",
         video_size: "16:9",
         default_duration_sec: 6,
+        ...mockProviderDefaults,
       },
     });
     expect(response.ok()).toBeTruthy();
 
     const pages = [
       ["/project", "项目小说"],
-      ["/writing", "小说分析与剧本"],
-      ["/assets", "素材与提示词"],
-      ["/asset-images", "素材图片"],
-      ["/shots", "分镜与提示词"],
-      ["/keyframes", "分镜关键帧"],
+      ["/writing", "剧本生成"],
+      ["/assets", "素材库"],
+      ["/asset-images", "素材库"],
+      ["/shots", "分镜视频"],
+      ["/keyframes", "分镜视频"],
       ["/videos", "分镜视频"],
+      ["/settings", "平台设置"],
       ["/providers", "接口配置"],
       ["/jobs", "任务中心"],
     ] as const;
@@ -184,6 +251,7 @@ test("test_mock_full_pipeline_renders_generated_image_and_video", async ({
   page,
   request,
 }) => {
+  test.setTimeout(240_000);
   const projectName = `E2E-全链路-${Date.now()}`;
   const consoleErrors: string[] = [];
   page.on("console", (message) => {
@@ -202,6 +270,7 @@ test("test_mock_full_pipeline_renders_generated_image_and_video", async ({
         image_size: "1920x1080",
         video_size: "16:9",
         default_duration_sec: 2,
+        ...mockProviderDefaults,
       },
     });
     expect(projectResponse.status()).toBe(201);
@@ -287,12 +356,6 @@ test("test_mock_full_pipeline_renders_generated_image_and_video", async ({
       )).status,
     ).toBe("completed");
 
-    await waitForBatch(
-      request,
-      await request.post(`/api/projects/${project.id}/shots/prompts/batch`, {
-        data: {},
-      }),
-    );
     const shotsResponse = await request.get(
       `/api/projects/${project.id}/shots`,
     );
@@ -348,23 +411,22 @@ test("test_mock_full_pipeline_renders_generated_image_and_video", async ({
 
     await page.goto("/asset-images");
     await expect(
-      page.getByRole("heading", { name: "素材图片", exact: true }),
+      page.getByRole("heading", { name: "素材库", exact: true }),
     ).toBeVisible();
     await expect(
       page.getByRole("img", { name: "主角 参考图", exact: true }),
     ).toBeVisible();
 
-    await page.goto("/keyframes");
+    await page.goto("/shots");
     await expect(
-      page.getByRole("heading", { name: "分镜关键帧", exact: true }),
+      page.getByRole("heading", {
+        name: "分镜视频",
+        exact: true,
+        level: 1,
+      }),
     ).toBeVisible();
     await expect(
       page.getByRole("img", { name: "分镜 1 关键帧", exact: true }),
-    ).toBeVisible();
-
-    await page.goto("/videos");
-    await expect(
-      page.getByRole("heading", { name: "分镜视频", exact: true }),
     ).toBeVisible();
     await expect(page.locator("video")).toHaveCount(1);
 

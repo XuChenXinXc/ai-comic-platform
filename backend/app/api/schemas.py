@@ -3,10 +3,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas import ScreenplayDialogue
+
 AssetType = Literal["character", "scene", "prop"]
 ContentStatus = Literal["draft", "ready", "confirmed", "failed"]
 ProviderKind = Literal["text", "image", "video"]
 ShotSourceType = Literal["novel", "screenplay"]
+ProjectStorageSource = Literal["database", "environment", "default"]
 
 
 def _sensitive_param_path(value: Any, path: str = "params") -> str | None:
@@ -89,6 +92,15 @@ class ProjectUpdate(ApiModel):
     default_text_provider_id: str | None = None
     default_image_provider_id: str | None = None
     default_video_provider_id: str | None = None
+
+
+class ProjectStorageSetting(ApiModel):
+    path: str
+    source: ProjectStorageSource
+
+
+class ProjectStorageSelectionResult(ProjectStorageSetting):
+    selected: bool
 
 
 class GenerateRequest(ApiModel):
@@ -175,7 +187,7 @@ class AssetBatchRequest(GenerateRequest):
 
 
 class ShotExtractRequest(GenerateRequest):
-    source_type: ShotSourceType = "novel"
+    source_type: ShotSourceType = "screenplay"
     scope: Literal["all", "scene"] = "all"
     scene_no: int | None = Field(default=None, ge=1)
 
@@ -188,22 +200,104 @@ class ShotExtractRequest(GenerateRequest):
         return self
 
 
+def _normalize_shot_nested_aliases(value: Any, aliases: dict[str, str]) -> Any:
+    if not isinstance(value, dict):
+        return value
+    normalized = dict(value)
+    for alias, target in aliases.items():
+        if normalized.get(target) in (None, "") and normalized.get(alias) not in (None, ""):
+            normalized[target] = normalized[alias]
+    return normalized
+
+
+class ShotPositionInput(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    character: str = ""
+    position: str = ""
+    facing: str | None = None
+    gaze: str | None = None
+    action_direction: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value: Any) -> Any:
+        return _normalize_shot_nested_aliases(
+            value,
+            {
+                "character_id": "character",
+                "name": "character",
+                "speaker": "character",
+                "character_name": "character",
+                "side": "position",
+                "location": "position",
+                "placement": "position",
+                "direction": "facing",
+                "look": "gaze",
+                "eye_line": "gaze",
+                "movement_direction": "action_direction",
+            },
+        )
+
+
+class ShotExpressionInput(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    character: str = ""
+    expression: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value: Any) -> Any:
+        return _normalize_shot_nested_aliases(
+            value,
+            {
+                "character_id": "character",
+                "name": "character",
+                "speaker": "character",
+                "character_name": "character",
+                "emotion": "expression",
+                "mood": "expression",
+            },
+        )
+
+
+class ShotDialogueInput(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    speaker: str = ""
+    text: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value: Any) -> Any:
+        return _normalize_shot_nested_aliases(
+            value,
+            {
+                "character": "speaker",
+                "name": "speaker",
+                "content": "text",
+                "line": "text",
+            },
+        )
+
+
 class ShotFields(ApiModel):
-    source_type: ShotSourceType = "novel"
+    source_type: ShotSourceType = "screenplay"
     source_ref: str = ""
     scene_asset_id: str | None = None
     character_ids: list[str] = Field(default_factory=list)
     prop_ids: list[str] = Field(default_factory=list)
-    positions: list[dict[str, Any]] = Field(default_factory=list)
+    positions: list[ShotPositionInput] = Field(default_factory=list)
     start_state: str = ""
     action: str = ""
-    expressions: list[dict[str, Any]] = Field(default_factory=list)
-    dialogue: list[dict[str, Any]] = Field(default_factory=list)
+    expressions: list[ShotExpressionInput] = Field(default_factory=list)
+    dialogue: list[ShotDialogueInput] = Field(default_factory=list)
     narration: str = ""
     shot_type: str = ""
     camera_angle: str = ""
     camera_move: str = ""
-    duration_sec: float = Field(default=6, gt=0)
+    duration_sec: float = Field(gt=0)
     end_state: str = ""
     next_hook: str = ""
     frame_description: str = ""
@@ -224,11 +318,11 @@ class ShotUpdate(ApiModel):
     scene_asset_id: str | None = None
     character_ids: list[str] | None = None
     prop_ids: list[str] | None = None
-    positions: list[dict[str, Any]] | None = None
+    positions: list[ShotPositionInput] | None = None
     start_state: str | None = None
     action: str | None = None
-    expressions: list[dict[str, Any]] | None = None
-    dialogue: list[dict[str, Any]] | None = None
+    expressions: list[ShotExpressionInput] | None = None
+    dialogue: list[ShotDialogueInput] | None = None
     narration: str | None = None
     shot_type: str | None = None
     camera_angle: str | None = None
@@ -264,7 +358,7 @@ class ShotSplitPart(ApiModel):
     start_state: str = ""
     end_state: str = ""
     frame_description: str = ""
-    dialogue: list[dict[str, Any]] | None = None
+    dialogue: list[ScreenplayDialogue] | None = None
     narration: str | None = None
     duration_sec: float | None = Field(default=None, gt=0)
 
@@ -326,6 +420,7 @@ class ProviderCreate(ApiModel):
     adapter: str = Field(min_length=1, max_length=100)
     base_url: str = ""
     api_key_env: str = ""
+    api_key: str = Field(default="", max_length=2000)
     model: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     timeout_sec: int = Field(default=120, ge=1)
@@ -341,6 +436,7 @@ class ProviderUpdate(ApiModel):
     adapter: str | None = Field(default=None, min_length=1, max_length=100)
     base_url: str | None = None
     api_key_env: str | None = None
+    api_key: str | None = Field(default=None, max_length=2000)
     model: str | None = None
     params: dict[str, Any] | None = None
     timeout_sec: int | None = Field(default=None, ge=1)

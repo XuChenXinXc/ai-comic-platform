@@ -2,14 +2,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "../api/client";
 import type { Asset, Shot } from "../types/api";
-import { AssetImagesPage } from "./AssetImagesPage";
 import { AssetsPage } from "./AssetsPage";
-import { KeyframesPage } from "./KeyframesPage";
 import { ShotsPage } from "./ShotsPage";
-import { VideosPage } from "./VideosPage";
 
 const projectState = vi.hoisted(() => ({ id: "project-1" }));
 
@@ -59,6 +57,7 @@ const asset = {
   asset_type: "character",
   name: "林昭",
   prompt: "角色提示词",
+  compiled_prompt: "角色完整设定模板",
 } as Asset;
 const shot = {
   id: "shot-1",
@@ -66,6 +65,7 @@ const shot = {
   shot_no: 1,
   shot_order: 1,
   action: "推开旧剧院的门",
+  image_prompt: "",
 } as Shot;
 
 function renderPage(page: ReactNode) {
@@ -76,7 +76,9 @@ function renderPage(page: ReactNode) {
     },
   });
   return render(
-    <QueryClientProvider client={queryClient}>{page}</QueryClientProvider>,
+    <MemoryRouter>
+      <QueryClientProvider client={queryClient}>{page}</QueryClientProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -94,34 +96,13 @@ beforeEach(() => {
 
 describe("切换项目清空批量选择", () => {
   test.each([
-    ["素材页", <AssetsPage />, "checkbox", "选择 林昭", /生成所选提示词（1）/],
-    [
-      "素材图片页",
-      <AssetImagesPage />,
-      "checkbox",
-      "选择 林昭",
-      /生成所选（1）/,
-    ],
+    ["素材库", <AssetsPage />, "checkbox", "选择 林昭", /生成所选素材图（1）/],
     [
       "分镜页",
       <ShotsPage />,
       "checkbox",
       "选择分镜 1",
-      /生成所选提示词（1）/,
-    ],
-    [
-      "关键帧页",
-      <KeyframesPage />,
-      "button",
-      "选择分镜 1",
-      /生成所选（1）/,
-    ],
-    [
-      "视频页",
-      <VideosPage />,
-      "button",
-      "选择分镜 1",
-      /生成所选（1）/,
+      /生成所选关键帧（1）/,
     ],
   ])(
     "test_%s_switch_project_clears_selection",
@@ -138,18 +119,20 @@ describe("切换项目清空批量选择", () => {
 
       projectState.id = "project-2";
       view.rerender(
-        <QueryClientProvider
-          client={
-            new QueryClient({
-              defaultOptions: {
-                queries: { retry: false },
-                mutations: { retry: false },
-              },
-            })
-          }
-        >
-          {page}
-        </QueryClientProvider>,
+        <MemoryRouter>
+          <QueryClientProvider
+            client={
+              new QueryClient({
+                defaultOptions: {
+                  queries: { retry: false },
+                  mutations: { retry: false },
+                },
+              })
+            }
+          >
+            {page}
+          </QueryClientProvider>
+        </MemoryRouter>,
       );
 
       await waitFor(() => {

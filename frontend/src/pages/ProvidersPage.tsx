@@ -58,6 +58,7 @@ function blankProvider(kind: ProviderKind): ProviderInput {
     adapter: "mock",
     base_url: "",
     api_key_env: "",
+    api_key: "",
     model: "mock-v1",
     params: {},
     timeout_sec: 120,
@@ -74,8 +75,6 @@ export function ProvidersPage() {
   const [form, setForm] = useState<ProviderInput>(blankProvider("text"));
   const [paramsText, setParamsText] = useState("{}");
   const [paramsError, setParamsError] = useState("");
-  const apiKeyEnvPrefix = form.kind.toUpperCase();
-
   const query = useQuery({
     queryKey: queryKeys.providers,
     queryFn: () => api.providers.list(),
@@ -142,6 +141,7 @@ export function ProvidersPage() {
       adapter: provider.adapter,
       base_url: provider.base_url,
       api_key_env: provider.api_key_env,
+      api_key: "",
       model: provider.model,
       params,
       timeout_sec: provider.timeout_sec,
@@ -158,7 +158,7 @@ export function ProvidersPage() {
       <PageHeader
         eyebrow="Workspace / Providers"
         title="接口配置"
-        description="文字、图片与视频 Provider 独立配置。密钥正文只从本机环境变量读取，数据库仅记录变量名。"
+        description="文字、图片与视频 Provider 独立配置。API Key 直接加密保存在本机，不需要手动维护环境变量。"
         actions={
           <Button variant="primary" onClick={() => openNew()}>
             <Plus className="h-4 w-4" />
@@ -277,9 +277,15 @@ export function ProvidersPage() {
                 </dd>
               </div>
               <div>
-                <dt className="text-xs text-muted">密钥环境变量</dt>
+                <dt className="text-xs text-muted">API Key 状态</dt>
                 <dd className="mt-1 truncate font-mono text-xs font-semibold">
-                  {provider.api_key_env || "无需密钥"}
+                  {provider.api_key_configured
+                    ? provider.api_key_source === "direct"
+                      ? "已配置 API Key"
+                      : provider.api_key_env
+                        ? `环境变量：${provider.api_key_env}`
+                        : "已配置"
+                    : "未配置"}
                 </dd>
               </div>
               <div className="sm:col-span-2">
@@ -413,21 +419,23 @@ export function ProvidersPage() {
             />
           </div>
           <div className="sm:col-span-2">
-            <Label htmlFor="provider-key-env">API Key 环境变量名</Label>
+            <Label htmlFor="provider-api-key">API Key</Label>
             <Input
-              id="provider-key-env"
-              value={form.api_key_env}
-              placeholder={`${apiKeyEnvPrefix}_API_KEY`}
+              id="provider-api-key"
+              type="password"
+              value={form.api_key || ""}
+              placeholder="直接输入 API Key"
+              autoComplete="new-password"
               spellCheck={false}
               onChange={(event) =>
                 setForm((current) => ({
                   ...current,
-                  api_key_env: event.target.value,
+                  api_key: event.target.value,
                 }))
               }
             />
             <p className="mt-1.5 text-xs text-muted">
-              这里只填写变量名，不要粘贴密钥正文。格式：{apiKeyEnvPrefix}_API_KEY 或 {apiKeyEnvPrefix}_PROVIDER_API_KEY。
+              直接填写密钥。保存后不会再次显示；编辑时留空表示保留已保存的 Key。
             </p>
           </div>
           <div>

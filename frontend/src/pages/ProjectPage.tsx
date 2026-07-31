@@ -23,7 +23,7 @@ const emptyProject: ProjectInput = {
   style_prompt:
     "电影感国风二维漫剧，克制线条，稳定人物比例，细腻自然光影，统一色彩叙事",
   aspect_ratio: "16:9",
-  image_size: "1920x1080",
+  image_size: "3840x2160",
   video_size: "16:9",
   default_duration_sec: 6,
   default_text_provider_id: null,
@@ -57,10 +57,10 @@ export function ProjectPage() {
         name: activeProject.name,
         source_text: activeProject.source_text,
         style_prompt: activeProject.style_prompt,
-        aspect_ratio: activeProject.aspect_ratio,
-        image_size: activeProject.image_size,
-        video_size: activeProject.video_size,
-        default_duration_sec: activeProject.default_duration_sec,
+        aspect_ratio: "16:9",
+        image_size: "3840x2160",
+        video_size: "16:9",
+        default_duration_sec: 6,
         default_text_provider_id: activeProject.default_text_provider_id,
         default_image_provider_id: activeProject.default_image_provider_id,
         default_video_provider_id: activeProject.default_video_provider_id,
@@ -133,7 +133,7 @@ export function ProjectPage() {
       <PageHeader
         eyebrow="Step 01 / Source"
         title={creating ? "创建漫剧项目" : "项目小说"}
-        description="把小说原文、统一画风与生成基准集中在一个地方。修改小说后，后续内容会保留并标记来源变化。"
+        description="集中管理小说原文与默认生成接口。修改小说后，后续内容会保留并标记来源变化。"
         actions={
           <>
             {!creating ? (
@@ -206,6 +206,20 @@ export function ProjectPage() {
                 onChange={(event) => setField("name", event.target.value)}
               />
             </div>
+            {!creating && activeProject ? (
+              <div>
+                <Label htmlFor="project-storage-path">项目存储路径</Label>
+                <Input
+                  id="project-storage-path"
+                  value={activeProject.storage_path}
+                  readOnly
+                  title={activeProject.storage_path}
+                />
+                <p className="mt-2 text-xs leading-5 text-muted">
+                  角色、物品、场景、分镜关键帧和分镜视频会分别存放在该目录的子文件夹中。
+                </p>
+              </div>
+            ) : null}
             <div>
               <div className="mb-1.5 flex items-center justify-between">
                 <Label htmlFor="source-text" className="mb-0">
@@ -224,76 +238,10 @@ export function ProjectPage() {
                 onChange={(event) => setField("source_text", event.target.value)}
               />
             </div>
-            <div>
-              <Label htmlFor="style-prompt">统一画风 STYLE_ANCHOR</Label>
-              <Textarea
-                id="style-prompt"
-                value={form.style_prompt}
-                rows={4}
-                placeholder="描述整个项目唯一且稳定的画面语言…"
-                onChange={(event) => setField("style_prompt", event.target.value)}
-              />
-              <p className="mt-2 text-xs leading-5 text-muted">
-                该画风会编译进所有素材图、关键帧和视频提示词。
-              </p>
-            </div>
           </div>
         </Card>
 
         <div className="space-y-6">
-          <Card className="p-5 sm:p-6">
-            <h2 className="font-bold">生产基准</h2>
-            <div className="mt-5 grid grid-cols-2 gap-4">
-              <div>
-                <Label htmlFor="aspect-ratio">画面比例</Label>
-                <Select
-                  id="aspect-ratio"
-                  value={form.aspect_ratio}
-                  onChange={(event) => setField("aspect_ratio", event.target.value)}
-                >
-                  <option value="16:9">16:9 横屏</option>
-                  <option value="9:16">9:16 竖屏</option>
-                  <option value="1:1">1:1 方形</option>
-                  <option value="4:3">4:3</option>
-                </Select>
-              </div>
-              <div>
-                <Label htmlFor="default-duration">默认镜头时长</Label>
-                <Input
-                  id="default-duration"
-                  type="number"
-                  min={0.5}
-                  step={0.5}
-                  value={form.default_duration_sec}
-                  onChange={(event) =>
-                    setField(
-                      "default_duration_sec",
-                      Number(event.target.value) || 0,
-                    )
-                  }
-                />
-              </div>
-              <div>
-                <Label htmlFor="image-size">图片尺寸</Label>
-                <Input
-                  id="image-size"
-                  value={form.image_size}
-                  placeholder="1920x1080"
-                  onChange={(event) => setField("image_size", event.target.value)}
-                />
-              </div>
-              <div>
-                <Label htmlFor="video-size">视频尺寸 / 比例</Label>
-                <Input
-                  id="video-size"
-                  value={form.video_size}
-                  placeholder="16:9"
-                  onChange={(event) => setField("video_size", event.target.value)}
-                />
-              </div>
-            </div>
-          </Card>
-
           <Card className="p-5 sm:p-6">
             <div className="flex items-center justify-between gap-3">
               <h2 className="font-bold">默认接口</h2>
@@ -345,14 +293,14 @@ export function ProjectPage() {
             <Card className="p-5 sm:p-6">
               <h2 className="font-bold">下一步</h2>
               <p className="mt-2 text-sm leading-6 text-muted">
-                保存小说后，进入文字工作台生成分析与可编辑剧本。
+                保存小说后，进入剧本生成；小说分析会在后台自动完成。
               </p>
               <Button
                 className="mt-4 w-full"
                 variant="primary"
                 onClick={() => navigate("/writing")}
               >
-                进入小说分析与剧本
+                进入剧本生成
                 <ArrowRight className="h-4 w-4" />
               </Button>
             </Card>
