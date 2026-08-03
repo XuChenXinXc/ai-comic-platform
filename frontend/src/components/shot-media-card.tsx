@@ -162,6 +162,18 @@ export function ShotMediaCard({
     onError: (error) => toast.error(formatError(error)),
   });
 
+  const optimizeMutation = useMutation({
+    mutationFn: () =>
+      api.shots.optimizeVideoPrompt(shot.id, { prompt: prompt.trim() }),
+    onSuccess: async (result) => {
+      // 只回填编辑框，不更新 baseline：优化结果保持「未保存」状态，
+      // 保存按钮恢复可用，用户检查后点保存才写入 override。
+      setPrompt(result.prompt);
+      toast.success("提示词已优化，请检查后保存");
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
   const uploadMutation = useMutation({
     mutationFn: (file: File) =>
       kind === "keyframe"
@@ -221,13 +233,18 @@ export function ShotMediaCard({
     ),
   );
   const missingSceneAsset = !shot.scene_asset_id;
+  const missingReferenceAssetIds = selectedAssetIds.filter(
+    (assetId) => !boundAssetIds.has(assetId),
+  );
+  const missingReferenceLabels = missingReferenceAssetIds
+    .map((assetId) => assetMap.get(assetId)?.name || assetId)
+    .filter(Boolean);
   const missingAssetReference =
-    selectedAssetIds.length === 0 ||
-    selectedAssetIds.some((assetId) => !boundAssetIds.has(assetId));
+    selectedAssetIds.length === 0 || missingReferenceAssetIds.length > 0;
   const assetBindingNotice = missingSceneAsset
     ? "尚未绑定场景素材，图片和视频生成暂不可用；请先到分镜编辑中绑定场景素材。"
     : missingAssetReference
-      ? "素材参考图未就绪，图片和视频生成暂不可用；请先到分镜编辑中绑定素材，并确保素材已有当前图片。"
+      ? `素材参考图未就绪（${missingReferenceLabels.join("、")}），图片和视频生成暂不可用；请先到素材库为这些素材生成或上传图片。`
       : "";
   const currentKeyframe = (keyframesQuery.data || []).find(
     (version) => version.is_current && version.status === "completed",
@@ -339,16 +356,34 @@ export function ShotMediaCard({
               <Label className="mb-0">
                 {kind === "keyframe" ? "最终关键帧提示词" : "最终视频提示词"}
               </Label>
-              <Button
-                size="sm"
-                variant="ghost"
-                busy={promptMutation.isPending}
-                disabled={generateMutation.isPending || prompt === promptBaseline}
-                onClick={() => promptMutation.mutate(prompt)}
-              >
-                <Save className="h-3.5 w-3.5" />
-                保存
-              </Button>
+              <div className="flex items-center gap-2">
+                {kind === "video" ? (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    busy={optimizeMutation.isPending}
+                    disabled={
+                      promptMutation.isPending ||
+                      generateMutation.isPending ||
+                      promptMissing
+                    }
+                    onClick={() => optimizeMutation.mutate()}
+                  >
+                    <WandSparkles className="h-3.5 w-3.5" />
+                    优化提示词
+                  </Button>
+                ) : null}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  busy={promptMutation.isPending}
+                  disabled={generateMutation.isPending || prompt === promptBaseline}
+                  onClick={() => promptMutation.mutate(prompt)}
+                >
+                  <Save className="h-3.5 w-3.5" />
+                  保存
+                </Button>
+              </div>
             </div>
             <Textarea
               rows={kind === "keyframe" ? 9 : 11}

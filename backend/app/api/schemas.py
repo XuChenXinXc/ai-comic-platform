@@ -110,6 +110,22 @@ class GenerateRequest(ApiModel):
     _validate_params = field_validator("params")(_validate_public_params)
 
 
+class VideoPromptOptimizeRequest(ApiModel):
+    prompt: str = Field(min_length=1, max_length=8000)
+    provider_id: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+
+    _validate_params = field_validator("params")(_validate_public_params)
+
+
+class VideoPromptOptimizeAllRequest(ApiModel):
+    ids: list[str] | None = None
+    provider_id: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+
+    _validate_params = field_validator("params")(_validate_public_params)
+
+
 class TextContentUpdate(ApiModel):
     content: dict[str, Any] | None = None
     content_json: dict[str, Any] | None = None

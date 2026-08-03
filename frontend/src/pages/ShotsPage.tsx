@@ -267,6 +267,32 @@ export function ShotsPage() {
     onError: (error) => toast.error(formatError(error)),
   });
 
+  const optimizeAllMutation = useMutation({
+    mutationFn: () =>
+      api.shots.optimizeVideoPromptsAll(activeProjectId, { ids: batchIds }),
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      const failures = result.preflight_failures ?? [];
+      if (failures.length) {
+        const description = failures
+          .map(({ target_id, error }) => {
+            const shot = shots.find((item) => item.id === target_id);
+            return `分镜 ${shot?.shot_no ?? target_id}：${error}`;
+          })
+          .join("；");
+        toast.warning(
+          `已入队 ${result.jobs.length} 个优化任务，跳过 ${failures.length} 项`,
+          { description },
+        );
+        return;
+      }
+      toast.success(`已入队 ${result.jobs.length} 个优化任务，完成后自动写入各分镜`);
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
   const exportZip = async () => {
     if (!activeProject) return;
     setExporting(true);
@@ -568,6 +594,31 @@ export function ShotsPage() {
                   : scope === "scene"
                     ? "生成当前场次视频"
                     : "生成全部视频"}
+              </Button>
+              <Button
+                variant="secondary"
+                busy={optimizeAllMutation.isPending}
+                disabled={batchDisabled}
+                onClick={() => {
+                  const rangeLabel = selected.size
+                    ? `所选 ${selected.size} 个分镜`
+                    : scope === "scene"
+                      ? "当前场次分镜"
+                      : "全部分镜";
+                  const confirmed = window.confirm(
+                    `一键优化${rangeLabel}的视频提示词？\n\n` +
+                      "将调用文字模型逐个优化并自动写入各分镜（覆盖已保存的自定义提示词），" +
+                      "无提示词的分镜自动跳过。",
+                  );
+                  if (confirmed) optimizeAllMutation.mutate();
+                }}
+              >
+                <WandSparkles className="h-4 w-4" />
+                {selected.size
+                  ? `一键优化所选提示词（${selected.size}）`
+                  : scope === "scene"
+                    ? "一键优化当前场次提示词"
+                    : "一键优化全部提示词"}
               </Button>
             </div>
           </div>

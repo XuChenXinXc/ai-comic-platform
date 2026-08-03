@@ -510,6 +510,12 @@ class ShotVideoPromptOutput(OutputModel):
     continuity_notes: list[str]
 
 
+class ShotVideoPromptOptimizeOutput(OutputModel):
+    plain_text_output_field: ClassVar[str] = "prompt"
+
+    prompt: NonEmptyText
+
+
 class AssetReferenceBinding(OutputModel):
     role: Literal["character_identity", "scene_layout", "prop_identity"]
     asset_id: str

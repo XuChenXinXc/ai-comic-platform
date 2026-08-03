@@ -492,6 +492,7 @@ class MediaService:
             ),
             params,
             record["reference_files_json"],
+            bool(input_data.get("reference_mode")),
         )
 
     def _keyframe_expected_signature(
@@ -756,7 +757,9 @@ class MediaService:
             negative_prompt=negative_prompt,
             consistency_keywords=current["consistency_keywords"],
             composition=current["composition"],
+            reference_mode=bool(options.get("reference_mode")),
         )
+        reference_mode = bool(options.get("reference_mode"))
         version = self._insert_version(
             table=asset_image,
             parent_column="asset_id",
@@ -777,6 +780,7 @@ class MediaService:
                     config["model"],
                     params,
                     references,
+                    reference_mode,
                 ),
                 "source": "generated",
                 "error": "",
@@ -793,6 +797,7 @@ class MediaService:
                 "asset_id": asset_id,
                 "provider_updated_at": str(config.get("updated_at") or ""),
                 "params": request_params,
+                "reference_mode": reference_mode,
             },
             batch_id=options.get("_batch_id"),
         )
@@ -1730,13 +1735,19 @@ class MediaService:
             else:
                 current = self._shot(version["shot_id"])
                 project_id = current["project_id"]
-                references = [
-                    path
-                    for path, _ in self._binding_reference_items(
-                        project_id,
-                        version["reference_bindings_json"],
+                bound_items = self._binding_reference_items(
+                    project_id,
+                    version.get("reference_bindings") or [],
+                )
+                references = [path for path, _ in bound_items]
+                if (version.get("reference_bindings") or []) and len(bound_items) < len(
+                    version.get("reference_bindings") or []
+                ):
+                    # 参考图绑定存在但文件缺失/记录失效：不允许静默降级（含部分缺失）
+                    raise conflict(
+                        "关键帧参考图文件缺失或失效（分镜已绑定素材图，但磁盘文件不存在或"
+                        "记录无法解析），请先在素材库重新生成或上传图片后重试"
                     )
-                ]
                 target = file_service.keyframe_path(
                     project_id,
                     current["id"],

@@ -18,20 +18,30 @@ JSON Schema 的对象，不要输出 Markdown 或额外说明。
    - 每个分镜只绑定目录中存在且当前镜真实涉及的关键物品，不绑定其他镜头的物品；
    - 不得编造目录中不存在的素材 ID。
 7. `duration_sec` 必须填写大于 0 的整数秒，并由本镜动作、对白和镜头调度决定。
+   若供应商存在最低生成时长（如 6 秒），本镜时长仍按剧情需要填写，
+   模板会在编译时自动补齐生成时长，并在提示词中区分「剪辑使用时长」与「生成时长」。
 8. 每个分镜必须在同一次提取中补齐 `image_prompt`、`video_prompt` 和
    `negative_prompt`，不得留空：
    - `image_prompt` 描述动作发生前约 0.2-0.5 秒或动作刚开始的稳定首帧，
      明确人物、场景、物品、构图、灯光和环境细节，不得提前画出动作结果；
+     画面中人物处于动作尚未开始的静止状态，例如「站在屋檐下」而不是
+     「跑进屋檐后站在屋檐下」；
    - `video_prompt` 按当前 `duration_sec` 写成可直接执行的时间轴，包含连续动作、
      角色表演、镜头变化、结束状态及必要的环境声/音效信息；
-   - `negative_prompt` 写明本镜身份、服装、空间、道具和画面稳定性禁止事项。
-9. 以上三个字段只填写当前分镜的具体内容，后端会自动套用固定的分镜图片与视频
-   V2 模板；不要输出 Markdown，不要在字段中重复模板标题。
-10. `positions`、`expressions`、`dialogue` 必须使用以下标准对象结构，不得改用别名：
+   - `negative_prompt` 写明本镜身份、服装、空间、道具和画面稳定性禁止事项；
+     使用「禁止出现：A、B、C」的统一格式，不用「不要出现X，不要出现Y」的重复句式。
+9. `dialogue` 只记录画面内真实开口说话的角色台词。录音笔播放、旁白、
+   画外音、内心独白等非画面内对白，必须放入 `narration` 字段
+   （speaker 注明「录音」或「旁白」），不得写入 `dialogue`；
+   画面内需要展示的缴费单、笔记、招牌等文字内容，只保留在
+   `action`、`frame_description` 的「后期叠字」说明中，不得要求生成画面文字。
+10. 以上三个字段只填写当前分镜的具体内容，后端会自动套用固定的分镜图片与视频
+    V2 模板；不要输出 Markdown，不要在字段中重复模板标题。
+11. `positions`、`expressions`、`dialogue` 必须使用以下标准对象结构，不得改用别名：
     - `positions`：`{"character":"角色名","position":"画面位置",`
       `"facing":"身体朝向","gaze":"视线目标","action_direction":"动作方向"}`；
       后三个字段没有内容时可省略；
     - `expressions`：`{"character":"角色名","expression":"明确可见的表情"}`；
     - `dialogue`：`{"speaker":"角色名","text":"完整台词内容"}`。
-11. `scene_asset_id`、`character_asset_ids`、`prop_asset_ids` 三个字段都必须输出；
+12. `scene_asset_id`、`character_asset_ids`、`prop_asset_ids` 三个字段都必须输出；
     角色或物品为空时输出空数组，数组内不得包含空字符串或重复 ID。

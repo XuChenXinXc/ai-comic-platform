@@ -390,6 +390,22 @@ export const api = {
       request<Job>(`/shots/${id}/image-prompt/generate`, json("POST", body)),
     generateVideoPrompt: (id: string, body: Record<string, unknown> = {}) =>
       request<Job>(`/shots/${id}/video-prompt/generate`, json("POST", body)),
+    optimizeVideoPrompt: (
+      id: string,
+      body: { prompt: string; provider_id?: string | null; params?: Record<string, unknown> },
+    ) =>
+      request<{ shot_id: string; original: string; prompt: string }>(
+        `/shots/${id}/video-prompt/optimize`,
+        json("POST", body),
+      ),
+    optimizeVideoPromptsAll: (
+      projectId: string,
+      body: { ids?: string[]; provider_id?: string | null; params?: Record<string, unknown> } = {},
+    ) =>
+      request<BatchResponse>(
+        `/projects/${projectId}/video-prompts/optimize-all`,
+        json("POST", body),
+      ),
     batchPrompts: (
       projectId: string,
       body: { ids?: string[]; prompt_types?: Array<"image" | "video"> } = {},

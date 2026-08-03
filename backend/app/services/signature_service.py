@@ -139,6 +139,7 @@ def asset_image_signature(
     model: str,
     params: Mapping[str, Any],
     reference_files: Sequence[str | Path],
+    reference_mode: bool = False,
 ) -> str:
     return calculate_signature(
         asset_own_signature,
@@ -146,6 +147,7 @@ def asset_image_signature(
         model,
         params,
         _reference_fingerprints(reference_files),
+        "clean_reference" if reference_mode else "setting_sheet",
     )
 
 

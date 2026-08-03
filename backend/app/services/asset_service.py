@@ -12,7 +12,7 @@ from app.schemas import AssetExtractionOutput, AssetPromptOutput
 from app.services.errors import bad_request, conflict, not_found
 from app.services.file_service import file_service, project_media_url
 from app.services.job_service import JobService
-from app.services.prompt_service import compile_asset_prompt, resolve_asset_negative_prompt
+from app.services.prompt_service import compile_asset_prompt
 from app.services.provider_service import ProviderService
 from app.services.signature_service import (
     SHOT_SIGNATURE_FIELDS,
@@ -564,10 +564,9 @@ class AssetService:
         profile.pop("name", None)
         importance = profile.pop("importance", "normal")
         prompt = str(profile.pop("prompt", "")).strip()
-        negative_prompt = resolve_asset_negative_prompt(
-            asset_type,
-            str(profile.pop("negative_prompt", "")).strip(),
-        )
+        # 负向提示词存储 LLM 原始内容；默认约束（多人/单件/无文字/非摄影等）
+        # 在编译素材提示词时统一合并，避免存储阶段丢失或重复默认项。
+        negative_prompt = str(profile.pop("negative_prompt", "")).strip()
         consistency_keywords = [
             str(item).strip()
             for item in profile.pop("consistency_keywords", [])

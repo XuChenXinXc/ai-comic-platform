@@ -25,6 +25,7 @@ from app.schemas import (
     ScreenplayOutput,
     ShotExtractionOutput,
     ShotImagePromptOutput,
+    ShotVideoPromptOptimizeOutput,
     ShotVideoPromptOutput,
     VisualStyleOutput,
 )
@@ -254,6 +255,13 @@ class MockTextProvider:
                     {"start_sec": 2, "end_sec": 6, "action": "停下并观察"},
                 ],
                 "continuity_notes": ["保持角色身份、服装和画面方向不变"],
+            }
+        if schema is ShotVideoPromptOptimizeOutput:
+            return {
+                "prompt": (
+                    "0-2秒：主角向前走；2-4秒：停下观察；4-5秒：视线转向画外。"
+                    "固定机位，画面变化由人物动作推动。"
+                ),
             }
         return self._generic_model_payload(schema)
 

@@ -874,6 +874,50 @@ def test_gpt_image_2_x5_multipart_retry_resends_complete_reference(
         return response
 
     monkeypatch.setattr(requests, "request", fake_request)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="角色基础设定图",
+            negative_prompt="",
+            reference_files=[reference],
+            params={"size": "3840x2560"},
+        )
+    )
+
+    # POST 允许重试：第一次连接被重置后自动重试，第二次成功；
+    # 重试时 multipart 参考文件重新读取，两次发送内容完整一致。
+    assert sent_contents == [b"complete-reference", b"complete-reference"]
+    assert submission.status == "completed"
+
+
+def test_gpt_image_2_x5_multipart_retry_can_be_disabled_by_params(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider 配置 params 显式传 retry_unsafe_methods=false 时，POST 不重试（兼容行为）。"""
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-gpt-x5",
+            kind="image",
+            adapter="http_image",
+            base_url="https://api.x5m5x.com/v1",
+            model="gpt-image-2",
+            max_retries=1,
+            params={"retry_unsafe_methods": False},
+        )
+    )
+    reference = tmp_path / "character.png"
+    reference.write_bytes(b"complete-reference")
+    sent_contents: list[bytes] = []
+    failures = 0
+
+    def fake_request(_method: str, _url: str, **kwargs: Any) -> requests.Response:
+        nonlocal failures
+        failures += 1
+        value = kwargs["files"][0][1][1]
+        sent_contents.append(value.read() if hasattr(value, "read") else value)
+        raise requests.ConnectionError("connection reset")
+
+    monkeypatch.setattr(requests, "request", fake_request)
     with pytest.raises(ProviderError, match="Provider 请求失败"):
         asyncio.run(
             provider.submit(
@@ -884,6 +928,7 @@ def test_gpt_image_2_x5_multipart_retry_resends_complete_reference(
             )
         )
 
+    assert failures == 1
     assert sent_contents == [b"complete-reference"]
 
 

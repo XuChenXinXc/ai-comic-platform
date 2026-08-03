@@ -175,6 +175,15 @@ class JobService:
             raise conflict(str(exc)) from exc
         return self._public_record(record)
 
+    def update_progress(
+        self,
+        job_id: str,
+        current: int,
+        total: int | None = None,
+        message: str = "",
+    ) -> None:
+        self.repository.update_progress(job_id, current, total=total, message=message)
+
     def _sync_cancelled_target(
         self,
         record: dict[str, Any],

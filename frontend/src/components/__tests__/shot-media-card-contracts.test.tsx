@@ -378,7 +378,7 @@ describe("分镜媒体显式提示词门禁", () => {
     );
 
     expect(screen.getByRole("button", { name: "生成新版本" })).toBeDisabled();
-    expect(screen.getByText(/请先到分镜编辑中绑定素材/)).toBeInTheDocument();
+    expect(screen.getByText(/素材参考图未就绪/)).toBeInTheDocument();
     expect(screen.queryByText(/纯文字降级/)).not.toBeInTheDocument();
   });
 
@@ -393,7 +393,7 @@ describe("分镜媒体显式提示词门禁", () => {
     );
 
     expect(screen.getByRole("button", { name: "生成新版本" })).toBeDisabled();
-    expect(screen.getByText(/请先到分镜编辑中绑定素材/)).toBeInTheDocument();
+    expect(screen.getByText(/素材参考图未就绪/)).toBeInTheDocument();
   });
 
   test.each(["keyframe", "video"] as const)(

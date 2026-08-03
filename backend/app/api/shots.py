@@ -10,6 +10,8 @@ from app.api.schemas import (
     ShotReorderRequest,
     ShotSplitRequest,
     ShotUpdate,
+    VideoPromptOptimizeAllRequest,
+    VideoPromptOptimizeRequest,
 )
 from app.dependencies import get_shot_service
 from app.services.shot_service import ShotService
@@ -122,6 +124,32 @@ def generate_shot_video_prompt(
     service: ShotService = Depends(get_shot_service),
 ) -> dict:
     return service.queue_prompt(shot_id, "video", body.model_dump())
+
+
+@router.post("/shots/{shot_id}/video-prompt/optimize")
+async def optimize_shot_video_prompt(
+    shot_id: str,
+    body: VideoPromptOptimizeRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return await service.optimize_video_prompt(
+        shot_id,
+        prompt=body.prompt,
+        provider_id=body.provider_id,
+        params=body.params,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/video-prompts/optimize-all",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def optimize_project_video_prompts(
+    project_id: str,
+    body: VideoPromptOptimizeAllRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return service.queue_video_prompt_optimize_batch(project_id, body.model_dump())
 
 
 @router.post(

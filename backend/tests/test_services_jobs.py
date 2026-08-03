@@ -719,6 +719,104 @@ def test_keyframe_job_auto_binds_current_asset_image_as_reference(
     assert result["version_id"] == queued["target_id"]
 
 
+def test_keyframe_queued_with_missing_asset_image_file_reports_error(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """素材图文件缺失时生成关键帧必须明确报错，不能静默降级为纯文字。
+
+    注：该用例命中入队阶段的既有校验（_resolve_shot_reference_bindings），
+    作为回归保护；新增的执行阶段校验见
+    test_keyframe_execution_with_reference_files_deleted_reports_error。
+    """
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    character = AssetService(database, jobs).create(
+        project["id"],
+        {
+            "asset_type": "character",
+            "name": "林风",
+            "prompt": "黑发少年剑修",
+        },
+    )
+    media.upload_asset_image(
+        character["id"],
+        "character.png",
+        "image/png",
+        _PNG,
+    )
+    # 模拟素材图文件丢失：删除磁盘文件但保留 DB 记录
+    project_dir = file_service.projects_dir / "媒体任务测试"
+    for path in [path for path in project_dir.rglob("*") if path.is_file()]:
+        path.unlink()
+    current_shot = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            character_ids=[character["id"]],
+            action="林风站在山门石阶上",
+            image_prompt="林风站在山门石阶中央。",
+        ).model_dump(),
+    )
+    with pytest.raises(ServiceError) as excinfo:
+        media.queue_keyframe(current_shot["id"], {})
+    assert excinfo.value.status_code == 409
+    assert "林风" in str(excinfo.value)
+
+
+def test_keyframe_execution_with_reference_files_deleted_reports_error(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """关键帧任务执行前参考图文件被删除：必须报错，不能静默降级为纯文字。"""
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    current_shot = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            action="主角走入画面",
+            image_prompt="主角站在画面中央",
+        ).model_dump(),
+    )
+
+    class NeverCalledProvider:
+        async def submit(self, **kwargs: Any) -> ProviderSubmission:
+            raise AssertionError("参考图缺失时不应调用 Provider")
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            NeverCalledProvider(),
+            {
+                "id": "mock-image",
+                "model": "gpt-image-2",
+                "params": {},
+                "timeout_sec": 60,
+            },
+        ),
+    )
+
+    queued = media.queue_keyframe(current_shot["id"], {})
+    # 任务入队后、执行前，素材图文件被删除
+    project_dir = file_service.projects_dir / "媒体任务测试"
+    for path in [path for path in project_dir.rglob("*") if path.is_file()]:
+        path.unlink()
+
+    with pytest.raises(ServiceError) as excinfo:
+        asyncio.run(media.handle_keyframe(repository.require(queued["id"])))
+    assert excinfo.value.status_code == 409
+    assert "参考图文件缺失" in str(excinfo.value)
+
+
 def test_keyframe_job_with_invalid_download_removes_target_file(
     media_job_services: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,

@@ -21,6 +21,7 @@ from app.prompts import load_prompt
 from app.schemas import (
     ShotExtractionOutput,
     ShotImagePromptOutput,
+    ShotVideoPromptOptimizeOutput,
     ShotVideoPromptOutput,
 )
 from app.services.errors import ServiceError, bad_request, conflict, not_found
@@ -35,7 +36,14 @@ from app.services.prompt_service import (
 )
 from app.services.provider_service import ProviderService
 from app.services.signature_service import shot_signature
-from app.services.utils import json_dumps, json_loads, new_id, row_dict, utc_now
+from app.services.utils import (
+    json_dumps,
+    json_loads,
+    new_id,
+    row_dict,
+    sanitize_error_message,
+    utc_now,
+)
 
 _JSON_FIELDS = {
     "character_ids": "character_ids_json",
@@ -1427,6 +1435,208 @@ class ShotService:
         if updated is None:
             return self._skipped_prompt_result(current["id"], generated)
         return {"shot_id": updated["id"], "prompt": generated}
+
+    async def _optimize_video_prompt_once(
+        self,
+        current: dict[str, Any],
+        current_project: dict[str, Any],
+        original: str,
+        *,
+        provider_id: str | None,
+        params: dict[str, Any] | None,
+    ) -> str:
+        """调用文字模型优化单条视频提示词（有限优化），返回优化后文本。"""
+        with self.database.engine.connect() as connection:
+            asset_names = self._asset_names(connection, current)
+        context = shot_template_context(current, asset_names)
+        provider, config = self.providers.resolve(
+            kind="text",
+            provider_id=provider_id or current_project["default_text_provider_id"],
+        )
+        output = await provider.generate_json(
+            system_prompt=load_prompt("shot_video_optimize"),
+            user_prompt=(
+                f"项目画风：{current_project['style_prompt']}\n"
+                f"分镜时长：{current['duration_sec']:g} 秒\n"
+                f"场景：{context.get('scene_name', '当前分镜场景')}\n"
+                f"人物：{context.get('characters', '当前分镜角色')}\n"
+                f"物品：{context.get('props', '当前分镜物品')}\n"
+                "当前视频提示词（模板已编译）：\n"
+                f"{original}"
+            ),
+            schema=ShotVideoPromptOptimizeOutput,
+            params={**config["params"], **(params or {})},
+        )
+        optimized = str(output.prompt or "").strip()
+        if not optimized:
+            raise bad_request("文字模型返回了空提示词，请重试")
+        return optimized
+
+    async def optimize_video_prompt(
+        self,
+        shot_id: str,
+        *,
+        prompt: str,
+        provider_id: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """调用文字模型优化当前分镜的视频提示词（有限优化，不改剧情内容）。
+
+        返回优化后的提示词文本，由前端填入提示词编辑区；不落库，
+        用户确认后可保存为 video_prompt_override。
+        """
+        current = self.get(shot_id)
+        current_project = self._project(current["project_id"])
+        original = str(prompt or "").strip()
+        if not original:
+            raise bad_request("当前分镜没有可优化的视频提示词")
+        optimized = await self._optimize_video_prompt_once(
+            current,
+            current_project,
+            original,
+            provider_id=provider_id,
+            params=params,
+        )
+        return {
+            "shot_id": shot_id,
+            "original": original,
+            "prompt": optimized,
+        }
+
+    def queue_video_prompt_optimize_batch(
+        self,
+        project_id: str,
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        """一键优化全部分镜视频提示词：入队批量任务，结果直接写入 override。"""
+        current_project = self._project(project_id)
+        statement = select(shot).where(shot.c.project_id == project_id)
+        if options.get("ids"):
+            statement = statement.where(shot.c.id.in_(options["ids"]))
+        with self.database.engine.connect() as connection:
+            records = [self._decode(dict(row._mapping)) for row in connection.execute(statement)]
+        targets: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
+        for record in records:
+            final = (
+                str(record.get("video_prompt_override") or "").strip()
+                or str(record.get("video_prompt") or "").strip()
+            )
+            if not final:
+                skipped.append(
+                    {
+                        "target_id": record["id"],
+                        "error": f"分镜 {record['shot_no']} 没有视频提示词，已跳过",
+                    }
+                )
+                continue
+            targets.append(record)
+        if not targets:
+            raise bad_request("没有可优化的分镜视频提示词")
+        provider, config = self.providers.resolve(
+            kind="text",
+            provider_id=options.get("provider_id") or current_project["default_text_provider_id"],
+        )
+        job = self.jobs.create(
+            project_id=project_id,
+            job_type="optimize_shot_video_prompts",
+            target_type="project",
+            target_id=project_id,
+            provider_kind="text",
+            provider_id=config["id"],
+            input_data={
+                "params": options.get("params", {}),
+                "ids": options.get("ids") or [],
+            },
+            progress_total=len(targets),
+        )
+        return {
+            "batch_id": job.get("batch_id") or job["id"],
+            "jobs": [job],
+            "preflight_failures": skipped,
+        }
+
+    async def handle_optimize_video_prompts(self, job: dict[str, Any]) -> dict[str, Any]:
+        """批量优化视频提示词任务：逐个优化并写入 video_prompt_override。"""
+        project_id = str(job["target_id"])
+        current_project = self._project(project_id)
+        input_data = json_loads(job.get("input_json"), {})
+        provider_id = job.get("provider_id")
+        params = input_data.get("params", {})
+        requested_ids = {str(item) for item in (input_data.get("ids") or [])}
+        shots = self.list(project_id)
+        targets = [
+            item
+            for item in shots
+            if (not requested_ids or item["id"] in requested_ids)
+            and (
+                str(item.get("video_prompt_override") or "").strip()
+                or str(item.get("video_prompt") or "").strip()
+            )
+        ]
+        total = len(targets)
+        succeeded = 0
+        failed = 0
+        skipped = 0
+        failures: list[dict[str, Any]] = []
+        for index, item in enumerate(targets, start=1):
+            original = (
+                str(item.get("video_prompt_override") or "").strip()
+                or str(item.get("video_prompt") or "").strip()
+            )
+            try:
+                optimized = await self._optimize_video_prompt_once(
+                    item,
+                    current_project,
+                    original,
+                    provider_id=provider_id,
+                    params=params,
+                )
+                try:
+                    self.update(
+                        item["id"],
+                        {"video_prompt_override": optimized},
+                        expected_revision=item["revision"],
+                    )
+                    succeeded += 1
+                except ServiceError as exc:
+                    if exc.status_code not in {409, 404}:
+                        raise
+                    # 优化期间分镜被其他请求修改或删除：跳过，保留用户最新内容
+                    skipped += 1
+                    failures.append(
+                        {
+                            "shot_id": item["id"],
+                            "shot_no": item["shot_no"],
+                            "error": (
+                                "分镜已被其他请求更新，本次跳过"
+                                if exc.status_code == 409
+                                else "分镜已被删除，本次跳过"
+                            ),
+                        }
+                    )
+            except Exception as exc:
+                failed += 1
+                failures.append(
+                    {
+                        "shot_id": item["id"],
+                        "shot_no": item["shot_no"],
+                        "error": sanitize_error_message(exc),
+                    }
+                )
+            self.jobs.update_progress(
+                job["id"],
+                index,
+                total,
+                message=f"优化中 {index}/{total}",
+            )
+        return {
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "skipped": skipped,
+            "failures": failures,
+        }
 
     def _prompt_job_matches(
         self,
