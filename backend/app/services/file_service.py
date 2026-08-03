@@ -1,21 +1,34 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import re
 import shutil
 from collections.abc import Mapping
 from pathlib import Path
+from threading import RLock
 from typing import BinaryIO
 from urllib.parse import quote
 from uuid import uuid4
 
 import requests
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.config import get_settings
 from app.db import Database, db
-from app.models.tables import platform_setting, project
+from app.models.tables import (
+    asset,
+    asset_image,
+    keyframe_version,
+    platform_setting,
+    project,
+    shot,
+    video_version,
+)
 from app.services.utils import sanitize_error_message
+
+logger = logging.getLogger(__name__)
 
 
 class FileServiceError(RuntimeError):
@@ -27,25 +40,21 @@ _MAX_PROJECT_STORAGE_NAME_UTF16_UNITS = 80
 _WINDOWS_MAX_PATH_UTF16_UNITS = 259
 _MAX_WINDOWS_PROJECTS_DIR_UTF16_UNITS = 137
 _MAX_MEDIA_CATEGORY_UTF16_UNITS = 6
-_MAX_MEDIA_ITEM_ID_UTF16_UNITS = 38
-_MAX_MEDIA_FILENAME_UTF16_UNITS = 32
+_MAX_MEDIA_NAME_UTF16_UNITS = 80
+_MAX_MEDIA_FILENAME_UTF16_UNITS = 96
 _PROJECT_MEDIA_PATH_TAIL_UTF16_UNITS = (
-    1
-    + _MAX_MEDIA_CATEGORY_UTF16_UNITS
-    + 1
-    + _MAX_MEDIA_ITEM_ID_UTF16_UNITS
-    + 1
-    + _MAX_MEDIA_FILENAME_UTF16_UNITS
+    1 + _MAX_MEDIA_CATEGORY_UTF16_UNITS + 1 + _MAX_MEDIA_FILENAME_UTF16_UNITS
 )
 _CATEGORIZED_MEDIA_DIRECTORIES = (
     "角色",
     "物品",
     "场景",
-    "分镜关键帧",
+    "分镜图",
     "分镜视频",
 )
 _PROJECT_STORAGE_ROOT_KEY = "project_storage_root"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_MEDIA_FILE_LOCK = RLock()
 
 
 def _utf16_units(value: str) -> int:
@@ -72,6 +81,30 @@ def sanitize_project_storage_name(
         max_utf16_units,
     ).rstrip(". ")
     return sanitized or "项目"
+
+
+def _media_filename(
+    prefix: str,
+    name: str,
+    version_no: int,
+    suffix: str,
+    *,
+    current: bool,
+    disambiguator: str | None = None,
+) -> str:
+    if not suffix.startswith(".") or "/" in suffix or "\\" in suffix:
+        raise FileServiceError("媒体文件扩展名无效")
+    identity_suffix = (
+        f"-{hashlib.sha256(disambiguator.encode('utf-8')).hexdigest()[:12]}"
+        if disambiguator
+        else ""
+    )
+    safe_name = sanitize_project_storage_name(
+        name,
+        max_utf16_units=_MAX_MEDIA_NAME_UTF16_UNITS - _utf16_units(identity_suffix),
+    )
+    version = "" if current else f"-v{version_no:03d}"
+    return f"{prefix}-{safe_name}{identity_suffix}{version}{suffix}"
 
 
 def project_media_url(project_id: str, relative_path: str | Path) -> str:
@@ -415,6 +448,36 @@ class FileService:
         resolved = self._inside(Path(path), project_dir)
         return resolved.relative_to(project_dir).as_posix()
 
+    def _asset_media_disambiguator(
+        self,
+        project_id: str,
+        asset_type: str,
+        asset_id: str,
+        asset_name: str,
+    ) -> str | None:
+        if self.database is None:
+            return None
+        safe_name = sanitize_project_storage_name(
+            asset_name,
+            max_utf16_units=_MAX_MEDIA_NAME_UTF16_UNITS,
+        ).casefold()
+        with self.database.engine.connect() as connection:
+            names = connection.scalars(
+                select(asset.c.name).where(
+                    asset.c.project_id == project_id,
+                    asset.c.asset_type == asset_type,
+                )
+            ).all()
+        collision_count = sum(
+            sanitize_project_storage_name(
+                name,
+                max_utf16_units=_MAX_MEDIA_NAME_UTF16_UNITS,
+            ).casefold()
+            == safe_name
+            for name in names
+        )
+        return asset_id if collision_count > 1 else None
+
     def asset_image_path(
         self,
         project_id: str,
@@ -423,6 +486,8 @@ class FileService:
         version_no: int,
         suffix: str = ".png",
         *,
+        asset_name: str | None = None,
+        current: bool = False,
         storage_name: str | None = None,
     ) -> Path:
         folders = {"character": "characters", "scene": "scenes", "prop": "props"}
@@ -431,7 +496,20 @@ class FileService:
         layout, persisted_storage_name = self._project_storage(project_id)
         if layout == "categorized":
             named_folders = {"character": "角色", "scene": "场景", "prop": "物品"}
-            relative = Path(named_folders[asset_type]) / asset_id / f"v{version_no:03d}{suffix}"
+            folder = named_folders[asset_type]
+            relative = Path(folder) / _media_filename(
+                folder,
+                asset_name or asset_id,
+                version_no,
+                suffix,
+                current=current,
+                disambiguator=self._asset_media_disambiguator(
+                    project_id,
+                    asset_type,
+                    asset_id,
+                    asset_name or asset_id,
+                ),
+            )
         elif storage_name or persisted_storage_name:
             named_folders = {"character": "角色", "scene": "场景", "prop": "物品"}
             safe_name = sanitize_project_storage_name(storage_name or persisted_storage_name or "")
@@ -450,21 +528,32 @@ class FileService:
         version_no: int,
         suffix: str = ".png",
         *,
+        shot_no: int | None = None,
+        current: bool = False,
         storage_name: str | None = None,
     ) -> Path:
         layout, persisted_storage_name = self._project_storage(project_id)
         effective_storage_name = storage_name or persisted_storage_name
         if layout == "categorized":
-            folder = "分镜关键帧"
+            folder = "分镜图"
+            name = f"{shot_no:03d}" if shot_no is not None else shot_id
+            relative = Path(folder) / _media_filename(
+                folder,
+                name,
+                version_no,
+                suffix,
+                current=current,
+            )
         else:
             folder = (
                 f"{sanitize_project_storage_name(effective_storage_name)}-分镜关键帧"
                 if effective_storage_name
                 else "keyframes"
             )
+            relative = Path(folder) / shot_id / f"v{version_no:03d}{suffix}"
         return self.resolve_project_path(
             project_id,
-            Path(folder) / shot_id / f"v{version_no:03d}{suffix}",
+            relative,
         )
 
     def video_path(
@@ -474,22 +563,279 @@ class FileService:
         version_no: int,
         suffix: str = ".mp4",
         *,
+        shot_no: int | None = None,
+        current: bool = False,
         storage_name: str | None = None,
     ) -> Path:
         layout, persisted_storage_name = self._project_storage(project_id)
         effective_storage_name = storage_name or persisted_storage_name
         if layout == "categorized":
             folder = "分镜视频"
+            name = f"{shot_no:03d}" if shot_no is not None else shot_id
+            relative = Path(folder) / _media_filename(
+                folder,
+                name,
+                version_no,
+                suffix,
+                current=current,
+            )
         else:
             folder = (
                 f"{sanitize_project_storage_name(effective_storage_name)}-分镜视频"
                 if effective_storage_name
                 else "videos"
             )
+            relative = Path(folder) / shot_id / f"v{version_no:03d}{suffix}"
         return self.resolve_project_path(
             project_id,
-            Path(folder) / shot_id / f"v{version_no:03d}{suffix}",
+            relative,
         )
+
+    def _categorized_media_records(self, project_id: str) -> list[dict[str, object]]:
+        if self.database is None:
+            return []
+        records: list[dict[str, object]] = []
+        with self.database.engine.connect() as connection:
+            for row in connection.execute(
+                select(
+                    asset_image.c.id,
+                    asset_image.c.file_path,
+                    asset_image.c.version_no,
+                    asset_image.c.is_current,
+                    asset.c.id.label("asset_id"),
+                    asset.c.asset_type,
+                    asset.c.name.label("asset_name"),
+                )
+                .select_from(asset_image.join(asset, asset_image.c.asset_id == asset.c.id))
+                .where(
+                    asset.c.project_id == project_id,
+                    asset_image.c.file_path.is_not(None),
+                )
+            ):
+                records.append(
+                    {
+                        "table": asset_image,
+                        "kind": "asset_image",
+                        **dict(row._mapping),
+                    }
+                )
+            for table, kind in (
+                (keyframe_version, "keyframe"),
+                (video_version, "video"),
+            ):
+                for row in connection.execute(
+                    select(
+                        table.c.id,
+                        table.c.file_path,
+                        table.c.version_no,
+                        table.c.is_current,
+                        shot.c.id.label("shot_id"),
+                        shot.c.shot_no,
+                    )
+                    .select_from(table.join(shot, table.c.shot_id == shot.c.id))
+                    .where(
+                        shot.c.project_id == project_id,
+                        table.c.file_path.is_not(None),
+                    )
+                ):
+                    records.append(
+                        {
+                            "table": table,
+                            "kind": kind,
+                            **dict(row._mapping),
+                        }
+                    )
+        return records
+
+    def _categorized_media_target(
+        self,
+        project_id: str,
+        record: dict[str, object],
+    ) -> Path:
+        file_path = str(record["file_path"])
+        suffix = Path(file_path).suffix
+        if not suffix:
+            raise FileServiceError(f"媒体文件缺少扩展名：{file_path}")
+        version_no = int(record["version_no"])
+        current = bool(record["is_current"])
+        if record["kind"] == "asset_image":
+            return self.asset_image_path(
+                project_id,
+                str(record["asset_type"]),
+                str(record["asset_id"]),
+                version_no,
+                suffix,
+                asset_name=str(record["asset_name"]),
+                current=current,
+            )
+        if record["kind"] == "keyframe":
+            return self.keyframe_path(
+                project_id,
+                str(record["shot_id"]),
+                version_no,
+                suffix,
+                shot_no=int(record["shot_no"]),
+                current=current,
+            )
+        return self.video_path(
+            project_id,
+            str(record["shot_id"]),
+            version_no,
+            suffix,
+            shot_no=int(record["shot_no"]),
+            current=current,
+        )
+
+    def migrate_categorized_media_layouts(self, *, strict: bool = True) -> int:
+        if self.database is None:
+            return 0
+        with self.database.engine.connect() as connection:
+            project_ids = connection.scalars(
+                select(project.c.id).where(project.c.storage_layout == "categorized")
+            ).all()
+        moved_count = 0
+        for project_id in project_ids:
+            try:
+                moved_count += self._migrate_categorized_project_media(str(project_id))
+            except Exception:
+                if strict:
+                    raise
+                logger.exception("项目媒体目录迁移失败，已跳过项目 %s", project_id)
+        return moved_count
+
+    def _migration_stage_path(
+        self,
+        project_id: str,
+        record: dict[str, object],
+        suffix: str,
+    ) -> Path:
+        table = record["table"]
+        identity = hashlib.sha256(f"{table.name}:{record['id']}".encode()).hexdigest()
+        return self.resolve_project_path(
+            project_id,
+            Path("temp") / "layout-migration" / f"{table.name}-{identity}{suffix}",
+        )
+
+    @staticmethod
+    def _cleanup_empty_media_directories(project_dir: Path) -> None:
+        for directory in (*_CATEGORIZED_MEDIA_DIRECTORIES, "分镜关键帧"):
+            category_dir = project_dir / directory
+            if not category_dir.is_dir() or is_reparse_point(category_dir):
+                continue
+            for child in category_dir.iterdir():
+                if child.is_dir() and not is_reparse_point(child):
+                    try:
+                        child.rmdir()
+                    except OSError:
+                        pass
+            if directory == "分镜关键帧":
+                try:
+                    category_dir.rmdir()
+                except OSError:
+                    pass
+
+    def _migrate_categorized_project_media(self, project_id: str) -> int:
+        records = self._categorized_media_records(project_id)
+        project_dir = self.project_path(project_id)
+        targets: dict[str, str] = {}
+        moves: list[dict[str, object]] = []
+        for record in records:
+            source = self.resolve_project_path(project_id, str(record["file_path"]))
+            target = self._categorized_media_target(project_id, record)
+            target_key = str(target).casefold()
+            existing_id = targets.get(target_key)
+            if existing_id and existing_id != str(record["id"]):
+                raise FileServiceError(f"项目媒体迁移目标重名：{target.name}")
+            targets[target_key] = str(record["id"])
+            if source == target:
+                continue
+            suffix = target.suffix
+            moves.append(
+                {
+                    **record,
+                    "source": source,
+                    "target": target,
+                    "stage": self._migration_stage_path(project_id, record, suffix),
+                    "target_relative": self.relative_project_path(project_id, target),
+                }
+            )
+
+        source_paths = {Path(move["source"]) for move in moves}
+        for move in moves:
+            source = Path(move["source"])
+            target = Path(move["target"])
+            stage = Path(move["stage"])
+            if stage.exists() and not stage.is_file():
+                raise FileServiceError(f"项目媒体迁移暂存路径无效：{stage.name}")
+            if source.exists() and not source.is_file():
+                raise FileServiceError(f"项目媒体迁移源路径无效：{move['file_path']}")
+            if target.exists() and not target.is_file():
+                raise FileServiceError(f"项目媒体迁移目标路径无效：{target.name}")
+            if stage.is_file() and source.is_file():
+                raise FileServiceError(f"项目媒体迁移暂存文件冲突：{stage.name}")
+            if target.is_file() and source.is_file() and target not in source_paths:
+                raise FileServiceError(f"项目媒体迁移目标已存在：{target.name}")
+            if not source.is_file() and not stage.is_file() and not target.is_file():
+                raise FileServiceError(f"项目媒体迁移失败，源文件不存在：{move['file_path']}")
+
+        migration_dir = self.resolve_project_path(project_id, Path("temp") / "layout-migration")
+        with _MEDIA_FILE_LOCK:
+            try:
+                for move in moves:
+                    source = Path(move["source"])
+                    stage = Path(move["stage"])
+                    if source.is_file():
+                        self.move_file(project_id, source, stage)
+                for move in moves:
+                    stage = Path(move["stage"])
+                    target = Path(move["target"])
+                    if stage.is_file():
+                        if target.exists():
+                            raise FileServiceError(f"项目媒体迁移目标已存在：{target.name}")
+                        self.move_file(project_id, stage, target)
+                    elif not target.is_file():
+                        raise FileServiceError(f"项目媒体迁移暂存文件不存在：{stage.name}")
+                with self.database.engine.begin() as connection:
+                    for move in moves:
+                        table = move["table"]
+                        connection.execute(
+                            update(table)
+                            .where(table.c.id == str(move["id"]))
+                            .values(file_path=str(move["target_relative"]))
+                        )
+            except Exception as exc:
+                rollback_errors: list[str] = []
+                for move in reversed(moves):
+                    source = Path(move["source"])
+                    stage = Path(move["stage"])
+                    target = Path(move["target"])
+                    if source.exists():
+                        continue
+                    recovery_source = target if target.is_file() else stage
+                    if not recovery_source.is_file():
+                        continue
+                    try:
+                        self.move_file(project_id, recovery_source, source)
+                    except FileServiceError as rollback_exc:
+                        rollback_errors.append(str(rollback_exc))
+                if rollback_errors:
+                    raise FileServiceError(
+                        "项目媒体迁移失败，且文件回滚失败：" + "；".join(rollback_errors)
+                    ) from exc
+                if isinstance(exc, FileServiceError):
+                    raise
+                raise FileServiceError(f"项目媒体迁移失败：{exc}") from exc
+            finally:
+                if migration_dir.exists():
+                    try:
+                        migration_dir.rmdir()
+                    except OSError:
+                        pass
+
+        self._cleanup_empty_media_directories(project_dir)
+        for directory in _CATEGORIZED_MEDIA_DIRECTORIES:
+            (project_dir / directory).mkdir(parents=True, exist_ok=True)
+        return len(moves)
 
     def upload_path(self, project_id: str, filename: str | None = None) -> Path:
         upload_dir = self.resolve_project_path(project_id, "uploads")
@@ -524,6 +870,39 @@ class FileService:
             self.resolve_project_path(project_id, relative_path),
             temp_dir=self.resolve_project_path(project_id, "temp"),
         )
+
+    def move_file(
+        self,
+        project_id: str,
+        source: str | Path,
+        target: str | Path,
+    ) -> Path:
+        project_dir = self.project_path(project_id)
+        source_value = Path(source)
+        target_value = Path(target)
+        source_path = (
+            self._inside(source_value, project_dir)
+            if source_value.is_absolute()
+            else self.resolve_project_path(project_id, source_value)
+        )
+        target_path = (
+            self._inside(target_value, project_dir)
+            if target_value.is_absolute()
+            else self.resolve_project_path(project_id, target_value)
+        )
+        if source_path == target_path:
+            return target_path
+        with _MEDIA_FILE_LOCK:
+            if not source_path.is_file():
+                raise FileServiceError(f"待移动媒体文件不存在：{source_path.name}")
+            if target_path.exists():
+                raise FileServiceError(f"媒体目标文件已存在：{target_path.name}")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                source_path.rename(target_path)
+            except OSError as exc:
+                raise FileServiceError(f"移动媒体文件失败：{source_path.name}") from exc
+        return target_path
 
     def download_atomic(
         self,

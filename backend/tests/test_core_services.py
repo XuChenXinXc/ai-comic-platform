@@ -81,6 +81,28 @@ def test_shot_signature_after_reference_binding_changes_returns_stale() -> None:
     assert is_stale(saved, current) is True
 
 
+def test_shot_signature_with_empty_prompt_overrides_matches_legacy_signature() -> None:
+    legacy = shot_signature(
+        {
+            "action": "主角向前走",
+            "image_prompt": "主角站在门前",
+            "video_prompt": "主角推开房门",
+        }
+    )
+
+    current = shot_signature(
+        {
+            "action": "主角向前走",
+            "image_prompt": "主角站在门前",
+            "image_prompt_override": "",
+            "video_prompt": "主角推开房门",
+            "video_prompt_override": "",
+        }
+    )
+
+    assert current == legacy
+
+
 def test_video_signature_without_reference_bindings_keeps_existing_signature() -> None:
     legacy = calculate_signature(
         "keyframe-1", "动作提示词", 6, "video-1", "model-1", {"size": "16:9"}

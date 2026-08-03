@@ -7,6 +7,7 @@ from app.services.prompt_service import (
     compile_asset_prompt,
     compile_keyframe_prompt,
     compile_video_prompt,
+    resolve_asset_negative_prompt,
     shot_template_context,
 )
 
@@ -17,6 +18,31 @@ def test_asset_extraction_prompt_requires_independent_key_props() -> None:
     assert "值得单独生成素材参考图" in prompt
     assert "普通钥匙、手机、纸袋、杯子、文件、清洁工具" in prompt
     assert "物品的 `importance` 必须为 `core`" in prompt
+
+
+def test_asset_extraction_prompt_requires_scene_assets_to_be_empty_backgrounds() -> None:
+    prompt = load_prompt("asset_extract")
+
+    assert "场景设定图必须是无人纯背景空镜" in prompt
+    for field in (
+        "`prompt`",
+        "`composition`",
+        "`main_view`",
+        "`standard_view_1`",
+        "`standard_view_2`",
+    ):
+        assert field in prompt
+    assert "不得包含人物姓名、人物动作、人影、剪影、倒影中的人物或人体局部" in prompt
+    assert "`character_position` 只描述可供表演的空置区域" in prompt
+
+
+def test_asset_prompt_requires_scene_outputs_to_be_empty_backgrounds() -> None:
+    prompt = load_prompt("asset_prompt")
+
+    assert "场景素材必须输出无人纯背景空镜" in prompt
+    assert "即使素材资料含有人物姓名、动作、站位、人物视角或随身物" in prompt
+    assert "不得写入人物、" in prompt
+    assert "人群、路人、人影、剪影、倒影中的人物或人体局部" in prompt
 
 
 def test_shot_extraction_prompt_keeps_generic_items_out_of_asset_bindings() -> None:
@@ -165,6 +191,123 @@ def test_compile_asset_prompt_uses_type_specific_default_negative_prompt() -> No
     assert "negative prompt: 完整人物、人物脸、多件物品" in prompt
 
 
+def test_scene_negative_prompt_merge_is_idempotent() -> None:
+    merged = resolve_asset_negative_prompt("scene", "现代装修")
+
+    assert resolve_asset_negative_prompt("scene", merged) == merged
+    assert merged.count("人物、角色、人群、路人、行人、人影、人形、剪影") == 1
+
+
+def test_compile_scene_asset_prompt_enforces_empty_background_with_custom_negative_prompt() -> None:
+    prompt = compile_asset_prompt(
+        style_prompt="都市温情二维国漫",
+        aspect_ratio="16:9",
+        asset_type="scene",
+        asset_name="林记钟表店",
+        profile={
+            "concept": "林舟父亲留下的钟表店",
+            "architecture": "老旧钟表店内部",
+            "layout": "入口正对木柜台，后墙挂满旧钟",
+            "character_position": "林舟站在柜台前打开暗格",
+            "furnishings": ["木柜台", "挂钟墙"],
+            "main_view": "人物站在柜台前，镜头从入口向内",
+            "main_light": "林舟手机电筒光",
+            "lighting": "冷白手电筒光束扫过挂钟墙",
+        },
+        prompt="钟表店内设有儿童阅读区。两个人影站在柜台前。手电光扫过挂钟墙。",
+        negative_prompt="现代装修",
+        consistency_keywords=["木柜台", "挂钟墙"],
+        composition="人物位于画面中央",
+    )
+
+    assert "【最高优先级：无人纯背景空镜】" in prompt
+    assert "人物姓名、人物动作、角色站位、人物视角或人物持有物" in prompt
+    assert "表演活动区按主要区域和动线预留为空置空间" in prompt
+    assert "林舟站在柜台前打开暗格" not in prompt
+    assert "两个人影站在柜台前" not in prompt
+    assert "人物位于画面中央" not in prompt
+    assert "林舟" not in prompt
+    assert "儿童阅读区" in prompt
+    assert "手电光扫过挂钟墙" in prompt
+    assert "negative prompt: 现代装修、人物、角色、人群、路人、行人、人影、人形、剪影" in prompt
+
+
+def test_compile_scene_asset_prompt_removes_people_actions_from_all_free_text_fields() -> None:
+    injected_names = [
+        "林舟",
+        "张助理",
+        "顾律师",
+        "周前台",
+        "王经理",
+        "陈女士",
+        "赵先生",
+        "孙秘书",
+        "钱主任",
+        "吴助理",
+        "郑律师",
+        "冯店员",
+        "褚保安",
+        "卫顾客",
+        "蒋同事",
+        "沈主管",
+        "韩记者",
+        "杨医生",
+        "朱护士",
+        "秦师傅",
+        "许老板",
+        "何警官",
+        "吕司机",
+        "施老师",
+        "孔学生",
+        "曹导演",
+        "严摄影师",
+    ]
+    profile = {
+        "worldview": f"{injected_names[0]}站在当代都市办公室",
+        "place_type": f"{injected_names[1]}坐在室内接待区",
+        "layout": f"{injected_names[2]}走向开放式办公区",
+        "scale": f"{injected_names[3]}跑向宽阔大厅",
+        "furnishings": f"{injected_names[4]}躺在深色沙发旁",
+        "architecture": f"{injected_names[5]}蹲在现代玻璃隔断后",
+        "regions": f"{injected_names[6]}看向会议室",
+        "entrance_position": f"{injected_names[7]}手持文件站在东侧入口",
+        "window_position": f"{injected_names[8]}穿着西装靠近落地窗",
+        "movement_path": f"{injected_names[9]}走进中央走廊",
+        "wall_material": f"{injected_names[10]}推开灰色石材墙旁的门",
+        "floor_material": f"{injected_names[11]}拉开浅灰地毯上的椅子",
+        "furniture_material": f"{injected_names[12]}打开深色木柜",
+        "glass_metal_material": f"{injected_names[13]}关上金属玻璃门",
+        "special_material": f"{injected_names[14]}转身离开磨砂玻璃墙",
+        "color_mood": f"{injected_names[15]}抬手触碰冷灰色背景",
+        "main_color": f"{injected_names[16]}低头站在深灰主色区域",
+        "accent_color": f"{injected_names[17]}抬头看向青绿点缀区",
+        "color_quality": f"{injected_names[18]}拿着病历进入低饱和空间",
+        "main_view": f"{injected_names[19]}握着工具站在主视角中央",
+        "standard_view_1": f"{injected_names[20]}走出正向全景",
+        "standard_view_2": f"{injected_names[21]}离开反向全景",
+        "detail_zone": f"{injected_names[22]}坐在接待台细节区",
+        "lighting": f"{injected_names[23]}手持灯具照亮主光区",
+        "fill_light": f"{injected_names[24]}的手机光形成柔和辅光",
+        "atmosphere": f"{injected_names[25]}走入安静氛围区",
+    }
+    prompt = compile_asset_prompt(
+        style_prompt="都市二维国漫",
+        aspect_ratio="16:9",
+        asset_type="scene",
+        asset_name="律师事务所",
+        profile=profile,
+        prompt=f"木柜台保留。{injected_names[26]}站在柜台旁。",
+        negative_prompt="",
+        consistency_keywords=["木柜台", f"{injected_names[0]}坐在入口"],
+        composition=f"入口位于左侧。{injected_names[1]}看向镜头。",
+    )
+
+    assert "木柜台" in prompt
+    assert "入口位于左侧" in prompt
+    for name in injected_names:
+        assert name not in prompt
+
+
 def test_compile_keyframe_prompt_uses_v2_template_and_reference_order() -> None:
     prompt = compile_keyframe_prompt(
         style_prompt="东方奇幻二维动画",
@@ -200,6 +343,7 @@ def test_compile_keyframe_prompt_uses_v2_template_and_reference_order() -> None:
     assert "negative prompt: 身份漂移、服装变化、文字水印" in prompt
     assert "画面比例：16:9。" in prompt
     assert "画面比例：9:16。" not in prompt
+    assert "导演画面补充" not in prompt
 
 
 def test_compile_keyframe_prompt_includes_positions_and_expressions() -> None:

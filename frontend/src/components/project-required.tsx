@@ -1,4 +1,4 @@
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { useProject } from "../hooks/use-project";
 import { EmptyState, LoadingState } from "./status";
 import { Button } from "./ui";

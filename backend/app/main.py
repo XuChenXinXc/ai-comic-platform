@@ -26,7 +26,7 @@ from app.db import Database, db, init_db
 from app.jobs.runner import job_runner
 from app.models.tables import project
 from app.services.errors import ServiceError
-from app.services.file_service import is_reparse_point
+from app.services.file_service import file_service, is_reparse_point
 from app.services.task_handlers import register_handlers
 
 
@@ -114,6 +114,7 @@ class ProjectMediaStaticFiles(StaticFiles):
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     init_db(seed_mock_providers=True)
+    file_service.migrate_categorized_media_layouts(strict=False)
     register_handlers()
     job_runner.start(recover=True)
     try:

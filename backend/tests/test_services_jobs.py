@@ -6,17 +6,25 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
 from app.api.schemas import ShotCreate
 from app.db import Database
 from app.jobs.repository import JobRepository
 from app.jobs.runner import JobRunner
-from app.models.tables import asset, asset_image, novel_analysis, screenplay, video_version
+from app.models.tables import (
+    api_provider,
+    asset,
+    asset_image,
+    keyframe_version,
+    novel_analysis,
+    screenplay,
+    video_version,
+)
 from app.schemas import ProviderSubmission
 from app.services.asset_service import AssetService
 from app.services.errors import ServiceError
-from app.services.file_service import FileService, file_service
+from app.services.file_service import FileService, FileServiceError, file_service
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
 from app.services.project_service import ProjectService
@@ -270,6 +278,269 @@ def test_video_queue_without_explicit_video_prompt_returns_bad_request(
     assert media.list_videos(current["id"]) == []
 
 
+def test_shot_prompt_batch_with_image_and_video_updates_both_prompts(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    project = media_job_services["project"]
+    shots = ShotService(database, jobs)
+    current = shots.create(
+        project["id"],
+        _shot_create(action="主角推开房门").model_dump(),
+    )
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+
+    batch = shots.queue_prompt_batch(
+        project["id"],
+        {
+            "ids": [current["id"]],
+            "prompt_types": ["image", "video"],
+            "only_missing": False,
+            "params": {},
+        },
+    )
+    queued_jobs = [repository.require(item["id"]) for item in batch["jobs"]]
+
+    asyncio.run(shots.handle_image_prompt(queued_jobs[0]))
+    asyncio.run(shots.handle_video_prompt(queued_jobs[1]))
+
+    updated = shots.get(current["id"])
+    assert updated["image_prompt"]
+    assert updated["video_prompt"]
+
+
+def test_keyframe_queue_uses_saved_final_prompt_override_verbatim(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    override = "用户编辑后的最终关键帧提示词\n保持原样，不再套用模板。"
+    current = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            image_prompt="",
+            image_prompt_override=override,
+        ).model_dump(),
+    )
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    media.queue_keyframe(current["id"], {})
+
+    version = media.list_keyframes(current["id"])[0]
+    assert version["prompt_snapshot"] == override
+    assert ShotService(database, jobs).get(current["id"])["final_image_prompt"] == override
+
+
+def test_keyframe_after_provider_model_change_returns_stale_with_later_version_timestamp(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    current = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            image_prompt="主角站在房门前",
+        ).model_dump(),
+    )
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+
+    media.queue_keyframe(current["id"], {})
+    version = media.list_keyframes(current["id"])[0]
+    with database.engine.begin() as connection:
+        connection.execute(
+            update(api_provider)
+            .where(api_provider.c.id == "mock-image")
+            .values(model="new-image-model", updated_at="2026-08-03T00:00:00+00:00")
+        )
+        connection.execute(
+            update(keyframe_version)
+            .where(keyframe_version.c.id == version["id"])
+            .values(created_at="2026-08-04T00:00:00+00:00")
+        )
+
+    assert media.list_keyframes(current["id"])[0]["is_stale"] is True
+
+
+def test_video_queue_uses_saved_final_prompt_override_verbatim(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    override = "用户编辑后的最终视频提示词\n严格按此文本执行。"
+    current = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            video_prompt="",
+            video_prompt_override=override,
+        ).model_dump(),
+    )
+    media.upload_keyframe(current["id"], "frame.png", "image/png", _PNG)
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    media.queue_video(current["id"], {})
+
+    version = media.list_videos(current["id"])[0]
+    assert version["prompt_snapshot"] == override
+    assert ShotService(database, jobs).get(current["id"])["final_video_prompt"] == override
+
+
+def test_uploaded_keyframe_uses_saved_final_prompt_override(
+    media_job_services: dict[str, Any],
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    override = "上传关键帧使用的最终提示词"
+    current = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            image_prompt_override=override,
+        ).model_dump(),
+    )
+
+    version = media.upload_keyframe(current["id"], "frame.png", "image/png", _PNG)
+
+    assert version["prompt_snapshot"] == override
+
+
+def test_asset_image_versions_use_readable_current_and_flat_history_paths(
+    media_job_services: dict[str, Any],
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    current = AssetService(database, jobs).create(
+        project["id"],
+        {
+            "asset_type": "character",
+            "name": "林舟",
+            "prompt": "黑色短发，灰色风衣",
+        },
+    )
+
+    first = media.upload_asset_image(current["id"], "first.png", "image/png", _PNG)
+    second = media.upload_asset_image(current["id"], "second.jpg", "image/jpeg", _PNG)
+
+    versions = {item["version_no"]: item for item in media.list_asset_images(current["id"])}
+    assert versions[1]["file_path"] == "角色/角色-林舟-v001.png"
+    assert versions[1]["is_current"] is False
+    assert versions[2]["file_path"] == "角色/角色-林舟.jpg"
+    assert versions[2]["is_current"] is True
+    assert file_service.resolve_project_path(project["id"], versions[1]["file_path"]).is_file()
+    assert file_service.resolve_project_path(project["id"], versions[2]["file_path"]).is_file()
+
+    media.set_current("asset_image", first["id"])
+
+    switched = {item["version_no"]: item for item in media.list_asset_images(current["id"])}
+    assert switched[1]["file_path"] == "角色/角色-林舟.png"
+    assert switched[1]["is_current"] is True
+    assert switched[2]["file_path"] == "角色/角色-林舟-v002.jpg"
+    assert switched[2]["is_current"] is False
+    assert second["id"] == switched[2]["id"]
+
+
+def test_asset_image_sanitized_name_collision_keeps_each_asset_file(
+    media_job_services: dict[str, Any],
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    assets = AssetService(database, jobs)
+    first_asset = assets.create(
+        project["id"],
+        {"asset_type": "character", "name": "A?", "prompt": "第一个角色"},
+    )
+    second_asset = assets.create(
+        project["id"],
+        {"asset_type": "character", "name": "A*", "prompt": "第二个角色"},
+    )
+
+    media.upload_asset_image(first_asset["id"], "first-v1.png", "image/png", _PNG)
+    media.upload_asset_image(first_asset["id"], "first-v2.png", "image/png", _PNG)
+    media.upload_asset_image(second_asset["id"], "second-v1.png", "image/png", _PNG)
+
+    versions = [
+        *media.list_asset_images(first_asset["id"]),
+        *media.list_asset_images(second_asset["id"]),
+    ]
+    file_paths = [item["file_path"] for item in versions]
+    assert len(set(file_paths)) == 3
+    for relative in file_paths:
+        path = file_service.resolve_project_path(project["id"], relative)
+        assert path.read_bytes() == _PNG
+
+
+def test_asset_image_upload_with_occupied_target_keeps_existing_file(
+    media_job_services: dict[str, Any],
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    current_asset = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "character", "name": "林舟", "prompt": "角色设定"},
+    )
+    occupied_relative = "角色/角色-林舟-v001.png"
+    occupied = file_service.write_bytes_atomic(
+        project["id"],
+        occupied_relative,
+        b"existing",
+    )
+
+    with pytest.raises(FileServiceError, match="媒体目标文件已存在"):
+        media.upload_asset_image(current_asset["id"], "new.png", "image/png", _PNG)
+
+    assert occupied.read_bytes() == b"existing"
+    assert media.list_asset_images(current_asset["id"]) == []
+
+
+def test_uploaded_video_uses_saved_final_prompt_override(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    override = "上传视频使用的最终提示词"
+    current = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            video_prompt_override=override,
+        ).model_dump(),
+    )
+    keyframe = media.upload_keyframe(current["id"], "frame.png", "image/png", _PNG)
+    monkeypatch.setattr(media, "_verify_video", lambda _path: 1.0)
+
+    version = media.upload_video(current["id"], "clip.mp4", "video/mp4", b"video")
+
+    assert version["prompt_snapshot"] == override
+    assert version["keyframe_version_id"] == keyframe["id"]
+
+
 def test_keyframe_queue_without_scene_binding_returns_conflict_before_provider_resolution(
     media_job_services: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -446,6 +717,172 @@ def test_keyframe_job_auto_binds_current_asset_image_as_reference(
     assert version["reference_bindings"] == refreshed["reference_bindings"]
     assert [path.read_bytes() for path in captured["reference_files"]] == [_PNG, _PNG]
     assert result["version_id"] == queued["target_id"]
+
+
+def test_keyframe_job_with_invalid_download_removes_target_file(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    current_shot = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            action="主角走入画面",
+            image_prompt="主角站在画面中央",
+        ).model_dump(),
+    )
+
+    class InvalidImageProvider:
+        async def submit(self, **_kwargs: Any) -> ProviderSubmission:
+            return ProviderSubmission(
+                status="completed",
+                result={"content_base64": base64.b64encode(b"not-an-image").decode("ascii")},
+            )
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            InvalidImageProvider(),
+            {
+                "id": "mock-image",
+                "model": "gpt-image-2",
+                "params": {},
+                "timeout_sec": 60,
+            },
+        ),
+    )
+
+    queued = media.queue_keyframe(current_shot["id"], {})
+    target = file_service.keyframe_path(
+        project["id"],
+        current_shot["id"],
+        1,
+        storage_name=media._project_storage_name(project["id"]),
+    )
+
+    with pytest.raises(ServiceError, match="不是可解码图片"):
+        asyncio.run(media.handle_keyframe(repository.require(queued["id"])))
+
+    assert target.exists() is False
+
+
+def test_keyframe_job_with_failed_target_cleanup_marks_version_failed(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    current_shot = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            image_prompt="主角站在画面中央",
+        ).model_dump(),
+    )
+
+    class InvalidImageProvider:
+        async def submit(self, **_kwargs: Any) -> ProviderSubmission:
+            return ProviderSubmission(
+                status="completed",
+                result={"content_base64": base64.b64encode(b"not-an-image").decode("ascii")},
+            )
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            InvalidImageProvider(),
+            {
+                "id": "mock-image",
+                "model": "gpt-image-2",
+                "params": {},
+                "timeout_sec": 60,
+            },
+        ),
+    )
+
+    def fail_target_cleanup(_project_id: str, _relative_path: str | Path) -> bool:
+        raise PermissionError("坏文件仍被占用")
+
+    monkeypatch.setattr(file_service, "delete_file", fail_target_cleanup)
+
+    queued = media.queue_keyframe(current_shot["id"], {})
+
+    with pytest.raises(ServiceError, match="不是可解码图片"):
+        asyncio.run(media.handle_keyframe(repository.require(queued["id"])))
+
+    version = media.list_keyframes(current_shot["id"])[0]
+    assert version["status"] == "failed"
+
+
+def test_keyframe_job_with_staged_cleanup_failure_keeps_completed_media(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    current_shot = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            image_prompt="主角站在画面中央",
+        ).model_dump(),
+    )
+
+    class SuccessfulImageProvider:
+        async def submit(self, **_kwargs: Any) -> ProviderSubmission:
+            return ProviderSubmission(
+                status="completed",
+                result={"content_base64": base64.b64encode(_PNG).decode("ascii")},
+            )
+
+    original_delete_file = file_service.delete_file
+
+    def fail_staged_cleanup(project_id: str, relative_path: str | Path) -> bool:
+        if str(relative_path).replace("\\", "/").startswith("temp/provider-results/"):
+            raise PermissionError("临时文件仍被占用")
+        return original_delete_file(project_id, relative_path)
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            SuccessfulImageProvider(),
+            {
+                "id": "mock-image",
+                "model": "gpt-image-2",
+                "params": {},
+                "timeout_sec": 60,
+            },
+        ),
+    )
+    monkeypatch.setattr(file_service, "delete_file", fail_staged_cleanup)
+
+    queued = media.queue_keyframe(current_shot["id"], {})
+    result = asyncio.run(media.handle_keyframe(repository.require(queued["id"])))
+    version = media.list_keyframes(current_shot["id"])[0]
+
+    assert result["version_id"] == version["id"]
+    assert version["status"] == "completed"
+    assert file_service.resolve_project_path(project["id"], version["file_path"]).is_file()
 
 
 def test_asset_image_completion_auto_binds_existing_shot_reference(

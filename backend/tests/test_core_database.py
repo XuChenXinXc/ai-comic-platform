@@ -136,9 +136,11 @@ def test_init_db_with_fresh_database_migrates_to_head_and_seeds_mock_providers(
         "alembic_version",
         *(table.name for table in ALL_TABLES),
     }
+    shot_columns = {column["name"] for column in inspect(database.engine).get_columns("shot")}
+    assert {"image_prompt_override", "video_prompt_override"} <= shot_columns
     with database.engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "20260730_0004"
+            "20260731_0005"
         )
         assert connection.scalar(select(func.count()).select_from(api_provider)) == 3
     database.dispose()

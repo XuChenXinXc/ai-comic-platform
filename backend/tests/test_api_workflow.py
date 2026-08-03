@@ -263,7 +263,7 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     assert "【当前分镜素材参考图】" in keyframes[0]["prompt_snapshot"]
     assert "negative prompt:" in keyframes[0]["prompt_snapshot"]
     assert keyframes[0]["prompt_snapshot"] == current_shots[0]["compiled_image_prompt"]
-    assert keyframes[0]["file_path"].startswith("分镜关键帧/")
+    assert keyframes[0]["file_path"].startswith("分镜图/")
 
     video_job = api_client.post(f"/api/shots/{shot_id}/videos/generate", json={})
     assert video_job.status_code == 202
@@ -361,7 +361,7 @@ def test_asset_image_after_highest_version_deleted_uses_next_version_number(
 
     assert third.status_code == 201
     assert third.json()["version_no"] == 3
-    assert third.json()["file_path"].endswith("/v003.png")
+    assert third.json()["file_path"] == "角色/角色-主角.png"
 
 
 def test_shot_split_copy_merge_and_reorder_preserve_contiguous_numbers(
@@ -396,6 +396,51 @@ def test_shot_split_copy_merge_and_reorder_preserve_contiguous_numbers(
     assert merged.status_code == 200
     final_shots = api_client.get(f"/api/projects/{project['id']}/shots").json()
     assert [item["shot_no"] for item in final_shots] == list(range(1, len(final_shots) + 1))
+
+
+def test_shot_split_clears_prompt_overrides(api_client: TestClient) -> None:
+    project = _create_project(api_client)
+    current = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={
+            "action": "主角走入房间，然后停下观察。",
+            "duration_sec": 4,
+            "image_prompt_override": "旧的最终关键帧提示词",
+            "video_prompt_override": "旧的最终视频提示词",
+        },
+    ).json()
+
+    response = api_client.post(f"/api/shots/{current['id']}/split", json={})
+
+    assert response.status_code == 200
+    assert [item["image_prompt_override"] for item in response.json()] == ["", ""]
+    assert [item["video_prompt_override"] for item in response.json()] == ["", ""]
+
+
+def test_shot_merge_clears_prompt_overrides(api_client: TestClient) -> None:
+    project = _create_project(api_client)
+    target = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={
+            "action": "主角走入房间。",
+            "duration_sec": 2,
+            "image_prompt_override": "旧的最终关键帧提示词",
+            "video_prompt_override": "旧的最终视频提示词",
+        },
+    ).json()
+    source = api_client.post(
+        f"/api/projects/{project['id']}/shots",
+        json={"action": "主角停下观察。", "duration_sec": 2},
+    ).json()
+
+    response = api_client.post(
+        f"/api/projects/{project['id']}/shots/merge",
+        json={"ids": [target["id"], source["id"]]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["image_prompt_override"] == ""
+    assert response.json()["video_prompt_override"] == ""
 
 
 def test_shot_create_requires_duration_and_forces_screenplay_source(

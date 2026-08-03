@@ -118,7 +118,6 @@ function shotPayload(body: Partial<Shot>, includeCreateFields: boolean) {
     ? `${scenePrefix}${rawSourceRef.replace(/^scene:\d+\|?/, "")}`
     : rawSourceRef;
   const payload: Record<string, unknown> = {
-    source_ref: sourceRef,
     scene_asset_id: body.scene_asset_id,
     character_ids: body.character_ids_json ?? body.character_ids,
     prop_ids: body.prop_ids_json ?? body.prop_ids,
@@ -136,12 +135,17 @@ function shotPayload(body: Partial<Shot>, includeCreateFields: boolean) {
     next_hook: body.next_hook,
     frame_description: body.frame_description,
     image_prompt: body.image_prompt,
+    image_prompt_override: body.image_prompt_override,
     video_prompt: body.video_prompt,
+    video_prompt_override: body.video_prompt_override,
     negative_prompt: body.negative_prompt,
     reference_bindings:
       body.reference_bindings_json ?? body.reference_bindings,
     status: body.status,
   };
+  if (body.source_ref !== undefined || body.scene_no !== undefined) {
+    payload.source_ref = sourceRef;
+  }
   if (includeCreateFields) {
     payload.source_type = body.source_type;
     payload.shot_no = body.shot_no;

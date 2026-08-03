@@ -8,15 +8,24 @@ import pytest
 from sqlalchemy import event, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
+from app.api.schemas import ShotCreate
 from app.db import Database
 from app.jobs.repository import JobRepository
-from app.models.tables import platform_setting, project
+from app.models.tables import (
+    asset_image,
+    keyframe_version,
+    platform_setting,
+    project,
+    video_version,
+)
+from app.services.asset_service import AssetService
 from app.services.errors import ServiceError
 from app.services.file_service import FileService, FileServiceError
 from app.services.project_service import ProjectService
+from app.services.shot_service import ShotService
 from app.services.utils import utc_now
 
-_MEDIA_DIRECTORIES = {"角色", "物品", "场景", "分镜关键帧", "分镜视频"}
+_MEDIA_DIRECTORIES = {"角色", "物品", "场景", "分镜图", "分镜视频"}
 
 
 def _create_database(tmp_path: Path, name: str = "platform.db") -> Database:
@@ -44,6 +53,37 @@ def _insert_project(
                 storage_layout=storage_layout,
                 created_at=now,
                 updated_at=now,
+            )
+        )
+
+
+def _insert_asset_image_record(
+    database: Database,
+    *,
+    image_id: str,
+    asset_id: str,
+    file_path: str,
+    is_current: bool = True,
+) -> None:
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(asset_image).values(
+                id=image_id,
+                asset_id=asset_id,
+                version_no=1,
+                file_path=file_path,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                reference_files_json="[]",
+                provider_id=None,
+                model="",
+                provider_task_id="",
+                status="completed",
+                is_current=is_current,
+                input_signature="",
+                source="generated",
+                error="",
+                created_at=utc_now(),
             )
         )
 
@@ -141,9 +181,23 @@ def test_file_service_with_project_layout_resolves_new_and_legacy_paths(
     )
     storage = FileService(tmp_path / "fallback", database=database)
 
-    new_asset = storage.asset_image_path("project-new", "character", "asset-1", 1)
-    new_keyframe = storage.keyframe_path("project-new", "shot-1", 1)
-    new_video = storage.video_path("project-new", "shot-1", 1)
+    new_asset = storage.asset_image_path(
+        "project-new",
+        "character",
+        "asset-1",
+        1,
+        asset_name="林舟",
+    )
+    new_current_asset = storage.asset_image_path(
+        "project-new",
+        "character",
+        "asset-1",
+        1,
+        asset_name="林舟",
+        current=True,
+    )
+    new_keyframe = storage.keyframe_path("project-new", "shot-1", 1, shot_no=1)
+    new_video = storage.video_path("project-new", "shot-1", 1, shot_no=1)
     old_asset = storage.asset_image_path("project-old", "character", "asset-1", 1)
     legacy_relative = storage.resolve_project_path(
         "project-old", "assets/characters/asset-1/v001.png"
@@ -151,17 +205,332 @@ def test_file_service_with_project_layout_resolves_new_and_legacy_paths(
 
     assert storage.project_path("project-new") == categorized_root / "新项目"
     assert storage.project_path("project-old") == prefixed_root / "project-old"
-    assert storage.relative_project_path("project-new", new_asset) == ("角色/asset-1/v001.png")
+    assert storage.relative_project_path("project-new", new_asset) == ("角色/角色-林舟-v001.png")
+    assert storage.relative_project_path("project-new", new_current_asset) == ("角色/角色-林舟.png")
     assert storage.relative_project_path("project-new", new_keyframe) == (
-        "分镜关键帧/shot-1/v001.png"
+        "分镜图/分镜图-001-v001.png"
     )
-    assert storage.relative_project_path("project-new", new_video) == ("分镜视频/shot-1/v001.mp4")
+    assert storage.relative_project_path("project-new", new_video) == (
+        "分镜视频/分镜视频-001-v001.mp4"
+    )
     assert storage.relative_project_path("project-old", old_asset) == (
         "旧项目-角色/asset-1/v001.png"
     )
     assert storage.relative_project_path("project-old", legacy_relative) == (
         "assets/characters/asset-1/v001.png"
     )
+    database.dispose()
+
+
+def test_file_service_migrates_existing_categorized_media_to_flat_readable_paths(
+    tmp_path: Path,
+) -> None:
+    database = _create_database(tmp_path)
+    storage = FileService(tmp_path / "workspace", database=database)
+    current_project = ProjectService(database, storage).create({"name": "测试文章"})
+    current_asset = AssetService(database).create(
+        current_project["id"],
+        {"asset_type": "character", "name": "林舟"},
+    )
+    current_shot = ShotService(database).create(
+        current_project["id"],
+        ShotCreate(duration_sec=6).model_dump(),
+    )
+    old_asset_v1 = f"角色/{current_asset['id']}/v001.png"
+    old_asset_v2 = f"角色/{current_asset['id']}/v002.png"
+    old_keyframe = f"分镜关键帧/{current_shot['id']}/v001.png"
+    old_video = f"分镜视频/{current_shot['id']}/v001.mp4"
+    for relative, content in (
+        (old_asset_v1, b"asset-v1"),
+        (old_asset_v2, b"asset-v2"),
+        (old_keyframe, b"keyframe"),
+        (old_video, b"video"),
+    ):
+        storage.write_bytes_atomic(current_project["id"], relative, content)
+
+    now = utc_now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(asset_image),
+            [
+                {
+                    "id": "asset-image-1",
+                    "asset_id": current_asset["id"],
+                    "version_no": 1,
+                    "file_path": old_asset_v1,
+                    "prompt_snapshot": "",
+                    "negative_prompt_snapshot": "",
+                    "reference_files_json": "[]",
+                    "provider_id": None,
+                    "model": "",
+                    "provider_task_id": "",
+                    "status": "completed",
+                    "is_current": False,
+                    "input_signature": "",
+                    "source": "generated",
+                    "error": "",
+                    "created_at": now,
+                },
+                {
+                    "id": "asset-image-2",
+                    "asset_id": current_asset["id"],
+                    "version_no": 2,
+                    "file_path": old_asset_v2,
+                    "prompt_snapshot": "",
+                    "negative_prompt_snapshot": "",
+                    "reference_files_json": "[]",
+                    "provider_id": None,
+                    "model": "",
+                    "provider_task_id": "",
+                    "status": "completed",
+                    "is_current": True,
+                    "input_signature": "",
+                    "source": "generated",
+                    "error": "",
+                    "created_at": now,
+                },
+            ],
+        )
+        connection.execute(
+            insert(keyframe_version).values(
+                id="keyframe-1",
+                shot_id=current_shot["id"],
+                version_no=1,
+                file_path=old_keyframe,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                reference_bindings_json="[]",
+                provider_id=None,
+                model="",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="",
+                source="generated",
+                error="",
+                created_at=now,
+            )
+        )
+        connection.execute(
+            insert(video_version).values(
+                id="video-1",
+                shot_id=current_shot["id"],
+                keyframe_version_id="keyframe-1",
+                version_no=1,
+                file_path=old_video,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                requested_duration_sec=6,
+                actual_duration_sec=6,
+                provider_id=None,
+                model="",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="",
+                source="generated",
+                cost_estimate=0,
+                error="",
+                created_at=now,
+            )
+        )
+
+    assert storage.migrate_categorized_media_layouts() == 4
+
+    with database.engine.connect() as connection:
+        asset_paths = connection.execute(
+            select(asset_image.c.version_no, asset_image.c.file_path).order_by(
+                asset_image.c.version_no
+            )
+        ).all()
+        keyframe_path = connection.scalar(select(keyframe_version.c.file_path))
+        video_path = connection.scalar(select(video_version.c.file_path))
+    assert asset_paths == [
+        (1, "角色/角色-林舟-v001.png"),
+        (2, "角色/角色-林舟.png"),
+    ]
+    assert keyframe_path == "分镜图/分镜图-001.png"
+    assert video_path == "分镜视频/分镜视频-001.mp4"
+    assert (
+        storage.resolve_project_path(current_project["id"], "角色/角色-林舟-v001.png").read_bytes()
+        == b"asset-v1"
+    )
+    assert (
+        storage.resolve_project_path(current_project["id"], "角色/角色-林舟.png").read_bytes()
+        == b"asset-v2"
+    )
+    assert (
+        storage.resolve_project_path(current_project["id"], "分镜图/分镜图-001.png").read_bytes()
+        == b"keyframe"
+    )
+    assert (
+        storage.resolve_project_path(
+            current_project["id"], "分镜视频/分镜视频-001.mp4"
+        ).read_bytes()
+        == b"video"
+    )
+    assert (
+        storage.resolve_project_path(current_project["id"], f"角色/{current_asset['id']}").exists()
+        is False
+    )
+    assert storage.resolve_project_path(current_project["id"], "分镜关键帧").exists() is False
+    database.dispose()
+
+
+def test_file_service_media_migration_with_existing_target_keeps_original_files(
+    tmp_path: Path,
+) -> None:
+    database = _create_database(tmp_path)
+    storage = FileService(tmp_path / "workspace", database=database)
+    current_project = ProjectService(database, storage).create({"name": "冲突测试"})
+    current_asset = AssetService(database).create(
+        current_project["id"],
+        {"asset_type": "character", "name": "林舟"},
+    )
+    old_relative = f"角色/{current_asset['id']}/v001.png"
+    target_relative = "角色/角色-林舟.png"
+    storage.write_bytes_atomic(current_project["id"], old_relative, b"original")
+    storage.write_bytes_atomic(current_project["id"], target_relative, b"existing")
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(asset_image).values(
+                id="asset-image-1",
+                asset_id=current_asset["id"],
+                version_no=1,
+                file_path=old_relative,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                reference_files_json="[]",
+                provider_id=None,
+                model="",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="",
+                source="generated",
+                error="",
+                created_at=utc_now(),
+            )
+        )
+
+    with pytest.raises(FileServiceError, match="迁移目标已存在"):
+        storage.migrate_categorized_media_layouts()
+
+    assert (
+        storage.resolve_project_path(current_project["id"], old_relative).read_bytes()
+        == b"original"
+    )
+    assert (
+        storage.resolve_project_path(current_project["id"], target_relative).read_bytes()
+        == b"existing"
+    )
+    with database.engine.connect() as connection:
+        assert connection.scalar(select(asset_image.c.file_path)) == old_relative
+    database.dispose()
+
+
+def test_file_service_media_migration_recovers_interrupted_staged_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _create_database(tmp_path)
+    storage = FileService(tmp_path / "workspace", database=database)
+    current_project = ProjectService(database, storage).create({"name": "中断恢复"})
+    current_asset = AssetService(database).create(
+        current_project["id"],
+        {"asset_type": "character", "name": "林舟"},
+    )
+    old_relative = f"角色/{current_asset['id']}/v001.png"
+    target_relative = "角色/角色-林舟.png"
+    storage.write_bytes_atomic(current_project["id"], old_relative, b"original")
+    _insert_asset_image_record(
+        database,
+        image_id="asset-image-interrupted-stage",
+        asset_id=current_asset["id"],
+        file_path=old_relative,
+    )
+    original_move_file = storage.move_file
+    move_count = 0
+
+    def interrupt_after_first_move(*args: object, **kwargs: object) -> Path:
+        nonlocal move_count
+        result = original_move_file(*args, **kwargs)
+        move_count += 1
+        if move_count == 1:
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(storage, "move_file", interrupt_after_first_move)
+    with pytest.raises(KeyboardInterrupt):
+        storage.migrate_categorized_media_layouts()
+    monkeypatch.setattr(storage, "move_file", original_move_file)
+
+    assert storage.resolve_project_path(current_project["id"], old_relative).exists() is False
+    assert storage.resolve_project_path(current_project["id"], target_relative).exists() is False
+
+    assert storage.migrate_categorized_media_layouts() == 1
+
+    with database.engine.connect() as connection:
+        assert connection.scalar(select(asset_image.c.file_path)) == target_relative
+    assert (
+        storage.resolve_project_path(current_project["id"], target_relative).read_bytes()
+        == b"original"
+    )
+    database.dispose()
+
+
+def test_file_service_media_migration_recovers_file_moved_before_database_update(
+    tmp_path: Path,
+) -> None:
+    database = _create_database(tmp_path)
+    storage = FileService(tmp_path / "workspace", database=database)
+    current_project = ProjectService(database, storage).create({"name": "提交前中断"})
+    current_asset = AssetService(database).create(
+        current_project["id"],
+        {"asset_type": "character", "name": "林舟"},
+    )
+    old_relative = f"角色/{current_asset['id']}/v001.png"
+    target_relative = "角色/角色-林舟.png"
+    source = storage.write_bytes_atomic(current_project["id"], old_relative, b"original")
+    target = storage.resolve_project_path(current_project["id"], target_relative)
+    _insert_asset_image_record(
+        database,
+        image_id="asset-image-interrupted-target",
+        asset_id=current_asset["id"],
+        file_path=old_relative,
+    )
+    storage.move_file(current_project["id"], source, target)
+
+    assert storage.migrate_categorized_media_layouts() == 1
+
+    with database.engine.connect() as connection:
+        assert connection.scalar(select(asset_image.c.file_path)) == target_relative
+    assert target.read_bytes() == b"original"
+    database.dispose()
+
+
+def test_file_service_media_migration_lenient_mode_does_not_block_on_missing_file(
+    tmp_path: Path,
+) -> None:
+    database = _create_database(tmp_path)
+    storage = FileService(tmp_path / "workspace", database=database)
+    current_project = ProjectService(database, storage).create({"name": "缺失文件"})
+    current_asset = AssetService(database).create(
+        current_project["id"],
+        {"asset_type": "character", "name": "林舟"},
+    )
+    old_relative = f"角色/{current_asset['id']}/v001.png"
+    _insert_asset_image_record(
+        database,
+        image_id="asset-image-missing",
+        asset_id=current_asset["id"],
+        file_path=old_relative,
+    )
+
+    assert storage.migrate_categorized_media_layouts(strict=False) == 0
+
+    with database.engine.connect() as connection:
+        assert connection.scalar(select(asset_image.c.file_path)) == old_relative
     database.dispose()
 
 

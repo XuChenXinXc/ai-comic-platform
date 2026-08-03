@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Check,
   Download,
   Film,
@@ -34,9 +35,13 @@ export function MediaVersions({
   onDelete,
   onDownload,
 }: MediaVersionsProps) {
+  const visibleVersions = versions.filter((version) => version.status !== "failed");
+  const failedVersions = versions
+    .filter((version) => version.status === "failed")
+    .sort((a, b) => b.version_no - a.version_no);
   const current =
-    versions.find((version) => version.is_current) ||
-    versions.find((version) => version.status === "completed") ||
+    visibleVersions.find((version) => version.is_current) ||
+    visibleVersions.find((version) => version.status === "completed") ||
     null;
 
   if (!versions.length) {
@@ -49,8 +54,46 @@ export function MediaVersions({
     );
   }
 
+  const failureNotice = failedVersions.length ? (
+    <div className="space-y-2">
+      {failedVersions.map((version) => (
+        <div
+          key={version.id}
+          role="alert"
+          className="rounded-md border border-[#e0a39e] bg-[#fff0ee] px-3 py-2 text-[#9b342c]"
+        >
+          <div className="flex gap-2">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-bold">V{version.version_no} 生成失败</p>
+              <p className="mt-0.5 break-words text-xs leading-5">
+                {version.error || "生成失败，请在任务中心查看详情。"}
+              </p>
+            </div>
+          </div>
+          <div className="mt-2 flex justify-end">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="min-h-7 px-2 text-[#9b342c]"
+              busy={deletingId === version.id}
+              onClick={() => onDelete(version)}
+              aria-label={`删除失败版本 ${version.version_no}`}
+              title="删除失败版本"
+            >
+              <Trash2 className="h-3 w-3" />
+            </Button>
+          </div>
+        </div>
+      ))}
+    </div>
+  ) : null;
+
+  if (!visibleVersions.length) return <div className="space-y-3">{failureNotice}</div>;
+
   return (
     <div className="space-y-3">
+      {failureNotice}
       <div className="relative overflow-hidden rounded-lg border border-[#cdc8bd] bg-[#222622]">
         {current && mediaUrl(current) ? (
           mediaKind === "image" ? (
@@ -96,7 +139,7 @@ export function MediaVersions({
       ))}
 
       <div className="flex gap-2 overflow-x-auto pb-1" aria-label="媒体版本">
-        {[...versions]
+        {[...visibleVersions]
           .sort((a, b) => b.version_no - a.version_no)
           .map((version) => {
             const url = mediaUrl(version);

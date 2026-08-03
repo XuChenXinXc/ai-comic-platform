@@ -7,7 +7,7 @@ import {
   Settings2,
   Sparkles,
 } from "lucide-react";
-import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import { NavLink, Outlet, useNavigate } from "react-router";
 import { formatError } from "../lib/utils";
 import { useJobPolling, isJobActive } from "../hooks/use-job-polling";
 import { useProject } from "../hooks/use-project";

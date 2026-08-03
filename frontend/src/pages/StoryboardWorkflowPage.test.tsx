@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "../api/client";
 import type { Asset, Shot } from "../types/api";
@@ -159,12 +159,9 @@ describe("分镜视频统一页面", () => {
       screen.getByRole("button", { name: "生成全部视频" }),
     ).toBeInTheDocument();
     expect(
-      await screen.findByText(/【当前分镜素材参考图】/),
-    ).toBeInTheDocument();
-    expect(await screen.findByText(/【镜头与声音】/)).toBeInTheDocument();
-    expect(
       screen.queryByRole("button", { name: /生成.*提示词|补齐.*提示词/ }),
     ).not.toBeInTheDocument();
+    expect(screen.queryByText("最终视频执行提示词")).not.toBeInTheDocument();
     expect(
       await screen.findByLabelText("分镜 1 关键帧区块"),
     ).toBeInTheDocument();
@@ -241,6 +238,17 @@ describe("分镜视频统一页面", () => {
     expect(document.body).toHaveTextContent("看向小红");
     expect(document.body).toHaveTextContent("紧张警觉");
     expect(document.body).toHaveTextContent("压低声音");
+  });
+
+  test("test_shot_edit_modal_hides_legacy_prompt_fields", async () => {
+    const user = userEvent.setup();
+    renderShotsPage();
+
+    await user.click(await screen.findByRole("button", { name: "编辑" }));
+
+    expect(screen.getByText("负向提示词 / 禁止事项")).toBeInTheDocument();
+    expect(screen.queryByText("关键帧图片提示词")).not.toBeInTheDocument();
+    expect(screen.queryByText("视频执行提示词")).not.toBeInTheDocument();
   });
 
   test("test_shot_card_with_bound_assets_displays_only_bound_images", async () => {

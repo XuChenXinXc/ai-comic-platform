@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Save, Upload, WandSparkles } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { toast } from "sonner";
 import { api, mediaUrl, queryKeys } from "../api/client";
 import { formatError, parseJson } from "../lib/utils";
@@ -40,13 +40,29 @@ export function ShotMediaCard({
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
-  const [prompt, setPrompt] = useState(
-    kind === "keyframe" ? shot.image_prompt : shot.video_prompt,
-  );
-  const compiledPrompt =
+  const basePrompt = kind === "keyframe" ? shot.image_prompt : shot.video_prompt;
+  const overridePrompt =
     kind === "keyframe"
-      ? shot.compiled_image_prompt
-      : shot.compiled_video_prompt;
+      ? shot.image_prompt_override || ""
+      : shot.video_prompt_override || "";
+  const hasSavedPrompt = Boolean(
+    overridePrompt.trim() || basePrompt.trim(),
+  );
+  const finalPrompt =
+    kind === "keyframe"
+      ? overridePrompt ||
+        shot.final_image_prompt ||
+        shot.compiled_image_prompt ||
+        basePrompt
+      : overridePrompt ||
+        shot.final_video_prompt ||
+        shot.compiled_video_prompt ||
+        basePrompt;
+  const [prompt, setPrompt] = useState(finalPrompt);
+  const [promptBaseline, setPromptBaseline] = useState(finalPrompt);
+  const promptBaselineRef = useRef(finalPrompt);
+  const promptField =
+    kind === "keyframe" ? "image_prompt_override" : "video_prompt_override";
   const queryKey =
     kind === "keyframe"
       ? queryKeys.keyframes(shot.id)
@@ -65,8 +81,14 @@ export function ShotMediaCard({
   });
 
   useEffect(() => {
-    setPrompt(kind === "keyframe" ? shot.image_prompt : shot.video_prompt);
-  }, [kind, shot.image_prompt, shot.video_prompt]);
+    // 后台轮询会刷新 shot；用户正在编辑时保留本地文本，避免丢失输入。
+    const previousBaseline = promptBaselineRef.current;
+    promptBaselineRef.current = finalPrompt;
+    setPrompt((current) =>
+      current === previousBaseline ? finalPrompt : current,
+    );
+    setPromptBaseline(finalPrompt);
+  }, [finalPrompt]);
 
   const invalidate = () =>
     Promise.all([
@@ -83,11 +105,52 @@ export function ShotMediaCard({
         : []),
     ]);
 
-  const generateMutation = useMutation({
-    mutationFn: () =>
+  const applySavedPrompt = (updatedShot: Shot, requestedPrompt: string) => {
+    const savedPrompt =
       kind === "keyframe"
+        ? updatedShot.image_prompt_override?.trim() ||
+          updatedShot.final_image_prompt ||
+          updatedShot.compiled_image_prompt ||
+          updatedShot.image_prompt
+        : updatedShot.video_prompt_override?.trim() ||
+          updatedShot.final_video_prompt ||
+          updatedShot.compiled_video_prompt ||
+          updatedShot.video_prompt;
+    promptBaselineRef.current = savedPrompt;
+    setPromptBaseline(savedPrompt);
+    setPrompt((current) =>
+      current === requestedPrompt ? savedPrompt : current,
+    );
+    queryClient.setQueryData<Shot[]>(queryKeys.shots(shot.project_id), (shots) =>
+      shots?.map((item) => (item.id === updatedShot.id ? updatedShot : item)),
+    );
+  };
+
+  const promptMutation = useMutation({
+    mutationFn: (nextPrompt: string) =>
+      api.shots.update(shot.id, { [promptField]: nextPrompt.trim() }),
+    onSuccess: async (updatedShot, requestedPrompt) => {
+      applySavedPrompt(updatedShot, requestedPrompt);
+      await invalidate();
+      toast.success("提示词已保存，旧媒体会显示来源变化");
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
+  const generateMutation = useMutation({
+    mutationFn: async () => {
+      const requestedPrompt = prompt;
+      const nextPrompt = prompt.trim();
+      if (nextPrompt !== promptBaseline || !hasSavedPrompt) {
+        const updatedShot = await api.shots.update(shot.id, {
+          [promptField]: nextPrompt,
+        });
+        applySavedPrompt(updatedShot, requestedPrompt);
+      }
+      return kind === "keyframe"
         ? api.shots.keyframes.generate(shot.id)
-        : api.shots.videos.generate(shot.id),
+        : api.shots.videos.generate(shot.id);
+    },
     onSuccess: async () => {
       await queryClient.invalidateQueries({
         queryKey: queryKeys.jobs(shot.project_id),
@@ -135,18 +198,6 @@ export function ShotMediaCard({
     onError: (error) => toast.error(formatError(error)),
   });
 
-  const promptMutation = useMutation({
-    mutationFn: () =>
-      api.shots.update(shot.id, {
-        [kind === "keyframe" ? "image_prompt" : "video_prompt"]: prompt,
-      }),
-    onSuccess: async () => {
-      await invalidate();
-      toast.success("提示词已保存，旧媒体会显示来源变化");
-    },
-    onError: (error) => toast.error(formatError(error)),
-  });
-
   const characterIds = parseJson<string[]>(shot.character_ids_json, []);
   const propIds = parseJson<string[]>(shot.prop_ids_json, []);
   const characterNames = characterIds
@@ -182,9 +233,7 @@ export function ShotMediaCard({
     (version) => version.is_current && version.status === "completed",
   ) || shot.current_keyframe;
   const promptMissing =
-    kind === "keyframe"
-      ? !shot.image_prompt.trim()
-      : !shot.video_prompt.trim();
+    !prompt.trim();
   const videoMissingKeyframe = kind === "video" && !currentKeyframe;
 
   return (
@@ -259,6 +308,7 @@ export function ShotMediaCard({
             variant="primary"
             busy={generateMutation.isPending}
             disabled={
+              promptMutation.isPending ||
               promptMissing ||
               videoMissingKeyframe ||
               missingSceneAsset ||
@@ -285,42 +335,24 @@ export function ShotMediaCard({
           }`}
         >
           <div>
-            <div className="mb-4 rounded-md border border-line bg-white/55 p-3">
-              <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
-                {kind === "keyframe"
-                  ? "最终 V2 关键帧提示词"
-                  : "最终 V2 视频提示词"}
-              </p>
-              <p className="mt-2 max-h-56 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
-                {compiledPrompt || prompt}
-              </p>
-            </div>
             <div className="mb-2 flex items-center justify-between gap-2">
               <Label className="mb-0">
-                导演补充（可选）
+                {kind === "keyframe" ? "最终关键帧提示词" : "最终视频提示词"}
               </Label>
               <Button
                 size="sm"
                 variant="ghost"
                 busy={promptMutation.isPending}
-                disabled={
-                  prompt ===
-                  (kind === "keyframe" ? shot.image_prompt : shot.video_prompt)
-                }
-                onClick={() => promptMutation.mutate()}
+                disabled={generateMutation.isPending || prompt === promptBaseline}
+                onClick={() => promptMutation.mutate(prompt)}
               >
                 <Save className="h-3.5 w-3.5" />
                 保存
               </Button>
             </div>
             <Textarea
-              rows={kind === "keyframe" ? 4 : 6}
+              rows={kind === "keyframe" ? 9 : 11}
               value={prompt}
-              placeholder={
-                kind === "keyframe"
-                  ? "可补充本镜构图、灯光或环境细节；留空时按分镜结构自动编译。"
-                  : "可补充本镜动作时间轴、表演或镜头变化；留空时按分镜结构自动编译。"
-              }
               onChange={(event) => setPrompt(event.target.value)}
             />
           </div>
@@ -386,6 +418,10 @@ export function ShotMediaCard({
                 if (!version.is_current) currentMutation.mutate(version);
               }}
               onDelete={(version) => {
+                if (kind === "keyframe" && version.status === "failed") {
+                  deleteMutation.mutate(version);
+                  return;
+                }
                 if (
                   window.confirm(
                     `确认删除分镜 ${shot.shot_no} 的 V${version.version_no} ${

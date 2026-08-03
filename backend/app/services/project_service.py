@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, insert, select, update
@@ -104,6 +105,16 @@ class ProjectService:
             raise not_found("项目")
         return self._public_record(record)
 
+    @staticmethod
+    def _next_updated_at(previous: str) -> str:
+        now = utc_now()
+        if now > previous:
+            return now
+        try:
+            return (datetime.fromisoformat(previous) + timedelta(microseconds=1)).isoformat()
+        except ValueError:
+            return now
+
     def update(self, project_id: str, values: dict[str, Any]) -> dict[str, Any]:
         current = self.get(project_id)
         changes = dict(values)
@@ -114,7 +125,7 @@ class ProjectService:
                 changes["source_revision"] = current["source_revision"] + 1
         if not changes:
             return current
-        changes["updated_at"] = utc_now()
+        changes["updated_at"] = self._next_updated_at(current["updated_at"])
         with self.database.engine.begin() as connection:
             self._validate_provider_defaults(connection, changes)
             connection.execute(update(project).where(project.c.id == project_id).values(**changes))

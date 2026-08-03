@@ -105,6 +105,46 @@ def test_job_runner_with_async_handler_persists_completed_result(tmp_path: Path)
     database.dispose()
 
 
+def test_job_runner_image_batch_with_failed_item_completes_other_items(
+    tmp_path: Path,
+) -> None:
+    database, repository = _repository(tmp_path)
+    runner = JobRunner(repository, {"text": 1, "image": 1, "video": 1})
+    service = JobService(database, repository=repository, runner=runner)
+
+    def handler(record: dict[str, Any]) -> dict[str, Any]:
+        if record["input_data"]["result"] == "failed":
+            raise RuntimeError("图片生成失败")
+        return {"result": "completed"}
+
+    runner.register_handler("generate_asset_image", handler)
+    batch = service.create_batch(
+        [
+            {
+                "project_id": "project-1",
+                "job_type": "generate_asset_image",
+                "provider_kind": "image",
+                "input_data": {"result": "failed"},
+            },
+            {
+                "project_id": "project-1",
+                "job_type": "generate_asset_image",
+                "provider_kind": "image",
+                "input_data": {"result": "completed"},
+            },
+        ]
+    )
+
+    failed = _wait_for_status(repository, batch["jobs"][0]["id"], "failed")
+    completed = _wait_for_status(repository, batch["jobs"][1]["id"], "completed")
+
+    assert failed["batch_id"] == batch["batch_id"]
+    assert completed["batch_id"] == batch["batch_id"]
+    assert completed["result_data"] == {"result": "completed"}
+    runner.shutdown()
+    database.dispose()
+
+
 def test_job_runner_with_signed_url_error_persists_redacted_error(tmp_path: Path) -> None:
     database, repository = _repository(tmp_path)
     runner = JobRunner(repository, {"text": 1, "image": 1, "video": 1})

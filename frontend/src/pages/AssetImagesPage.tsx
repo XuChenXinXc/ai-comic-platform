@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Upload, WandSparkles } from "lucide-react";
 import { useRef } from "react";
-import { Navigate } from "react-router-dom";
+import { Navigate } from "react-router";
 import { toast } from "sonner";
 import { api, mediaUrl, queryKeys } from "../api/client";
 import { MediaVersions } from "../components/media-versions";
@@ -168,6 +168,10 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
             if (!version.is_current) currentMutation.mutate(version);
           }}
           onDelete={(version) => {
+            if (version.status === "failed") {
+              deleteMutation.mutate(version);
+              return;
+            }
             if (
               window.confirm(
                 `确认删除 ${asset.name} 的 V${version.version_no} 图片吗？`,

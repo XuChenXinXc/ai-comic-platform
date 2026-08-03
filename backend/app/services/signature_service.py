@@ -33,7 +33,9 @@ SHOT_SIGNATURE_FIELDS = (
     "next_hook",
     "frame_description",
     "image_prompt",
+    "image_prompt_override",
     "video_prompt",
+    "video_prompt_override",
     "negative_prompt",
     "reference_bindings",
     "reference_bindings_json",
@@ -103,7 +105,15 @@ def shot_signature(
 ) -> str:
     raw = values.model_dump(mode="json") if isinstance(values, BaseModel) else dict(values)
     raw.update(overrides)
-    semantic_values = {name: raw[name] for name in SHOT_SIGNATURE_FIELDS if name in raw}
+    semantic_values = {
+        name: raw[name]
+        for name in SHOT_SIGNATURE_FIELDS
+        if name in raw
+        and not (
+            name in {"image_prompt_override", "video_prompt_override"}
+            and not str(raw[name] or "").strip()
+        )
+    }
     return calculate_signature(semantic_values)
 
 

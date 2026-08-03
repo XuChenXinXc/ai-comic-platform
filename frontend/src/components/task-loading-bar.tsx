@@ -1,5 +1,5 @@
 import { LoaderCircle, ListChecks } from "lucide-react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { isJobActive } from "../hooks/use-job-polling";
 import { jobTypeLabel } from "../lib/job-labels";
 import type { Job } from "../types/api";

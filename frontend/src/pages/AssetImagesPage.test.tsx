@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "../api/client";
-import type { Asset } from "../types/api";
+import type { Asset, MediaVersion } from "../types/api";
 import { AssetImagePanel } from "./AssetImagesPage";
 
 vi.mock("sonner", () => ({
@@ -75,5 +76,70 @@ describe("素材图片真实内容门禁", () => {
     });
 
     expect(screen.getByRole("button", { name: "生成新版本" })).toBeEnabled();
+  });
+});
+
+describe("素材图片失败记录删除", () => {
+  test("test_delete_failed_asset_image_removes_without_confirmation", async () => {
+    const user = userEvent.setup();
+    const failedVersion: MediaVersion = {
+      id: "image-failed",
+      asset_id: baseAsset.id,
+      version_no: 2,
+      file_path: null,
+      prompt_snapshot: "失败提示词",
+      negative_prompt_snapshot: "",
+      model: "image-model",
+      status: "failed",
+      is_current: false,
+      source: "generated",
+      input_signature: "failed-signature",
+      error: "生成失败",
+      created_at: "2026-08-03T00:00:00Z",
+    };
+    vi.mocked(api.assets.images.list).mockResolvedValue([failedVersion]);
+    const removeSpy = vi
+      .spyOn(api.assets.images, "remove")
+      .mockResolvedValue(undefined);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    renderPanel(baseAsset);
+    await user.click(
+      await screen.findByRole("button", { name: "删除失败版本 2" }),
+    );
+
+    await waitFor(() => expect(removeSpy).toHaveBeenCalledWith("image-failed"));
+    expect(confirmSpy).not.toHaveBeenCalled();
+  });
+
+  test("test_delete_completed_asset_image_keeps_confirmation", async () => {
+    const user = userEvent.setup();
+    const completedVersion: MediaVersion = {
+      id: "image-completed",
+      asset_id: baseAsset.id,
+      version_no: 1,
+      file_path: "角色/角色-小明-v001.png",
+      prompt_snapshot: "成功提示词",
+      negative_prompt_snapshot: "",
+      model: "image-model",
+      status: "completed",
+      is_current: false,
+      source: "generated",
+      input_signature: "completed-signature",
+      created_at: "2026-08-03T00:00:00Z",
+    };
+    vi.mocked(api.assets.images.list).mockResolvedValue([completedVersion]);
+    const removeSpy = vi
+      .spyOn(api.assets.images, "remove")
+      .mockResolvedValue(undefined);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    renderPanel(baseAsset);
+    await user.click(
+      await screen.findByRole("button", { name: "删除版本 1" }),
+    );
+
+    expect(confirmSpy).toHaveBeenCalledOnce();
+    await waitFor(() => expect(removeSpy).toHaveBeenCalledWith("image-completed"));
   });
 });

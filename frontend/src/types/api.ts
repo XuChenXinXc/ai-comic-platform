@@ -204,8 +204,12 @@ export interface Shot {
   next_hook: string;
   frame_description: string;
   image_prompt: string;
+  image_prompt_override?: string | null;
+  final_image_prompt?: string;
   compiled_image_prompt: string;
   video_prompt: string;
+  video_prompt_override?: string | null;
+  final_video_prompt?: string;
   compiled_video_prompt: string;
   negative_prompt: string;
   reference_bindings_json: ReferenceBinding[] | string;

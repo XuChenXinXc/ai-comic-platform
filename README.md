@@ -20,7 +20,7 @@ V1 不包含配音、字幕、BGM 和最终视频合成。
 
 - Windows PowerShell 5.1 或 PowerShell 7
 - Python 3.11
-- Node.js 20 或更高版本
+- Node.js 22.22 或更高版本
 - FFmpeg 与 ffprobe 已加入 `PATH`（Mock 视频生成与可播放性校验需要）
 
 ## 一键启动

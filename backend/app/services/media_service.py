@@ -5,6 +5,7 @@ import math
 import subprocess
 import zipfile
 from pathlib import Path
+from threading import RLock
 from typing import Any, Literal
 
 from PIL import Image, UnidentifiedImageError
@@ -68,6 +69,7 @@ _MEDIA_TABLES = {
 }
 _DELETED_MEDIA_ERROR = "__deleted_by_user__"
 _ACTIVE_MEDIA_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+_MEDIA_VERSION_FILE_LOCK = RLock()
 _GPT_IMAGE_2_SIZES = {
     "character": "3840x2560",
     "scene": "3840x2160",
@@ -419,14 +421,22 @@ class MediaService:
         return result
 
     @staticmethod
-    def _job_params(connection: Any, version_id: str, provider_id: str | None) -> dict[str, Any]:
+    def _job_input(connection: Any, version_id: str) -> dict[str, Any]:
         raw = connection.execute(
             select(job.c.input_json)
             .where(job.c.target_id == version_id)
             .order_by(job.c.created_at.desc())
             .limit(1)
         ).scalar()
-        overrides = json_loads(raw, {}).get("params", {})
+        return json_loads(raw, {})
+
+    @staticmethod
+    def _job_params(
+        connection: Any,
+        input_data: dict[str, Any],
+        provider_id: str | None,
+    ) -> dict[str, Any]:
+        overrides = input_data.get("params", {})
         if not provider_id:
             return overrides
         provider_params = connection.execute(
@@ -434,10 +444,37 @@ class MediaService:
         ).scalar()
         return {**json_loads(provider_params, {}), **overrides}
 
+    def _provider_model_value(
+        self,
+        connection: Any,
+        provider_id: str | None,
+        fallback: str,
+        input_data: dict[str, Any],
+        created_at: str,
+    ) -> str:
+        if not provider_id:
+            return fallback
+        provider_record = connection.execute(
+            select(api_provider.c.model, api_provider.c.updated_at).where(
+                api_provider.c.id == provider_id
+            )
+        ).first()
+        if provider_record is None:
+            return fallback
+        queued_provider_updated_at = input_data.get("provider_updated_at")
+        if isinstance(queued_provider_updated_at, str) and queued_provider_updated_at:
+            if provider_record.updated_at == queued_provider_updated_at:
+                return fallback
+            return str(provider_record.model or fallback)
+        if provider_record.updated_at > created_at:
+            return str(provider_record.model or fallback)
+        return fallback
+
     def _asset_expected_signature(
         self, connection: Any, record: dict[str, Any], current: dict[str, Any]
     ) -> str:
-        params = self._job_params(connection, record["id"], record["provider_id"])
+        input_data = self._job_input(connection, record["id"])
+        params = self._job_params(connection, input_data, record["provider_id"])
         project_record = row_dict(
             connection.execute(select(project).where(project.c.id == current["project_id"])).first()
         )
@@ -446,7 +483,13 @@ class MediaService:
         return asset_image_signature(
             self._effective_asset_signature(current, project_record),
             record["provider_id"] or "uploaded",
-            record["model"],
+            self._provider_model_value(
+                connection,
+                record["provider_id"],
+                record["model"],
+                input_data,
+                record["created_at"],
+            ),
             params,
             record["reference_files_json"],
         )
@@ -454,7 +497,8 @@ class MediaService:
     def _keyframe_expected_signature(
         self, connection: Any, record: dict[str, Any], current: dict[str, Any]
     ) -> str:
-        params = self._job_params(connection, record["id"], record["provider_id"])
+        input_data = self._job_input(connection, record["id"])
+        params = self._job_params(connection, input_data, record["provider_id"])
         project_record = row_dict(
             connection.execute(select(project).where(project.c.id == current["project_id"])).first()
         )
@@ -464,33 +508,40 @@ class MediaService:
             self._effective_shot_signature(current, project_record),
             current["reference_bindings"],
             record["provider_id"] or "uploaded",
-            record["model"],
+            self._provider_model_value(
+                connection,
+                record["provider_id"],
+                record["model"],
+                input_data,
+                record["created_at"],
+            ),
             params,
         )
 
     def _video_expected_signature(
         self, connection: Any, record: dict[str, Any], current: dict[str, Any]
     ) -> str:
-        params = self._job_params(connection, record["id"], record["provider_id"])
+        input_data = self._job_input(connection, record["id"])
+        params = self._job_params(connection, input_data, record["provider_id"])
         project_record = row_dict(
             connection.execute(select(project).where(project.c.id == current["project_id"])).first()
         )
         if project_record is None:
             raise not_found("项目")
-        raw_input = connection.execute(
-            select(job.c.input_json)
-            .where(job.c.target_id == record["id"])
-            .order_by(job.c.created_at.desc())
-            .limit(1)
-        ).scalar()
-        input_data = json_loads(raw_input, {})
         reference_bindings = (
             current["reference_bindings"]
             if input_data.get("supports_multiple_input_images") is True
             else []
         )
-        effective_duration = self._effective_video_duration(
+        current_model = self._provider_model_value(
+            connection,
+            record["provider_id"],
             record["model"],
+            input_data,
+            record["created_at"],
+        )
+        effective_duration = self._effective_video_duration(
+            current_model,
             current["duration_sec"],
         )
         generation_current = {**current, "duration_sec": effective_duration}
@@ -503,7 +554,7 @@ class MediaService:
             ),
             effective_duration,
             record["provider_id"] or "uploaded",
-            record["model"],
+            current_model,
             params,
             reference_bindings,
         )
@@ -551,7 +602,9 @@ class MediaService:
         *,
         reference_bindings: list[dict[str, Any]] | None = None,
     ) -> str:
-        video_prompt = resolve_video_description(
+        video_prompt = str(
+            current.get("video_prompt_override") or ""
+        ).strip() or resolve_video_description(
             video_prompt=current["video_prompt"],
             start_state=current["start_state"],
             action=current["action"],
@@ -736,7 +789,11 @@ class MediaService:
             target_id=version["id"],
             provider_kind="image",
             provider_id=config["id"],
-            input_data={"asset_id": asset_id, "params": request_params},
+            input_data={
+                "asset_id": asset_id,
+                "provider_updated_at": str(config.get("updated_at") or ""),
+                "params": request_params,
+            },
             batch_id=options.get("_batch_id"),
         )
 
@@ -786,7 +843,8 @@ class MediaService:
     def queue_keyframe(self, shot_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current = self._shot(shot_id)
         current_project = self._project(current["project_id"])
-        image_prompt = str(current["image_prompt"] or "").strip()
+        image_prompt_override = str(current.get("image_prompt_override") or "").strip()
+        image_prompt = image_prompt_override or str(current["image_prompt"] or "").strip()
         if not image_prompt:
             raise bad_request("分镜缺少明确的关键帧提示词")
         current = self._refresh_shot_reference_bindings(current)
@@ -811,7 +869,8 @@ class MediaService:
             parent_id=shot_id,
             values={
                 "file_path": None,
-                "prompt_snapshot": compile_keyframe_prompt(
+                "prompt_snapshot": image_prompt_override
+                or compile_keyframe_prompt(
                     style_prompt=current_project["style_prompt"],
                     aspect_ratio=current_project["aspect_ratio"],
                     image_prompt=image_prompt,
@@ -844,7 +903,11 @@ class MediaService:
             target_id=version["id"],
             provider_kind="image",
             provider_id=config["id"],
-            input_data={"shot_id": shot_id, "params": request_params},
+            input_data={
+                "shot_id": shot_id,
+                "provider_updated_at": str(config.get("updated_at") or ""),
+                "params": request_params,
+            },
             batch_id=options.get("_batch_id"),
         )
 
@@ -854,7 +917,8 @@ class MediaService:
     def queue_video(self, shot_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current = self._shot(shot_id)
         current_project = self._project(current["project_id"])
-        video_prompt = str(current["video_prompt"] or "").strip()
+        video_prompt_override = str(current.get("video_prompt_override") or "").strip()
+        video_prompt = video_prompt_override or str(current["video_prompt"] or "").strip()
         if not video_prompt:
             raise bad_request("分镜缺少明确的视频提示词")
         with self.database.engine.connect() as connection:
@@ -899,7 +963,7 @@ class MediaService:
                 for index, (_, label) in enumerate(reference_items, start=2)
             ],
         ]
-        prompt = compile_video_prompt(
+        prompt = video_prompt_override or compile_video_prompt(
             style_prompt=current_project["style_prompt"],
             aspect_ratio=current_project["aspect_ratio"],
             video_prompt=video_prompt,
@@ -954,6 +1018,7 @@ class MediaService:
                 "keyframe_version_id": keyframe["id"],
                 "reference_bindings": reference_bindings,
                 "supports_multiple_input_images": supports_multiple_input_images,
+                "provider_updated_at": str(config.get("updated_at") or ""),
                 "params": options.get("params", {}),
             },
             batch_id=options.get("_batch_id"),
@@ -1106,6 +1171,7 @@ class MediaService:
             asset_id,
             version["version_no"],
             suffix,
+            asset_name=current["name"],
             storage_name=self._project_storage_name(current["project_id"]),
         )
         return self._finish_upload(
@@ -1133,7 +1199,9 @@ class MediaService:
             parent_id=shot_id,
             values={
                 "file_path": None,
-                "prompt_snapshot": current["image_prompt"],
+                "prompt_snapshot": str(
+                    current.get("image_prompt_override") or current["image_prompt"] or ""
+                ).strip(),
                 "negative_prompt_snapshot": current["negative_prompt"],
                 "reference_bindings_json": current["reference_bindings_json"],
                 "provider_id": None,
@@ -1157,6 +1225,7 @@ class MediaService:
             shot_id,
             version["version_no"],
             suffix,
+            shot_no=current["shot_no"],
             storage_name=self._project_storage_name(current["project_id"]),
         )
         return self._finish_upload(
@@ -1193,7 +1262,9 @@ class MediaService:
             values={
                 "keyframe_version_id": keyframe_id,
                 "file_path": None,
-                "prompt_snapshot": current["video_prompt"],
+                "prompt_snapshot": str(
+                    current.get("video_prompt_override") or current["video_prompt"] or ""
+                ).strip(),
                 "negative_prompt_snapshot": current["negative_prompt"],
                 "requested_duration_sec": current["duration_sec"],
                 "actual_duration_sec": None,
@@ -1220,6 +1291,7 @@ class MediaService:
             shot_id,
             version["version_no"],
             suffix,
+            shot_no=current["shot_no"],
             storage_name=self._project_storage_name(current["project_id"]),
         )
         return self._finish_upload(
@@ -1230,6 +1302,198 @@ class MediaService:
             data=data,
         )
 
+    def _media_version_storage_path(
+        self,
+        kind: MediaKind,
+        record: dict[str, Any],
+        *,
+        current: bool,
+    ) -> tuple[str, Path]:
+        file_path = str(record.get("file_path") or "")
+        suffix = Path(file_path).suffix
+        if not suffix:
+            raise FileServiceError("媒体文件缺少扩展名")
+        if kind == "asset_image":
+            parent = self._asset(record["asset_id"])
+            return parent["project_id"], file_service.asset_image_path(
+                parent["project_id"],
+                parent["asset_type"],
+                parent["id"],
+                record["version_no"],
+                suffix,
+                asset_name=parent["name"],
+                current=current,
+                storage_name=self._project_storage_name(parent["project_id"]),
+            )
+        parent = self._shot(record["shot_id"])
+        path_builder = file_service.keyframe_path if kind == "keyframe" else file_service.video_path
+        return parent["project_id"], path_builder(
+            parent["project_id"],
+            parent["id"],
+            record["version_no"],
+            suffix,
+            shot_no=parent["shot_no"],
+            current=current,
+            storage_name=self._project_storage_name(parent["project_id"]),
+        )
+
+    @staticmethod
+    def _rollback_media_moves(
+        project_id: str,
+        moves: list[tuple[Path, Path]],
+    ) -> None:
+        errors: list[str] = []
+        for source, target in reversed(moves):
+            if not target.exists():
+                continue
+            try:
+                file_service.move_file(project_id, target, source)
+            except FileServiceError as exc:
+                errors.append(str(exc))
+        if errors:
+            raise FileServiceError("媒体文件回滚失败：" + "；".join(errors))
+
+    def _activate_media_version(
+        self,
+        kind: MediaKind,
+        version_id: str,
+        *,
+        source_relative: str | None = None,
+        complete: bool = False,
+        actual_duration_sec: float | None = None,
+    ) -> dict[str, Any]:
+        table, parent_column = _MEDIA_TABLES[kind]
+        with _MEDIA_VERSION_FILE_LOCK:
+            with self.database.engine.connect() as connection:
+                record = row_dict(
+                    connection.execute(select(table).where(table.c.id == version_id)).first()
+                )
+                if record is None:
+                    raise not_found("媒体版本")
+                if source_relative is not None:
+                    record["file_path"] = source_relative
+                if not record.get("file_path"):
+                    raise FileServiceError("媒体版本缺少文件路径")
+                old_current = row_dict(
+                    connection.execute(
+                        select(table).where(
+                            table.c[parent_column] == record[parent_column],
+                            table.c.is_current.is_(True),
+                            table.c.id != version_id,
+                        )
+                    ).first()
+                )
+
+            project_id, current_target = self._media_version_storage_path(
+                kind,
+                record,
+                current=True,
+            )
+            source = file_service.resolve_project_path(project_id, record["file_path"])
+            moves: list[tuple[Path, Path]] = []
+            old_history_relative: str | None = None
+            try:
+                if old_current and old_current.get("file_path"):
+                    _, old_history_target = self._media_version_storage_path(
+                        kind,
+                        old_current,
+                        current=False,
+                    )
+                    old_source = file_service.resolve_project_path(
+                        project_id,
+                        old_current["file_path"],
+                    )
+                    if old_source != old_history_target:
+                        file_service.move_file(project_id, old_source, old_history_target)
+                        moves.append((old_source, old_history_target))
+                    old_history_relative = file_service.relative_project_path(
+                        project_id,
+                        old_history_target,
+                    )
+                if source != current_target:
+                    file_service.move_file(project_id, source, current_target)
+                    moves.append((source, current_target))
+                current_relative = file_service.relative_project_path(
+                    project_id,
+                    current_target,
+                )
+                values: dict[str, Any] = {
+                    "file_path": current_relative,
+                    "is_current": True,
+                }
+                if complete:
+                    values.update(status="completed", error="")
+                if kind == "video" and complete:
+                    values["actual_duration_sec"] = actual_duration_sec
+                with self.database.engine.begin() as connection:
+                    connection.execute(
+                        update(table)
+                        .where(table.c[parent_column] == record[parent_column])
+                        .values(is_current=False)
+                    )
+                    if old_current and old_history_relative:
+                        connection.execute(
+                            update(table)
+                            .where(table.c.id == old_current["id"])
+                            .values(file_path=old_history_relative)
+                        )
+                    connection.execute(
+                        update(table).where(table.c.id == version_id).values(**values)
+                    )
+            except Exception as exc:
+                try:
+                    self._rollback_media_moves(project_id, moves)
+                except FileServiceError as rollback_exc:
+                    raise FileServiceError(f"媒体版本切换失败，且回滚失败：{rollback_exc}") from exc
+                raise
+        return self._get_version(kind, version_id)
+
+    def _deactivate_media_version(
+        self,
+        kind: MediaKind,
+        version_id: str,
+    ) -> dict[str, Any]:
+        table, _ = _MEDIA_TABLES[kind]
+        with _MEDIA_VERSION_FILE_LOCK:
+            with self.database.engine.connect() as connection:
+                record = row_dict(
+                    connection.execute(select(table).where(table.c.id == version_id)).first()
+                )
+            if record is None or record["error"] == _DELETED_MEDIA_ERROR:
+                raise not_found("媒体版本")
+            if not record["is_current"]:
+                return self._get_version(kind, version_id)
+            project_id, history_target = self._media_version_storage_path(
+                kind,
+                record,
+                current=False,
+            )
+            source = file_service.resolve_project_path(project_id, record["file_path"])
+            moved = source != history_target
+            try:
+                if moved:
+                    file_service.move_file(project_id, source, history_target)
+                history_relative = file_service.relative_project_path(
+                    project_id,
+                    history_target,
+                )
+                with self.database.engine.begin() as connection:
+                    connection.execute(
+                        update(table)
+                        .where(table.c.id == version_id)
+                        .values(file_path=history_relative, is_current=False)
+                    )
+            except Exception as exc:
+                if moved and history_target.exists():
+                    try:
+                        file_service.move_file(project_id, history_target, source)
+                    except FileServiceError as rollback_exc:
+                        raise FileServiceError(
+                            f"取消当前版本失败，且回滚失败：{rollback_exc}"
+                        ) from exc
+                raise
+        return self._get_version(kind, version_id)
+
     def _finish_upload(
         self,
         *,
@@ -1239,46 +1503,39 @@ class MediaService:
         target: Path,
         data: bytes,
     ) -> dict[str, Any]:
-        table, parent_column = _MEDIA_TABLES[kind]
+        table, _ = _MEDIA_TABLES[kind]
         relative = file_service.relative_project_path(project_id, target)
-        asset_id: str | None = None
+        working_target = file_service.resolve_project_path(
+            project_id,
+            Path("temp") / "media-results" / f"{version_id}{target.suffix}",
+        )
+        working_relative = file_service.relative_project_path(project_id, working_target)
+        target_created = False
         try:
-            file_service.write_bytes_atomic(project_id, relative, data)
+            file_service.write_bytes_atomic(project_id, working_relative, data)
+            file_service.move_file(project_id, working_target, target)
+            target_created = True
             actual_duration_sec = self._verify_video(target) if kind == "video" else None
-            with self.database.engine.begin() as connection:
-                record = row_dict(
-                    connection.execute(select(table).where(table.c.id == version_id)).first()
-                )
-                if record is None:
-                    raise not_found("媒体版本")
-                if table is asset_image:
-                    asset_id = record["asset_id"]
-                connection.execute(
-                    update(table)
-                    .where(table.c[parent_column] == record[parent_column])
-                    .values(is_current=False)
-                )
-                connection.execute(
-                    update(table)
-                    .where(table.c.id == version_id)
-                    .values(
-                        file_path=relative,
-                        is_current=True,
-                        **(
-                            {"actual_duration_sec": actual_duration_sec}
-                            if table is video_version
-                            else {}
-                        ),
-                    )
-                )
+            activated = self._activate_media_version(
+                kind,
+                version_id,
+                source_relative=relative,
+                complete=True,
+                actual_duration_sec=actual_duration_sec,
+            )
         except Exception:
-            file_service.delete_file(project_id, relative)
+            self._delete_failed_target(project_id, working_target)
+            if target_created:
+                self._delete_failed_target(project_id, target)
             with self.database.engine.begin() as connection:
                 connection.execute(delete(table).where(table.c.id == version_id))
             raise
-        if asset_id:
-            ShotService(self.database, self.jobs).sync_asset_image_binding(asset_id, version_id)
-        return self._get_version(kind, version_id)
+        if kind == "asset_image":
+            ShotService(self.database, self.jobs).sync_asset_image_binding(
+                activated["asset_id"],
+                version_id,
+            )
+        return activated
 
     def _get_version(self, kind: MediaKind, version_id: str) -> dict[str, Any]:
         table, parent_column = _MEDIA_TABLES[kind]
@@ -1301,9 +1558,8 @@ class MediaService:
         return self._decode_version(record, project_id)
 
     def set_current(self, kind: MediaKind, version_id: str) -> dict[str, Any]:
-        table, parent_column = _MEDIA_TABLES[kind]
-        asset_id: str | None = None
-        with self.database.engine.begin() as connection:
+        table, _ = _MEDIA_TABLES[kind]
+        with self.database.engine.connect() as connection:
             record = row_dict(
                 connection.execute(select(table).where(table.c.id == version_id)).first()
             )
@@ -1311,32 +1567,16 @@ class MediaService:
                 raise not_found("媒体版本")
             if record["status"] != "completed" or not record.get("file_path"):
                 raise conflict("只有已完成且文件存在的版本可以设为当前版本")
-            if table is asset_image:
-                asset_id = record["asset_id"]
-            connection.execute(
-                update(table)
-                .where(table.c[parent_column] == record[parent_column])
-                .values(is_current=False)
+        activated = self._activate_media_version(kind, version_id)
+        if kind == "asset_image":
+            ShotService(self.database, self.jobs).sync_asset_image_binding(
+                activated["asset_id"],
+                version_id,
             )
-            connection.execute(
-                update(table).where(table.c.id == version_id).values(is_current=True)
-            )
-        if asset_id:
-            ShotService(self.database, self.jobs).sync_asset_image_binding(asset_id, version_id)
-        return self._get_version(kind, version_id)
+        return activated
 
     def unset_current(self, kind: MediaKind, version_id: str) -> dict[str, Any]:
-        table, _ = _MEDIA_TABLES[kind]
-        with self.database.engine.begin() as connection:
-            record = row_dict(
-                connection.execute(select(table).where(table.c.id == version_id)).first()
-            )
-            if record is None or record["error"] == _DELETED_MEDIA_ERROR:
-                raise not_found("媒体版本")
-            connection.execute(
-                update(table).where(table.c.id == version_id).values(is_current=False)
-            )
-        return self._get_version(kind, version_id)
+        return self._deactivate_media_version(kind, version_id)
 
     def delete_version(self, kind: MediaKind, version_id: str) -> None:
         table, parent_column = _MEDIA_TABLES[kind]
@@ -1465,6 +1705,10 @@ class MediaService:
         table = asset_image if kind == "asset_image" else keyframe_version
         version_id = job_record["target_id"]
         version = self._get_version(kind, version_id)
+        project_id = ""
+        target: Path | None = None
+        working_target: Path | None = None
+        target_created = False
         try:
             input_data = json_loads(job_record.get("input_json"), {})
             if kind == "asset_image":
@@ -1480,6 +1724,7 @@ class MediaService:
                     current["asset_type"],
                     current["id"],
                     version["version_no"],
+                    asset_name=current["name"],
                     storage_name=self._project_storage_name(project_id),
                 )
             else:
@@ -1496,8 +1741,13 @@ class MediaService:
                     project_id,
                     current["id"],
                     version["version_no"],
+                    shot_no=current["shot_no"],
                     storage_name=self._project_storage_name(project_id),
                 )
+            working_target = file_service.resolve_project_path(
+                project_id,
+                Path("temp") / "media-results" / f"{version_id}{target.suffix}",
+            )
             provider, config = self.providers.resolve(
                 kind="image",
                 provider_id=version["provider_id"],
@@ -1536,13 +1786,18 @@ class MediaService:
                     submission,
                     config["timeout_sec"],
                 )
-            await self._download_provider_result(provider, result, target)
-            self._delete_staged_provider_result(project_id, result)
-            self._verify_image(target.read_bytes())
+            await self._download_provider_result(provider, result, working_target)
+            self._verify_image(working_target.read_bytes())
+            file_service.move_file(project_id, working_target, target)
+            target_created = True
             relative = file_service.relative_project_path(project_id, target)
-            self._complete_media(table, version_id, relative)
-            return {"version_id": version_id, "file_path": relative}
+            completed = self._complete_media(table, version_id, relative)
+            self._delete_staged_provider_result(project_id, result)
+            return {"version_id": version_id, "file_path": completed["file_path"]}
         except Exception as exc:
+            self._delete_failed_target(project_id, working_target)
+            if target_created:
+                self._delete_failed_target(project_id, target)
             self._set_media_status(table, version_id, "failed", str(exc))
             raise
 
@@ -1554,6 +1809,8 @@ class MediaService:
         version = self._get_version("video", version_id)
         project_id = ""
         target: Path | None = None
+        working_target: Path | None = None
+        target_created = False
         try:
             current = self._shot(version["shot_id"])
             project_id = current["project_id"]
@@ -1569,7 +1826,12 @@ class MediaService:
                 project_id,
                 current["id"],
                 version["version_no"],
+                shot_no=current["shot_no"],
                 storage_name=self._project_storage_name(project_id),
+            )
+            working_target = file_service.resolve_project_path(
+                project_id,
+                Path("temp") / "media-results" / f"{version_id}{target.suffix}",
             )
             self._set_media_status(video_version, version_id, "running")
             if self._has_saved_result(job_record):
@@ -1617,23 +1879,25 @@ class MediaService:
             self.jobs.repository.set_status(
                 job_record["id"], "downloading", message="正在下载视频结果"
             )
-            await self._download_provider_result(provider, result, target)
-            self._delete_staged_provider_result(project_id, result)
-            if not target.is_file() or target.stat().st_size <= 0:
+            await self._download_provider_result(provider, result, working_target)
+            if not working_target.is_file() or working_target.stat().st_size <= 0:
                 raise FileServiceError("视频文件为空")
-            actual_duration_sec = self._verify_video(target)
+            actual_duration_sec = self._verify_video(working_target)
+            file_service.move_file(project_id, working_target, target)
+            target_created = True
             relative = file_service.relative_project_path(project_id, target)
-            self._complete_media(
+            completed = self._complete_media(
                 video_version,
                 version_id,
                 relative,
                 actual_duration_sec=actual_duration_sec,
             )
-            return {"version_id": version_id, "file_path": relative}
+            self._delete_staged_provider_result(project_id, result)
+            return {"version_id": version_id, "file_path": completed["file_path"]}
         except Exception as exc:
-            if target is not None and target.is_file():
-                relative = file_service.relative_project_path(project_id, target)
-                file_service.delete_file(project_id, relative)
+            self._delete_failed_target(project_id, working_target)
+            if target_created:
+                self._delete_failed_target(project_id, target)
             self._set_media_status(video_version, version_id, "failed", str(exc))
             raise
 
@@ -1745,10 +2009,21 @@ class MediaService:
             return
         try:
             relative = file_service.relative_project_path(project_id, local_file)
-        except FileServiceError:
+            if relative.startswith("temp/provider-results/"):
+                file_service.delete_file(project_id, relative)
+        except (FileServiceError, OSError):
             return
-        if relative.startswith("temp/provider-results/"):
-            file_service.delete_file(project_id, relative)
+
+    @staticmethod
+    def _delete_failed_target(project_id: str, target: Path | None) -> None:
+        if target is None:
+            return
+        try:
+            if target.is_file():
+                relative = file_service.relative_project_path(project_id, target)
+                file_service.delete_file(project_id, relative)
+        except (FileServiceError, OSError):
+            return
 
     @staticmethod
     def _has_saved_result(job_record: dict[str, Any]) -> bool:
@@ -1783,30 +2058,24 @@ class MediaService:
         relative: str,
         *,
         actual_duration_sec: float | None = None,
-    ) -> None:
-        parent_column = "asset_id" if table is asset_image else "shot_id"
-        values: dict[str, Any] = {
-            "file_path": relative,
-            "status": "completed",
-            "is_current": True,
-            "error": "",
-        }
-        if table is video_version:
-            values["actual_duration_sec"] = actual_duration_sec
-        asset_id: str | None = None
-        with self.database.engine.begin() as connection:
-            record = row_dict(
-                connection.execute(select(table).where(table.c.id == version_id)).first()
+    ) -> dict[str, Any]:
+        kind: MediaKind = (
+            "asset_image"
+            if table is asset_image
+            else "video"
+            if table is video_version
+            else "keyframe"
+        )
+        activated = self._activate_media_version(
+            kind,
+            version_id,
+            source_relative=relative,
+            complete=True,
+            actual_duration_sec=actual_duration_sec,
+        )
+        if kind == "asset_image":
+            ShotService(self.database, self.jobs).sync_asset_image_binding(
+                activated["asset_id"],
+                version_id,
             )
-            if record is None:
-                raise not_found("媒体版本")
-            if table is asset_image:
-                asset_id = record["asset_id"]
-            connection.execute(
-                update(table)
-                .where(table.c[parent_column] == record[parent_column])
-                .values(is_current=False)
-            )
-            connection.execute(update(table).where(table.c.id == version_id).values(**values))
-        if asset_id:
-            ShotService(self.database, self.jobs).sync_asset_image_binding(asset_id, version_id)
+        return activated

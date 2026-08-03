@@ -12,6 +12,56 @@ _FIXED_VISUAL_ASPECT_RATIOS = {
     "video": "16:9",
 }
 _TIMELINE_PATTERN = re.compile(r"(?:^|[；;\n])\s*\d+(?:\.\d+)?\s*[-–—~－至]\s*\d+(?:\.\d+)?\s*秒")
+_SCENE_CLAUSE_PATTERN = re.compile(r"[^。！？；;\n]+[。！？；;]?\s*")
+_SCENE_PERSON_MARKERS = (
+    "人物",
+    "角色",
+    "人群",
+    "路人",
+    "行人",
+    "人影",
+    "身影",
+    "人形",
+    "人体",
+)
+_SCENE_PERSON_ACTION_MARKERS = (
+    "站在",
+    "坐在",
+    "走向",
+    "走入",
+    "走进",
+    "走出",
+    "跑向",
+    "跑入",
+    "跑进",
+    "跑出",
+    "躺在",
+    "蹲在",
+    "看向",
+    "望向",
+    "手持",
+    "拿着",
+    "握着",
+    "穿着",
+    "进入",
+    "离开",
+    "推开",
+    "拉开",
+    "打开",
+    "关上",
+    "转身",
+    "抬手",
+    "低头",
+    "抬头",
+)
+_SCENE_NON_ENVIRONMENT_MARKERS = (*_SCENE_PERSON_MARKERS, *_SCENE_PERSON_ACTION_MARKERS)
+_SCENE_PERSON_OWNED_OBJECT_PATTERN = re.compile(
+    r"[\u4e00-\u9fff]{2,4}的(?:手机|手电筒?|随身物|衣物|服装|外套|背包|提包|公文包|文件|道具|武器)"
+)
+_SCENE_REQUIRED_NEGATIVE_PROMPT = (
+    "人物、角色、人群、路人、行人、人影、人形、剪影、倒影中的人物、镜中人物、"
+    "照片或海报中的人物、人体局部"
+)
 
 _SAFETY_REPLACEMENTS = {
     "血肉模糊": "受伤后的非血腥画面",
@@ -111,18 +161,55 @@ def _asset_detail(prompt: str, profile: dict[str, Any]) -> str:
     return "；".join(values) or "以素材资料保持稳定一致"
 
 
+def _scene_environment_text(value: Any, fallback: str) -> str:
+    if isinstance(value, list):
+        items = [_scene_environment_text(item, "") for item in value]
+        return "、".join(item for item in items if item) or fallback
+    text = _value(value, "")
+    if not text:
+        return fallback
+    clauses = _SCENE_CLAUSE_PATTERN.findall(text)
+    filtered = [
+        clause.strip()
+        for clause in clauses
+        if not any(marker in clause for marker in _SCENE_NON_ENVIRONMENT_MARKERS)
+        and _SCENE_PERSON_OWNED_OBJECT_PATTERN.search(clause) is None
+    ]
+    return "".join(filtered).strip() or fallback
+
+
+def _scene_profile_value(
+    profile: dict[str, Any],
+    *keys: str,
+    fallback: str,
+) -> str:
+    for key in keys:
+        if key in profile:
+            value = _scene_environment_text(profile[key], "")
+            if value:
+                return value
+    return fallback
+
+
 def resolve_asset_negative_prompt(asset_type: str, negative_prompt: str) -> str:
-    if negative_prompt.strip():
-        return negative_prompt.strip()
     defaults = {
         "character": "多人、身份漂移、脸型变化、发型变化、服装不一致、畸形手指、"
         "文字、水印、真人摄影、产品摄影、3D建模渲染",
         "prop": "完整人物、人物脸、多件物品、结构错误、比例错误、材质漂移、"
         "文字、水印、真人摄影、产品摄影、3D建模渲染",
-        "scene": "人物、空间结构矛盾、门窗家具漂移、视角冲突、文字、水印、"
-        "真实建筑摄影、产品摄影、3D建模渲染",
+        "scene": f"{_SCENE_REQUIRED_NEGATIVE_PROMPT}、空间结构矛盾、门窗家具漂移、"
+        "视角冲突、文字、水印、真实建筑摄影、产品摄影、3D建模渲染",
     }
-    return defaults.get(asset_type, "文字、水印、真人摄影、产品摄影、3D建模渲染")
+    default_prompt = defaults.get(
+        asset_type,
+        "文字、水印、真人摄影、产品摄影、3D建模渲染",
+    )
+    custom_prompt = negative_prompt.strip()
+    if asset_type == "scene" and custom_prompt:
+        if default_prompt in custom_prompt:
+            return custom_prompt
+        return f"{custom_prompt}、{default_prompt}"
+    return custom_prompt or default_prompt
 
 
 def _character_setting_sheet(
@@ -279,66 +366,90 @@ def _scene_setting_sheet(
     composition: str,
     negative_prompt: str,
 ) -> str:
-    concept = _profile_value(profile, "concept", "architecture", fallback="核心场景")
-    worldview = _profile_value(profile, "worldview", "world", fallback="本项目世界观")
-    place_type = _profile_value(profile, "place_type", "indoor_outdoor", fallback="剧情地点")
-    plot_function = _profile_value(profile, "plot_function", fallback="当前剧情叙事")
-    layout = _profile_value(
+    worldview = _scene_profile_value(profile, "worldview", "world", fallback="本项目世界观")
+    place_type = _scene_profile_value(profile, "place_type", "indoor_outdoor", fallback="剧情地点")
+    layout = _scene_profile_value(
         profile,
         "space_keywords",
         "layout",
         fallback="空间布局以素材资料为准",
     )
-    scale = _profile_value(profile, "scale", "shape_scale", fallback="形状与尺度以素材资料为准")
-    furnishings = _profile_value(profile, "furnishings", fallback="固定陈设以素材资料为准")
-    architecture = _profile_value(profile, "architecture", fallback="建筑/室内风格以素材资料为准")
-    observer = _profile_value(profile, "observer_reference", fallback="主场景透视图")
-    regions = _profile_value(profile, "regions", "layout", fallback=layout)
-    entrance = _profile_value(profile, "entrance_position", fallback="以主视角为准")
-    windows = _profile_value(profile, "window_position", fallback="以主视角为准")
-    character_position = _profile_value(profile, "character_position", fallback="以分镜站位为准")
-    prop_position = _profile_value(profile, "prop_position", fallback="以剧情道具位置为准")
-    movement = _profile_value(profile, "movement_path", fallback="遵循主要区域动线")
-    wall_material = _profile_value(profile, "wall_material", fallback=architecture)
-    floor_material = _profile_value(profile, "floor_material", fallback=architecture)
-    furniture_material = _profile_value(profile, "furniture_material", fallback=architecture)
-    glass_metal = _profile_value(profile, "glass_metal_material", fallback="按场景资料保持一致")
-    special_material = _profile_value(profile, "special_material", fallback="无额外特殊材质")
-    color_mood = _profile_value(profile, "color_mood", fallback="主色与点缀色以素材资料为准")
-    main_color = _profile_value(profile, "main_color", "color_mood", fallback=color_mood)
-    accent_color = _profile_value(profile, "accent_color", fallback="以场景资料为准")
-    color_quality = _profile_value(profile, "color_quality", "color_mood", fallback=color_mood)
-    main_view = _profile_value(profile, "main_view", fallback="主场景透视图")
-    standard_view_1 = _profile_value(profile, "standard_view_1", fallback="正向全景")
-    standard_view_2 = _profile_value(profile, "standard_view_2", fallback="反向或侧向全景")
-    detail_zone = _profile_value(profile, "detail_zone", fallback=furnishings)
-    main_light = _profile_value(profile, "main_light", "lighting", fallback="主光源以场景资料为准")
-    fill_light = _profile_value(profile, "fill_light", fallback="辅光以场景资料为准")
-    atmosphere = _profile_value(profile, "atmosphere", "color_mood", fallback=color_mood)
+    scale = _scene_profile_value(
+        profile, "scale", "shape_scale", fallback="形状与尺度以素材资料为准"
+    )
+    furnishings = _scene_profile_value(profile, "furnishings", fallback="固定陈设以素材资料为准")
+    architecture = _scene_profile_value(
+        profile, "architecture", fallback="建筑/室内风格以素材资料为准"
+    )
+    regions = _scene_profile_value(profile, "regions", "layout", fallback=layout)
+    entrance = _scene_profile_value(profile, "entrance_position", fallback="以主视角为准")
+    windows = _scene_profile_value(profile, "window_position", fallback="以主视角为准")
+    movement = _scene_profile_value(profile, "movement_path", fallback="遵循主要区域动线")
+    wall_material = _scene_profile_value(profile, "wall_material", fallback=architecture)
+    floor_material = _scene_profile_value(profile, "floor_material", fallback=architecture)
+    furniture_material = _scene_profile_value(profile, "furniture_material", fallback=architecture)
+    glass_metal = _scene_profile_value(
+        profile, "glass_metal_material", fallback="按场景资料保持一致"
+    )
+    special_material = _scene_profile_value(profile, "special_material", fallback="无额外特殊材质")
+    color_mood = _scene_profile_value(profile, "color_mood", fallback="主色与点缀色以素材资料为准")
+    main_color = _scene_profile_value(profile, "main_color", "color_mood", fallback=color_mood)
+    accent_color = _scene_profile_value(profile, "accent_color", fallback="以场景资料为准")
+    color_quality = _scene_profile_value(
+        profile, "color_quality", "color_mood", fallback=color_mood
+    )
+    main_view = _scene_profile_value(profile, "main_view", fallback="主场景透视图（无人空镜）")
+    standard_view_1 = _scene_profile_value(
+        profile, "standard_view_1", fallback="正向全景（无人空镜）"
+    )
+    standard_view_2 = _scene_profile_value(
+        profile, "standard_view_2", fallback="反向或侧向全景（无人空镜）"
+    )
+    detail_zone = _scene_profile_value(profile, "detail_zone", fallback=furnishings)
+    main_light = _scene_profile_value(
+        profile, "lighting", "main_light", fallback="主光源以场景资料为准"
+    )
+    fill_light = _scene_profile_value(profile, "fill_light", fallback="辅光以场景资料为准")
+    atmosphere = _scene_profile_value(profile, "atmosphere", "color_mood", fallback=color_mood)
+    environment_detail = _scene_environment_text(detail, "按上述资料补充环境细节")
+    environment_composition = _scene_environment_text(composition, "")
+    environment_keywords = []
+    for keyword in consistency_keywords:
+        environment_keyword = _scene_environment_text(keyword, "")
+        if environment_keyword:
+            environment_keywords.append(environment_keyword)
     return join_non_empty(
         [
-            f"《{name}・{concept} 完整场景设定稿》",
+            f"《{name}・完整场景设定稿》",
+            "【最高优先级：无人纯背景空镜】",
+            "这是供后续分镜复用的纯环境场景资产，不是剧情分镜。所有视图必须为空场景，"
+            "禁止出现人物、人群、路人、行人、人影、人形、剪影、倒影或镜面中的人物以及人体局部。",
+            "下方资料中出现的任何人物姓名、人物动作、角色站位、人物视角或人物持有物，"
+            "都只能用于理解空间尺度和动线，不得成为画面内容。",
             "核心场景设定：",
-            f"{name}，位于{worldview}中的{place_type}，主要用于{plot_function}。",
+            f"{name}，位于{worldview}中的{place_type}。",
             f"空间关键词：{layout}；空间规模{scale}；建筑/室内风格{architecture}。",
             f"核心视觉识别点：{furnishings}。",
             "空间结构与区域关系：",
-            f"以{observer}为统一方向基准。主要区域：{regions}。",
-            f"入口{entrance}；窗户/自然光入口{windows}；角色常用站位{character_position}；"
-            f"核心道具位置{prop_position}；动线{movement}。",
+            f"以入口、主要空间轴线与主场景透视方向为统一方向基准。主要区域：{regions}。",
+            f"入口{entrance}；窗户/自然光入口{windows}；"
+            f"表演活动区按主要区域和动线预留为空置空间；动线{movement}。",
             f"固定陈设：{furnishings}。墙面{wall_material}；地面{floor_material}；"
             f"家具{furniture_material}；金属/玻璃{glass_metal}；特殊材质{special_material}。",
             f"主色{main_color}，点缀色{accent_color}，色彩气质{color_quality}。",
-            f"补充细节：{detail}。",
+            f"环境补充细节：{environment_detail}。",
             "版面：",
-            "纯白背景，16:9 横向专业场景设定面板；不出现人物。",
+            "纯白背景，16:9 横向专业场景设定面板；每个视图都是无人纯背景空镜。",
+            "以下视角资料若原本涉及人物，只保留相同机位和环境构图，删除人物及其随身物。",
             f"左上场景资料卡；左侧 40%~45% 主场景透视图：{main_view}；"
             f"右上正向全景与反向/侧向全景：{standard_view_1}、{standard_view_2}；"
             f"右侧中部俯视平面布局图；右下三个关键区域细节：{detail_zone}。",
             "所有视图必须是同一个场景，门窗、家具、陈设、光线方向和空间朝向完全一致。",
-            "一致性锚点：" + "、".join(consistency_keywords) if consistency_keywords else "",
-            f"构图补充：{composition}" if composition else "",
-            f"主光{main_light}，辅光{fill_light}，营造{atmosphere}。",
+            "一致性锚点：" + "、".join(environment_keywords) if environment_keywords else "",
+            f"构图补充：{environment_composition}" if environment_composition else "",
+            f"主光效果{main_light}，只表现光线结果，不绘制光源持有者；"
+            f"辅光{fill_light}，营造{atmosphere}。",
+            "最终检查：所有面板均不得出现人物、人影、剪影、倒影中的人物或人体局部。",
             "高质量动画场景设定图；不是真实建筑摄影。",
             f"negative prompt: {negative_prompt}" if negative_prompt else "",
         ]
@@ -433,7 +544,6 @@ def compile_keyframe_prompt(
                 f"视觉：{_value(shot_context.get('lighting'), '符合场景设定的光线')}，"
                 f"{_value(shot_context.get('color_tone'), '统一色调')}，"
                 f"{_value(shot_context.get('environment_details'), '场景固定环境细节')}。",
-                f"导演画面补充：{image_prompt}。不得覆盖上述第0秒起始状态。",
                 continuity_instruction,
                 f"negative prompt: {negative_prompt}" if negative_prompt.strip() else "",
             ]

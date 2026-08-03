@@ -17,7 +17,7 @@ import {
   WandSparkles,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation } from "react-router";
 import { toast } from "sonner";
 import { api, mediaUrl, queryKeys } from "../api/client";
 import { ImagePreview } from "../components/image-preview";
@@ -169,6 +169,10 @@ export function ShotsPage() {
     () => new Map(assets.map((asset) => [asset.id, asset])),
     [assets],
   );
+  const hasExecutablePrompt = (shot: Shot, kind: "image" | "video") =>
+    kind === "image"
+      ? Boolean(shot.image_prompt_override?.trim() || shot.image_prompt.trim())
+      : Boolean(shot.video_prompt_override?.trim() || shot.video_prompt.trim());
   const batchIds = useMemo(() => {
     if (selected.size) return [...selected];
     if (scope !== "scene" || !sceneNo) return undefined;
@@ -510,7 +514,8 @@ export function ShotsPage() {
                 {
                   shots.filter(
                     (shot) =>
-                      shot.image_prompt.trim() && shot.video_prompt.trim(),
+                      hasExecutablePrompt(shot, "image") &&
+                      hasExecutablePrompt(shot, "video"),
                   ).length
                 }{" "}
                 个已自动补齐提示词
@@ -842,7 +847,7 @@ export function ShotsPage() {
                       )}
                     </section>
 
-                    <div className="grid gap-4 px-5 py-5 xl:grid-cols-[0.75fr_1fr_1fr]">
+                    <div className="grid gap-4 px-5 py-5">
                       <div className="space-y-3">
                         <div>
                           <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
@@ -887,24 +892,7 @@ export function ShotsPage() {
                           </p>
                         </div>
                       </div>
-                      <div className="rounded-md border border-line bg-white/55 p-3">
-                        <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
-                          最终关键帧提示词
-                        </p>
-                        <p className="mt-2 max-h-36 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
-                          {shot.compiled_image_prompt || shot.image_prompt}
-                        </p>
-                      </div>
-                      <div className="rounded-md border border-line bg-white/55 p-3">
-                        <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
-                          最终视频执行提示词
-                        </p>
-                        <p className="mt-2 max-h-36 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
-                          {shot.compiled_video_prompt || shot.video_prompt}
-                        </p>
-                      </div>
                     </div>
-
                     {stale ? (
                       <div className="px-5 pb-4">
                         <StaleNotice
@@ -1417,34 +1405,8 @@ export function ShotsPage() {
               </div>
             </div>
 
-            <div className="grid gap-4 lg:grid-cols-2">
+            <div className="grid gap-4">
               <div>
-                <Label>关键帧图片提示词</Label>
-                <Textarea
-                  rows={8}
-                  value={form.image_prompt || ""}
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      image_prompt: event.target.value,
-                    }))
-                  }
-                />
-              </div>
-              <div>
-                <Label>视频执行提示词</Label>
-                <Textarea
-                  rows={8}
-                  value={form.video_prompt || ""}
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      video_prompt: event.target.value,
-                    }))
-                  }
-                />
-              </div>
-              <div className="lg:col-span-2">
                 <Label>负向提示词 / 禁止事项</Label>
                 <Textarea
                   rows={4}

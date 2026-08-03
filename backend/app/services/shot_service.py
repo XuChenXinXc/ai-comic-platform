@@ -23,7 +23,7 @@ from app.schemas import (
     ShotImagePromptOutput,
     ShotVideoPromptOutput,
 )
-from app.services.errors import bad_request, conflict, not_found
+from app.services.errors import ServiceError, bad_request, conflict, not_found
 from app.services.file_service import file_service, project_media_url
 from app.services.job_service import JobService
 from app.services.prompt_service import (
@@ -66,12 +66,24 @@ _SIGNATURE_FIELDS = (
     "next_hook",
     "frame_description",
     "image_prompt",
+    "image_prompt_override",
     "video_prompt",
+    "video_prompt_override",
     "negative_prompt",
     "reference_bindings",
 )
 
 _ACTIVE_JOB_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+_PROMPT_GENERATED_FIELDS = {
+    "image_prompt",
+    "image_prompt_override",
+    "video_prompt",
+    "video_prompt_override",
+    "negative_prompt",
+}
+_PROMPT_GUARD_FIELDS = tuple(
+    field for field in _SIGNATURE_FIELDS if field not in _PROMPT_GENERATED_FIELDS
+)
 
 
 class ShotService:
@@ -212,6 +224,9 @@ class ShotService:
             shot_context=context,
             negative_prompt=current["negative_prompt"],
         )
+        current["final_image_prompt"] = (
+            str(current["image_prompt_override"] or "").strip() or current["compiled_image_prompt"]
+        )
         current["compiled_video_prompt"] = compile_video_prompt(
             style_prompt=current_project["style_prompt"],
             aspect_ratio=current_project["aspect_ratio"],
@@ -223,6 +238,9 @@ class ShotService:
             ],
             shot_context=context,
             negative_prompt=current["negative_prompt"],
+        )
+        current["final_video_prompt"] = (
+            str(current["video_prompt_override"] or "").strip() or current["compiled_video_prompt"]
         )
 
     def list(self, project_id: str) -> list[dict[str, Any]]:
@@ -291,6 +309,27 @@ class ShotService:
 
     def _signature(self, values: dict[str, Any]) -> str:
         return shot_signature({key: values.get(key) for key in _SIGNATURE_FIELDS})
+
+    @staticmethod
+    def _prompt_guard_signature(current: dict[str, Any], prompt_type: str) -> str:
+        values = {field: current.get(field) for field in _PROMPT_GUARD_FIELDS}
+        values[f"{prompt_type}_prompt"] = current.get(f"{prompt_type}_prompt")
+        values[f"{prompt_type}_prompt_override"] = current.get(f"{prompt_type}_prompt_override")
+        return shot_signature(values)
+
+    def _prompt_job_input(
+        self,
+        current: dict[str, Any],
+        prompt_type: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "expected_revision": current["revision"],
+            "expected_prompt_signature": self._prompt_guard_signature(current, prompt_type),
+            "expected_negative_prompt": current["negative_prompt"],
+            "expected_status": current["status"],
+            "params": params,
+        }
 
     def _validate_asset_ids(
         self,
@@ -397,6 +436,8 @@ class ShotService:
         semantic = {key: values.get(key) for key in _SIGNATURE_FIELDS if key in values}
         semantic["source_type"] = source_type
         semantic["duration_sec"] = values["duration_sec"]
+        semantic.setdefault("image_prompt_override", "")
+        semantic.setdefault("video_prompt_override", "")
         if not values.get("reference_bindings"):
             auto_bindings, _ = self._current_reference_bindings(
                 {
@@ -720,6 +761,14 @@ class ShotService:
                     "duration_sec": max(current["duration_sec"] - first_duration, 0.1),
                 },
             ]
+        parts = [
+            {
+                **part,
+                "image_prompt_override": "",
+                "video_prompt_override": "",
+            }
+            for part in parts
+        ]
         self.update(shot_id, parts[0])
         created_ids = [shot_id]
         insert_after = shot_id
@@ -797,6 +846,8 @@ class ShotService:
             "frame_description": "\n".join(
                 item["frame_description"] for item in records if item["frame_description"]
             ),
+            "image_prompt_override": "",
+            "video_prompt_override": "",
             "status": "ready",
         }
         semantic = {key: merged.get(key, target.get(key)) for key in _SIGNATURE_FIELDS}
@@ -888,33 +939,42 @@ class ShotService:
             target_id=shot_id,
             provider_kind="text",
             provider_id=options.get("provider_id") or current_project["default_text_provider_id"],
-            input_data={"params": options.get("params", {})},
+            input_data=self._prompt_job_input(
+                current,
+                prompt_type,
+                options.get("params", {}),
+            ),
         )
 
     def queue_prompt_batch(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current_project = self._project(project_id)
-        statement = select(shot.c.id, shot.c.image_prompt, shot.c.video_prompt).where(
-            shot.c.project_id == project_id
-        )
+        statement = select(shot).where(shot.c.project_id == project_id)
         if options.get("ids"):
             statement = statement.where(shot.c.id.in_(options["ids"]))
         with self.database.engine.connect() as connection:
-            records = connection.execute(statement).all()
+            records = [self._decode(dict(row._mapping)) for row in connection.execute(statement)]
         items = []
         for record in records:
             for prompt_type in options["prompt_types"]:
-                if options.get("only_missing") and record._mapping[f"{prompt_type}_prompt"]:
+                if options.get("only_missing") and (
+                    str(record[f"{prompt_type}_prompt_override"] or "").strip()
+                    or str(record[f"{prompt_type}_prompt"] or "").strip()
+                ):
                     continue
                 items.append(
                     {
                         "project_id": project_id,
                         "job_type": f"generate_shot_{prompt_type}_prompt",
                         "target_type": "shot",
-                        "target_id": record.id,
+                        "target_id": record["id"],
                         "provider_kind": "text",
                         "provider_id": options.get("provider_id")
                         or current_project["default_text_provider_id"],
-                        "input_data": {"params": options.get("params", {})},
+                        "input_data": self._prompt_job_input(
+                            record,
+                            prompt_type,
+                            options.get("params", {}),
+                        ),
                     }
                 )
         return self.jobs.create_batch(items)
@@ -1134,6 +1194,8 @@ class ShotService:
                 "character_ids": character_ids,
                 "prop_ids": prop_ids,
                 **item,
+                "image_prompt_override": "",
+                "video_prompt_override": "",
                 "reference_bindings": [],
                 "status": "ready",
             }
@@ -1284,6 +1346,14 @@ class ShotService:
         current = self.get(job["target_id"])
         current_project = self._project(current["project_id"])
         input_data = json_loads(job.get("input_json"), {})
+        expected_revision = self._prompt_expected_revision(input_data, current)
+        if not self._prompt_job_matches(
+            input_data,
+            current,
+            "image",
+            expected_revision,
+        ):
+            return self._skipped_prompt_result(current["id"])
         provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
         bindings, warnings = self._current_reference_bindings(current)
         output = await provider.generate_json(
@@ -1297,15 +1367,21 @@ class ShotService:
             params={**config["params"], **input_data.get("params", {})},
         )
         generated = output.model_dump(mode="json")
-        updated = self.update(
+        updated = self._save_generated_prompt(
             current["id"],
+            "image",
+            input_data,
+            expected_revision,
             {
                 "image_prompt": generated["prompt"],
-                "negative_prompt": generated["negative_prompt"],
+                "image_prompt_override": "",
                 "reference_bindings": bindings,
                 "status": "ready",
             },
+            generated["negative_prompt"],
         )
+        if updated is None:
+            return self._skipped_prompt_result(current["id"], generated)
         return {
             "shot_id": updated["id"],
             "prompt": generated,
@@ -1316,6 +1392,14 @@ class ShotService:
         current = self.get(job["target_id"])
         current_project = self._project(current["project_id"])
         input_data = json_loads(job.get("input_json"), {})
+        expected_revision = self._prompt_expected_revision(input_data, current)
+        if not self._prompt_job_matches(
+            input_data,
+            current,
+            "video",
+            expected_revision,
+        ):
+            return self._skipped_prompt_result(current["id"])
         provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
         output = await provider.generate_json(
             system_prompt=load_prompt("shot_video_prompt"),
@@ -1328,12 +1412,101 @@ class ShotService:
             params={**config["params"], **input_data.get("params", {})},
         )
         generated = output.model_dump(mode="json")
-        updated = self.update(
+        updated = self._save_generated_prompt(
             current["id"],
+            "video",
+            input_data,
+            expected_revision,
             {
                 "video_prompt": generated["prompt"],
-                "negative_prompt": generated["negative_prompt"],
+                "video_prompt_override": "",
                 "status": "ready",
             },
+            generated["negative_prompt"],
         )
+        if updated is None:
+            return self._skipped_prompt_result(current["id"], generated)
         return {"shot_id": updated["id"], "prompt": generated}
+
+    def _prompt_job_matches(
+        self,
+        input_data: dict[str, Any],
+        current: dict[str, Any],
+        prompt_type: str,
+        expected_revision: int | None,
+    ) -> bool:
+        if "expected_prompt_signature" in input_data:
+            expected_signature = input_data["expected_prompt_signature"]
+            return (
+                isinstance(expected_signature, str)
+                and bool(expected_signature)
+                and self._prompt_guard_signature(current, prompt_type) == expected_signature
+            )
+        return expected_revision is not None and current["revision"] == expected_revision
+
+    def _save_generated_prompt(
+        self,
+        shot_id: str,
+        prompt_type: str,
+        input_data: dict[str, Any],
+        expected_revision: int | None,
+        values: dict[str, Any],
+        generated_negative_prompt: str,
+    ) -> dict[str, Any] | None:
+        for _attempt in range(2):
+            latest = self.get(shot_id)
+            if not self._prompt_job_matches(
+                input_data,
+                latest,
+                prompt_type,
+                expected_revision,
+            ):
+                return None
+            changes = dict(values)
+            expected_negative_prompt = input_data.get("expected_negative_prompt")
+            if "expected_negative_prompt" not in input_data or (
+                isinstance(expected_negative_prompt, str)
+                and latest["negative_prompt"] == expected_negative_prompt
+            ):
+                changes["negative_prompt"] = generated_negative_prompt
+            expected_status = input_data.get("expected_status")
+            if (
+                "status" in changes
+                and "expected_status" in input_data
+                and latest["status"] != expected_status
+            ):
+                changes.pop("status")
+            try:
+                return self.update(
+                    shot_id,
+                    changes,
+                    expected_revision=latest["revision"],
+                )
+            except ServiceError as exc:
+                if exc.status_code != 409:
+                    raise
+        return None
+
+    @staticmethod
+    def _prompt_expected_revision(
+        input_data: dict[str, Any],
+        current: dict[str, Any],
+    ) -> int | None:
+        value = input_data.get("expected_revision")
+        if type(value) is int and value >= 0:
+            return value
+        if "expected_revision" in input_data:
+            return None
+        return current["revision"]
+
+    @staticmethod
+    def _skipped_prompt_result(
+        shot_id: str,
+        generated: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "shot_id": shot_id,
+            "skipped": True,
+            "reason": "分镜已被其他请求更新，已保留最新内容",
+            "prompt": generated or {},
+        }

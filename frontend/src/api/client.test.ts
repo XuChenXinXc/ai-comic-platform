@@ -77,6 +77,20 @@ describe("API 契约适配", () => {
     expect(body).not.toHaveProperty("source_type");
   });
 
+  test("test_shot_partial_update_without_source_fields_preserves_source_ref", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: "shot-1" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.shots.update("shot-1", {
+      image_prompt_override: "用户编辑后的最终关键帧提示词",
+    });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body).toEqual({
+      image_prompt_override: "用户编辑后的最终关键帧提示词",
+    });
+  });
+
   test("test_provider_update_does_not_send_immutable_kind", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: "provider-1" }));
     vi.stubGlobal("fetch", fetchMock);

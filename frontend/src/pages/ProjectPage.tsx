@@ -8,7 +8,7 @@ import {
   Upload,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import { api, queryKeys } from "../api/client";
 import { ErrorState, PageHeader } from "../components/status";
@@ -216,7 +216,7 @@ export function ProjectPage() {
                   title={activeProject.storage_path}
                 />
                 <p className="mt-2 text-xs leading-5 text-muted">
-                  角色、物品、场景、分镜关键帧和分镜视频会分别存放在该目录的子文件夹中。
+                  角色、物品、场景、分镜图和分镜视频会分别存放在该目录的子文件夹中。
                 </p>
               </div>
             ) : null}

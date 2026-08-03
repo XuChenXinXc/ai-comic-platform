@@ -122,7 +122,7 @@ def test_http_provider_request_with_cross_origin_absolute_path_is_rejected() -> 
         provider._url("https://attacker.example/collect")
 
 
-def test_http_provider_with_json_http_error_preserves_provider_message_after_transport_retry(
+def test_http_provider_with_json_http_error_preserves_provider_message_without_unsafe_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = OpenAICompatibleTextProvider(
@@ -162,7 +162,7 @@ def test_http_provider_with_json_http_error_preserves_provider_message_after_tra
             options={},
         )
 
-    assert calls == 2
+    assert calls == 1
 
 
 @pytest.mark.parametrize("header_name", ["Authorization", "X-Signature"])

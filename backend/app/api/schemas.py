@@ -302,7 +302,9 @@ class ShotFields(ApiModel):
     next_hook: str = ""
     frame_description: str = ""
     image_prompt: str = ""
+    image_prompt_override: str = ""
     video_prompt: str = ""
+    video_prompt_override: str = ""
     negative_prompt: str = ""
     reference_bindings: list[dict[str, Any]] = Field(default_factory=list)
     status: ContentStatus = "draft"
@@ -332,7 +334,9 @@ class ShotUpdate(ApiModel):
     next_hook: str | None = None
     frame_description: str | None = None
     image_prompt: str | None = None
+    image_prompt_override: str | None = None
     video_prompt: str | None = None
+    video_prompt_override: str | None = None
     negative_prompt: str | None = None
     reference_bindings: list[dict[str, Any]] | None = None
     status: ContentStatus | None = None

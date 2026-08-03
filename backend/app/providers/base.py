@@ -299,7 +299,7 @@ class HttpProviderBase:
         last_error: Exception | None = None
         last_http_failure = ""
         method_name = method.strip().upper()
-        retry_unsafe_methods = bool(options.get("retry_unsafe_methods", True))
+        retry_unsafe_methods = bool(options.get("retry_unsafe_methods", False))
         attempts = self.config.max_retries + 1
         if method_name not in {"GET", "HEAD", "OPTIONS"} and not retry_unsafe_methods:
             attempts = 1
