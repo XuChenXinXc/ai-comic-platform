@@ -25,7 +25,8 @@ class HttpVideoProvider(HttpProviderBase):
 
     def _options(self) -> dict[str, Any]:
         options = dict(self.config.params)
-        if self.config.model.strip().lower() in {
+        model = self.config.model.strip().lower()
+        if model in {
             "grok-imagine-1.5-video-apimart",
             "grok-imagine-1.5-video-ext",
         }:
@@ -51,6 +52,38 @@ class HttpVideoProvider(HttpProviderBase):
             options["default_params"] = {
                 "size": "16:9",
                 "quality": "720p",
+                **dict(options.get("default_params", {})),
+            }
+        elif model in {
+            "doubao-seedance-2.0",
+            "doubao-seedance-2.0-fast",
+            "doubao-seedance-2.0-mini",
+        }:
+            # doubao-seedance-2.0 系列：分镜填多少秒就传多少秒（4~15 秒整数），
+            # 不做向上取整或最低时长抬升；生成音频默认开启。
+            options.setdefault("retry_unsafe_methods", False)
+            options.setdefault("submit_path", "videos/generations")
+            options.setdefault("poll_path", "tasks/{task_id}")
+            options.setdefault("task_id_path", "data.0.task_id")
+            options.setdefault("submit_status_path", "data.0.status")
+            options.setdefault("status_path", "data.status")
+            options.setdefault("result_url_path", "data.result.videos.0.url.0")
+            options.setdefault("error_path", "data.error")
+            options.setdefault("input_image_field", "image_urls")
+            options.setdefault("input_image_list", True)
+            options.setdefault("input_image_mode", "upload")
+            options.setdefault("upload_path", "uploads/images")
+            options.setdefault("upload_file_field", "file")
+            options.setdefault("upload_result_path", "url")
+            options.setdefault("max_reference_files", 9)
+            options.setdefault("min_duration_sec", 4)
+            options.setdefault("max_duration_sec", 15)
+            options.setdefault("duration_integer_only", True)
+            options.setdefault("duration_round_up", False)
+            options["default_params"] = {
+                "size": "16:9",
+                "resolution": "720p",
+                "generate_audio": True,
                 **dict(options.get("default_params", {})),
             }
         return options
@@ -96,10 +129,15 @@ class HttpVideoProvider(HttpProviderBase):
             raise ProviderError("视频时长必须大于 0")
         options = self._options()
         effective_duration: float | int = duration_sec
-        if options.get("duration_round_up"):
+        round_up = bool(options.get("duration_round_up"))
+        # 显式配置 duration_round_up=False 的模型（如 doubao-seedance）分镜多少秒
+        # 就传多少秒，超范围由 _validate_duration 报错；缺省或 True 时保留旧行为：
+        # 向上取整并把时长抬到供应商下限（grok 等模型）。
+        suppress_floor = options.get("duration_round_up") is False
+        if round_up:
             effective_duration = math.ceil(duration_sec)
         minimum_duration = options.get("min_duration_sec")
-        if minimum_duration is not None:
+        if minimum_duration is not None and not suppress_floor:
             effective_duration = max(effective_duration, float(minimum_duration))
         self._validate_duration(effective_duration, options)
         if options.get("duration_integer_only"):
@@ -198,21 +236,22 @@ class HttpVideoProvider(HttpProviderBase):
         def upload() -> dict[str, Any]:
             headers = self._headers(options)
             field = str(options.get("upload_file_field", "file"))
-            with local_file.open("rb") as source:
-                response = self._request(
-                    str(options.get("upload_method", "POST")),
-                    self._url(upload_path),
-                    options=options,
-                    headers=headers,
-                    files={
-                        field: (
-                            local_file.name,
-                            source,
-                            mimetypes.guess_type(local_file.name)[0] or "image/png",
-                        )
-                    },
-                    data=dict(options.get("upload_data", {})),
-                )
+            # 内存 bytes 可被 requests 在每次重试时重新读取（文件句柄在重试时会读到 EOF 发空文件）
+            content = local_file.read_bytes()
+            response = self._request(
+                str(options.get("upload_method", "POST")),
+                self._url(upload_path),
+                options=options,
+                headers=headers,
+                files={
+                    field: (
+                        local_file.name,
+                        content,
+                        mimetypes.guess_type(local_file.name)[0] or "image/png",
+                    )
+                },
+                data=dict(options.get("upload_data", {})),
+            )
             try:
                 payload = response.json()
             except requests.JSONDecodeError as exc:

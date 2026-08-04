@@ -1,6 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Check,
   ChevronDown,
   ChevronUp,
   Plus,
@@ -500,25 +499,6 @@ export function WritingPage() {
               >
                 <Save className="h-4 w-4" />
                 保存
-              </Button>
-              <Button
-                variant="primary"
-                busy={
-                  stylePromptMutation.isPending ||
-                  (saveMutation.isPending &&
-                    saveMutation.variables?.projectId === activeProjectId &&
-                    saveMutation.variables?.status === "confirmed" &&
-                    saveMutation.variables.contentType === tab)
-                }
-                disabled={
-                  saveMutation.isPending ||
-                  stylePromptMutation.isPending ||
-                  (tab === "analysis" && !analysisValid)
-                }
-                onClick={() => void saveCurrent("confirmed")}
-              >
-                <Check className="h-4 w-4" />
-                确认当前内容
               </Button>
             </>
           }

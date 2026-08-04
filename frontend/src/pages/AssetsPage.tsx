@@ -1,6 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Check,
   ImagePlus,
   ImageOff,
   Merge,
@@ -167,21 +166,6 @@ export function AssetsPage() {
       await invalidate();
       toast.success(editing === "new" ? "素材已添加" : "素材已保存");
       setEditing(null);
-    },
-    onError: (error) => toast.error(formatError(error)),
-  });
-
-  const updateMutation = useMutation({
-    mutationFn: ({
-      id,
-      patch,
-    }: {
-      id: string;
-      patch: Partial<Asset>;
-    }) => api.assets.update(id, patch),
-    onSuccess: async () => {
-      await invalidate();
-      toast.success("素材状态已更新");
     },
     onError: (error) => toast.error(formatError(error)),
   });
@@ -425,27 +409,6 @@ export function AssetsPage() {
                       <p className="mt-2 max-h-44 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
                         {asset.compiled_prompt || asset.prompt}
                       </p>
-                    </div>
-                    <div className="mt-4 flex flex-wrap gap-2">
-                      {asset.status !== "confirmed" ? (
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          busy={
-                            updateMutation.isPending &&
-                            updateMutation.variables?.id === asset.id
-                          }
-                          onClick={() =>
-                            updateMutation.mutate({
-                              id: asset.id,
-                              patch: { status: "confirmed" },
-                            })
-                          }
-                        >
-                          <Check className="h-4 w-4" />
-                          确认
-                        </Button>
-                      ) : null}
                     </div>
                   </div>
                 </div>

@@ -174,6 +174,7 @@ class AssetUpdate(ApiModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     profile: dict[str, Any] | None = None
     prompt: str | None = None
+    prompt_override: str | None = None
     negative_prompt: str | None = None
     consistency_keywords: list[str] | None = None
     composition: str | None = None

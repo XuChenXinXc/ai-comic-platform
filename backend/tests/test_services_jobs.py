@@ -1905,3 +1905,101 @@ def test_retry_failed_job_requeues_same_id_and_increments_retry_count(
     assert retried["id"] == record["id"]
     assert retried["retry_count"] == 1
     assert retried["status"] in {"queued", "failed"}
+
+
+def test_asset_image_queue_uses_prompt_override_verbatim(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """素材图提示词覆盖值：生成时直接使用覆盖值，不再按模板编译。"""
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    service = AssetService(database, jobs)
+    current = service.create(
+        project["id"],
+        {"asset_type": "character", "name": "林风", "prompt": "黑发少年剑修"},
+    )
+    service.update(
+        current["id"],
+        {"prompt_override": "自定义白底角色提示词：林风全身立绘，纯白背景。"},
+    )
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    queued = media.queue_asset_image(current["id"], {})
+
+    version = media.list_asset_images(current["id"])[0]
+    assert version["prompt_snapshot"] == "自定义白底角色提示词：林风全身立绘，纯白背景。"
+    assert queued["target_type"] == "asset_image"
+    # 非空覆盖值纳入签名，与分镜 override 语义一致
+    assert version["input_signature"] != ""
+    override_signature = version["input_signature"]
+    service.update(current["id"], {"prompt_override": "另一个自定义提示词"})
+    media.queue_asset_image(current["id"], {})
+    version_after = media.list_asset_images(current["id"])[0]
+    assert version_after["input_signature"] != override_signature
+
+
+def test_video_execution_with_reference_files_deleted_reports_error(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """视频任务执行前参考图文件被删除：必须报错，不能静默跳过参考图。"""
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    character = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "character", "name": "林风", "prompt": "黑发少年剑修"},
+    )
+    media.upload_asset_image(character["id"], "character.png", "image/png", _PNG)
+    current_shot = ShotService(database, jobs).create(
+        project["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            character_ids=[character["id"]],
+            action="主角走入画面",
+            image_prompt="主角站在画面中央",
+            video_prompt="主角从画面左侧走入，镜头缓缓跟随。",
+        ).model_dump(),
+    )
+    media.upload_keyframe(current_shot["id"], "frame.png", "image/png", _PNG)
+
+    class NeverCalledVideoProvider:
+        supports_multiple_input_images = True
+
+        async def prepare_input_images(self, _paths: list[Path]) -> dict[str, Any]:
+            raise AssertionError("参考图缺失时不应调用 prepare_input_images")
+
+        async def submit(self, **kwargs: Any) -> ProviderSubmission:
+            raise AssertionError("参考图缺失时不应调用 Provider")
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            NeverCalledVideoProvider(),
+            {
+                "id": "mock-video",
+                "model": "grok-imagine-1.5-video-apimart",
+                "params": {},
+                "timeout_sec": 60,
+            },
+        ),
+    )
+
+    queued = media.queue_video(current_shot["id"], {})
+    # 任务入队后、执行前，素材图文件被删除
+    project_dir = file_service.projects_dir / "媒体任务测试"
+    for path in [path for path in project_dir.rglob("*") if path.is_file()]:
+        path.unlink()
+
+    with pytest.raises(ServiceError) as excinfo:
+        asyncio.run(media.handle_video(repository.require(queued["id"])))
+    assert excinfo.value.status_code == 409
+    assert "视频参考图文件缺失" in str(excinfo.value)

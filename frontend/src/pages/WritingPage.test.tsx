@@ -274,9 +274,7 @@ describe("文字工作台延迟保存", () => {
       target: { value: "提交版本" },
     });
     await userEvent.click(screen.getByRole("button", { name: "保存" }));
-    expect(
-      screen.getByRole("button", { name: "确认当前内容" }),
-    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
     fireEvent.change(titleInput, {
       target: { value: "保存期间的新编辑" },
     });
@@ -287,9 +285,7 @@ describe("文字工作台延迟保存", () => {
     await waitFor(() => {
       expect(queryClient.isMutating()).toBe(0);
     });
-    expect(
-      screen.getByRole("button", { name: "确认当前内容" }),
-    ).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "保存" })).not.toBeDisabled();
     expect(api.screenplay.update).toHaveBeenCalledWith("project-1", {
       content_json: { title: "提交版本", logline: "", scenes: [] },
       status: "ready",

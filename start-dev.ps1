@@ -1,9 +1,12 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$NoBrowser,
 
     [ValidateRange(1, 120)]
-    [int]$HealthTimeoutSeconds = 30
+    [int]$HealthTimeoutSeconds = 30,
+
+    [ValidateRange(1024, 65535)]
+    [int]$FrontendPort = 3000
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,7 +43,6 @@ $RuntimeConfig = Get-PlatformRuntimeConfig `
 $BackendClientHost = Get-PlatformClientHost -HostName $RuntimeConfig.Host
 $BackendUrl = "http://${BackendClientHost}:$($RuntimeConfig.Port)"
 $FrontendHost = "127.0.0.1"
-$FrontendPort = 3000
 $FrontendUrl = "http://${FrontendHost}:$FrontendPort"
 $Mutex = Enter-PlatformMutex -ProjectRoot $ProjectRoot
 
@@ -50,6 +52,27 @@ try {
         -PythonPath $PythonPath
     Assert-PortAvailable -Port $RuntimeConfig.Port
     Assert-PortAvailable -Port $FrontendPort
+
+    # 前端端口不在 CORS 白名单时自动追加，避免 dev 模式 API 被浏览器拦截；
+    # 优先级与 pydantic 一致：进程环境变量 > .env 文件 > 默认 3000 列表。
+    $CorsOrigins = [Environment]::GetEnvironmentVariable("APP_CORS_ORIGINS", "Process")
+    if ([string]::IsNullOrWhiteSpace($CorsOrigins)) {
+        $EnvFilePath = Join-Path $ProjectRoot ".env"
+        if (Test-Path -LiteralPath $EnvFilePath) {
+            $CorsLine = Select-String `
+                -LiteralPath $EnvFilePath `
+                -Pattern '^\s*APP_CORS_ORIGINS\s*=' `
+                -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($null -ne $CorsLine) {
+                $CorsOrigins = $CorsLine.Line -replace '^\s*APP_CORS_ORIGINS\s*=\s*', ''
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($CorsOrigins)) {
+        $CorsOrigins = "http://127.0.0.1:3000,http://localhost:3000"
+    }
+    $env:APP_CORS_ORIGINS = "$CorsOrigins,http://${FrontendHost}:$FrontendPort"
 
     try {
         $BackendState = Start-TrackedProcess `

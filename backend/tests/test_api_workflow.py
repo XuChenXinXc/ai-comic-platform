@@ -216,9 +216,9 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     assert image_batch.status_code == 202
     _wait_batch(api_client, image_batch.json())
     template_markers = {
-        "character": "横向角色设定面板",
-        "scene": "横向专业场景设定面板",
-        "prop": "横向专业道具设定面板",
+        "character": "分块拼接式专业角色设定面板",
+        "scene": "分块拼接式专业场景设定面板",
+        "prop": "分块拼接式专业道具设定面板",
     }
     storage_folders = {
         "character": "角色/",
@@ -250,7 +250,7 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     assert current_shots[0]["image_prompt"]
     assert current_shots[0]["video_prompt"]
     assert current_shots[0]["negative_prompt"]
-    assert "【当前分镜素材参考图】" in current_shots[0]["compiled_image_prompt"]
+    assert "【参考】" in current_shots[0]["compiled_image_prompt"]
     assert "【镜头与声音】" in current_shots[0]["compiled_video_prompt"]
     assert current_shots[0]["reference_bindings"]
     keyframe_job = api_client.post(f"/api/shots/{shot_id}/keyframes/generate", json={})
@@ -260,7 +260,7 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     assert len(keyframes) == 1
     assert keyframes[0]["is_current"] is True
     assert keyframes[0]["is_stale"] is False
-    assert "【当前分镜素材参考图】" in keyframes[0]["prompt_snapshot"]
+    assert "【参考】" in keyframes[0]["prompt_snapshot"]
     assert "negative prompt:" in keyframes[0]["prompt_snapshot"]
     assert keyframes[0]["prompt_snapshot"] == current_shots[0]["compiled_image_prompt"]
     assert keyframes[0]["file_path"].startswith("分镜图/")

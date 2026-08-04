@@ -144,6 +144,7 @@ asset = Table(
     Column("profile_json", Text, nullable=False, server_default="{}"),
     Column("prompt", Text, nullable=False, server_default=""),
     Column("negative_prompt", Text, nullable=False, server_default=""),
+    Column("prompt_override", Text, nullable=False, server_default=""),
     Column("consistency_json", Text, nullable=False, server_default="[]"),
     Column("composition", Text, nullable=False, server_default=""),
     Column("importance", Text, nullable=False, server_default="normal"),

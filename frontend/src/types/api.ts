@@ -147,6 +147,7 @@ export interface Asset {
   prompt: string;
   compiled_prompt: string;
   negative_prompt: string;
+  prompt_override?: string | null;
   consistency_json: string[] | string;
   consistency_keywords?: string[];
   composition: string;

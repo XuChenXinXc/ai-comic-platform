@@ -1,4 +1,4 @@
-function Invoke-NativeChecked {
+﻿function Invoke-NativeChecked {
     param(
         [Parameter(Mandatory = $true)]
         [string]$FilePath,
@@ -744,7 +744,9 @@ function Assert-PortAvailable {
             }
     )
     throw (
-        "端口 {0} 已被非本次启动的进程占用：{1}。为避免误杀，未终止这些进程。" -f
+        "端口 {0} 已被非本次启动的进程占用：{1}。为避免误杀，未终止这些进程。`n" +
+        "若该进程是本平台上次启动遗留，可先运行 .\stop.ps1 停止后重试；" +
+        "否则请先核对占用者（PID/进程名）是否为可信进程，再决定是否直接访问该端口。" -f
         $Port,
         ($OwnerDescriptions -join "、")
     )

@@ -6,7 +6,7 @@ const backendPython =
     : "../backend/.venv/bin/python";
 const backendCommand =
   process.env.E2E_BACKEND_COMMAND ??
-  `"${backendPython}" -m uvicorn app.main:app --app-dir ../backend --host 127.0.0.1 --port 8000`;
+  `"${backendPython}" -m uvicorn app.main:app --app-dir ../backend --host 127.0.0.1 --port 8012`;
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -27,7 +27,7 @@ export default defineConfig({
   webServer: [
     {
       command: backendCommand,
-      url: "http://127.0.0.1:8000/docs",
+      url: "http://127.0.0.1:8012/docs",
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
       stdout: "pipe",

@@ -30,7 +30,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("APP_HOST", "HOST"),
     )
     port: int = Field(
-        default=8000,
+        default=8012,
         ge=1,
         le=65535,
         validation_alias=AliasChoices("APP_PORT", "PORT"),
@@ -93,6 +93,16 @@ class Settings(BaseSettings):
     def empty_project_storage_dir_uses_default(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
             return None
+        return value
+
+    @field_validator("cors_origins", mode="after")
+    @classmethod
+    def reject_wildcard_cors(cls, value: str) -> str:
+        for item in (part.strip() for part in value.split(",")):
+            if item == "*":
+                raise ValueError(
+                    "APP_CORS_ORIGINS 不允许通配符 *，请明确列出允许的来源"
+                )
         return value
 
     @model_validator(mode="after")

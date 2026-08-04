@@ -562,7 +562,7 @@ class MediaService:
 
     @staticmethod
     def _effective_asset_signature(current: dict[str, Any], project_record: dict[str, Any]) -> str:
-        return calculate_signature(
+        values = [
             VISUAL_PROMPT_TEMPLATE_VERSION,
             current["asset_type"],
             current["name"],
@@ -573,7 +573,12 @@ class MediaService:
             current["composition"],
             project_record["style_prompt"],
             resolve_visual_aspect_ratio(current["asset_type"], project_record["aspect_ratio"]),
-        )
+        ]
+        # 与分镜 override 语义一致：非空覆盖值纳入签名，空串（未编辑）不参与
+        prompt_override = str(current.get("prompt_override") or "").strip()
+        if prompt_override:
+            values.append(prompt_override)
+        return calculate_signature(*values)
 
     def _effective_shot_signature(
         self,
@@ -759,6 +764,10 @@ class MediaService:
             composition=current["composition"],
             reference_mode=bool(options.get("reference_mode")),
         )
+        prompt_override = str(current.get("prompt_override") or "").strip()
+        if prompt_override:
+            # 用户编辑过的最终提示词优先，不再按模板重新编译
+            prompt = prompt_override
         reference_mode = bool(options.get("reference_mode"))
         version = self._insert_version(
             table=asset_image,
@@ -1869,6 +1878,12 @@ class MediaService:
                     if not isinstance(bindings, list):
                         bindings = current["reference_bindings"]
                     reference_paths = self._resolve_binding_files(project_id, bindings)
+                    if bindings and len(reference_paths) < len(bindings):
+                        # 参考图绑定存在但文件缺失/记录失效：不允许静默降级（含部分缺失）
+                        raise conflict(
+                            "视频参考图文件缺失或失效（分镜已绑定素材图，但磁盘文件不存在或"
+                            "记录无法解析），请先在素材库重新生成或上传图片后重试"
+                        )
                     prepared = await prepare_multiple([keyframe_path, *reference_paths])
                 else:
                     prepared = await provider.prepare_input_image(keyframe_path)

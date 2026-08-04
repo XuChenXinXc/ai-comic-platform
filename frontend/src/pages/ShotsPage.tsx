@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
-  Check,
   ChevronDown,
   ChevronUp,
+  Clapperboard,
   Copy,
   Film,
   GripVertical,
@@ -21,6 +21,7 @@ import { useLocation } from "react-router";
 import { toast } from "sonner";
 import { api, mediaUrl, queryKeys } from "../api/client";
 import { ImagePreview } from "../components/image-preview";
+import { ContinuityCheck } from "../components/continuity-check";
 import { JsonEditor } from "../components/json-editor";
 import { ProjectRequired } from "../components/project-required";
 import { ShotMediaCard } from "../components/shot-media-card";
@@ -143,6 +144,7 @@ export function ShotsPage() {
   const location = useLocation();
   const { activeProject, activeProjectId } = useProject();
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [continuityOpen, setContinuityOpen] = useState(false);
   const [scope, setScope] = useState<"all" | "scene">("all");
   const [sceneNo, setSceneNo] = useState("");
   const [exporting, setExporting] = useState(false);
@@ -322,21 +324,6 @@ export function ShotsPage() {
     onError: (error) => toast.error(formatError(error)),
   });
 
-  const updateMutation = useMutation({
-    mutationFn: ({
-      id,
-      patch,
-    }: {
-      id: string;
-      patch: Partial<Shot>;
-    }) => api.shots.update(id, patch),
-    onSuccess: async () => {
-      await invalidate();
-      toast.success("分镜已确认");
-    },
-    onError: (error) => toast.error(formatError(error)),
-  });
-
   const structureMutation = useMutation<
     unknown,
     Error,
@@ -454,6 +441,13 @@ export function ShotsPage() {
               >
                 <WandSparkles className="h-4 w-4" />
                 {shots.length ? "重新提取全部" : "提取分镜"}
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() => setContinuityOpen(true)}
+              >
+                <Clapperboard className="h-4 w-4" />
+                连贯性检查
               </Button>
               <Button busy={exporting} onClick={() => void exportZip()}>
                 <Archive className="h-4 w-4" />
@@ -1012,25 +1006,6 @@ export function ShotsPage() {
                         ) : null}
                       </div>
                       <div className="flex gap-1">
-                        {shot.status !== "confirmed" ? (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            busy={
-                              updateMutation.isPending &&
-                              updateMutation.variables?.id === shot.id
-                            }
-                            onClick={() =>
-                              updateMutation.mutate({
-                                id: shot.id,
-                                patch: { status: "confirmed" },
-                              })
-                            }
-                          >
-                            <Check className="h-4 w-4" />
-                            确认
-                          </Button>
-                        ) : null}
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1487,6 +1462,16 @@ export function ShotsPage() {
               rows={9}
             />
           </div>
+        </Modal>
+
+        <Modal
+          open={continuityOpen}
+          onClose={() => setContinuityOpen(false)}
+          title="连贯性检查"
+          description="连播预览整场视频，或用相邻镜头首末帧对比检查视觉衔接是否突兀。"
+          wide
+        >
+          <ContinuityCheck shots={shots} />
         </Modal>
       </div>
     </ProjectRequired>

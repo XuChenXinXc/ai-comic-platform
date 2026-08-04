@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$NoBrowser,
 
@@ -46,6 +46,7 @@ try {
     $ClientHost = Get-PlatformClientHost -HostName $RuntimeConfig.Host
     $AppUrl = "http://${ClientHost}:$($RuntimeConfig.Port)"
     $HealthUrl = "$AppUrl/api/health"
+    Write-Host "正在启动平台（$AppUrl）..." -ForegroundColor Cyan
     Assert-PortAvailable -Port $RuntimeConfig.Port
     Push-Location $BackendRoot
     try {

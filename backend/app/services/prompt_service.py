@@ -3,7 +3,7 @@ from collections.abc import Iterable
 from typing import Any
 
 STYLE_ANCHOR = "[STYLE_ANCHOR]"
-VISUAL_PROMPT_TEMPLATE_VERSION = "visual-prompt-v2.1"
+VISUAL_PROMPT_TEMPLATE_VERSION = "visual-prompt-v3.0"
 _FIXED_VISUAL_ASPECT_RATIOS = {
     "character": "3:2",
     "prop": "3:2",
@@ -251,13 +251,6 @@ def _character_setting_sheet(
     )
     body = _profile_value(profile, "body", fallback="身形以素材资料为准")
     immutable = _profile_value(profile, "immutable_features", fallback="固定识别特征以素材资料为准")
-    acting_traits = _profile_value(
-        profile,
-        "acting_traits",
-        "expression_group",
-        "personality",
-        fallback="自然克制",
-    )
     costume = _profile_value(profile, "costume", fallback="服装以素材资料为准")
     main_color = _profile_value(profile, "main_color", "color", fallback="服装主色以素材资料为准")
     accent_color = _profile_value(profile, "accent_color", fallback="服装点缀色以素材资料为准")
@@ -275,36 +268,93 @@ def _character_setting_sheet(
         profile,
         "expression_group",
         "acting_traits",
-        fallback=acting_traits,
+        fallback=normal_expression,
     )
     lighting = _profile_value(profile, "lighting", fallback="标准角色设定柔光")
     atmosphere = _profile_value(profile, "atmosphere", fallback=style_tone)
-    return join_non_empty(
-        [
-            f"《{name}・{concept} 角色基础设定稿》",
-            "核心人物设定：",
-            f"{name}，一位{age}的{gender}角色，身份为{identity}，生活在{worldview}。",
-            f"性格关键词：{personality}。",
-            f"外貌：{hair}；{appearance}；{eyes}；常态表情{normal_expression}；身形{body}。",
-            f"核心视觉识别点：{immutable}。",
-            "服饰与造型设定：",
-            f"服装：{costume}；主色{main_color}；点缀色{accent_color}；材质{material}。",
-            f"上装{upper}；下装{lower}；外搭{outer}；鞋履{shoes}；配饰{accessories}；核心道具{props}。",
-            f"整体造型呈现{style_tone}。",
-            "版面：",
-            "纯白背景，3:2 横向角色设定面板；仅一名角色。",
-            "左上人物资料卡；左侧 40%~45% 完整全身主立绘；"
-            f"右上正面/侧面/背面三视图；右下三个核心表情特写：{expression_group}。",
-            "资料卡与标注文字必须清晰规范、无乱码、无错别字；"
-            "除资料卡、三视图标签与表情标签外，画面中不得出现任何其他文字。",
-            "所有模块必须为同一角色，脸型、发型、服装、配饰、道具完全一致。",
-            "一致性锚点：" + "、".join(consistency_keywords) if consistency_keywords else "",
-            f"构图补充：{composition}" if composition else "",
-            f"{lighting}；主色{main_color}、点缀色{accent_color}；氛围{atmosphere}。",
-            "高质量二维动画角色设定图；不是真人摄影。",
-            f"negative prompt: {negative_prompt}" if negative_prompt else "",
-        ]
-    )
+    anchors = "、".join(consistency_keywords)
+    detail_clean = detail.rstrip("。") if detail else detail
+    has_detail = bool(detail_clean) and detail_clean != "以素材资料保持稳定一致"
+    paragraphs = [
+        f"《{name}・{concept} 角色基础设定稿》",
+        "核心人物设定：\n"
+        f"{name}，一位{age}的{gender}角色，身份为{identity}，生活在{worldview}中。"
+        f"性格关键词为{personality}。\n"
+        f"外貌：{hair}；{appearance}；{eyes}；常态表情{normal_expression}；身形{body}。\n"
+        f"核心视觉识别点包括：{immutable}。",
+        "服饰与造型设定：\n"
+        f"角色穿着{costume}，主色调为{main_color}，辅以{accent_color}少量点缀，"
+        f"材质为{material}，清晰表现不同材质之间的纹理、厚度和光泽差异。\n"
+        f"上装为{upper}；下装为{lower}；外搭为{outer}；鞋履为{shoes}；"
+        f"配饰{accessories}；核心道具{props}。\n"
+        f"整体造型呈现{style_tone}的气质，具有鲜明辨识度，"
+        "同时适合后续AI漫剧分镜图和视频生成时保持角色一致性。",
+        f"细节补充：{detail_clean}。" if has_detail else "",
+        "版面背景与整体要求：\n"
+        "整张角色设定展板使用标准纯白色背景，背景干净、明亮、极简、通透。"
+        "不要浅灰背景，不要米白背景，不要渐变背景，不要彩色背景，不要环境场景，"
+        "不要室内或室外布景。\n"
+        "仅使用极细浅灰色分隔线和少量低饱和冷蓝灰色细线建立版面秩序，"
+        "不使用厚重边框、大面积色块、复杂花纹或抢眼装饰。\n"
+        "整体呈现高规格动画、漫画或AI漫剧项目的官方角色设定面板质感，"
+        "专业、精致、高级、规整、清晰。",
+        "版面排布结构：\n"
+        f"采用3:2横向宽幅、分块拼接式专业角色设定面板排版。画面只展示{name}同一名角色，"
+        "不出现其他人物。\n"
+        "面板只保留人物介绍、主人物立绘、三视图和核心面部特写四类信息，"
+        "不加入服装拆解、配饰拆解、发型拆解、道具拆解、场景插图或意境参考图。",
+        "左上角人物介绍区：\n"
+        "在画面左上角设置简洁、高级、规整的人物资料卡，与左侧主人物立绘形成一个完整区域。\n"
+        "人物资料卡内容为：\n"
+        f"角色姓名：{name}\n"
+        f"角色意境或代号：{concept}\n"
+        f"身份定位：{identity}\n"
+        f"世界观或背景：{worldview}\n"
+        f"性格关键词：{personality}\n"
+        f"视觉识别点：{immutable}\n"
+        "人物资料卡采用现代官方动画设定稿式排版，标题、姓名和正文具有清晰的字号层级，"
+        "文字区域留白舒适、排列整齐。中文文字尽量清晰、准确、可读，"
+        "不要乱码、错字、重复文字或无意义符号。",
+        "左侧主人物立绘：\n"
+        f"左侧主体区域放置一张尺寸最大的{name}全身精致立绘，占整张画面约40%至45%。\n"
+        "完整展示头部、清晰五官、发型、服装、鞋履和随身配饰。"
+        "人物从头顶到脚底全部处于画面内，不裁切头部、手臂、腿部或鞋履，"
+        "不被人物资料卡和其他模块遮挡。",
+        "右上区域三视图：\n"
+        "右上区域规整排列三张标准全身视图，依次为正面全身、标准侧面全身、背面全身。\n"
+        "三张视图采用统一自然站姿、统一身体比例、统一服装、统一发型和统一影棚光照。"
+        "清楚展示人物正面轮廓、侧面结构、背部造型和服装前后结构。"
+        "每张视图均保持完整全身，不裁切、不遮挡、不采用夸张透视。",
+        "右下区域核心面部特写：\n"
+        f"右下区域排列三个高精度面部特写，分别为{expression_group}。\n"
+        "三个面部特写必须保持完全一致的脸型、骨相、五官比例、年龄感、肤色、发型和发色，"
+        "仅通过眼神、眉形、眼睑和嘴角的细微变化表现状态差异，"
+        "表情自然细腻，不夸张、不低幼、不颜艺化。",
+        "角色一致性要求：\n"
+        f"主人物立绘、三视图和三个面部特写必须严格表现为同一个{name}。"
+        "所有模块保持完全一致的脸型、五官比例、年龄感、肤色、身体比例、发型结构、发色、"
+        "服装款式、服装颜色、材质和核心视觉识别点。\n"
+        "不得生成不同版本的角色，不得改变年龄、脸型、服装或发型，"
+        "不得随机增加或删除配饰。"
+        + (f"一致性锚点：{anchors}。" if anchors else ""),
+        f"构图补充：{composition.rstrip('。')}。" if composition else "",
+        "画面美术风格：\n"
+        "整体采用半写实二维国漫动画风，精致干净的角色线稿，细腻克制的二维动画上色，"
+        "高质量AI漫剧角色设定图质感。\n"
+        "严格保持插画、动漫和二维动画媒介，不转换为真人摄影、影视剧照、三次元演员、"
+        "真人模特或写实实拍风格。",
+        "灯光与色彩氛围：\n"
+        f"{lighting}，角色整体配色以{main_color}和{accent_color}为核心，"
+        f"营造{atmosphere}的氛围。",
+        "画质与成图要求：\n"
+        "高精度视觉效果，人物发丝、眼眸、服装纹理和配饰细节清楚可见。"
+        "全画面保持高清晰度，无景深模糊，无低清缩略图感，无杂色噪点，无脏污背景。\n"
+        "无其他人物，无不同版本角色，无重复头部，无多余肢体，无手脚缺失，无错误手指，"
+        "无肢体粘连，无五官错位，无年龄漂移，无比例失衡，无服装变化，无发型变化，"
+        "无服装穿模。版面模块对齐，间距统一，信息完整但不拥挤，留白舒适，视觉层级明确。",
+        f"negative prompt: {negative_prompt}" if negative_prompt else "",
+    ]
+    return "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
 
 
 def _prop_setting_sheet(
@@ -345,33 +395,85 @@ def _prop_setting_sheet(
     wear = _profile_value(profile, "wear", "usage_marks", fallback="固定使用痕迹以素材资料为准")
     detail_zone = _profile_value(profile, "detail_zone", fallback=special_features)
     scale = _profile_value(profile, "scale_reference", fallback="与成年人手掌的比例以素材资料为准")
-    return join_non_empty(
-        [
-            f"《{name}・{concept} 完整道具设定稿》",
-            "核心物品设定：",
-            f"{name}，属于{worldview}中的{category}，由{owner}使用，用于{plot_function}。",
-            f"整体轮廓{silhouette}，尺寸约{dimensions}，重量感{weight}。",
-            f"核心视觉识别点：{special_features}。",
-            "外观结构与细节：",
-            f"正面{front}；侧面{side}；背面{back}；顶部/底部/内部{other}；"
-            f"按钮、接口、纹样、把手等位于{key_position}。",
-            f"主体材质{material}；辅助材质{secondary_material}；主色{color}，"
-            f"点缀色{accent_color}；表面质感{surface}；固定磨损{wear}。",
-            f"补充细节：{detail}。",
-            "版面：",
-            "纯白背景，3:2 横向专业道具设定面板；只展示一件物品。",
-            "左上资料卡；左侧 40%~45% 四十五度略俯视主展示图；"
-            f"右上正面/侧面/背面/顶部或底部四视图；右侧中部三个细节特写：{detail_zone}；"
-            f"右下尺寸标注及与成年人手掌的比例参考：{scale}。",
-            "资料卡与标注文字必须清晰规范、无乱码、无错别字；"
-            "除资料卡、视图标签与尺寸标注外，画面中不得出现任何其他文字。",
-            "所有模块的形状、尺寸、颜色、材质、纹样、磨损和部件位置必须一致。",
-            "一致性锚点：" + "、".join(consistency_keywords) if consistency_keywords else "",
-            f"构图补充：{composition}" if composition else "",
-            "中性影棚柔光；高质量动画道具设定图；不出现完整人物或人物脸。",
-            f"negative prompt: {negative_prompt}" if negative_prompt else "",
-        ]
-    )
+    anchors = "、".join(consistency_keywords)
+    detail_clean = detail.rstrip("。") if detail else detail
+    has_detail = bool(detail_clean) and detail_clean != "以素材资料保持稳定一致"
+    paragraphs = [
+        f"《{name}・{concept} 完整道具设定稿》",
+        "核心物品设定：\n"
+        f"{name}，属于{worldview}中的{category}，主要由{owner}使用，用于{plot_function}。\n"
+        f"整体轮廓{silhouette}，尺寸约{dimensions}，重量感{weight}。\n"
+        f"核心视觉识别点包括：{special_features}。",
+        "外观结构与细节：\n"
+        f"正面{front}；侧面{side}；背面{back}；顶部/底部/内部{other}；"
+        f"按钮、接口、纹样、把手等位于{key_position}。\n"
+        "所有结构的位置符合真实使用逻辑，物品可以被正常握持、佩戴或摆放，"
+        "不出现无法操作或结构矛盾的部分。",
+        "材质与色彩设定：\n"
+        f"主体材质{material}；辅助材质{secondary_material}；主色{color}，"
+        f"点缀色{accent_color}；表面质感{surface}；固定磨损{wear}。\n"
+        "所有纹样、接缝、按钮、接口、结构、磨损位置和配色必须固定，"
+        "便于后续AI漫剧分镜图与视频生成保持一致。",
+        f"细节补充：{detail_clean}。" if has_detail else "",
+        "版面背景与整体要求：\n"
+        "整张物品设定展板使用标准纯白色背景，背景干净、明亮、极简、通透。"
+        "不要浅灰背景，不要米白背景，不要渐变背景，不要完整环境场景。\n"
+        "仅使用极细浅灰色分隔线和少量低饱和冷蓝灰色细线建立版面秩序。"
+        "整体呈现高规格动画、漫画或AI漫剧项目的官方道具设定面板质感，"
+        "专业、精致、高级、规整、清晰。",
+        "版面排布结构：\n"
+        f"采用3:2横向宽幅、分块拼接式专业道具设定面板。画面只展示同一件{name}，"
+        "不出现其他无关道具，不出现完整人物角色，不出现完整环境场景。\n"
+        "面板只保留物品介绍、主物品精致展示图、标准多视图、三个关键细节"
+        "和尺寸使用比例参考。",
+        "左上角物品介绍区：\n"
+        "在画面左上角设置简洁、规整的物品资料卡。\n"
+        "物品资料卡内容为：\n"
+        f"物品名称：{name}\n"
+        f"物品意象：{concept}\n"
+        f"物品类别：{category}\n"
+        f"所属角色：{owner}\n"
+        f"主要用途：{plot_function}\n"
+        f"核心材质：{material}\n"
+        f"视觉识别点：{special_features}\n"
+        "资料卡采用官方动画道具设定稿式排版，标题与正文层级清晰，文字区域留白舒适。"
+        "中文尽量清晰、准确、可读，不要乱码、错字或无意义符号。",
+        "左侧主物品展示图：\n"
+        f"左侧主体区域放置一张尺寸最大的{name}精致立体展示图，占整张画面约40%至45%。\n"
+        "采用四十五度略微俯视视角，同时展示正面、顶部和侧面结构，完整表现物品轮廓、"
+        "厚度和关键部件。\n"
+        "物品不裁切、不遮挡、不变形，不使用夸张透视，是整张面板的视觉中心。"
+        "主体材质只产生细腻克制的边缘反光，不呈现镜面高亮。",
+        "右上区域标准多视图：\n"
+        "右上区域规整排列四个标准视图：正面视图、侧面视图、背面视图、顶部或底部视图。\n"
+        "四个视图保持完全一致的尺寸比例、轮廓、结构、颜色、材质、磨损和部件位置，"
+        "不得出现不同型号或不同版本。",
+        "右侧中部关键细节：\n"
+        f"三个高精度局部细节：{detail_zone}。",
+        "右下区域尺寸与使用比例：\n"
+        f"展示物品标准尺寸标注与使用比例参考：{scale}。"
+        "所有比例参考中的物品外观必须保持完全一致。",
+        "物品一致性要求：\n"
+        f"主物品图、多视图、关键细节和比例参考必须严格表现为同一件{name}。"
+        "所有模块保持完全一致的形状、尺寸比例、颜色、材质、结构、磨损和划痕。\n"
+        "不得生成不同型号，不得随机改变颜色，不得增减部件，不得改变磨损痕迹的位置、"
+        "方向或长度。"
+        + (f"一致性锚点：{anchors}。" if anchors else ""),
+        f"构图补充：{composition.rstrip('。')}。" if composition else "",
+        "画面美术风格：\n"
+        "整体采用半写实二维国漫动画道具设定风，精致清晰的设计线稿，"
+        "细腻克制的二维动画上色与材质表现。\n"
+        "严格保持动画道具设定图质感，不转换为真人产品摄影、电商白底摄影、"
+        "三维写实工业渲染或真实品牌商品宣传图。",
+        "灯光与画质：\n"
+        "采用中性偏冷影棚柔光，正面使用干净柔和的主光，右后方使用细腻轮廓光，"
+        "清晰展示物品轮廓、厚度、材质纹理、接缝、按钮和固定磨损。\n"
+        "高精度视觉效果，无景深模糊，无低清区域，无多余物品，无不同型号，无重复部件，"
+        "无结构错位，无悬浮零件，无错误透视，无材质混乱，无随机文字或品牌标志。"
+        "整张设定面板背景始终保持标准纯白色，版面模块对齐，间距统一，留白舒适。",
+        f"negative prompt: {negative_prompt}" if negative_prompt else "",
+    ]
+    return "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
 
 
 def _scene_setting_sheet(
@@ -435,44 +537,99 @@ def _scene_setting_sheet(
         environment_keyword = _scene_environment_text(keyword, "")
         if environment_keyword:
             environment_keywords.append(environment_keyword)
-    return join_non_empty(
-        [
-            f"《{name}・完整场景设定稿》",
-            "【最高优先级：无人纯背景空镜】",
-            "这是供后续分镜复用的纯环境场景资产，不是剧情分镜。所有视图必须为空场景，"
-            "禁止出现人物、人群、路人、行人、人影、人形、剪影、倒影或镜面中的人物以及人体局部。",
-            "下方资料中出现的任何人物姓名、人物动作、角色站位、人物视角或人物持有物，"
-            "都只能用于理解空间尺度和动线，不得成为画面内容。",
-            "核心场景设定：",
-            f"{name}，位于{worldview}中的{place_type}。",
-            f"空间关键词：{layout}；空间规模{scale}；建筑/室内风格{architecture}。",
-            f"核心视觉识别点：{furnishings}。",
-            "空间结构与区域关系：",
-            f"以入口、主要空间轴线与主场景透视方向为统一方向基准。主要区域：{regions}。",
-            f"入口{entrance}；窗户/自然光入口{windows}；"
-            f"表演活动区按主要区域和动线预留为空置空间；动线{movement}。",
-            f"固定陈设：{furnishings}。墙面{wall_material}；地面{floor_material}；"
-            f"家具{furniture_material}；金属/玻璃{glass_metal}；特殊材质{special_material}。",
-            f"主色{main_color}，点缀色{accent_color}，色彩气质{color_quality}。",
-            f"环境补充细节：{environment_detail}。",
-            "版面：",
-            "纯白背景，16:9 横向专业场景设定面板；每个视图都是无人纯背景空镜。",
-            "以下视角资料若原本涉及人物，只保留相同机位和环境构图，删除人物及其随身物。",
-            f"左上场景资料卡；左侧 40%~45% 主场景透视图：{main_view}；"
-            f"右上正向全景与反向/侧向全景：{standard_view_1}、{standard_view_2}；"
-            f"右侧中部俯视平面布局图；右下三个关键区域细节：{detail_zone}。",
-            "资料卡与标注文字必须清晰规范、无乱码、无错别字；"
-            "除资料卡、视图标签与平面图标注外，画面中不得出现任何其他文字。",
-            "所有视图必须是同一个场景，门窗、家具、陈设、光线方向和空间朝向完全一致。",
-            "一致性锚点：" + "、".join(environment_keywords) if environment_keywords else "",
-            f"构图补充：{environment_composition}" if environment_composition else "",
-            f"主光效果{main_light}，只表现光线结果，不绘制光源持有者；"
-            f"辅光{fill_light}，营造{atmosphere}。",
-            "最终检查：所有面板均不得出现人物、人影、剪影、倒影中的人物或人体局部。",
-            "高质量动画场景设定图；不是真实建筑摄影。",
-            f"negative prompt: {negative_prompt}" if negative_prompt else "",
-        ]
-    )
+    anchors = "、".join(environment_keywords)
+    paragraphs = [
+        f"《{name}・完整场景设定稿》",
+        "【最高优先级：无人纯背景空镜】\n"
+        "这是供后续分镜复用的纯环境场景资产，不是剧情分镜。所有视图必须为空场景，"
+        "禁止出现人物、人群、路人、行人、人影、人形、剪影、倒影或镜面中的人物以及人体局部。\n"
+        "下方资料中出现的任何人物姓名、人物动作、角色站位、人物视角或人物持有物，"
+        "都只能用于理解空间尺度和动线，不得成为画面内容。",
+        "核心场景设定：\n"
+        f"{name}，位于{worldview}中的{place_type}。\n"
+        f"空间关键词为{layout}；空间规模{scale}；建筑与室内风格为{architecture}。\n"
+        f"核心视觉识别点包括：{furnishings}。",
+        "空间结构与区域关系：\n"
+        "以入口、主要空间轴线与主场景透视方向为统一方向基准。\n"
+        f"主要区域：{regions}。\n"
+        f"入口{entrance}；窗户/自然光入口{windows}；"
+        f"表演活动区按主要区域和动线预留为空置空间；动线{movement}。\n"
+        "所有通道宽度合理，符合真实使用逻辑。",
+        "建筑、家具与陈设：\n"
+        f"墙面{wall_material}；地面{floor_material}；家具{furniture_material}；"
+        f"金属/玻璃{glass_metal}；特殊材质{special_material}。\n"
+        "家具尺寸、门窗高度、桌椅比例和空间尺度符合真实使用逻辑。"
+        "所有核心陈设的位置、外观、颜色和数量固定，"
+        "不得随机增加无关陈设、装饰或复杂文字标识。",
+        "材质与色彩设定：\n"
+        f"主色{main_color}，点缀色{accent_color}，色彩气质{color_quality}。"
+        "整体色彩陈旧、克制、低饱和，不过度鲜艳，不使用杂乱无规律的颜色。",
+        f"环境补充细节：{environment_detail}。" if environment_detail else "",
+        "版面背景与整体要求：\n"
+        "整张场景设定展板使用标准纯白色背景，背景干净、明亮、极简、通透。"
+        "不要浅灰背景，不要米白背景，不要渐变底色，不要将完整环境延伸为面板背景。\n"
+        "仅使用极细浅灰色分隔线和少量低饱和冷蓝灰色细线建立版面秩序。"
+        "整体呈现高规格动画、漫画或AI漫剧项目的官方场景设定面板质感，"
+        "专业、精致、高级、规整、清晰。",
+        "版面排布结构：\n"
+        f"采用16:9横向宽幅、分块拼接式专业场景设定面板。画面只展示{name}这一个场景，"
+        "不出现其他无关场景，不出现人物角色或人体残影。\n"
+        "面板只保留场景介绍、主场景图、两个标准观察角度、俯视平面布局图"
+        "和三个关键区域细节，不加入剧情分镜、人物动作、无关意境插图或大量装饰性小图。",
+        "左上角场景介绍区：\n"
+        "在画面左上角设置简洁、规整的场景资料卡。\n"
+        "场景资料卡内容为：\n"
+        f"场景名称：{name}\n"
+        f"场景定位：{place_type}\n"
+        f"时代与世界观：{worldview}\n"
+        f"空间关键词：{layout}\n"
+        f"核心视觉识别点：{furnishings}\n"
+        "资料卡采用官方动画场景设定稿式排版，标题与正文层级清晰，"
+        "文字区域留白舒适、排列整齐。中文尽量清晰、准确、可读，"
+        "不要乱码、错字或无意义符号。",
+        "左侧主场景图：\n"
+        f"左侧主体区域放置一张尺寸最大的完整场景透视图，占整张画面约40%至45%。\n"
+        f"构图：{main_view}。\n"
+        "使用适度广角全景，不使用夸张超广角，不产生严重透视畸变，不遮挡关键区域。"
+        "主场景图不出现人物。",
+        "右上区域标准观察角度：\n"
+        f"第一个视角：{standard_view_1}。\n"
+        f"第二个视角：{standard_view_2}。\n"
+        "两个视角必须表现为完全相同的场景，保持一致的门窗位置、家具摆放、装饰数量、"
+        "材质、颜色、空间比例和光照方向。",
+        "右侧中部俯视平面布局图：\n"
+        "放置一张简洁清晰的俯视平面布局图，使用简洁箭头标示主要通行路线与角色常用站位。"
+        "平面图风格简洁专业，不做复杂装饰，不改变实际空间结构。",
+        "右下区域关键区域细节：\n"
+        f"三个关键区域细节：{detail_zone}。\n"
+        "所有细节必须与主场景图完全一致，不得额外增加、删除或移动陈设。",
+        "场景一致性要求：\n"
+        "主场景图、两个观察角度、俯视平面布局图和三个关键区域细节必须严格表现为同一个场景。"
+        "所有模块保持完全一致的空间尺寸、门窗结构、家具造型、家具位置、装饰数量、颜色、"
+        "材质、磨损痕迹和核心视觉识别点。\n"
+        "不得生成不同版本的房间，不得改变空间朝向，不得让门窗或家具在不同视图中随机移动，"
+        "不得出现镜像颠倒或空间结构冲突。"
+        + (f"一致性锚点：{anchors}。" if anchors else ""),
+        f"构图补充：{environment_composition.rstrip('。')}。" if environment_composition else "",
+        "画面美术风格：\n"
+        "整体采用半写实二维国漫动画场景风，精致清晰的动画背景线稿，"
+        "细腻克制的二维动画上色与材质表现，与项目角色设定图保持相同的动画媒介"
+        "和世界观审美。\n"
+        "严格保持插画、动漫或二维动画场景设定风格，不转换为真人摄影、影视实拍、"
+        "建筑摄影、三维写实渲染或写实样板间。",
+        "灯光与色彩氛围：\n"
+        f"主光效果{main_light}，只表现光线结果，不绘制光源持有者；"
+        f"辅光{fill_light}，营造{atmosphere}的氛围。\n"
+        "灯光清晰展示空间结构和材质，不让暗部吞没陈设细节。",
+        "画质与成图要求：\n"
+        "高精度视觉效果，建筑结构、家具边缘、材质纹理、墙面痕迹和金属细节清晰可见。"
+        "全画面无景深模糊，无低清缩略图感，无脏污背景，无人物，无人体残影，"
+        "无错误透视，无弯曲墙面，无悬浮家具。\n"
+        "最终检查：所有面板均不得出现人物、人影、剪影、倒影中的人物或人体局部。"
+        "版面模块对齐，间距统一，信息完整但不拥挤，留白舒适，视觉层级明确。",
+        f"negative prompt: {negative_prompt}" if negative_prompt else "",
+    ]
+    return "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
 
 
 def _character_clean_reference(
@@ -507,7 +664,7 @@ def _character_clean_reference(
             f"服装{costume}，主色{main_color}；表情{expression}。",
             f"固定识别特征：{immutable}。",
             f"细节补充：{detail}。" if detail and detail != "以素材资料保持稳定一致" else "",
-            "构图：全身立绘，正面微侧，人物完整居中，四肢与道具无遮挡；背景为单一中性纯色。",
+            "构图：全身立绘，正面微侧，人物完整居中，四肢与道具无遮挡；背景为纯白色，无任何环境陈设。",
             "画风：与项目设定稿完全一致的二维动画角色，不是真人摄影。",
             f"negative prompt: {negative_prompt}" if negative_prompt else "",
         ]
@@ -539,7 +696,7 @@ def _prop_clean_reference(
             f"画面内容：单件物品{name}，{description}；关键结构{special_features}；"
             f"主体材质{material}，主色{color}；大小{scale}。",
             f"细节补充：{detail}。" if detail and detail != "以素材资料保持稳定一致" else "",
-            "构图：物品完整居中，四十五度略俯视，无人物手部入镜；背景为单一中性纯色。",
+            "构图：物品完整居中，四十五度略俯视，无人物手部入镜；背景为纯白色，无任何环境陈设。",
             "画风：与项目设定稿完全一致的二维动画道具，不是产品摄影。",
             f"negative prompt: {negative_prompt}" if negative_prompt else "",
         ]
@@ -660,51 +817,87 @@ def compile_keyframe_prompt(
     expressions = _value(shot_context.get("expressions"), "")
     dialogue = _value(shot_context.get("dialogue"), "")
     voice_over = _value(shot_context.get("voice_over"), "")
-    return apply_content_safety(
-        join_non_empty(
-            [
-                style_anchor(style_prompt, effective_aspect_ratio),
-                "【当前分镜素材参考图】",
-                *anchors,
-                "只使用以上当前分镜涉及的角色、场景和道具素材图锁定身份与空间，不得引入其他镜头的人物、场景或道具。"
-                if anchors
-                else "当前分镜没有可用绑定参考图，按文字描述生成并保持内部一致。",
-                f"风格：{style_prompt}。",
-                f"时间地点：{_value(shot_context.get('time_place'), '以当前场景资料为准')}。",
-                f"首帧关键构图：{opening_frame}。",
-                "用途：生成当前分镜唯一的分镜图，并作为图生视频严格第0秒起始帧。",
-                "画面必须停在动作发生前约0.2-0.5秒或动作刚开始的稳定边界，不得提前呈现动作完成结果。",
-                f"本镜剧情目标：{image_prompt}。该信息只用于预留动作和构图空间，不得画成动作中段或结束状态。",
-                f"视频末帧边界：{ending_frame}。",
-                f"人物：{characters}。",
-                f"人物站位、朝向与视线：{positions}。" if positions else "",
-                f"人物表情：{expressions}。" if expressions else "",
-                (
-                    f"对白与口型状态：{dialogue}。说话角色呈现与台词对应的自然开口表情，"
-                    "非说话角色闭口；对白只作为表演依据，不得生成字幕或画面文字。"
-                    if dialogue
-                    else ""
-                ),
-                (
-                    f"画外音（后期配音，画面人物闭口）：{voice_over}。"
-                    "本镜台词来自录音或旁白，画面中所有人物全程闭口，不产生说话口型；"
-                    "对白由后期配音添加，不得生成字幕或画面文字。"
-                    if voice_over
-                    else ""
-                ),
-                f"场景：{_value(shot_context.get('scene_name'), '当前分镜场景')}。",
-                f"物品：{props}。",
-                f"镜头：{_value(shot_context.get('shot_type'), '中景')}，"
-                f"{_value(shot_context.get('camera_angle'), '平视')}，"
-                f"{_value(shot_context.get('camera_move'), '稳定机位')}，"
-                f"焦点{_value(shot_context.get('focus'), '当前主要动作')}。",
-                f"视觉：{_value(shot_context.get('lighting'), '符合场景设定的光线')}，"
-                f"{_value(shot_context.get('color_tone'), '统一色调')}，"
-                f"{_value(shot_context.get('environment_details'), '场景固定环境细节')}。",
-                continuity_instruction,
-                f"negative prompt: {negative_prompt}" if negative_prompt.strip() else "",
-            ]
+    paragraphs = [
+        "【参考】\n"
+        + style_anchor(style_prompt, effective_aspect_ratio)
+        + "\n"
+        + "\n".join(anchors)
+        + (
+            "\n只使用以上当前分镜涉及的角色、场景和道具素材图锁定身份与空间，"
+            "不得引入其他镜头的人物、场景或道具。"
+            if anchors
+            else "\n当前分镜没有可用绑定参考图，按文字描述生成并保持内部一致。"
+        ),
+        "【剧情时刻】\n"
+        f"{image_prompt.rstrip('。')}。\n"
+        "画面只呈现该剧情时刻对应的单一关键瞬间，不制作多格漫画，不制作设定展板，"
+        "不制作动作分解图，不在同一画面重复展示同一角色，"
+        "不在同一画面重复呈现起始动作和完成动作。",
+        "【人物与动作】\n"
+        f"人物：{characters}。"
+        + (f"\n站位、朝向与视线：{positions}。" if positions else "")
+        + (
+            f"\n对白与口型状态：{dialogue.rstrip('。')}。说话角色呈现与台词对应的自然开口表情，"
+            "非说话角色闭口；对白只作为表演依据，不得生成字幕或画面文字。"
+            if dialogue
+            else ""
         )
+        + (
+            f"\n画外音（后期配音，画面人物闭口）：{voice_over.rstrip('。')}。"
+            "本镜台词来自录音或旁白，画面中所有人物全程闭口，不产生说话口型；"
+            "对白由后期配音添加，不得生成字幕或画面文字。"
+            if voice_over
+            else ""
+        ),
+        "【场景与空间关系】\n"
+        f"时间地点：{_value(shot_context.get('time_place'), '以当前场景资料为准')}。\n"
+        f"场景：{_value(shot_context.get('scene_name'), '当前分镜场景')}。"
+        "空间结构、门窗位置、家具摆放与陈设布局沿用绑定参考图，"
+        "不得随机改变房间朝向、移动陈设、增加无关物品或其他人物，不得将场景镜像翻转。",
+        "【关键物品】\n"
+        f"物品：{props}。"
+        "外观、尺寸、颜色与磨损痕迹沿用绑定参考图，"
+        "不放大、不缩小、不变形、不漂浮、不穿模、不遮挡人物关键动作。",
+        "【镜头构图】\n"
+        f"景别{_value(shot_context.get('shot_type'), '中景')}，"
+        f"机位{_value(shot_context.get('camera_angle'), '平视')}，"
+        f"运镜{_value(shot_context.get('camera_move'), '稳定机位')}，"
+        f"焦点{_value(shot_context.get('focus'), '当前主要动作')}。\n"
+        f"首帧关键构图：{opening_frame.rstrip('。')}。\n"
+        "用途：生成当前分镜唯一的分镜图，并作为图生视频严格第0秒起始帧。\n"
+        "画面必须停在动作发生前约0.2-0.5秒或动作刚开始的稳定边界，"
+        "不得提前呈现动作完成结果。\n"
+        f"视频末帧边界：{ending_frame.rstrip('。')}。",
+        "【人物神态与情绪】\n"
+        + (
+            f"{expressions}。表情自然细腻、克制真实，不使用夸张颜艺，"
+            "不瞪大双眼，不张大嘴，情绪强度适中。"
+            if expressions
+            else "人物表情自然克制，情绪强度适中，不使用夸张颜艺。"
+        ),
+        "【灯光与色彩】\n"
+        f"{_value(shot_context.get('lighting'), '符合场景设定的光线')}，"
+        f"{_value(shot_context.get('color_tone'), '统一色调')}，"
+        f"环境细节{_value(shot_context.get('environment_details'), '场景固定环境细节')}。\n"
+        "光线符合场景设定的真实光源逻辑，清晰照亮人物五官、双手与关键物品，"
+        "不让暗部吞没剧情信息，不产生无来源的强光或过度戏剧化阴影。",
+        "【画面美术质感】\n"
+        f"保持{style_prompt.strip() or '项目既定动画风格'}的动画/插画质感，"
+        "人物线条干净，面部和手部结构准确，场景空间清晰，材质区分明确，光影自然克制。\n"
+        "人物、场景与物品的完成精度保持统一，不呈现真人摄影、影视剧照、三次元演员、"
+        "写实实拍或过度三维游戏CG质感。",
+        f"【连续性要求】\n{continuity_instruction}" if continuity_instruction.strip() else "",
+        "【成图限制】\n"
+        "画面只表现当前一个剧情瞬间，不制作多格漫画，不制作设定展板，"
+        "不制作动作分解图，不在同一画面重复展示同一角色。\n"
+        "无人物漂浮，无物品漂浮，无穿模，无物品尺寸异常，无家具移动，无门窗错位，"
+        "无场景镜像翻转，无错误透视。\n"
+        "画面中不出现字幕、对白、对话框、旁白文字、水印、品牌标志、"
+        "文件文字、乱码或无意义符号。"
+        + (f"\nnegative prompt: {negative_prompt}" if negative_prompt.strip() else ""),
+    ]
+    return apply_content_safety(
+        "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
     )
 
 

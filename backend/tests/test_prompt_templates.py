@@ -118,7 +118,7 @@ def test_shot_template_context_normalizes_dialogue_aliases() -> None:
                 "costume": "青灰短斗篷与皮靴",
                 "immutable_features": ["左眉小痣", "铜制符笔"],
             },
-            "3:2 横向角色设定面板",
+            "3:2横向宽幅、分块拼接式专业角色设定面板",
             "3:2",
         ),
         (
@@ -131,7 +131,7 @@ def test_shot_template_context_normalizes_dialogue_aliases() -> None:
                 "special_features": ["星纹刻度", "可旋转外环"],
                 "plot_function": "寻找古墓入口",
             },
-            "3:2 横向专业道具设定面板",
+            "3:2横向宽幅、分块拼接式专业道具设定面板",
             "3:2",
         ),
         (
@@ -143,7 +143,7 @@ def test_shot_template_context_normalizes_dialogue_aliases() -> None:
                 "color_mood": "青灰、暖金",
                 "furnishings": ["供台", "铜灯", "旧书架"],
             },
-            "16:9 横向专业场景设定面板",
+            "16:9横向宽幅、分块拼接式专业场景设定面板",
             "16:9",
         ),
     ],
@@ -310,7 +310,7 @@ def test_compile_scene_asset_prompt_removes_people_actions_from_all_free_text_fi
         assert name not in prompt
 
 
-def test_compile_keyframe_prompt_uses_v2_template_and_reference_order() -> None:
+def test_compile_keyframe_prompt_uses_v3_template_and_reference_order() -> None:
     prompt = compile_keyframe_prompt(
         style_prompt="东方奇幻二维动画",
         aspect_ratio="9:16",
@@ -337,7 +337,7 @@ def test_compile_keyframe_prompt_uses_v2_template_and_reference_order() -> None:
         },
     )
 
-    assert "【当前分镜素材参考图】" in prompt
+    assert "【参考】" in prompt
     assert "@Image1：林雪" in prompt
     assert "用途：生成当前分镜唯一的分镜图" in prompt
     assert "不得提前呈现动作完成结果" in prompt
@@ -670,7 +670,7 @@ def test_compile_asset_prompt_clean_reference_mode_has_no_setting_sheet_text() -
     assert "干净角色参考图" in prompt
     assert "左上人物资料卡" not in prompt
     assert "三视图" not in prompt
-    assert "单一中性纯色" in prompt
+    assert "纯白色" in prompt
     assert "不包含任何文字" in prompt
 
 

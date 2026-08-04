@@ -100,6 +100,7 @@ function assetPayload(body: Partial<Asset>, includeType: boolean) {
     name: body.name,
     profile: body.profile_json ?? body.profile,
     prompt: body.prompt,
+    prompt_override: body.prompt_override,
     negative_prompt: body.negative_prompt,
     consistency_keywords:
       body.consistency_json ?? body.consistency_keywords,
