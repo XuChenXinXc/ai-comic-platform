@@ -9,6 +9,7 @@ import {
   GripVertical,
   ImageOff,
   Images,
+  Link2,
   Merge,
   Pencil,
   Plus,
@@ -295,6 +296,26 @@ export function ShotsPage() {
     onError: (error) => toast.error(formatError(error)),
   });
 
+  // 剧情连贯审校：把相邻分镜的起止状态与旁白交给文字模型逐对检查，
+  // 修正直接写回源字段。改完需要重新生成提示词才会生效。
+  const continuityFixMutation = useMutation({
+    mutationFn: () =>
+      api.shots.checkContinuity(activeProjectId, {
+        ids: batchIds,
+        apply_fixes: true,
+        insert_transitions: false,
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      toast.success("剧情连贯审校已入队", {
+        description: "完成后请重新生成提示词，修正才会写入提示词",
+      });
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
   const exportZip = async () => {
     if (!activeProject) return;
     setExporting(true);
@@ -441,6 +462,16 @@ export function ShotsPage() {
               >
                 <WandSparkles className="h-4 w-4" />
                 {shots.length ? "重新提取全部" : "提取分镜"}
+              </Button>
+              <Button
+                variant="secondary"
+                busy={continuityFixMutation.isPending}
+                disabled={!shots.length}
+                title="把相邻分镜的起止状态与旁白交给文字模型逐对审校并自动修正源字段；完成后需重新生成提示词才会生效"
+                onClick={() => continuityFixMutation.mutate()}
+              >
+                <Link2 className="h-4 w-4" />
+                剧情连贯审校
               </Button>
               <Button
                 variant="secondary"

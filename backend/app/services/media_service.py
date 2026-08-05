@@ -71,10 +71,12 @@ _DELETED_MEDIA_ERROR = "__deleted_by_user__"
 _ACTIVE_MEDIA_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
 _MEDIA_VERSION_FILE_LOCK = RLock()
 _GPT_IMAGE_2_SIZES = {
-    "character": "3840x2560",
-    "scene": "3840x2160",
-    "prop": "3840x2560",
-    "keyframe": "3840x2160",
+    # 2K 分辨率，长宽比与 4K 版本保持一致（角色/物品 3:2，场景/关键帧 16:9）。
+    # 4K 出图在多参考图场景下一致性明显更差，且请求体积大易触发中转限制。
+    "character": "2560x1707",
+    "scene": "2560x1440",
+    "prop": "2560x1707",
+    "keyframe": "2560x1440",
 }
 _INTEGER_DURATION_VIDEO_MODELS = {
     "grok-imagine-1.5-video-apimart",

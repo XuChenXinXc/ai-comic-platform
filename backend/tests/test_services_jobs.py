@@ -129,10 +129,10 @@ def _fail_second_provider_resolve(
 @pytest.mark.parametrize(
     ("target_type", "expected_size"),
     [
-        ("character", "3840x2560"),
-        ("scene", "3840x2160"),
-        ("prop", "3840x2560"),
-        ("keyframe", "3840x2160"),
+        ("character", "2560x1707"),
+        ("scene", "2560x1440"),
+        ("prop", "2560x1707"),
+        ("keyframe", "2560x1440"),
     ],
 )
 def test_gpt_image_2_generation_params_use_target_size(

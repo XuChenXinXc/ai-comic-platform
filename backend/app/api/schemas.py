@@ -429,6 +429,25 @@ class ShotPromptBatchRequest(GenerateRequest):
         return self
 
 
+class ContinuityCheckRequest(GenerateRequest):
+    ids: list[str] | None = None
+    apply_fixes: bool = True
+    insert_transitions: bool = False
+
+
+class RefinePromptsRequest(GenerateRequest):
+    chunk_size: int = Field(default=6, ge=2, le=12)
+    prompt_types: list[Literal["image", "video"]] = Field(default_factory=lambda: ["video"])
+
+    @model_validator(mode="after")
+    def validate_prompt_types(self) -> "RefinePromptsRequest":
+        if not self.prompt_types:
+            raise ValueError("prompt_types 不能为空")
+        if len(set(self.prompt_types)) != len(self.prompt_types):
+            raise ValueError("prompt_types 不能重复")
+        return self
+
+
 class MediaBatchRequest(GenerateRequest):
     ids: list[str] | None = None
     scene_no: int | None = Field(default=None, ge=1)

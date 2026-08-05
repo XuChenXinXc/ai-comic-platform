@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Response, status
 
 from app.api.schemas import (
+    ContinuityCheckRequest,
     GenerateRequest,
     ShotCopyRequest,
     ShotCreate,
@@ -10,6 +11,7 @@ from app.api.schemas import (
     ShotReorderRequest,
     ShotSplitRequest,
     ShotUpdate,
+    RefinePromptsRequest,
     VideoPromptOptimizeAllRequest,
     VideoPromptOptimizeRequest,
 )
@@ -162,3 +164,27 @@ def generate_shot_prompts_batch(
     service: ShotService = Depends(get_shot_service),
 ) -> dict:
     return service.queue_prompt_batch(project_id, body.model_dump())
+
+
+@router.post(
+    "/projects/{project_id}/shots/continuity/check",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def check_shot_continuity(
+    project_id: str,
+    body: ContinuityCheckRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return service.queue_continuity_check(project_id, body.model_dump())
+
+
+@router.post(
+    "/projects/{project_id}/shots/prompts/refine",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def refine_shot_prompts(
+    project_id: str,
+    body: RefinePromptsRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return service.queue_refine_prompts(project_id, body.model_dump())

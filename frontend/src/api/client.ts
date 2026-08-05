@@ -415,6 +415,33 @@ export const api = {
         `/projects/${projectId}/shots/prompts/batch`,
         json("POST", body),
       ),
+    checkContinuity: (
+      projectId: string,
+      body: {
+        ids?: string[];
+        apply_fixes?: boolean;
+        insert_transitions?: boolean;
+        provider_id?: string | null;
+        params?: Record<string, unknown>;
+      } = {},
+    ) =>
+      request<Job>(
+        `/projects/${projectId}/shots/continuity/check`,
+        json("POST", body),
+      ),
+    refinePrompts: (
+      projectId: string,
+      body: {
+        prompt_types?: Array<"image" | "video">;
+        chunk_size?: number;
+        provider_id?: string | null;
+        params?: Record<string, unknown>;
+      } = {},
+    ) =>
+      request<Job>(
+        `/projects/${projectId}/shots/prompts/refine`,
+        json("POST", body),
+      ),
     keyframes: {
       list: async (shotId: string) =>
         asList(

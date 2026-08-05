@@ -12,7 +12,9 @@ _FIXED_VISUAL_ASPECT_RATIOS = {
     "video": "16:9",
 }
 _TIMELINE_PATTERN = re.compile(
-    r"(?:^|[；;\n])\s*(\d+(?:\.\d+)?)\s*[-–—~－至]\s*(\d+(?:\.\d+)?)\s*秒"
+    # 前置分隔符需包含。，否则「0-1秒：…。1-2秒：…」只能匹配首段，
+    # 导致末段补尾用错 last_end 生成与已有分段重叠的时间轴
+    r"(?:^|[。；;，,\n])\s*(\d+(?:\.\d+)?)\s*[-–—~－至]\s*(\d+(?:\.\d+)?)\s*秒"
 )
 _SCENE_CLAUSE_PATTERN = re.compile(r"[^。！？；;\n]+[。！？；;]?\s*")
 _SCENE_PERSON_MARKERS = (
@@ -904,6 +906,7 @@ def compile_keyframe_prompt(
 def shot_template_context(
     current: dict[str, Any],
     asset_names: dict[str, str],
+    prev_end_state: str = "",
 ) -> dict[str, Any]:
     dialogue_parts: list[str] = []
     voice_over_parts: list[str] = []
@@ -918,13 +921,24 @@ def shot_template_context(
             continue
         # 录音笔、旁白、画外音等来源属于后期配音内容，画面人物必须全程闭口
         if any(marker in speaker for marker in ("录音", "画外音", "旁白", "OS", "内心")):
-            voice_over_parts.append(f"{speaker}：{text}")
+            # speaker 已表明来源，text 若重复带同名前缀则剥掉，避免「旁白：旁白：正文」
+            deduped = text
+            for prefix in (f"{speaker}：", "旁白：", "画外音：", "画外旁白："):
+                while deduped.startswith(prefix):
+                    deduped = deduped[len(prefix) :].lstrip()
+            voice_over_parts.append(f"{speaker}：{deduped}" if deduped else f"{speaker}：{text}")
         else:
             dialogue_parts.append(f"{speaker}自然开口说：{text}")
     if current.get("narration"):
         narration = str(current.get("narration") or "").strip()
+        # narration 内容常已自带「旁白：」「画外音：」前缀，模板外层还会套
+        # 「画外音（后期配音，画面人物闭口）：」，此处剥掉内层重复前缀，
+        # 避免叠成「画外音（…）：画外旁白：旁白：正文」三层标签
+        for prefix in ("画外旁白：", "画外音：", "旁白：", "OS：", "内心独白："):
+            while narration.startswith(prefix):
+                narration = narration[len(prefix) :].lstrip()
         if narration:
-            voice_over_parts.append(f"画外旁白：{narration}")
+            voice_over_parts.append(narration)
     position_parts: list[str] = []
     for item in current.get("positions", []):
         if not isinstance(item, dict):
@@ -955,7 +969,10 @@ def shot_template_context(
             expression_parts.append(f"{character}：{expression}")
     return {
         "time_place": current.get("source_ref", ""),
+        # previous_state 保持原语义（本镜起始状态），供其他模板段落使用；
+        # 上一镜结束状态单独放在 prev_end_state，仅作前情交代
         "previous_state": current.get("start_state", ""),
+        "prev_end_state": prev_end_state,
         # 关键帧必须以动作开始前的静态状态为准，不得把动作中段或结果画进首帧
         "opening_frame": current.get("start_state") or current.get("frame_description", ""),
         "ending_frame": current.get("end_state") or current.get("next_hook", ""),
@@ -1068,8 +1085,15 @@ def compile_video_prompt(
                 if anchors
                 else "",
                 "【执行】",
-                f"{_value(shot_context.get('previous_state'), '以当前关键帧作为上一镜衔接状态')}。",
-                f"第0秒以关键帧画面为准：{opening_frame}。",
+                # 上一镜结束状态只作为「已结束的前情」交代，不与第0秒画面并列，
+                # 避免跨场景或姿态变化时形成两个互相矛盾的开场状态声明
+                (
+                    f"前情（上一镜已结束，仅供衔接理解，不是本镜画面）："
+                    f"{_value(shot_context.get('prev_end_state'), '')}。"
+                    if str(shot_context.get("prev_end_state") or "").strip()
+                    else ""
+                ),
+                f"第0秒以关键帧画面为准（本镜唯一起始状态）：{opening_frame}。",
                 f"人物站位、朝向与视线：{positions}。" if positions else "",
                 f"人物表情：{expressions}。" if expressions else "",
                 *execution_lines,

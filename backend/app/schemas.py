@@ -492,6 +492,22 @@ class ShotOutput(OutputModel):
             raise ValueError("素材 ID 不能重复")
         return value
 
+    @model_validator(mode="after")
+    def validate_dialogue_duration(self) -> "ShotOutput":
+        """校验台词总字数是否超出时长承载能力（粗略：2字/秒含停顿）。"""
+        if not self.dialogue or self.duration_sec >= 12:
+            return self
+        total_chars = sum(len(item.text) for item in self.dialogue)
+        # 2字/秒，留20%余量给动作，阈值 = duration * 2 * 0.8
+        threshold = int(self.duration_sec * 2 * 0.8)
+        if total_chars > threshold:
+            raise ValueError(
+                f"镜{self.shot_no}：{self.duration_sec}秒内台词共{total_chars}字，"
+                f"超出建议阈值{threshold}字（按2字/秒+20%动作余量计算）。"
+                f"请延长时长至{(total_chars / 2 / 0.8):.0f}秒以上，或压缩台词。"
+            )
+        return self
+
 
 class ShotExtractionOutput(OutputModel):
     shots: list[ShotOutput]
@@ -632,3 +648,57 @@ class BatchSummary(BaseModel):
     failed: int = 0
     cancelled: int = 0
     interrupted: int = 0
+
+
+# ── 连续性审校 ──────────────────────────────────────────────────────────────
+
+
+class ShotContinuityFix(OutputModel):
+    """单条字段修正建议。"""
+
+    shot_no: int
+    field: Literal["end_state", "start_state", "next_hook", "action", "narration"]
+    current_value: str
+    suggested_value: NonEmptyText
+    reason: NonEmptyText
+
+
+class ShotContinuityTransition(OutputModel):
+    """建议在两镜之间插入的过渡镜描述。"""
+
+    insert_after_shot_no: int
+    action: NonEmptyText
+    start_state: NonEmptyText
+    end_state: NonEmptyText
+    duration_sec: int = Field(default=3, gt=0, le=4)
+
+
+class ShotContinuityPairOutput(OutputModel):
+    """单对相邻分镜的连续性审校结果。"""
+
+    prev_shot_no: int
+    next_shot_no: int
+    is_continuous: bool
+    issues: list[str] = Field(default_factory=list)
+    fixes: list[ShotContinuityFix] = Field(default_factory=list)
+    transition: ShotContinuityTransition | None = None
+
+
+class ShotContinuityCheckOutput(OutputModel):
+    """连续性审校批量结果（按相邻对返回）。"""
+
+    pairs: list[ShotContinuityPairOutput]
+
+
+class RefinedPromptChange(OutputModel):
+    """单镜提示词的改动说明，供用户复核。"""
+
+    shot_no: int
+    reason: NonEmptyText
+
+
+class BatchRefinedPromptsOutput(OutputModel):
+    """全量提示词连续性精修结果：prompts 顺序与输入分镜一一对应。"""
+
+    prompts: list[NonEmptyText]
+    changes: list[RefinedPromptChange] = Field(default_factory=list)
