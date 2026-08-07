@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import func, insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError
@@ -15,7 +16,15 @@ from alembic import command
 from app.config import BACKEND_DIR, PROJECT_ROOT, Settings
 from app.db import Database, init_db, migrate_schema, utc_now
 from app.models.tables import ALL_TABLES, api_provider, job, project
-from app.schemas import NovelAnalysisOutput, ReferenceBinding, VisualStyleOutput
+from app.schemas import NovelAnalysisOutput, ReferenceBinding
+
+
+def _alembic_config() -> Config:
+    config = Config()
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    config.set_main_option("prepend_sys_path", str(BACKEND_DIR))
+    config.set_main_option("path_separator", "os")
+    return config
 
 
 def _insert_project(database: Database, project_id: str = "project-1") -> None:
@@ -63,9 +72,7 @@ def test_settings_without_projects_dir_uses_workspace_projects(
 
     settings = Settings(_env_file=None)
 
-    assert settings.projects_dir == (
-        PROJECT_ROOT / "relative-workspace" / "projects"
-    ).resolve()
+    assert settings.projects_dir == (PROJECT_ROOT / "relative-workspace" / "projects").resolve()
 
 
 def test_settings_with_empty_projects_dir_uses_workspace_projects(
@@ -76,9 +83,7 @@ def test_settings_with_empty_projects_dir_uses_workspace_projects(
 
     settings = Settings(_env_file=None)
 
-    assert settings.projects_dir == (
-        PROJECT_ROOT / "relative-workspace" / "projects"
-    ).resolve()
+    assert settings.projects_dir == (PROJECT_ROOT / "relative-workspace" / "projects").resolve()
 
 
 @pytest.mark.parametrize(
@@ -138,9 +143,13 @@ def test_init_db_with_fresh_database_migrates_to_head_and_seeds_mock_providers(
     }
     shot_columns = {column["name"] for column in inspect(database.engine).get_columns("shot")}
     assert {"image_prompt_override", "video_prompt_override"} <= shot_columns
+    asset_columns = {column["name"] for column in inspect(database.engine).get_columns("asset")}
+    assert "prompt_override" in asset_columns
     with database.engine.connect() as connection:
+        # 与 alembic 脚本目录的 head 对比，避免每加一条迁移都要改硬编码版本号
+        script_directory = ScriptDirectory.from_config(_alembic_config())
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "20260731_0005"
+            script_directory.get_current_head()
         )
         assert connection.scalar(select(func.count()).select_from(api_provider)) == 3
     database.dispose()
@@ -229,24 +238,6 @@ def test_database_with_concurrent_short_transactions_writes_all_rows(
 def test_novel_analysis_output_with_missing_required_field_rejects_value() -> None:
     with pytest.raises(ValidationError):
         NovelAnalysisOutput.model_validate({"summary": "只有摘要"})
-
-
-def test_visual_style_output_with_only_whitespace_rejects_value() -> None:
-    with pytest.raises(ValidationError):
-        VisualStyleOutput.model_validate({"style_prompt": " " * 20})
-
-
-@pytest.mark.parametrize("length", [18, 32])
-def test_visual_style_output_with_boundary_length_accepts_value(length: int) -> None:
-    output = VisualStyleOutput.model_validate({"style_prompt": "画" * length})
-
-    assert output.style_prompt == "画" * length
-
-
-@pytest.mark.parametrize("length", [17, 33])
-def test_visual_style_output_outside_length_limit_rejects_value(length: int) -> None:
-    with pytest.raises(ValidationError):
-        VisualStyleOutput.model_validate({"style_prompt": "画" * length})
 
 
 def test_reference_binding_with_unknown_role_rejects_value() -> None:

@@ -3,13 +3,19 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.schemas import ScreenplayDialogue
+from app.schemas import ScreenplayDialogue, ShotTransitionFromPrev
 
 AssetType = Literal["character", "scene", "prop"]
 ContentStatus = Literal["draft", "ready", "confirmed", "failed"]
 ProviderKind = Literal["text", "image", "video"]
 ShotSourceType = Literal["novel", "screenplay"]
 ProjectStorageSource = Literal["database", "environment", "default"]
+
+# 项目默认画风：仅作为新建项目的初始值，之后只允许用户手动修改
+DEFAULT_STYLE_PROMPT = (
+    "电影感现实主义二维国漫，稳定自然的半写实人物比例，沉稳细腻线条，"
+    "低饱和冷暖协调色调，真实清晰的微表情，层次分明的电影光影。"
+)
 
 
 def _sensitive_param_path(value: Any, path: str = "params") -> str | None:
@@ -71,7 +77,7 @@ class ApiModel(BaseModel):
 class ProjectCreate(ApiModel):
     name: str = Field(min_length=1, max_length=200)
     source_text: str = ""
-    style_prompt: str = ""
+    style_prompt: str = DEFAULT_STYLE_PROMPT
     aspect_ratio: str = "16:9"
     image_size: str = "1920x1080"
     video_size: str = "16:9"
@@ -104,6 +110,22 @@ class ProjectStorageSelectionResult(ProjectStorageSetting):
 
 
 class GenerateRequest(ApiModel):
+    provider_id: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+
+    _validate_params = field_validator("params")(_validate_public_params)
+
+
+class VideoPromptOptimizeRequest(ApiModel):
+    prompt: str = Field(min_length=1, max_length=8000)
+    provider_id: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+
+    _validate_params = field_validator("params")(_validate_public_params)
+
+
+class VideoPromptOptimizeAllRequest(ApiModel):
+    ids: list[str] | None = None
     provider_id: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -158,6 +180,7 @@ class AssetUpdate(ApiModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     profile: dict[str, Any] | None = None
     prompt: str | None = None
+    prompt_override: str | None = None
     negative_prompt: str | None = None
     consistency_keywords: list[str] | None = None
     composition: str | None = None
@@ -300,6 +323,7 @@ class ShotFields(ApiModel):
     duration_sec: float = Field(gt=0)
     end_state: str = ""
     next_hook: str = ""
+    transition_from_prev: ShotTransitionFromPrev = "scene_change"
     frame_description: str = ""
     image_prompt: str = ""
     image_prompt_override: str = ""
@@ -332,6 +356,7 @@ class ShotUpdate(ApiModel):
     duration_sec: float | None = Field(default=None, gt=0)
     end_state: str | None = None
     next_hook: str | None = None
+    transition_from_prev: ShotTransitionFromPrev | None = None
     frame_description: str | None = None
     image_prompt: str | None = None
     image_prompt_override: str | None = None
@@ -412,6 +437,29 @@ class ShotPromptBatchRequest(GenerateRequest):
         return self
 
 
+class ContinuityCheckRequest(GenerateRequest):
+    ids: list[str] | None = None
+    apply_fixes: bool = True
+    insert_transitions: bool = False
+
+
+class RefinePromptsRequest(GenerateRequest):
+    chunk_size: int = Field(default=6, ge=2, le=12)
+    prompt_types: list[Literal["image", "video"]] = Field(default_factory=lambda: ["video"])
+
+    @model_validator(mode="after")
+    def validate_prompt_types(self) -> "RefinePromptsRequest":
+        if not self.prompt_types:
+            raise ValueError("prompt_types 不能为空")
+        if len(set(self.prompt_types)) != len(self.prompt_types):
+            raise ValueError("prompt_types 不能重复")
+        return self
+
+
+class QualityFixRequest(GenerateRequest):
+    ids: list[str] | None = None
+
+
 class MediaBatchRequest(GenerateRequest):
     ids: list[str] | None = None
     scene_no: int | None = Field(default=None, ge=1)
@@ -449,3 +497,27 @@ class ProviderUpdate(ApiModel):
     is_default: bool | None = None
 
     _validate_params = field_validator("params")(_validate_public_params)
+
+
+class ChapterCreate(ApiModel):
+    title: str = Field(default="", max_length=200)
+    source_text: str = ""
+    chapter_no: int | None = Field(default=None, ge=1)
+    status: ContentStatus = "draft"
+
+
+class ChapterUpdate(ApiModel):
+    title: str | None = Field(default=None, max_length=200)
+    source_text: str | None = None
+    chapter_no: int | None = Field(default=None, ge=1)
+    status: ContentStatus | None = None
+
+
+class ChapterReorderRequest(ApiModel):
+    ids: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique(self) -> "ChapterReorderRequest":
+        if len(set(self.ids)) != len(self.ids):
+            raise ValueError("ids 不能重复")
+        return self

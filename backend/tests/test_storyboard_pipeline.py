@@ -8,6 +8,7 @@ import pytest
 
 from app.db import Database
 from app.services.asset_service import AssetService
+from app.services.chapter_service import ChapterService
 from app.services.errors import ServiceError
 from app.services.file_service import FileService
 from app.services.project_service import ProjectService
@@ -90,30 +91,32 @@ def storyboard_services(
 ) -> tuple[Database, ShotService, RecordingJobService, dict[str, Any]]:
     database = Database(f"sqlite:///{(tmp_path / 'storyboard.db').as_posix()}")
     database.initialize(seed_mock_providers=True)
-    project = ProjectService(database, FileService(tmp_path)).create(
-        {"name": "分镜流水线", "source_text": "少年在青云山巅决定下山。"}
+    project = ProjectService(database, FileService(tmp_path)).create({"name": "分镜流水线"})
+    chapter = ChapterService(database, FileService(tmp_path)).create(
+        project["id"],
+        {"title": "第一章", "source_text": "少年在青云山巅决定下山。"},
     )
     WritingService(database).update_screenplay(
-        project["id"],
+        chapter["id"],
         {"content": _screenplay_content()},
     )
     jobs = RecordingJobService()
     service = ShotService(database, jobs=jobs)  # type: ignore[arg-type]
-    yield database, service, jobs, project
+    yield database, service, jobs, chapter
     database.dispose()
 
 
 def test_extract_queue_with_legacy_novel_source_uses_screenplay(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    database, service, jobs, project = storyboard_services
+    database, service, jobs, chapter = storyboard_services
     AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "scene", "name": "青云山巅"},
     )
 
     service.queue_extract(
-        project["id"],
+        chapter["id"],
         {"source_type": "novel", "scope": "all"},
     )
 
@@ -123,11 +126,11 @@ def test_extract_queue_with_legacy_novel_source_uses_screenplay(
 def test_extract_queue_without_scene_assets_returns_conflict(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    _database, service, _jobs, project = storyboard_services
+    _database, service, _jobs, chapter = storyboard_services
 
     with pytest.raises(ServiceError) as exc_info:
         service.queue_extract(
-            project["id"],
+            chapter["id"],
             {"source_type": "screenplay", "scope": "all"},
         )
 
@@ -139,9 +142,9 @@ def test_extract_shots_with_catalog_asset_id_binds_scene(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database, service, _jobs, project = storyboard_services
+    database, service, _jobs, chapter = storyboard_services
     scene = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {
             "asset_type": "scene",
             "name": "青云山巅",
@@ -164,7 +167,8 @@ def test_extract_shots_with_catalog_asset_id_binds_scene(
         ),
     )
     job = {
-        "project_id": project["id"],
+        "project_id": chapter["project_id"],
+        "chapter_id": chapter["id"],
         "provider_id": "mock-text",
         "input_json": json_dumps(
             {
@@ -178,7 +182,7 @@ def test_extract_shots_with_catalog_asset_id_binds_scene(
 
     asyncio.run(service.handle_extract(job))
 
-    shots = service.list(project["id"])
+    shots = service.list(chapter["id"])
     assert scene["id"] in captured["user_prompt"]
     assert "青云山巅" in captured["user_prompt"]
     assert shots[0]["scene_asset_id"] == scene["id"]
@@ -186,12 +190,71 @@ def test_extract_shots_with_catalog_asset_id_binds_scene(
     assert shots[0]["duration_sec"] == 3
 
 
+def test_extract_shots_chunks_by_scene_when_screenplay_has_multiple_scenes(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, service, _jobs, chapter = storyboard_services
+    scene = AssetService(database).create(
+        chapter["project_id"],
+        {
+            "asset_type": "scene",
+            "name": "青云山巅",
+            "profile": {"concept": "云海环绕的山巅平台"},
+        },
+    )
+    content = _screenplay_content()
+    content["scenes"] = [
+        {**content["scenes"][0], "scene_no": 1},
+        {**content["scenes"][0], "scene_no": 2, "scene_name": "第二场"},
+    ]
+    WritingService(database).update_screenplay(chapter["id"], {"content": content})
+    captured: list[str] = []
+
+    class SceneProvider:
+        async def generate_json(self, **values: Any) -> ExtractionOutput:
+            captured.append(str(values["user_prompt"]))
+            return ExtractionOutput([_extracted_shot(scene["id"])])
+
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_kwargs: (
+            SceneProvider(),
+            {"id": "mock-text", "params": {}},
+        ),
+    )
+    job = {
+        "project_id": chapter["project_id"],
+        "chapter_id": chapter["id"],
+        "provider_id": "mock-text",
+        "input_json": json_dumps(
+            {
+                "source_type": "screenplay",
+                "scope": "all",
+                "scene_no": None,
+                "params": {},
+            }
+        ),
+    }
+
+    result = asyncio.run(service.handle_extract(job))
+    shots = service.list(chapter["id"])
+
+    assert len(captured) == 2
+    assert "目标场次：1" in captured[0]
+    assert "目标场次：2" in captured[1]
+    assert len(shots) == 2
+    assert {item["scene_no"] for item in shots} == {1, 2}
+    assert result["count"] == 2
+
+
 def test_extract_shots_with_names_and_aliases_bind_assets(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    database, service, _jobs, project = storyboard_services
+    database, service, _jobs, chapter = storyboard_services
     scene = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {
             "asset_type": "scene",
             "name": "青云山巅",
@@ -199,14 +262,14 @@ def test_extract_shots_with_names_and_aliases_bind_assets(
         },
     )
     character = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {
             "asset_type": "character",
             "name": "少年",
         },
     )
     prop = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {
             "asset_type": "prop",
             "name": "下山令",
@@ -219,13 +282,13 @@ def test_extract_shots_with_names_and_aliases_bind_assets(
     extracted["prop_names"] = ["青铜令牌"]
 
     service._save_extracted(
-        project,
+        chapter,
         "screenplay",
         {"scope": "all", "scene_no": None},
         [extracted],
     )
 
-    saved = service.list(project["id"])[0]
+    saved = service.list(chapter["id"])[0]
     assert saved["scene_asset_id"] == scene["id"]
     assert saved["character_ids"] == [character["id"]]
     assert saved["prop_ids"] == [prop["id"]]
@@ -234,17 +297,17 @@ def test_extract_shots_with_names_and_aliases_bind_assets(
 def test_extract_shot_with_primary_name_colliding_with_alias_binds_primary_asset(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    database, service, _jobs, project = storyboard_services
+    database, service, _jobs, chapter = storyboard_services
     scene = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "scene", "name": "办公室"},
     )
     key_character = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "character", "name": "小明"},
     )
     AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {
             "asset_type": "character",
             "name": "李总",
@@ -257,26 +320,26 @@ def test_extract_shot_with_primary_name_colliding_with_alias_binds_primary_asset
     extracted["character_asset_ids"] = [key_character["id"]]
 
     service._save_extracted(
-        project,
+        chapter,
         "screenplay",
         {"scope": "all", "scene_no": None},
         [extracted],
     )
 
-    saved = service.list(project["id"])[0]
+    saved = service.list(chapter["id"])[0]
     assert saved["character_ids"] == [key_character["id"]]
 
 
 def test_extract_shots_with_key_and_minor_characters_binds_only_key_character(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    database, service, _jobs, project = storyboard_services
+    database, service, _jobs, chapter = storyboard_services
     scene = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "scene", "name": "办公室"},
     )
     key_character = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "character", "name": "小明"},
     )
     extracted = _extracted_shot(scene["id"])
@@ -285,13 +348,13 @@ def test_extract_shots_with_key_and_minor_characters_binds_only_key_character(
     extracted["character_asset_ids"] = [key_character["id"]]
 
     result = service._save_extracted(
-        project,
+        chapter,
         "screenplay",
         {"scope": "all", "scene_no": None},
         [extracted],
     )
 
-    saved = service.list(project["id"])[0]
+    saved = service.list(chapter["id"])[0]
     assert result["count"] == 1
     assert saved["scene_asset_id"] == scene["id"]
     assert saved["character_ids"] == [key_character["id"]]
@@ -300,17 +363,17 @@ def test_extract_shots_with_key_and_minor_characters_binds_only_key_character(
 def test_extract_shots_with_unmatched_scene_and_prop_raises_and_saves_nothing(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    database, service, _jobs, project = storyboard_services
+    database, service, _jobs, chapter = storyboard_services
     AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "scene", "name": "办公室"},
     )
     AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "character", "name": "小明"},
     )
     AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "prop", "name": "下山令"},
     )
     extracted = _extracted_shot("")
@@ -319,7 +382,7 @@ def test_extract_shots_with_unmatched_scene_and_prop_raises_and_saves_nothing(
 
     with pytest.raises(ServiceError) as exc_info:
         service._save_extracted(
-            project,
+            chapter,
             "screenplay",
             {"scope": "all", "scene_no": None},
             [extracted],
@@ -328,26 +391,26 @@ def test_extract_shots_with_unmatched_scene_and_prop_raises_and_saves_nothing(
     assert "分镜 1" in exc_info.value.detail
     assert "办公室门外" in exc_info.value.detail
     assert "未知令牌" in exc_info.value.detail
-    assert service.list(project["id"]) == []
+    assert service.list(chapter["id"]) == []
 
 
 def test_extract_shot_with_mismatched_scene_id_and_name_raises_and_saves_nothing(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    database, service, _jobs, project = storyboard_services
+    database, service, _jobs, chapter = storyboard_services
     AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "scene", "name": "青云山巅"},
     )
     wrong_scene = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "scene", "name": "竹林"},
     )
     extracted = _extracted_shot(wrong_scene["id"])
 
     with pytest.raises(ServiceError) as exc_info:
         service._save_extracted(
-            project,
+            chapter,
             "screenplay",
             {"scope": "all", "scene_no": None},
             [extracted],
@@ -355,23 +418,23 @@ def test_extract_shot_with_mismatched_scene_id_and_name_raises_and_saves_nothing
 
     assert exc_info.value.status_code == 400
     assert "青云山巅" in exc_info.value.detail
-    assert service.list(project["id"]) == []
+    assert service.list(chapter["id"]) == []
 
 
 def test_extract_shot_with_mismatched_character_id_and_name_raises_and_saves_nothing(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    database, service, _jobs, project = storyboard_services
+    database, service, _jobs, chapter = storyboard_services
     scene = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "scene", "name": "青云山巅"},
     )
     AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "character", "name": "少年"},
     )
     wrong_character = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "character", "name": "师姐"},
     )
     extracted = _extracted_shot(scene["id"])
@@ -380,7 +443,7 @@ def test_extract_shot_with_mismatched_character_id_and_name_raises_and_saves_not
 
     with pytest.raises(ServiceError) as exc_info:
         service._save_extracted(
-            project,
+            chapter,
             "screenplay",
             {"scope": "all", "scene_no": None},
             [extracted],
@@ -388,18 +451,18 @@ def test_extract_shot_with_mismatched_character_id_and_name_raises_and_saves_not
 
     assert exc_info.value.status_code == 400
     assert "少年" in exc_info.value.detail
-    assert service.list(project["id"]) == []
+    assert service.list(chapter["id"]) == []
 
 
 def test_resolve_asset_ids_with_duplicate_ids_returns_unique_ids(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    database, service, _jobs, project = storyboard_services
+    database, service, _jobs, chapter = storyboard_services
     character = AssetService(database).create(
-        project["id"],
+        chapter["project_id"],
         {"asset_type": "character", "name": "少年"},
     )
-    lookup = service._asset_lookup(project["id"])["character"]
+    lookup = service._asset_lookup(chapter["project_id"])["character"]
 
     resolved, unmatched = service._resolve_asset_ids(
         lookup,

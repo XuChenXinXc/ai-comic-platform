@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import (
@@ -96,20 +98,6 @@ class NovelAnalysisOutput(OutputModel):
     visualizable_content: list[str]
     hard_to_visualize: list[str]
     production_risks: list[str]
-
-
-class VisualStyleOutput(OutputModel):
-    plain_text_output_field: ClassVar[str] = "style_prompt"
-
-    style_prompt: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=18, max_length=32),
-    ] = Field(
-        description=(
-            "18至32个汉字，可直接写入项目统一画风 STYLE_ANCHOR 输入框的中文画风描述，"
-            "不含字段名、标题或解释"
-        ),
-    )
 
 
 class ScreenplayDialogue(OutputModel):
@@ -458,6 +446,14 @@ class ShotExpression(OutputModel):
         )
 
 
+ShotTransitionFromPrev = Literal[
+    "continuous",
+    "elliptical",
+    "same_scene_cut",
+    "scene_change",
+]
+
+
 class ShotOutput(OutputModel):
     shot_no: int
     scene_no: int | None = None
@@ -484,6 +480,9 @@ class ShotOutput(OutputModel):
     image_prompt: NonEmptyText
     video_prompt: NonEmptyText
     negative_prompt: NonEmptyText
+    # 与上一镜的衔接类型：由剧情动作是否连续决定，不能用场景素材是否相同来推断。
+    # 只有 continuous 才允许把上一镜末帧作为参考图下发。
+    transition_from_prev: ShotTransitionFromPrev = "scene_change"
 
     @field_validator("character_asset_ids", "prop_asset_ids")
     @classmethod
@@ -491,6 +490,168 @@ class ShotOutput(OutputModel):
         if len(value) != len(set(value)):
             raise ValueError("素材 ID 不能重复")
         return value
+
+    # 以下两项为「质量警告」而非硬校验：提取整批生成，若抛异常会导致
+    # 一镜不合规、整批重来。改为在保存阶段收集警告，由用户决定是否修复。
+    POSTURE_VERBS: ClassVar[tuple[str, ...]] = (
+        "站起",
+        "起身",
+        "坐下",
+        "转身",
+        "走出",
+        "离开",
+        "站立",
+    )
+    UNFINISHED_MARKERS: ClassVar[tuple[str, ...]] = ("准备", "即将", "尚未", "仍")
+    _DIALOGUE_SPEECH_MARKERS: ClassVar[tuple[str, ...]] = (
+        "说",
+        "讲",
+        "问",
+        "答",
+        "开口",
+        "道",
+        "念",
+        "喊",
+        "叫",
+        "读",
+        "唱",
+        "低语",
+        "自语",
+        "回应",
+        "回答",
+        "反问",
+        "念叨",
+        "讲述",
+    )
+    _NON_SPEECH_ACTION_MARKERS: ClassVar[tuple[str, ...]] = (
+        "走",
+        "跑",
+        "站",
+        "坐",
+        "躺",
+        "蹲",
+        "起身",
+        "站起",
+        "坐下",
+        "转身",
+        "伸手",
+        "抬起",
+        "放下",
+        "拿起",
+        "捡起",
+        "拾起",
+        "握住",
+        "攥住",
+        "推开",
+        "拉门",
+        "环顾",
+        "打量",
+        "看向",
+        "望向",
+        "低头",
+        "抬头",
+        "点头",
+        "摇头",
+        "挥手",
+        "前进",
+        "离开",
+        "进入",
+        "翻找",
+        "拿出",
+        "抽出",
+        "摸向",
+        "移向",
+        "放回",
+    )
+    _TIMELINE_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:^|[。；;，,\n])\s*(\d+(?:\.\d+)?)\s*[-–—~－至]\s*(\d+(?:\.\d+)?)\s*秒"
+    )
+
+    @classmethod
+    def _is_dialogue_focused(cls, action: str) -> bool:
+        """纯对白镜头（没有明确动作动词）按 2.5 字/秒计算，否则按 2 字/秒+20% 余量。"""
+        action_text = str(action or "").strip()
+        if not action_text:
+            return True
+        return not any(
+            marker in action_text for marker in cls._NON_SPEECH_ACTION_MARKERS
+        )
+
+    @classmethod
+    def timeline_conflict_warning(cls, video_prompt: str) -> str:
+        """检测时间轴是否出现多套划分或分段重叠，返回警告文本。"""
+        matches = list(cls._TIMELINE_PATTERN.finditer(video_prompt or ""))
+        if len(matches) < 2:
+            return ""
+        segments: list[tuple[float, float]] = []
+        for match in matches:
+            try:
+                start = float(match.group(1))
+                end = float(match.group(2))
+            except ValueError:
+                continue
+            segments.append((start, end))
+        for index in range(1, len(segments)):
+            if segments[index][0] < segments[index - 1][1] - 0.01:
+                return (
+                    "video_prompt 出现多套时间轴或时间分段重叠，"
+                    "请统一为单套覆盖全程的连续时间轴"
+                )
+        return ""
+
+    def end_state_warning(self) -> str:
+        """end_state 的姿态变化在 video_prompt 时间轴里是否有对应调度。
+
+        对应 shot_extract.md 第 1 条。只做关键词级检查（无法做语义级），
+        挡住最典型的「时间轴只写到蹲着查看、end_state 却写站起身」。
+        无问题返回空字符串。
+        """
+        end_state = self.end_state or ""
+        hit = [verb for verb in self.POSTURE_VERBS if verb in end_state]
+        if not hit:
+            return ""
+        if any(verb in (self.video_prompt or "") for verb in self.POSTURE_VERBS):
+            return ""
+        if any(marker in end_state for marker in self.UNFINISHED_MARKERS):
+            return ""
+        return (
+            f"end_state 含姿态动词「{hit[0]}」，但 video_prompt 时间轴没有对应调度。"
+            f"建议在时间轴补一段该动作（并相应增加 duration_sec），"
+            f"或把 end_state 改为「仍…，准备{hit[0]}」的未完成表述。"
+        )
+
+    def dialogue_duration_warning(self) -> str:
+        """台词总字数是否超出时长承载能力。
+
+        纯对白镜头按 2.5 字/秒；有动作镜头按 2 字/秒并留 20% 动作余量。
+        无问题返回空字符串。
+        """
+        if not self.dialogue or self.duration_sec >= 12:
+            return ""
+        total_chars = sum(len(item.text) for item in self.dialogue)
+        dialogue_focused = self._is_dialogue_focused(self.action)
+        usable_rate = 2.5 if dialogue_focused else 2 * 0.8
+        threshold = int(self.duration_sec * usable_rate)
+        if total_chars <= threshold:
+            return ""
+        recommended_sec = math.ceil(total_chars / usable_rate)
+        return (
+            f"{self.duration_sec}秒内台词共{total_chars}字，超出建议阈值{threshold}字"
+            f"（按{'2.5字/秒（纯对白）' if dialogue_focused else '2字/秒+20%动作余量'}计算）。"
+            f"建议延长时长至{recommended_sec}秒以上，或压缩台词。"
+        )
+
+    def quality_warnings(self) -> list[str]:
+        """收集本镜所有质量警告，供提取保存阶段回报给用户。"""
+        return [
+            warning
+            for warning in (
+                self.end_state_warning(),
+                self.dialogue_duration_warning(),
+                self.timeline_conflict_warning(self.video_prompt),
+            )
+            if warning
+        ]
 
 
 class ShotExtractionOutput(OutputModel):
@@ -500,14 +661,17 @@ class ShotExtractionOutput(OutputModel):
 class ShotImagePromptOutput(OutputModel):
     prompt: NonEmptyText
     negative_prompt: NonEmptyText
-    reference_requirements: list[dict[str, Any]]
 
 
 class ShotVideoPromptOutput(OutputModel):
     prompt: NonEmptyText
     negative_prompt: NonEmptyText
-    timeline: list[dict[str, Any]]
-    continuity_notes: list[str]
+
+
+class ShotVideoPromptOptimizeOutput(OutputModel):
+    plain_text_output_field: ClassVar[str] = "prompt"
+
+    prompt: NonEmptyText
 
 
 class AssetReferenceBinding(OutputModel):
@@ -581,6 +745,7 @@ class ProviderPollResult(BaseModel):
 class JobCreate(BaseModel):
     id: str | None = None
     project_id: str
+    chapter_id: str | None = None
     job_type: str
     target_type: str = ""
     target_id: str | None = None
@@ -594,6 +759,7 @@ class JobCreate(BaseModel):
 class JobRead(BaseModel):
     id: str
     project_id: str
+    chapter_id: str | None = None
     job_type: str
     target_type: str
     target_id: str | None
@@ -626,3 +792,86 @@ class BatchSummary(BaseModel):
     failed: int = 0
     cancelled: int = 0
     interrupted: int = 0
+
+
+# ── 连续性审校 ──────────────────────────────────────────────────────────────
+
+
+class ShotContinuityFix(OutputModel):
+    """单条字段修正建议。"""
+
+    shot_no: int
+    field: Literal[
+        "end_state",
+        "start_state",
+        "next_hook",
+        "action",
+        "narration",
+        "transition_from_prev",
+    ]
+    current_value: str
+    suggested_value: NonEmptyText
+    reason: NonEmptyText
+
+
+class ShotContinuityTransition(OutputModel):
+    """建议在两镜之间插入的过渡镜描述。"""
+
+    insert_after_shot_no: int
+    action: NonEmptyText
+    start_state: NonEmptyText
+    end_state: NonEmptyText
+    duration_sec: int = Field(default=3, gt=0, le=4)
+
+
+class ShotContinuityPairOutput(OutputModel):
+    """单对相邻分镜的连续性审校结果。"""
+
+    prev_shot_no: int
+    next_shot_no: int
+    is_continuous: bool
+    issues: list[str] = Field(default_factory=list)
+    fixes: list[ShotContinuityFix] = Field(default_factory=list)
+    transition: ShotContinuityTransition | None = None
+
+
+class ShotContinuityCheckOutput(OutputModel):
+    """连续性审校批量结果（按相邻对返回）。"""
+
+    pairs: list[ShotContinuityPairOutput]
+
+
+class RefinedPromptChange(OutputModel):
+    """单镜提示词的改动说明，供用户复核。"""
+
+    shot_no: int
+    reason: NonEmptyText
+
+
+class BatchRefinedPromptsOutput(OutputModel):
+    """全量提示词连续性精修结果：prompts 顺序与输入分镜一一对应。"""
+
+    prompts: list[NonEmptyText]
+    changes: list[RefinedPromptChange] = Field(default_factory=list)
+
+
+class ShotQualityFixOutput(OutputModel):
+    """单镜质量修复结果：只返回被修改的字段，未修改的字段应缺省。"""
+
+    duration_sec: int | None = Field(default=None, gt=0, le=12)
+    end_state: str | None = None
+    video_prompt: str | None = None
+    dialogue: list[ScreenplayDialogue] | None = None
+    changed_fields: list[Literal["duration_sec", "end_state", "video_prompt", "dialogue"]] = Field(
+        default_factory=list
+    )
+    reason: str = ""
+
+    @model_validator(mode="after")
+    def validate_has_change(self) -> ShotQualityFixOutput:
+        if not self.changed_fields:
+            raise ValueError("必须至少修改一个字段并在 changed_fields 中声明")
+        for name in self.changed_fields:
+            if getattr(self, name) is None:
+                raise ValueError(f"changed_fields 声明修改了 {name}，但未提供该字段的新值")
+        return self

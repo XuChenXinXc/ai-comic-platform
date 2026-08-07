@@ -25,8 +25,8 @@ from app.schemas import (
     ScreenplayOutput,
     ShotExtractionOutput,
     ShotImagePromptOutput,
+    ShotVideoPromptOptimizeOutput,
     ShotVideoPromptOutput,
-    VisualStyleOutput,
 )
 from app.services.file_service import atomic_copy, atomic_write_bytes
 
@@ -74,8 +74,6 @@ class MockTextProvider:
                 "hard_to_visualize": ["内心独白"],
                 "production_risks": [],
             }
-        if schema is VisualStyleOutput:
-            return {"style_prompt": "冷峻悬疑二维国漫，利落轮廓，低饱和冷色，分层暗光"}
         if schema is ScreenplayOutput:
             return {
                 "title": "Mock 漫剧",
@@ -243,17 +241,18 @@ class MockTextProvider:
             return {
                 "prompt": "中景，平视，主角位于画面中央，侧光，动作起始状态清晰",
                 "negative_prompt": "身份漂移，服装变化，多余人物，文字，水印",
-                "reference_requirements": [{"role": "character_identity", "name": "主角"}],
             }
         if schema is ShotVideoPromptOutput:
             return {
                 "prompt": "0-2秒主角向前走；2-4秒停下观察；4-6秒视线转向画外，镜头缓慢推进。",
                 "negative_prompt": "新增人物，服装漂移，肢体变形，镜头抖动",
-                "timeline": [
-                    {"start_sec": 0, "end_sec": 2, "action": "主角向前走"},
-                    {"start_sec": 2, "end_sec": 6, "action": "停下并观察"},
-                ],
-                "continuity_notes": ["保持角色身份、服装和画面方向不变"],
+            }
+        if schema is ShotVideoPromptOptimizeOutput:
+            return {
+                "prompt": (
+                    "0-2秒：主角向前走；2-4秒：停下观察；4-5秒：视线转向画外。"
+                    "固定机位，画面变化由人物动作推动。"
+                ),
             }
         return self._generic_model_payload(schema)
 

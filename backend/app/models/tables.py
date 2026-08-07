@@ -32,10 +32,16 @@ project = Table(
     Column("storage_name", Text, nullable=False, server_default=""),
     Column("storage_root", Text, nullable=False, server_default=""),
     Column("storage_layout", Text, nullable=False, server_default="prefixed"),
+    # 已废弃：正文与签名自 0008 起归属 chapter，保留列仅为兼容旧库结构
     Column("source_text", Text, nullable=False, server_default=""),
     Column("source_signature", Text, nullable=False, server_default=""),
     Column("source_revision", Integer, nullable=False, server_default="1"),
-    Column("style_prompt", Text, nullable=False, server_default=""),
+    Column(
+        "style_prompt",
+        Text,
+        nullable=False,
+        server_default="电影感现实主义二维国漫，稳定自然的半写实人物比例，沉稳细腻线条，低饱和冷暖协调色调，真实清晰的微表情，层次分明的电影光影。",
+    ),
     Column("aspect_ratio", Text, nullable=False, server_default="16:9"),
     Column("image_size", Text, nullable=False, server_default="1920x1080"),
     Column("video_size", Text, nullable=False, server_default="16:9"),
@@ -46,6 +52,25 @@ project = Table(
     Column("created_at", Text, nullable=False),
     Column("updated_at", Text, nullable=False),
 )
+
+
+chapter = Table(
+    "chapter",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("project_id", Text, ForeignKey("project.id", ondelete="CASCADE"), nullable=False),
+    Column("chapter_no", Integer, nullable=False),
+    Column("title", Text, nullable=False, server_default=""),
+    Column("source_text", Text, nullable=False, server_default=""),
+    Column("source_signature", Text, nullable=False, server_default=""),
+    Column("source_revision", Integer, nullable=False, server_default="1"),
+    Column("status", Text, nullable=False, server_default="draft"),
+    Column("created_at", Text, nullable=False),
+    Column("updated_at", Text, nullable=False),
+    CheckConstraint("status IN ('draft','ready','confirmed','failed')", name="status"),
+    UniqueConstraint("project_id", "chapter_no", name="uq_chapter_project_no"),
+)
+Index("idx_chapter_project_no", chapter.c.project_id, chapter.c.chapter_no)
 
 
 platform_setting = Table(
@@ -91,9 +116,9 @@ novel_analysis = Table(
     "novel_analysis",
     metadata,
     Column(
-        "project_id",
+        "chapter_id",
         Text,
-        ForeignKey("project.id", ondelete="CASCADE"),
+        ForeignKey("chapter.id", ondelete="CASCADE"),
         primary_key=True,
     ),
     Column("content_json", Text, nullable=False, server_default="{}"),
@@ -114,9 +139,9 @@ screenplay = Table(
     "screenplay",
     metadata,
     Column(
-        "project_id",
+        "chapter_id",
         Text,
-        ForeignKey("project.id", ondelete="CASCADE"),
+        ForeignKey("chapter.id", ondelete="CASCADE"),
         primary_key=True,
     ),
     Column("content_json", Text, nullable=False, server_default="{}"),
@@ -144,6 +169,7 @@ asset = Table(
     Column("profile_json", Text, nullable=False, server_default="{}"),
     Column("prompt", Text, nullable=False, server_default=""),
     Column("negative_prompt", Text, nullable=False, server_default=""),
+    Column("prompt_override", Text, nullable=False, server_default=""),
     Column("consistency_json", Text, nullable=False, server_default="[]"),
     Column("composition", Text, nullable=False, server_default=""),
     Column("importance", Text, nullable=False, server_default="normal"),
@@ -200,6 +226,7 @@ shot = Table(
     metadata,
     Column("id", Text, primary_key=True),
     Column("project_id", Text, ForeignKey("project.id", ondelete="CASCADE"), nullable=False),
+    Column("chapter_id", Text, ForeignKey("chapter.id", ondelete="CASCADE"), nullable=False),
     Column("shot_no", Integer, nullable=False),
     Column("shot_order", Integer, nullable=False),
     Column("source_type", Text, nullable=False),
@@ -220,6 +247,14 @@ shot = Table(
     Column("duration_sec", Float, nullable=False, server_default="6"),
     Column("end_state", Text, nullable=False, server_default=""),
     Column("next_hook", Text, nullable=False, server_default=""),
+    # 与上一镜的衔接类型，见 app/schemas.py ShotTransitionFromPrev。
+    # 存量数据默认 scene_change：不引用上一镜末帧是安全侧的选择。
+    Column(
+        "transition_from_prev",
+        Text,
+        nullable=False,
+        server_default="scene_change",
+    ),
     Column("frame_description", Text, nullable=False, server_default=""),
     Column("image_prompt", Text, nullable=False, server_default=""),
     Column("image_prompt_override", Text, nullable=False, server_default=""),
@@ -234,9 +269,9 @@ shot = Table(
     Column("updated_at", Text, nullable=False),
     CheckConstraint("source_type IN ('novel','screenplay')", name="source_type"),
     CheckConstraint("status IN ('draft','ready','confirmed','failed')", name="status"),
-    UniqueConstraint("project_id", "shot_no", name="uq_shot_project_no"),
+    UniqueConstraint("chapter_id", "shot_no", name="uq_shot_chapter_no"),
 )
-Index("idx_shot_project_order", shot.c.project_id, shot.c.shot_order)
+Index("idx_shot_chapter_order", shot.c.chapter_id, shot.c.shot_order)
 
 
 keyframe_version = Table(
@@ -285,6 +320,7 @@ video_version = Table(
     ),
     Column("version_no", Integer, nullable=False),
     Column("file_path", Text),
+    Column("end_frame_path", Text),
     Column("prompt_snapshot", Text, nullable=False, server_default=""),
     Column("negative_prompt_snapshot", Text, nullable=False, server_default=""),
     Column("requested_duration_sec", Float, nullable=False, server_default="0"),
@@ -319,6 +355,7 @@ job = Table(
     metadata,
     Column("id", Text, primary_key=True),
     Column("project_id", Text, ForeignKey("project.id", ondelete="CASCADE"), nullable=False),
+    Column("chapter_id", Text, ForeignKey("chapter.id", ondelete="CASCADE")),
     Column("job_type", Text, nullable=False),
     Column("target_type", Text, nullable=False, server_default=""),
     Column("target_id", Text),
@@ -351,6 +388,7 @@ Index("idx_job_batch", job.c.batch_id)
 
 ALL_TABLES = (
     project,
+    chapter,
     platform_setting,
     api_provider,
     novel_analysis,

@@ -14,5 +14,6 @@ frontend/test-results/
 workspace/platform.db
 workspace/platform.db-shm
 workspace/platform.db-wal
+workspace/platform.db.bak-*
 workspace/projects/*
 !workspace/projects/.gitkeep

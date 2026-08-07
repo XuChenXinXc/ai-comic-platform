@@ -20,6 +20,7 @@ from app.db import Database, db
 from app.models.tables import (
     asset,
     asset_image,
+    chapter,
     keyframe_version,
     platform_setting,
     project,
@@ -68,6 +69,14 @@ def _truncate_utf16(value: str, max_units: int) -> str:
         if units > max_units:
             return value[:index]
     return value
+
+
+def chapter_folder_name(chapter_no: int, title: str = "") -> str:
+    """章节媒体目录名：第01章-标题。标题为空时只保留章号。"""
+    clean = _INVALID_WINDOWS_NAME.sub("_", title or "").strip().rstrip(". ")
+    clean = _truncate_utf16(clean, 60).rstrip(". ")
+    base = f"第{chapter_no:02d}章"
+    return f"{base}-{clean}" if clean else base
 
 
 def sanitize_project_storage_name(
@@ -531,18 +540,30 @@ class FileService:
         shot_no: int | None = None,
         current: bool = False,
         storage_name: str | None = None,
+        chapter_no: int | None = None,
+        chapter_title: str = "",
     ) -> Path:
         layout, persisted_storage_name = self._project_storage(project_id)
         effective_storage_name = storage_name or persisted_storage_name
         if layout == "categorized":
             folder = "分镜图"
             name = f"{shot_no:03d}" if shot_no is not None else shot_id
-            relative = Path(folder) / _media_filename(
-                folder,
-                name,
-                version_no,
-                suffix,
-                current=current,
+            # 分镜媒体按章节分目录；素材图仍在项目根，全书共用
+            prefix = (
+                Path(chapter_folder_name(chapter_no, chapter_title))
+                if chapter_no is not None
+                else Path()
+            )
+            relative = (
+                prefix
+                / folder
+                / _media_filename(
+                    folder,
+                    name,
+                    version_no,
+                    suffix,
+                    current=current,
+                )
             )
         else:
             folder = (
@@ -566,18 +587,30 @@ class FileService:
         shot_no: int | None = None,
         current: bool = False,
         storage_name: str | None = None,
+        chapter_no: int | None = None,
+        chapter_title: str = "",
     ) -> Path:
         layout, persisted_storage_name = self._project_storage(project_id)
         effective_storage_name = storage_name or persisted_storage_name
         if layout == "categorized":
             folder = "分镜视频"
             name = f"{shot_no:03d}" if shot_no is not None else shot_id
-            relative = Path(folder) / _media_filename(
-                folder,
-                name,
-                version_no,
-                suffix,
-                current=current,
+            # 分镜媒体按章节分目录；素材图仍在项目根，全书共用
+            prefix = (
+                Path(chapter_folder_name(chapter_no, chapter_title))
+                if chapter_no is not None
+                else Path()
+            )
+            relative = (
+                prefix
+                / folder
+                / _media_filename(
+                    folder,
+                    name,
+                    version_no,
+                    suffix,
+                    current=current,
+                )
             )
         else:
             folder = (
@@ -631,8 +664,14 @@ class FileService:
                         table.c.is_current,
                         shot.c.id.label("shot_id"),
                         shot.c.shot_no,
+                        chapter.c.chapter_no,
+                        chapter.c.title.label("chapter_title"),
                     )
-                    .select_from(table.join(shot, table.c.shot_id == shot.c.id))
+                    .select_from(
+                        table.join(shot, table.c.shot_id == shot.c.id).join(
+                            chapter, chapter.c.id == shot.c.chapter_id
+                        )
+                    )
                     .where(
                         shot.c.project_id == project_id,
                         table.c.file_path.is_not(None),
@@ -668,6 +707,8 @@ class FileService:
                 asset_name=str(record["asset_name"]),
                 current=current,
             )
+        chapter_no = record.get("chapter_no")
+        chapter_title = str(record.get("chapter_title") or "")
         if record["kind"] == "keyframe":
             return self.keyframe_path(
                 project_id,
@@ -676,6 +717,8 @@ class FileService:
                 suffix,
                 shot_no=int(record["shot_no"]),
                 current=current,
+                chapter_no=int(chapter_no) if chapter_no is not None else None,
+                chapter_title=chapter_title,
             )
         return self.video_path(
             project_id,
@@ -684,6 +727,8 @@ class FileService:
             suffix,
             shot_no=int(record["shot_no"]),
             current=current,
+            chapter_no=int(chapter_no) if chapter_no is not None else None,
+            chapter_title=chapter_title,
         )
 
     def migrate_categorized_media_layouts(self, *, strict: bool = True) -> int:

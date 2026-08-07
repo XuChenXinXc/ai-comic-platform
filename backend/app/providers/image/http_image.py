@@ -27,7 +27,9 @@ class HttpImageProvider(HttpProviderBase):
     def _options(self) -> dict[str, Any]:
         options = dict(self.config.params)
         if self.config.model.strip().lower() == "gpt-image-2":
-            options.setdefault("retry_unsafe_methods", False)
+            # POST 提交允许重试：供应商瞬时错误（5xx/断连/限流）可自动重试，
+            # 与 Provider 配置的 max_retries 配合；用户 params 显式传值可覆盖。
+            options.setdefault("retry_unsafe_methods", True)
             options.setdefault("send_negative_prompt", False)
             options.setdefault("max_reference_files", 16)
             if self._uses_apib_protocol(options):

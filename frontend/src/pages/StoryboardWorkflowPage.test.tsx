@@ -16,16 +16,41 @@ vi.mock("sonner", () => ({
 vi.mock("../hooks/use-project", () => ({
   useProject: () => ({
     activeProject: {
-      id: "project-1",
+      id: "chapter-1",
       name: "统一分镜项目",
       source_signature: "source-1",
       default_duration_sec: 6,
     },
-    activeProjectId: "project-1",
+    activeProjectId: "chapter-1",
   }),
 }));
 vi.mock("../components/project-required", () => ({
   ProjectRequired: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("../hooks/use-chapter", () => ({
+  useChapter: () => ({
+    chapters: [
+      { id: "chapter-1", project_id: "chapter-1", chapter_no: 1, title: "第一章" },
+    ],
+    activeChapter: {
+      id: "chapter-1",
+      project_id: "chapter-1",
+      chapter_no: 1,
+      title: "第一章",
+      source_signature: "source-1",
+    },
+    activeChapterId: "chapter-1",
+    selectChapter: vi.fn(),
+    isLoading: false,
+    error: null,
+    refetch: vi.fn(),
+  }),
+}));
+vi.mock("../components/chapter-required", () => ({
+  ChapterRequired: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("../components/chapter-selector", () => ({
+  ChapterSelector: () => null,
 }));
 vi.mock("../components/shot-media-card", () => ({
   ShotMediaCard: ({
@@ -45,7 +70,8 @@ vi.mock("../components/shot-media-card", () => ({
 
 const shot: Shot = {
   id: "shot-1",
-  project_id: "project-1",
+  project_id: "chapter-1",
+      chapter_id: "test-chapter",
   shot_no: 1,
   shot_order: 1,
   source_type: "novel",
@@ -71,6 +97,7 @@ const shot: Shot = {
   camera_move: "固定",
   end_state: "主角进入屋内。",
   next_hook: "",
+  transition_from_prev: "scene_change",
   reference_bindings_json: [],
   status: "ready",
   own_signature: "shot-signature-1",
@@ -87,7 +114,7 @@ function assetWithImage(
 ): Asset {
   return {
     id,
-    project_id: "project-1",
+    project_id: "chapter-1",
     asset_type: assetType,
     name,
     profile_json: {},
@@ -184,7 +211,7 @@ describe("分镜视频统一页面", () => {
     await user.click(screen.getByRole("button", { name: /提取/ }));
 
     await waitFor(() => {
-      expect(api.shots.extract).toHaveBeenCalledWith("project-1", {
+      expect(api.shots.extract).toHaveBeenCalledWith("chapter-1", {
         scope: "all",
       });
     });

@@ -1,12 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Upload, WandSparkles } from "lucide-react";
-import { useRef } from "react";
+import { Pencil, Upload, WandSparkles } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { Navigate } from "react-router";
 import { toast } from "sonner";
 import { api, mediaUrl, queryKeys } from "../api/client";
 import { MediaVersions } from "../components/media-versions";
 import { ErrorState, LoadingState } from "../components/status";
-import { Button } from "../components/ui";
+import { Button, Modal, Textarea } from "../components/ui";
 import { formatError, parseJson } from "../lib/utils";
 import type { Asset, MediaVersion } from "../types/api";
 
@@ -57,6 +57,7 @@ function canGenerateAssetImage(asset: Asset): boolean {
 export function AssetImagePanel({ asset }: { asset: Asset }) {
   const queryClient = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
+  const [editingPrompt, setEditingPrompt] = useState(false);
   const canGenerate = canGenerateAssetImage(asset);
   const query = useQuery({
     queryKey: queryKeys.assetImages(asset.id),
@@ -64,6 +65,29 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
   });
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey: queryKeys.assetImages(asset.id) });
+  const currentVersion = query.data?.find((item) => item.is_current);
+  const currentPrompt = asset.prompt_override || currentVersion?.prompt_snapshot || "";
+
+  const promptMutation = useMutation({
+    mutationFn: (value: string) =>
+      api.assets.update(asset.id, { prompt_override: value }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.assets(asset.project_id),
+      });
+      toast.success("已保存图片提示词，下次生成将使用该提示词");
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+  const savePrompt = (value: string) => {
+    const next = value.trim();
+    promptMutation.mutate(next, {
+      onSuccess: () => {
+        setEditingPrompt(false);
+        if (next) invalidate();
+      },
+    });
+  };
 
   const generateMutation = useMutation({
     mutationFn: () => api.assets.images.generate(asset.id),
@@ -142,8 +166,27 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
             <WandSparkles className="h-4 w-4" />
             生成新版本
           </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setEditingPrompt(true)}
+          >
+            <Pencil className="h-4 w-4" />
+            编辑图片提示词
+          </Button>
         </div>
       </div>
+
+      {asset.prompt_override ? (
+        <div className="mb-3 rounded-md border border-line bg-white/60 p-3">
+          <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
+            已保存的图片提示词覆盖
+          </p>
+          <p className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+            {asset.prompt_override}
+          </p>
+        </div>
+      ) : null}
 
       {query.isLoading ? <LoadingState label="正在读取图片版本…" /> : null}
       {query.error ? (
@@ -190,7 +233,62 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
           }}
         />
       ) : null}
+
+      <PromptOverrideModal
+        open={editingPrompt}
+        title={`编辑 ${asset.name} 图片提示词`}
+        initial={currentPrompt}
+        busy={promptMutation.isPending}
+        onClose={() => setEditingPrompt(false)}
+        onSave={savePrompt}
+      />
     </div>
+  );
+}
+
+function PromptOverrideModal({
+  open,
+  title,
+  initial,
+  busy,
+  onClose,
+  onSave,
+}: {
+  open: boolean;
+  title: string;
+  initial: string;
+  busy: boolean;
+  onClose: () => void;
+  onSave: (value: string) => void;
+}) {
+  const [value, setValue] = useState(initial);
+  useEffect(() => {
+    if (open) setValue(initial);
+  }, [open, initial]);
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={title}
+      description="保存后，下次生成新版本将直接使用该提示词，不再按模板自动编译；清空并保存可恢复自动编译。"
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            取消
+          </Button>
+          <Button variant="primary" busy={busy} onClick={() => onSave(value)}>
+            保存
+          </Button>
+        </>
+      }
+    >
+      <Textarea
+        value={value}
+        rows={12}
+        onChange={(event) => setValue(event.target.value)}
+        placeholder="输入素材图提示词…"
+      />
+    </Modal>
   );
 }
 

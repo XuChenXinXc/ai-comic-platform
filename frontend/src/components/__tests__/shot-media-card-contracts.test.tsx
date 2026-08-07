@@ -35,6 +35,7 @@ const sceneBinding: ReferenceBinding = {
 const baseShot: Shot = {
   id: "shot-1",
   project_id: "project-1",
+      chapter_id: "test-chapter",
   shot_no: 1,
   shot_order: 1,
   source_type: "screenplay",
@@ -55,6 +56,7 @@ const baseShot: Shot = {
   duration_sec: 6,
   end_state: "小明进入屋内。",
   next_hook: "",
+  transition_from_prev: "scene_change",
   frame_description: "小明站在旧屋门口。",
   image_prompt: "",
   image_prompt_override: "",
@@ -378,7 +380,7 @@ describe("分镜媒体显式提示词门禁", () => {
     );
 
     expect(screen.getByRole("button", { name: "生成新版本" })).toBeDisabled();
-    expect(screen.getByText(/请先到分镜编辑中绑定素材/)).toBeInTheDocument();
+    expect(screen.getByText(/素材参考图未就绪/)).toBeInTheDocument();
     expect(screen.queryByText(/纯文字降级/)).not.toBeInTheDocument();
   });
 
@@ -393,7 +395,7 @@ describe("分镜媒体显式提示词门禁", () => {
     );
 
     expect(screen.getByRole("button", { name: "生成新版本" })).toBeDisabled();
-    expect(screen.getByText(/请先到分镜编辑中绑定素材/)).toBeInTheDocument();
+    expect(screen.getByText(/素材参考图未就绪/)).toBeInTheDocument();
   });
 
   test.each(["keyframe", "video"] as const)(

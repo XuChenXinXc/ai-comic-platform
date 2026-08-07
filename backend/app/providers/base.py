@@ -301,8 +301,10 @@ class HttpProviderBase:
         method_name = method.strip().upper()
         retry_unsafe_methods = bool(options.get("retry_unsafe_methods", False))
         attempts = self.config.max_retries + 1
-        if method_name not in {"GET", "HEAD", "OPTIONS"} and not retry_unsafe_methods:
-            attempts = 1
+        safe_method = method_name in {"GET", "HEAD", "OPTIONS"} or retry_unsafe_methods
+        # 非安全方法（POST 等）默认不重试；但瞬时性错误（429/5xx 过载、限流）除外，
+        # 这类错误重试不会造成重复提交语义问题，能显著提升上游短暂过载时的可用性。
+        transient_statuses = {429, 500, 502, 503, 504}
         for attempt in range(attempts):
             try:
                 response = requests.request(
@@ -317,11 +319,16 @@ class HttpProviderBase:
             except requests.HTTPError as exc:
                 last_error = exc
                 last_http_failure = self._http_failure_message(exc.response)
+                status_code = exc.response.status_code if exc.response is not None else 0
+                if not safe_method and status_code not in transient_statuses:
+                    break
                 if attempt >= attempts - 1:
                     break
                 time.sleep(min(2**attempt * 0.25, 2))
             except requests.RequestException as exc:
                 last_error = exc
+                if not safe_method:
+                    break
                 if attempt >= attempts - 1:
                     break
                 time.sleep(min(2**attempt * 0.25, 2))

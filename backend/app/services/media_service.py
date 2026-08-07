@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import logging
 import math
 import subprocess
 import zipfile
@@ -17,6 +18,7 @@ from app.models.tables import (
     api_provider,
     asset,
     asset_image,
+    chapter,
     job,
     keyframe_version,
     project,
@@ -60,6 +62,8 @@ from app.services.utils import (
     utc_now,
 )
 
+logger = logging.getLogger(__name__)
+
 MediaKind = Literal["asset_image", "keyframe", "video"]
 
 _MEDIA_TABLES = {
@@ -71,10 +75,12 @@ _DELETED_MEDIA_ERROR = "__deleted_by_user__"
 _ACTIVE_MEDIA_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
 _MEDIA_VERSION_FILE_LOCK = RLock()
 _GPT_IMAGE_2_SIZES = {
-    "character": "3840x2560",
-    "scene": "3840x2160",
-    "prop": "3840x2560",
-    "keyframe": "3840x2160",
+    # 2K 分辨率，长宽比与 4K 版本保持一致（角色/物品 3:2，场景/关键帧 16:9）。
+    # 4K 出图在多参考图场景下一致性明显更差，且请求体积大易触发中转限制。
+    "character": "2560x1707",
+    "scene": "2560x1440",
+    "prop": "2560x1707",
+    "keyframe": "2560x1440",
 }
 _INTEGER_DURATION_VIDEO_MODELS = {
     "grok-imagine-1.5-video-apimart",
@@ -206,6 +212,28 @@ class MediaService:
             record[column.removesuffix("_json")] = json_loads(record[column], [])
         return record
 
+    def _chapter_folder_info(self, chapter_id: str | None) -> tuple[int | None, str]:
+        """分镜媒体按章节分目录，这里取章号与标题用于拼路径。"""
+        if not chapter_id:
+            return None, ""
+        with self.database.engine.connect() as connection:
+            row = connection.execute(
+                select(chapter.c.chapter_no, chapter.c.title).where(chapter.c.id == chapter_id)
+            ).first()
+        if row is None:
+            return None, ""
+        return int(row.chapter_no), str(row.title or "")
+
+    def _chapter_project_id(self, chapter_id: str) -> str:
+        """章节所属项目 ID，不存在时抛 404。"""
+        with self.database.engine.connect() as connection:
+            project_id = connection.execute(
+                select(chapter.c.project_id).where(chapter.c.id == chapter_id)
+            ).scalar()
+        if not project_id:
+            raise not_found("章节")
+        return str(project_id)
+
     @staticmethod
     def _reference_role_label(role: str, name: str) -> str:
         labels = {
@@ -215,6 +243,20 @@ class MediaService:
             "previous_keyframe": "锁定上一镜构图与连续性",
         }
         return f"{name}，{labels.get(role, '锁定当前参考信息')}"
+
+    @staticmethod
+    def _readable_project_file(project_id: str, relative_path: str) -> Path | None:
+        """项目内相对路径可读时返回绝对路径，否则返回 None（不抛异常）。"""
+        try:
+            path = file_service.resolve_project_path(project_id, relative_path)
+        except (FileServiceError, OSError, ValueError):
+            return None
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return path
+        except OSError:
+            return None
+        return None
 
     def _binding_reference_items(
         self,
@@ -384,7 +426,11 @@ class MediaService:
                 latest = self._shot(latest["id"])
         raise conflict("分镜参考图绑定正在变化，请稍后重试")
 
-    def _shot_template_context(self, current: dict[str, Any]) -> dict[str, Any]:
+    def _shot_template_context(
+        self,
+        current: dict[str, Any],
+        prev_end_state: str = "",
+    ) -> dict[str, Any]:
         asset_ids = [
             item
             for item in [
@@ -403,7 +449,7 @@ class MediaService:
                         select(asset.c.id, asset.c.name).where(asset.c.id.in_(asset_ids))
                     )
                 }
-        return shot_template_context(current, names)
+        return shot_template_context(current, names, prev_end_state)
 
     @staticmethod
     def _decode_version(record: dict[str, Any], project_id: str) -> dict[str, Any]:
@@ -492,6 +538,7 @@ class MediaService:
             ),
             params,
             record["reference_files_json"],
+            bool(input_data.get("reference_mode")),
         )
 
     def _keyframe_expected_signature(
@@ -561,7 +608,7 @@ class MediaService:
 
     @staticmethod
     def _effective_asset_signature(current: dict[str, Any], project_record: dict[str, Any]) -> str:
-        return calculate_signature(
+        values = [
             VISUAL_PROMPT_TEMPLATE_VERSION,
             current["asset_type"],
             current["name"],
@@ -572,7 +619,12 @@ class MediaService:
             current["composition"],
             project_record["style_prompt"],
             resolve_visual_aspect_ratio(current["asset_type"], project_record["aspect_ratio"]),
-        )
+        ]
+        # 与分镜 override 语义一致：非空覆盖值纳入签名，空串（未编辑）不参与
+        prompt_override = str(current.get("prompt_override") or "").strip()
+        if prompt_override:
+            values.append(prompt_override)
+        return calculate_signature(*values)
 
     def _effective_shot_signature(
         self,
@@ -601,6 +653,8 @@ class MediaService:
         project_record: dict[str, Any],
         *,
         reference_bindings: list[dict[str, Any]] | None = None,
+        prev_end_state: str = "",
+        prev_end_frame_path: str | None = None,
     ) -> str:
         video_prompt = str(
             current.get("video_prompt_override") or ""
@@ -625,6 +679,8 @@ class MediaService:
             current["negative_prompt"],
             self._shot_template_context(current),
             reference_labels,
+            prev_end_state,
+            prev_end_frame_path or "",
             project_record["style_prompt"],
             resolve_visual_aspect_ratio("video", project_record["aspect_ratio"]),
         )
@@ -756,7 +812,13 @@ class MediaService:
             negative_prompt=negative_prompt,
             consistency_keywords=current["consistency_keywords"],
             composition=current["composition"],
+            reference_mode=bool(options.get("reference_mode")),
         )
+        prompt_override = str(current.get("prompt_override") or "").strip()
+        if prompt_override:
+            # 用户编辑过的最终提示词优先，不再按模板重新编译
+            prompt = prompt_override
+        reference_mode = bool(options.get("reference_mode"))
         version = self._insert_version(
             table=asset_image,
             parent_column="asset_id",
@@ -777,6 +839,7 @@ class MediaService:
                     config["model"],
                     params,
                     references,
+                    reference_mode,
                 ),
                 "source": "generated",
                 "error": "",
@@ -793,6 +856,7 @@ class MediaService:
                 "asset_id": asset_id,
                 "provider_updated_at": str(config.get("updated_at") or ""),
                 "params": request_params,
+                "reference_mode": reference_mode,
             },
             batch_id=options.get("_batch_id"),
         )
@@ -898,6 +962,7 @@ class MediaService:
         )
         return self.jobs.create(
             project_id=current["project_id"],
+            chapter_id=current["chapter_id"],
             job_type="generate_keyframe",
             target_type="keyframe",
             target_id=version["id"],
@@ -913,6 +978,18 @@ class MediaService:
 
     def queue_keyframe_batch(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
         return self._queue_shot_media_batch(project_id, options, media_kind="keyframe")
+
+    def queue_keyframe_batch_chapter(
+        self,
+        chapter_id: str,
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._queue_shot_media_batch(
+            "",
+            options,
+            media_kind="keyframe",
+            chapter_id=chapter_id,
+        )
 
     def queue_video(self, shot_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current = self._shot(shot_id)
@@ -931,6 +1008,42 @@ class MediaService:
                     )
                 ).first()
             )
+
+            # 上一镜视频末帧：仅在本镜声明动作与上一镜连续（continuous）时引用。
+            # 不能用「场景素材是否相同」推断——同场景可能是对切或时间跳跃，
+            # 跨场景也可能是连续动作（如推门从室内走到室外）。
+            prev_end_frame_relative = None
+            prev_end_state = ""
+            if current.get("transition_from_prev") in {"continuous", "elliptical"}:
+                prev_shot_row = connection.execute(
+                    select(shot.c.id, shot.c.end_state, shot.c.next_hook)
+                    .where(
+                        shot.c.chapter_id == current["chapter_id"],
+                        shot.c.shot_order < current["shot_order"],
+                    )
+                    .order_by(shot.c.shot_order.desc())
+                    .limit(1)
+                ).first()
+
+                if prev_shot_row:
+                    prev_end_state = str(
+                        prev_shot_row.end_state or prev_shot_row.next_hook or ""
+                    ).strip()
+                    if current.get("transition_from_prev") == "continuous":
+                        prev_video_row = connection.execute(
+                            select(video_version.c.end_frame_path)
+                            .where(
+                                video_version.c.shot_id == prev_shot_row.id,
+                                video_version.c.is_current.is_(True),
+                                video_version.c.status == "completed",
+                                video_version.c.end_frame_path.isnot(None),
+                            )
+                            .limit(1)
+                        ).first()
+
+                        if prev_video_row and prev_video_row[0]:
+                            prev_end_frame_relative = str(prev_video_row[0])
+
         if keyframe is None or not keyframe.get("file_path"):
             raise conflict("分镜缺少已完成的当前关键帧")
         keyframe_path = file_service.resolve_project_path(
@@ -939,6 +1052,18 @@ class MediaService:
         )
         if not keyframe_path.is_file() or keyframe_path.stat().st_size <= 0:
             raise conflict("当前分镜关键帧文件不存在或为空，请重新生成或上传关键帧")
+        # 入队即校验：路径失效时当场放弃该引用。prompt 一旦快照就无法改 @Image 编号，
+        # 留到执行期才发现对不上只能整单失败
+        if prev_end_frame_relative and not self._readable_project_file(
+            current["project_id"],
+            prev_end_frame_relative,
+        ):
+            logger.warning(
+                "上一镜结束帧文件失效，本次视频不引用：project=%s path=%s",
+                current["project_id"],
+                prev_end_frame_relative,
+            )
+            prev_end_frame_relative = None
         current = self._refresh_shot_reference_bindings(current)
         provider, config = self.providers.resolve(
             kind="video",
@@ -952,24 +1077,37 @@ class MediaService:
         generation_current = {**current, "duration_sec": effective_duration}
         supports_multiple_input_images = self._supports_multiple_video_inputs(provider)
         reference_bindings = current["reference_bindings"] if supports_multiple_input_images else []
+        if not supports_multiple_input_images:
+            # 单图 Provider 只下发首图，不能引用上一镜末帧，否则 @Image2 会悬空
+            prev_end_frame_relative = None
         reference_items = self._binding_reference_items(
             current["project_id"],
             reference_bindings,
         )
-        reference_anchors = [
-            "@Image1：当前分镜关键帧，锁定构图、人物左右关系和起始站位。",
-            *[
-                f"@Image{index}：{label}。"
-                for index, (_, label) in enumerate(reference_items, start=2)
-            ],
-        ]
+
+        # @Image 编号顺序必须与 handle_video 组装的图片列表严格一致。
+        # 当前关键帧固定第一：单图 Provider 只取首图（http_video 在 input_image_list
+        # 为假时仅发送 values[0]），而首图必须是本镜起始画面。
+        reference_anchors = ["@Image1：当前分镜关键帧，锁定构图、人物左右关系和起始站位。"]
+        if prev_end_frame_relative:
+            reference_anchors.append("@Image2：上一镜结束帧，仅用于衔接连贯，不是本镜起始画面。")
+        # 先算基准编号：extend 的生成器里取 len() 会随列表增长而漂移
+        base_index = len(reference_anchors) + 1
+        reference_anchors.extend(
+            f"@Image{base_index + index}：{label}。"
+            for index, (_, label) in enumerate(reference_items)
+        )
+
         prompt = video_prompt_override or compile_video_prompt(
             style_prompt=current_project["style_prompt"],
             aspect_ratio=current_project["aspect_ratio"],
             video_prompt=video_prompt,
             duration_sec=effective_duration,
             anchors=reference_anchors,
-            shot_context=self._shot_template_context(generation_current),
+            shot_context=self._shot_template_context(
+                generation_current,
+                prev_end_state=prev_end_state,
+            ),
             negative_prompt=current["negative_prompt"],
         )
         version = self._insert_version(
@@ -994,6 +1132,8 @@ class MediaService:
                         generation_current,
                         current_project,
                         reference_bindings=reference_bindings,
+                        prev_end_state=prev_end_state,
+                        prev_end_frame_path=prev_end_frame_relative,
                     ),
                     effective_duration,
                     config["id"],
@@ -1008,6 +1148,7 @@ class MediaService:
         )
         return self.jobs.create(
             project_id=current["project_id"],
+            chapter_id=current["chapter_id"],
             job_type="generate_video",
             target_type="video",
             target_id=version["id"],
@@ -1017,6 +1158,8 @@ class MediaService:
                 "shot_id": shot_id,
                 "keyframe_version_id": keyframe["id"],
                 "reference_bindings": reference_bindings,
+                # 项目内相对路径；为空表示本镜不引用上一镜结束帧
+                "prev_end_frame_path": prev_end_frame_relative,
                 "supports_multiple_input_images": supports_multiple_input_images,
                 "provider_updated_at": str(config.get("updated_at") or ""),
                 "params": options.get("params", {}),
@@ -1027,15 +1170,32 @@ class MediaService:
     def queue_video_batch(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
         return self._queue_shot_media_batch(project_id, options, media_kind="video")
 
+    def queue_video_batch_chapter(
+        self,
+        chapter_id: str,
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._queue_shot_media_batch(
+            "",
+            options,
+            media_kind="video",
+            chapter_id=chapter_id,
+        )
+
     def _queue_shot_media_batch(
         self,
         project_id: str,
         options: dict[str, Any],
         *,
         media_kind: Literal["keyframe", "video"],
+        chapter_id: str | None = None,
     ) -> dict[str, Any]:
+        if chapter_id:
+            project_id = self._chapter_project_id(chapter_id)
         self._project(project_id)
         statement = select(shot.c.id).where(shot.c.project_id == project_id)
+        if chapter_id:
+            statement = statement.where(shot.c.chapter_id == chapter_id)
         if options.get("ids"):
             statement = statement.where(shot.c.id.in_(options["ids"]))
         if options.get("scene_no"):
@@ -1129,6 +1289,41 @@ class MediaService:
             raise bad_request("视频文件无法解码")
         return duration
 
+    @staticmethod
+    def _extract_last_frame(video_path: Path, output_path: Path) -> None:
+        """从视频中提取最后一帧"""
+        try:
+            result = subprocess.run(
+                [
+                    settings.ffmpeg_path,
+                    "-sseof",
+                    "-1",  # 从视频末尾倒数
+                    "-i",
+                    str(video_path),
+                    "-update",
+                    "1",
+                    "-q:v",
+                    "1",  # 高质量
+                    "-vframes",
+                    "1",
+                    "-y",  # 覆盖输出文件
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+            if (
+                result.returncode != 0
+                or not output_path.is_file()
+                or output_path.stat().st_size <= 0
+            ):
+                raise FileServiceError(
+                    f"FFmpeg 提取最后一帧失败: {result.stderr.decode('utf-8', errors='ignore')}"
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise FileServiceError("无法提取视频最后一帧，请确认 FFmpeg 已安装且可用") from exc
+
     def upload_asset_image(
         self,
         asset_id: str,
@@ -1220,6 +1415,7 @@ class MediaService:
                 "error": "",
             },
         )
+        chapter_no, chapter_title = self._chapter_folder_info(current.get("chapter_id"))
         target = file_service.keyframe_path(
             current["project_id"],
             shot_id,
@@ -1227,6 +1423,8 @@ class MediaService:
             suffix,
             shot_no=current["shot_no"],
             storage_name=self._project_storage_name(current["project_id"]),
+            chapter_no=chapter_no,
+            chapter_title=chapter_title,
         )
         return self._finish_upload(
             kind="keyframe",
@@ -1286,6 +1484,7 @@ class MediaService:
                 "error": "",
             },
         )
+        chapter_no, chapter_title = self._chapter_folder_info(current.get("chapter_id"))
         target = file_service.video_path(
             current["project_id"],
             shot_id,
@@ -1293,6 +1492,8 @@ class MediaService:
             suffix,
             shot_no=current["shot_no"],
             storage_name=self._project_storage_name(current["project_id"]),
+            chapter_no=chapter_no,
+            chapter_title=chapter_title,
         )
         return self._finish_upload(
             kind="video",
@@ -1326,6 +1527,7 @@ class MediaService:
                 storage_name=self._project_storage_name(parent["project_id"]),
             )
         parent = self._shot(record["shot_id"])
+        chapter_no, chapter_title = self._chapter_folder_info(parent.get("chapter_id"))
         path_builder = file_service.keyframe_path if kind == "keyframe" else file_service.video_path
         return parent["project_id"], path_builder(
             parent["project_id"],
@@ -1335,6 +1537,8 @@ class MediaService:
             shot_no=parent["shot_no"],
             current=current,
             storage_name=self._project_storage_name(parent["project_id"]),
+            chapter_no=chapter_no,
+            chapter_title=chapter_title,
         )
 
     @staticmethod
@@ -1535,6 +1739,40 @@ class MediaService:
                 activated["asset_id"],
                 version_id,
             )
+        if kind == "video":
+            # 手动上传的视频同样提取末帧，保证下一镜可引用
+            end_frame_working: Path | None = None
+            try:
+                current_video = file_service.resolve_project_path(
+                    project_id,
+                    activated["file_path"],
+                )
+                end_frame_target = current_video.with_name(f"{current_video.stem}-end.jpg")
+                end_frame_working = file_service.resolve_project_path(
+                    project_id,
+                    Path("temp") / "media-results" / f"{version_id}-end.jpg",
+                )
+                end_frame_working.parent.mkdir(parents=True, exist_ok=True)
+                self._extract_last_frame(current_video, end_frame_working)
+                file_service.move_file(project_id, end_frame_working, end_frame_target)
+                end_frame_relative = file_service.relative_project_path(
+                    project_id,
+                    end_frame_target,
+                )
+                with self.database.engine.begin() as connection:
+                    connection.execute(
+                        update(video_version)
+                        .where(video_version.c.id == version_id)
+                        .values(end_frame_path=end_frame_relative)
+                    )
+            except Exception as frame_exc:
+                if end_frame_working is not None:
+                    self._delete_failed_target(project_id, end_frame_working)
+                logger.warning(
+                    "上传视频提取末帧失败，下一镜将不引用该帧：version=%s error=%s",
+                    version_id,
+                    frame_exc,
+                )
         return activated
 
     def _get_version(self, kind: MediaKind, version_id: str) -> dict[str, Any]:
@@ -1600,18 +1838,19 @@ class MediaService:
                 project_id = connection.execute(
                     select(shot.c.project_id).where(shot.c.id == record[parent_column])
                 ).scalar()
-            connection.execute(
-                update(table)
-                .where(table.c.id == version_id)
-                .values(
-                    file_path=None,
-                    status="failed",
-                    is_current=False,
-                    error=_DELETED_MEDIA_ERROR,
-                )
-            )
+            values: dict[str, Any] = {
+                "file_path": None,
+                "status": "failed",
+                "is_current": False,
+                "error": _DELETED_MEDIA_ERROR,
+            }
+            if kind == "video":
+                values["end_frame_path"] = None
+            connection.execute(update(table).where(table.c.id == version_id).values(**values))
             if project_id and record.get("file_path"):
                 file_service.delete_file(project_id, record["file_path"])
+            if kind == "video" and project_id and record.get("end_frame_path"):
+                file_service.delete_file(project_id, record["end_frame_path"])
 
     @staticmethod
     def _ensure_keyframe_not_referenced(connection: Any, keyframe_id: str) -> None:
@@ -1730,19 +1969,28 @@ class MediaService:
             else:
                 current = self._shot(version["shot_id"])
                 project_id = current["project_id"]
-                references = [
-                    path
-                    for path, _ in self._binding_reference_items(
-                        project_id,
-                        version["reference_bindings_json"],
+                bound_items = self._binding_reference_items(
+                    project_id,
+                    version.get("reference_bindings") or [],
+                )
+                references = [path for path, _ in bound_items]
+                if (version.get("reference_bindings") or []) and len(bound_items) < len(
+                    version.get("reference_bindings") or []
+                ):
+                    # 参考图绑定存在但文件缺失/记录失效：不允许静默降级（含部分缺失）
+                    raise conflict(
+                        "关键帧参考图文件缺失或失效（分镜已绑定素材图，但磁盘文件不存在或"
+                        "记录无法解析），请先在素材库重新生成或上传图片后重试"
                     )
-                ]
+                chapter_no, chapter_title = self._chapter_folder_info(current.get("chapter_id"))
                 target = file_service.keyframe_path(
                     project_id,
                     current["id"],
                     version["version_no"],
                     shot_no=current["shot_no"],
                     storage_name=self._project_storage_name(project_id),
+                    chapter_no=chapter_no,
+                    chapter_title=chapter_title,
                 )
             working_target = file_service.resolve_project_path(
                 project_id,
@@ -1822,12 +2070,15 @@ class MediaService:
                 provider_id=version["provider_id"],
             )
             params = {**config["params"], **input_data.get("params", {})}
+            chapter_no, chapter_title = self._chapter_folder_info(current.get("chapter_id"))
             target = file_service.video_path(
                 project_id,
                 current["id"],
                 version["version_no"],
                 shot_no=current["shot_no"],
                 storage_name=self._project_storage_name(project_id),
+                chapter_no=chapter_no,
+                chapter_title=chapter_title,
             )
             working_target = file_service.resolve_project_path(
                 project_id,
@@ -1858,7 +2109,33 @@ class MediaService:
                     if not isinstance(bindings, list):
                         bindings = current["reference_bindings"]
                     reference_paths = self._resolve_binding_files(project_id, bindings)
-                    prepared = await prepare_multiple([keyframe_path, *reference_paths])
+                    if bindings and len(reference_paths) < len(bindings):
+                        # 参考图绑定存在但文件缺失/记录失效：不允许静默降级（含部分缺失）
+                        raise conflict(
+                            "视频参考图文件缺失或失效（分镜已绑定素材图，但磁盘文件不存在或"
+                            "记录无法解析），请先在素材库重新生成或上传图片后重试"
+                        )
+
+                    # 图片顺序必须与 queue_video 写进 prompt 的 @Image 编号一一对应：
+                    # 关键帧 → 上一镜结束帧（可选）→ 各素材绑定。
+                    # 关键帧必须排首位：单图 Provider 只取 values[0]，那必须是本镜起始画面。
+                    all_input_paths = [keyframe_path]
+                    prev_end_frame_path = input_data.get("prev_end_frame_path")
+                    if prev_end_frame_path:
+                        resolved_prev = self._readable_project_file(
+                            project_id,
+                            str(prev_end_frame_path),
+                        )
+                        if resolved_prev is None:
+                            # prompt 已快照且声明了该图，缺图会让后续 @Image 编号整体错位，
+                            # 与素材绑定缺失同样按失败处理，不静默降级
+                            raise conflict(
+                                "上一镜结束帧文件缺失或失效，提示词中的参考图编号将无法对应。"
+                                "请重新生成上一镜视频，或重新生成本镜视频提示词后重试"
+                            )
+                        all_input_paths.append(resolved_prev)
+                    all_input_paths.extend(reference_paths)
+                    prepared = await prepare_multiple(all_input_paths)
                 else:
                     prepared = await provider.prepare_input_image(keyframe_path)
                 submission = await provider.submit(
@@ -1892,6 +2169,43 @@ class MediaService:
                 relative,
                 actual_duration_sec=actual_duration_sec,
             )
+
+            # 提取视频末帧，供下一镜衔接引用。失败不影响本次视频生成成功
+            end_frame_working: Path | None = None
+            try:
+                # 与视频同目录同名，仅扩展名不同：自动跟随项目存储布局与章节分目录，
+                # 激活后文件可能已被移动到 current 路径，须以 completed.file_path 为准
+                current_video = file_service.resolve_project_path(
+                    project_id,
+                    completed["file_path"],
+                )
+                end_frame_target = current_video.with_name(f"{current_video.stem}-end.jpg")
+                end_frame_working = file_service.resolve_project_path(
+                    project_id,
+                    Path("temp") / "media-results" / f"{version_id}-end.jpg",
+                )
+                end_frame_working.parent.mkdir(parents=True, exist_ok=True)
+                self._extract_last_frame(current_video, end_frame_working)
+                file_service.move_file(project_id, end_frame_working, end_frame_target)
+                end_frame_relative = file_service.relative_project_path(
+                    project_id,
+                    end_frame_target,
+                )
+                with self.database.engine.begin() as connection:
+                    connection.execute(
+                        update(video_version)
+                        .where(video_version.c.id == version_id)
+                        .values(end_frame_path=end_frame_relative)
+                    )
+            except Exception as frame_exc:
+                if end_frame_working is not None:
+                    self._delete_failed_target(project_id, end_frame_working)
+                logger.warning(
+                    "提取视频末帧失败，下一镜将不引用该帧：version=%s error=%s",
+                    version_id,
+                    frame_exc,
+                )
+
             self._delete_staged_provider_result(project_id, result)
             return {"version_id": version_id, "file_path": completed["file_path"]}
         except Exception as exc:

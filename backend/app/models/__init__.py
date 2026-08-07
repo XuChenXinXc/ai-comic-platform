@@ -3,6 +3,7 @@ from app.models.tables import (
     api_provider,
     asset,
     asset_image,
+    chapter,
     job,
     keyframe_version,
     metadata,
@@ -15,6 +16,7 @@ from app.models.tables import (
 
 __all__ = [
     "ALL_TABLES",
+    "chapter",
     "api_provider",
     "asset",
     "asset_image",

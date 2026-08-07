@@ -37,6 +37,7 @@ export function useJobPolling(projectId: string) {
         "screenplay",
         "assets",
         "asset-images",
+        "shot-quality",
         "shots",
         "keyframes",
         "videos",

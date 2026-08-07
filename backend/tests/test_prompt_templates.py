@@ -118,7 +118,7 @@ def test_shot_template_context_normalizes_dialogue_aliases() -> None:
                 "costume": "青灰短斗篷与皮靴",
                 "immutable_features": ["左眉小痣", "铜制符笔"],
             },
-            "3:2 横向角色设定面板",
+            "3:2横向宽幅、分块拼接式专业角色设定面板",
             "3:2",
         ),
         (
@@ -131,7 +131,7 @@ def test_shot_template_context_normalizes_dialogue_aliases() -> None:
                 "special_features": ["星纹刻度", "可旋转外环"],
                 "plot_function": "寻找古墓入口",
             },
-            "3:2 横向专业道具设定面板",
+            "3:2横向宽幅、分块拼接式专业道具设定面板",
             "3:2",
         ),
         (
@@ -143,7 +143,7 @@ def test_shot_template_context_normalizes_dialogue_aliases() -> None:
                 "color_mood": "青灰、暖金",
                 "furnishings": ["供台", "铜灯", "旧书架"],
             },
-            "16:9 横向专业场景设定面板",
+            "16:9横向宽幅、分块拼接式专业场景设定面板",
             "16:9",
         ),
     ],
@@ -169,7 +169,9 @@ def test_compile_asset_prompt_uses_type_specific_setting_sheet_template(
     assert "统一画风锁定" in prompt
     assert expected_text in prompt
     assert "补充的视觉细节" in prompt
-    assert "negative prompt: 文字水印，真人摄影" in prompt
+    # 自定义负向与默认负向合并：自定义项保留，默认约束自动追加
+    assert "negative prompt: 文字水印、真人摄影" in prompt
+    assert "文字、水印" in prompt
     assert f"画面比例：{expected_aspect_ratio}。" in prompt
     assert "画面比例：9:16。" not in prompt
     assert "{" not in prompt
@@ -308,7 +310,7 @@ def test_compile_scene_asset_prompt_removes_people_actions_from_all_free_text_fi
         assert name not in prompt
 
 
-def test_compile_keyframe_prompt_uses_v2_template_and_reference_order() -> None:
+def test_compile_keyframe_prompt_uses_v3_template_and_reference_order() -> None:
     prompt = compile_keyframe_prompt(
         style_prompt="东方奇幻二维动画",
         aspect_ratio="9:16",
@@ -335,7 +337,7 @@ def test_compile_keyframe_prompt_uses_v2_template_and_reference_order() -> None:
         },
     )
 
-    assert "【当前分镜素材参考图】" in prompt
+    assert "【参考】" in prompt
     assert "@Image1：林雪" in prompt
     assert "用途：生成当前分镜唯一的分镜图" in prompt
     assert "不得提前呈现动作完成结果" in prompt
@@ -416,15 +418,27 @@ def test_compile_video_prompt_uses_v2_template_and_reference_order() -> None:
         },
     )
 
-    assert "【参考】" in prompt
+    assert "【角色锁定】" in prompt
+    assert "@Image2：林雪，锁定角色身份与服装。" in prompt
+    assert "【物品锁定】" in prompt
+    assert "铜制罗盘" in prompt
+    assert "【场景锁定】" in prompt
+    assert "古寺偏殿" in prompt
+    assert "【本镜唯一开始状态】" in prompt
     assert "@Image1：当前分镜关键帧" in prompt
-    assert "【执行】" in prompt
-    assert "结束状态：木门打开一条缝，林雪停住。" in prompt
-    assert "【镜头与声音】" in prompt
-    assert "【保持】" in prompt
-    assert "补充禁止事项：身份漂移、道具穿模、文字水印。" in prompt
-    assert "东方奇幻二维动画，6秒，16:9。" in prompt
-    assert "画面比例：9:16。" not in prompt
+    assert "【核心动作】" in prompt
+    assert "林雪缓慢推开木门，门缝透出暖光。" in prompt
+    assert "【镜头】" in prompt
+    assert "【声音】" in prompt
+    assert "【结束状态】" in prompt
+    assert "木门打开一条缝，林雪停住。" in prompt
+    assert "【禁止项】" in prompt
+    assert "身份漂移、道具穿模、文字水印" in prompt
+    assert "画面比例：16:9，总时长：6秒。" in prompt
+    # 验证新模板的核心特征
+    assert "严格保持每位角色的身份、面部特征、发型、服装、体型、左右位置关系不变" in prompt
+    assert "重点道具的外观、尺寸、颜色和材质保持一致" in prompt
+    assert "其余静止物体不得在动画中移动、旋转或重新生成" in prompt
 
 
 def test_compile_video_prompt_includes_positions_and_expressions() -> None:
@@ -470,3 +484,229 @@ def test_compile_video_prompt_with_short_duration_omits_zero_length_segment() ->
 
     assert "0-1秒：林雪眨眼。" in prompt
     assert "1-1秒" not in prompt
+    # 双句号修复：非时间轴分支对白为空时不再追加多余句号
+    assert "。。" not in prompt
+
+
+def test_compile_video_prompt_without_anchors_omits_reference_ruling() -> None:
+    """无参考图时省略冲突裁决句与道具锁定行；机位为空走固定默认。"""
+    prompt = compile_video_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        video_prompt="0-2秒：林雪推门；2-4秒：门缝扩大；4-6秒：林雪停住。",
+        duration_sec=6,
+        anchors=[],
+        shot_context={},
+    )
+
+    assert "以参考图中的人物外观、服装、道具和空间关系为准" not in prompt
+    assert "重点道具" not in prompt
+    assert "固定机位，画面变化由人物动作推动，摄影机不移动。" in prompt
+
+
+def test_camera_line_treats_stable_move_as_moving() -> None:
+    """「稳定」是防抖描述，不视为固定机位。"""
+    prompt = compile_video_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        video_prompt="0-2秒：林雪推门；2-4秒：门缝扩大；4-6秒：林雪停住。",
+        duration_sec=6,
+        anchors=[],
+        shot_context={"camera_move": "稳定横移"},
+    )
+
+    assert "稳定横移；缓慢跟随人物运动" in prompt
+    assert "固定机位" not in prompt
+
+
+def test_compile_video_prompt_extends_short_timeline_to_generation_duration() -> None:
+    """时间轴末段不足生成时长时，模板补足稳定收尾段（供应商最低 6 秒场景）。"""
+    timeline = "0-2秒：林雪推门。"
+
+    prompt = compile_video_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        video_prompt=timeline,
+        duration_sec=6,
+        anchors=["@Image1：当前分镜关键帧。"],
+        shot_context={},
+    )
+
+    assert timeline in prompt
+    assert "2-6秒：保持上一段结束状态稳定" in prompt
+
+
+def test_compile_video_prompt_does_not_extend_complete_timeline() -> None:
+    timeline = "0-2秒：林雪推门；2-4秒：门缝扩大；4-6秒：林雪停住。"
+
+    prompt = compile_video_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        video_prompt=timeline,
+        duration_sec=6,
+        anchors=["@Image1：当前分镜关键帧。"],
+        shot_context={},
+    )
+
+    assert "4-6秒：林雪停住。" in prompt
+    assert "保持上一段结束状态稳定" not in prompt
+
+
+def test_compile_keyframe_prompt_uses_start_state_as_opening_frame() -> None:
+    """关键帧必须以 start_state（动作前状态）为开场，而不是 frame_description。"""
+    context = shot_template_context(
+        {
+            "start_state": "林舟站在屋檐下，照片还没从口袋取出。",
+            "frame_description": "林舟已经跑进屋檐、掏出照片低头看。",
+            "end_state": "林舟低头看着照片。",
+            "character_ids": [],
+            "scene_asset_id": "",
+            "prop_ids": [],
+            "dialogue": [],
+        },
+        {},
+    )
+
+    assert context["opening_frame"] == "林舟站在屋檐下，照片还没从口袋取出。"
+
+
+def test_compile_keyframe_prompt_marks_voice_over_as_closed_lips() -> None:
+    """录音笔/旁白属于画外音，关键帧要求画面人物全程闭口。"""
+    context = shot_template_context(
+        {
+            "dialogue": [
+                {"speaker": "父亲（录音）", "text": "小舟，听到这段话时我已经不在了。"},
+            ],
+            "character_ids": [],
+            "scene_asset_id": "",
+            "prop_ids": [],
+        },
+        {},
+    )
+
+    assert context["dialogue"] == ""
+    assert "父亲（录音）：小舟" in context["voice_over"]
+    prompt = compile_keyframe_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        image_prompt="林舟听着录音笔。",
+        negative_prompt="",
+        anchors=[],
+        shot_context=context,
+    )
+    assert "画面中所有人物全程闭口" in prompt
+
+
+def test_compile_video_prompt_voice_over_keeps_mouths_closed() -> None:
+    context = shot_template_context(
+        {
+            "dialogue": [
+                {"speaker": "父亲（录音）", "text": "怀表留给你。"},
+            ],
+            "character_ids": [],
+            "scene_asset_id": "",
+            "prop_ids": [],
+        },
+        {},
+    )
+
+    prompt = compile_video_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        video_prompt="0-2秒：林舟听着录音笔；2-4秒：他握紧怀表。",
+        duration_sec=4,
+        anchors=["@Image1：当前分镜关键帧。"],
+        shot_context=context,
+    )
+
+    assert "画面内无台词对白：所有人物全程闭口" in prompt
+    assert "画外音（后期配音，画面人物闭口）：父亲（录音）：怀表留给你。" in prompt
+
+
+def test_compile_video_prompt_mixes_dialogue_and_voice_over() -> None:
+    """画面内对白与画外音并存时：两者都输出，口型指令按画面内对白处理。"""
+    context = shot_template_context(
+        {
+            "dialogue": [
+                {"speaker": "林舟", "text": "你是谁？"},
+                {"speaker": "父亲（录音）", "text": "小舟，别学我逃跑。"},
+            ],
+            "character_ids": [],
+            "scene_asset_id": "",
+            "prop_ids": [],
+        },
+        {},
+    )
+
+    assert "林舟自然开口说：你是谁？" in context["dialogue"]
+    assert "父亲（录音）：小舟" in context["voice_over"]
+
+    prompt = compile_video_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        video_prompt="林舟质问苏晴。",
+        duration_sec=4,
+        anchors=["@Image1：当前分镜关键帧。"],
+        shot_context=context,
+    )
+
+    assert "说话角色嘴唇轻微开合、表情自然" in prompt
+    assert "画面内无台词对白" not in prompt
+    assert "画外音（后期配音，画面人物闭口）：父亲（录音）：小舟" in prompt
+
+
+def test_compile_asset_prompt_clean_reference_mode_has_no_setting_sheet_text() -> None:
+    """干净参考图模式：无资料卡、无标注文字，专供图生图和视频引用。"""
+    prompt = compile_asset_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        asset_type="character",
+        asset_name="林雪",
+        profile={"hair": "黑色长发", "costume": "青色长裙", "age": "22", "gender": "女"},
+        prompt="左眉有浅疤",
+        negative_prompt="",
+        consistency_keywords=["黑色长发"],
+        composition="",
+        reference_mode=True,
+    )
+
+    assert "干净角色参考图" in prompt
+    assert "左上人物资料卡" not in prompt
+    assert "三视图" not in prompt
+    assert "纯白色" in prompt
+    assert "不包含任何文字" in prompt
+
+
+def test_compile_asset_prompt_reference_mode_merges_default_negative_prompt() -> None:
+    prompt = compile_asset_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        asset_type="prop",
+        asset_name="铜制罗盘",
+        profile={"description": "刻有星纹的铜制罗盘"},
+        prompt="",
+        negative_prompt="",
+        consistency_keywords=[],
+        composition="",
+        reference_mode=True,
+    )
+
+    assert "干净道具参考图" in prompt
+    assert "negative prompt: 完整人物、人物脸、多件物品" in prompt
+
+
+def test_character_negative_prompt_merges_default_items() -> None:
+    merged = resolve_asset_negative_prompt("character", "身份漂移，服装变化")
+
+    assert "多人" in merged
+    assert "身份漂移" in merged
+    assert merged.count("身份漂移") == 1
+    assert resolve_asset_negative_prompt("character", merged) == merged
+
+
+def test_prop_negative_prompt_merges_default_items() -> None:
+    merged = resolve_asset_negative_prompt("prop", "不要现代电子表")
+
+    assert "完整人物、人物脸" in merged
+    assert "不要现代电子表" in merged
+    assert resolve_asset_negative_prompt("prop", merged) == merged

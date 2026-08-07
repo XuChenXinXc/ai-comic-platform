@@ -143,3 +143,54 @@ describe("素材图片失败记录删除", () => {
     await waitFor(() => expect(removeSpy).toHaveBeenCalledWith("image-completed"));
   });
 });
+
+describe("素材图片提示词编辑", () => {
+  test("test_edit_prompt_shows_current_snapshot_and_saves_override", async () => {
+    const user = userEvent.setup();
+    const currentVersion: MediaVersion = {
+      id: "image-current",
+      asset_id: baseAsset.id,
+      version_no: 1,
+      file_path: "character/林风.png",
+      prompt_snapshot: "自动编译的角色提示词",
+      negative_prompt_snapshot: "",
+      model: "image-model",
+      status: "completed",
+      is_current: true,
+      source: "generated",
+      input_signature: "signature-1",
+      created_at: "2026-08-03T00:00:00Z",
+    };
+    vi.mocked(api.assets.images.list).mockResolvedValue([currentVersion]);
+    const updateSpy = vi
+      .spyOn(api.assets, "update")
+      .mockResolvedValue({ ...baseAsset, prompt_override: "优化后的白底提示词" });
+
+    renderPanel(baseAsset);
+    await user.click(
+      await screen.findByRole("button", { name: "编辑图片提示词" }),
+    );
+
+    const textarea = await screen.findByPlaceholderText("输入素材图提示词…");
+    expect((textarea as HTMLTextAreaElement).value).toBe("自动编译的角色提示词");
+    await user.clear(textarea);
+    await user.type(textarea, "优化后的白底提示词");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(updateSpy).toHaveBeenCalledWith(baseAsset.id, {
+        prompt_override: "优化后的白底提示词",
+      }),
+    );
+  });
+
+  test("test_asset_with_prompt_override_shows_saved_block", () => {
+    renderPanel({
+      ...baseAsset,
+      prompt_override: "用户保存的白底提示词",
+    });
+
+    expect(screen.getByText("已保存的图片提示词覆盖")).toBeTruthy();
+    expect(screen.getByText("用户保存的白底提示词")).toBeTruthy();
+  });
+});

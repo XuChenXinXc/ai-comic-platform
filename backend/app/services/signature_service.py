@@ -88,15 +88,18 @@ def asset_signature(
     prompt: str,
     negative_prompt: str,
     style_prompt: str,
+    prompt_override: str = "",
 ) -> str:
-    return calculate_signature(
-        {
-            "profile": profile,
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "style_prompt": style_prompt,
-        }
-    )
+    values: dict[str, Any] = {
+        "profile": profile,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "style_prompt": style_prompt,
+    }
+    # 与分镜 override 语义一致：非空覆盖值纳入签名，空串（未编辑）不参与
+    if str(prompt_override or "").strip():
+        values["prompt_override"] = prompt_override
+    return calculate_signature(values)
 
 
 def shot_signature(
@@ -139,6 +142,7 @@ def asset_image_signature(
     model: str,
     params: Mapping[str, Any],
     reference_files: Sequence[str | Path],
+    reference_mode: bool = False,
 ) -> str:
     return calculate_signature(
         asset_own_signature,
@@ -146,6 +150,7 @@ def asset_image_signature(
         model,
         params,
         _reference_fingerprints(reference_files),
+        "clean_reference" if reference_mode else "setting_sheet",
     )
 
 

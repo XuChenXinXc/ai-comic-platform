@@ -5,14 +5,13 @@ import {
   FolderPlus,
   Save,
   Trash2,
-  Upload,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import { api, queryKeys } from "../api/client";
 import { ErrorState, PageHeader } from "../components/status";
-import { Button, Card, Input, Label, Select, Textarea } from "../components/ui";
+import { Button, Card, Input, Label, Select } from "../components/ui";
 import { useProject } from "../hooks/use-project";
 import { formatError } from "../lib/utils";
 import type { ProjectInput, ProviderKind } from "../types/api";
@@ -21,9 +20,9 @@ const emptyProject: ProjectInput = {
   name: "",
   source_text: "",
   style_prompt:
-    "电影感国风二维漫剧，克制线条，稳定人物比例，细腻自然光影，统一色彩叙事",
+    "电影感现实主义二维国漫，稳定自然的半写实人物比例，沉稳细腻线条，低饱和冷暖协调色调，真实清晰的微表情，层次分明的电影光影。",
   aspect_ratio: "16:9",
-  image_size: "3840x2160",
+  image_size: "2560x1440",
   video_size: "16:9",
   default_duration_sec: 6,
   default_text_provider_id: null,
@@ -35,7 +34,6 @@ export function ProjectPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
-  const fileRef = useRef<HTMLInputElement>(null);
   const {
     activeProject,
     activeProjectId,
@@ -55,7 +53,7 @@ export function ProjectPage() {
     if (activeProject) {
       setForm({
         name: activeProject.name,
-        source_text: activeProject.source_text,
+        source_text: "",
         style_prompt: activeProject.style_prompt,
         aspect_ratio: "16:9",
         image_size: "3840x2160",
@@ -126,14 +124,14 @@ export function ProjectPage() {
     value: ProjectInput[K],
   ) => setForm((current) => ({ ...current, [key]: value }));
 
-  const canSave = Boolean(form.name.trim() && form.source_text.trim());
+  const canSave = Boolean(form.name.trim());
 
   return (
     <div>
       <PageHeader
         eyebrow="Step 01 / Source"
         title={creating ? "创建漫剧项目" : "项目小说"}
-        description="集中管理小说原文与默认生成接口。修改小说后，后续内容会保留并标记来源变化。"
+        description="管理项目配置；小说原文在写作页按章节编辑。"
         actions={
           <>
             {!creating ? (
@@ -165,34 +163,9 @@ export function ProjectPage() {
               <div>
                 <h2 className="font-bold">小说与创作设定</h2>
                 <p className="mt-1 text-xs text-muted">
-                  TXT / Markdown 文件会在浏览器本地读取，不上传原始文件。
+                  小说原文请在各章节的写作页编辑。
                 </p>
               </div>
-              <input
-                ref={fileRef}
-                type="file"
-                accept=".txt,.md,text/plain,text/markdown"
-                className="hidden"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (!file) return;
-                  void file
-                    .text()
-                    .then((text) => {
-                      setField("source_text", text);
-                      if (!form.name) {
-                        setField("name", file.name.replace(/\.(txt|md)$/i, ""));
-                      }
-                      toast.success(`已读取 ${file.name}`);
-                    })
-                    .catch(() => toast.error("文件读取失败，请确认文件编码"));
-                  event.currentTarget.value = "";
-                }}
-              />
-              <Button onClick={() => fileRef.current?.click()}>
-                <Upload className="h-4 w-4" />
-                导入 TXT / MD
-              </Button>
             </div>
           </div>
           <div className="space-y-5 p-5 sm:p-6">
@@ -220,24 +193,6 @@ export function ProjectPage() {
                 </p>
               </div>
             ) : null}
-            <div>
-              <div className="mb-1.5 flex items-center justify-between">
-                <Label htmlFor="source-text" className="mb-0">
-                  小说正文
-                </Label>
-                <span className="text-[11px] text-muted">
-                  {form.source_text.length.toLocaleString("zh-CN")} 字符
-                </span>
-              </div>
-              <Textarea
-                id="source-text"
-                value={form.source_text}
-                rows={22}
-                className="leading-7"
-                placeholder="在这里粘贴小说正文，或从本地导入 TXT / Markdown…"
-                onChange={(event) => setField("source_text", event.target.value)}
-              />
-            </div>
           </div>
         </Card>
 
@@ -324,9 +279,6 @@ export function ProjectPage() {
                     <FileText className="h-4 w-4 text-muted" />
                     <span className="min-w-0 flex-1 truncate text-sm font-semibold">
                       {project.name}
-                    </span>
-                    <span className="text-[10px] text-muted">
-                      R{project.source_revision}
                     </span>
                   </button>
                 ))}

@@ -18,12 +18,37 @@ const toastMock = vi.hoisted(() => ({
 vi.mock("sonner", () => ({ toast: toastMock }));
 vi.mock("../hooks/use-project", () => ({
   useProject: () => ({
-    activeProject: { id: "project-1", name: "验收项目" },
-    activeProjectId: "project-1",
+    activeProject: { id: "chapter-1", name: "验收项目" },
+    activeProjectId: "chapter-1",
   }),
 }));
 vi.mock("../components/project-required", () => ({
   ProjectRequired: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("../hooks/use-chapter", () => ({
+  useChapter: () => ({
+    chapters: [
+      { id: "chapter-1", project_id: "chapter-1", chapter_no: 1, title: "第一章" },
+    ],
+    activeChapter: {
+      id: "chapter-1",
+      project_id: "chapter-1",
+      chapter_no: 1,
+      title: "第一章",
+      source_signature: "source-1",
+    },
+    activeChapterId: "chapter-1",
+    selectChapter: vi.fn(),
+    isLoading: false,
+    error: null,
+    refetch: vi.fn(),
+  }),
+}));
+vi.mock("../components/chapter-required", () => ({
+  ChapterRequired: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("../components/chapter-selector", () => ({
+  ChapterSelector: () => null,
 }));
 vi.mock("../components/shot-media-card", () => ({
   ShotMediaCard: () => null,
@@ -32,14 +57,14 @@ vi.mock("../components/shot-media-card", () => ({
 const shots = [
   {
     id: "shot-1",
-    project_id: "project-1",
+    project_id: "chapter-1",
     shot_no: 1,
     shot_order: 1,
     image_prompt: "",
   },
   {
     id: "shot-2",
-    project_id: "project-1",
+    project_id: "chapter-1",
     shot_no: 2,
     shot_order: 2,
     image_prompt: "",
@@ -48,7 +73,7 @@ const shots = [
 
 const queuedJob = {
   id: "job-1",
-  project_id: "project-1",
+  project_id: "chapter-1",
   job_type: "generate_media",
   target_type: "shot",
   provider_kind: "image",
@@ -64,7 +89,7 @@ const queuedJob = {
 const assets = [
   {
     id: "asset-1",
-    project_id: "project-1",
+    project_id: "chapter-1",
     asset_type: "character",
     name: "林昭",
     prompt: "角色定妆图",
@@ -72,7 +97,7 @@ const assets = [
   },
   {
     id: "asset-2",
-    project_id: "project-1",
+    project_id: "chapter-1",
     asset_type: "character",
     name: "顾临",
     prompt: "",

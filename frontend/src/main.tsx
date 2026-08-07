@@ -5,6 +5,7 @@ import ReactDOM from "react-dom/client";
 import { BrowserRouter } from "react-router";
 import { Toaster } from "sonner";
 import { App } from "./App";
+import { ChapterProvider } from "./hooks/use-chapter";
 import { ProjectProvider } from "./hooks/use-project";
 import "./index.css";
 
@@ -26,6 +27,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
         <ProjectProvider>
+          <ChapterProvider>
           <App />
           <Toaster
             position="bottom-right"
@@ -33,6 +35,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
             closeButton
             toastOptions={{ duration: 4_000 }}
           />
+          </ChapterProvider>
         </ProjectProvider>
       </BrowserRouter>
     </QueryClientProvider>

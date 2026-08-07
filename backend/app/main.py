@@ -13,6 +13,7 @@ from starlette.types import Scope
 
 from app.api import (
     assets,
+    chapters,
     jobs,
     media,
     projects,
@@ -147,6 +148,7 @@ def health() -> dict[str, str]:
 
 for api_router in (
     projects.router,
+    chapters.router,
     writing.router,
     assets.router,
     shots.router,

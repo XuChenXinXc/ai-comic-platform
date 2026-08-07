@@ -1,27 +1,33 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
-  Check,
   ChevronDown,
   ChevronUp,
+  Clapperboard,
   Copy,
   Film,
   GripVertical,
   ImageOff,
   Images,
+  Link2,
   Merge,
   Pencil,
   Plus,
   Scissors,
   Trash2,
+  TriangleAlert,
   WandSparkles,
+  Wrench,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router";
 import { toast } from "sonner";
 import { api, mediaUrl, queryKeys } from "../api/client";
 import { ImagePreview } from "../components/image-preview";
+import { ContinuityCheck } from "../components/continuity-check";
 import { JsonEditor } from "../components/json-editor";
+import { ChapterRequired } from "../components/chapter-required";
+import { ChapterSelector } from "../components/chapter-selector";
 import { ProjectRequired } from "../components/project-required";
 import { ShotMediaCard } from "../components/shot-media-card";
 import {
@@ -42,6 +48,7 @@ import {
   Select,
   Textarea,
 } from "../components/ui";
+import { useChapter } from "../hooks/use-chapter";
 import { useProject } from "../hooks/use-project";
 import { formatError, makeDownloadName, parseJson } from "../lib/utils";
 import type {
@@ -51,11 +58,20 @@ import type {
   Shot,
   ShotExpression,
   ShotPosition,
+  ShotTransitionFromPrev,
 } from "../types/api";
 
-function blankShot(projectId: string): Partial<Shot> {
+const transitionLabels: Record<ShotTransitionFromPrev, string> = {
+  continuous: "连续承接",
+  elliptical: "省略承接",
+  same_scene_cut: "同场切镜",
+  scene_change: "场景切换",
+};
+
+function blankShot(chapterId: string): Partial<Shot> {
   return {
-    project_id: projectId,
+    project_id: "",
+    chapter_id: chapterId,
     shot_no: 1,
     shot_order: 1,
     source_type: "screenplay",
@@ -75,6 +91,7 @@ function blankShot(projectId: string): Partial<Shot> {
     duration_sec: 0,
     end_state: "",
     next_hook: "",
+    transition_from_prev: "scene_change",
     frame_description: "",
     image_prompt: "",
     video_prompt: "",
@@ -142,21 +159,23 @@ export function ShotsPage() {
   const queryClient = useQueryClient();
   const location = useLocation();
   const { activeProject, activeProjectId } = useProject();
+  const { activeChapterId, activeChapter } = useChapter();
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [continuityOpen, setContinuityOpen] = useState(false);
   const [scope, setScope] = useState<"all" | "scene">("all");
   const [sceneNo, setSceneNo] = useState("");
   const [exporting, setExporting] = useState(false);
   const [editing, setEditing] = useState<Shot | "new" | null>(null);
   const [form, setForm] = useState<Partial<Shot>>(
-    blankShot(activeProjectId),
+    blankShot(activeChapterId),
   );
   const [jsonValidity, setJsonValidity] = useState<Record<string, boolean>>({});
   const [draggedId, setDraggedId] = useState("");
 
   const query = useQuery({
-    queryKey: queryKeys.shots(activeProjectId),
-    queryFn: () => api.shots.list(activeProjectId),
-    enabled: Boolean(activeProjectId),
+    queryKey: queryKeys.shots(activeChapterId),
+    queryFn: () => api.shots.list(activeChapterId),
+    enabled: Boolean(activeChapterId),
   });
   const assetsQuery = useQuery({
     queryKey: queryKeys.assets(activeProjectId),
@@ -189,7 +208,7 @@ export function ShotsPage() {
   useEffect(() => {
     setSelected(new Set());
     setSceneNo("");
-  }, [activeProjectId]);
+  }, [activeChapterId]);
 
   useEffect(() => {
     const stage = new URLSearchParams(location.search).get("stage");
@@ -232,12 +251,12 @@ export function ShotsPage() {
       shot?: Shot;
     }) => {
       if (action === "extract") {
-        return api.shots.extract(activeProjectId, {
+        return api.shots.extract(activeChapterId, {
           scope: "all",
         });
       }
       if (action === "extractScene" && shot) {
-        return api.shots.extract(activeProjectId, {
+        return api.shots.extract(activeChapterId, {
           scope: "scene",
           scene_no: shot.scene_no || undefined,
         });
@@ -256,13 +275,87 @@ export function ShotsPage() {
   const mediaBatchMutation = useMutation({
     mutationFn: (kind: "keyframe" | "video") =>
       kind === "keyframe"
-        ? api.shots.keyframes.batch(activeProjectId, { ids: batchIds })
-        : api.shots.videos.batch(activeProjectId, { ids: batchIds }),
+        ? api.shots.keyframes.batch(activeChapterId, { ids: batchIds })
+        : api.shots.videos.batch(activeChapterId, { ids: batchIds }),
     onSuccess: async (result, kind) => {
       await queryClient.invalidateQueries({
         queryKey: queryKeys.jobs(activeProjectId),
       });
       showBatchFeedback(result, kind === "keyframe" ? "关键帧" : "视频");
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
+  const optimizeAllMutation = useMutation({
+    mutationFn: () =>
+      api.shots.optimizeVideoPromptsAll(activeProjectId, { ids: batchIds }),
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      const failures = result.preflight_failures ?? [];
+      if (failures.length) {
+        const description = failures
+          .map(({ target_id, error }) => {
+            const shot = shots.find((item) => item.id === target_id);
+            return `分镜 ${shot?.shot_no ?? target_id}：${error}`;
+          })
+          .join("；");
+        toast.warning(
+          `已入队 ${result.jobs.length} 个优化任务，跳过 ${failures.length} 项`,
+          { description },
+        );
+        return;
+      }
+      toast.success(`已入队 ${result.jobs.length} 个优化任务，完成后自动写入各分镜`);
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
+  // 剧情连贯审校：把相邻分镜的起止状态与旁白交给文字模型逐对检查，
+  // 修正直接写回源字段。改完需要重新生成提示词才会生效。
+  const continuityFixMutation = useMutation({
+    mutationFn: () =>
+      api.shots.checkContinuity(activeProjectId, {
+        ids: batchIds,
+        apply_fixes: true,
+        insert_transitions: false,
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      toast.success("剧情连贯审校已入队", {
+        description: "完成后请重新生成提示词，修正才会写入提示词",
+      });
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
+  // 分镜质量报告：提取阶段的警告不阻断保存，这里主动扫描存量分镜。
+  const qualityQuery = useQuery({
+    queryKey: ["shot-quality", activeProjectId],
+    queryFn: () => api.shots.qualityReport(activeProjectId),
+    enabled: Boolean(activeChapterId) && shots.length > 0,
+  });
+  const qualityIssues = qualityQuery.data?.items ?? [];
+
+  const qualityFixMutation = useMutation({
+    mutationFn: async () => {
+      // 入队前先刷新质量报告，避免用旧数量误导“本次修复几个”
+      await qualityQuery.refetch();
+      return api.shots.fixQuality(activeProjectId, {});
+    },
+    onSuccess: async (job) => {
+      await queryClient.invalidateQueries({
+        queryKey: ["shot-quality", activeProjectId],
+      });
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      toast.success(`已入队 ${job.progress_total ?? qualityIssues.length} 个分镜的修复任务`, {
+        description: "完成后会自动调整时长与时间轴，可在分镜列表查看结果",
+      });
     },
     onError: (error) => toast.error(formatError(error)),
   });
@@ -286,27 +379,12 @@ export function ShotsPage() {
   const saveMutation = useMutation({
     mutationFn: () =>
       editing === "new"
-        ? api.shots.create(activeProjectId, form)
+        ? api.shots.create(activeChapterId, form)
         : api.shots.update((editing as Shot).id, form),
     onSuccess: async () => {
       await invalidate();
       toast.success(editing === "new" ? "分镜已添加" : "分镜已保存");
       setEditing(null);
-    },
-    onError: (error) => toast.error(formatError(error)),
-  });
-
-  const updateMutation = useMutation({
-    mutationFn: ({
-      id,
-      patch,
-    }: {
-      id: string;
-      patch: Partial<Shot>;
-    }) => api.shots.update(id, patch),
-    onSuccess: async () => {
-      await invalidate();
-      toast.success("分镜已确认");
     },
     onError: (error) => toast.error(formatError(error)),
   });
@@ -341,7 +419,7 @@ export function ShotsPage() {
   });
 
   const mergeMutation = useMutation({
-    mutationFn: () => api.shots.merge(activeProjectId, [...selected]),
+    mutationFn: () => api.shots.merge(activeChapterId, [...selected]),
     onSuccess: async () => {
       setSelected(new Set());
       await invalidate();
@@ -351,7 +429,7 @@ export function ShotsPage() {
   });
 
   const reorderMutation = useMutation({
-    mutationFn: (ids: string[]) => api.shots.reorder(activeProjectId, ids),
+    mutationFn: (ids: string[]) => api.shots.reorder(activeChapterId, ids),
     onSuccess: async () => {
       await invalidate();
       toast.success("分镜顺序已更新");
@@ -408,6 +486,7 @@ export function ShotsPage() {
 
   return (
     <ProjectRequired>
+      <ChapterRequired>
       <div>
         <PageHeader
           eyebrow="Step 05 / Storyboard"
@@ -415,6 +494,7 @@ export function ShotsPage() {
           description="提取时自动补齐 V2 关键帧与视频提示词，并在同一条流水线中完成关键帧和单镜视频生成。"
           actions={
             <>
+              <ChapterSelector />
               <Button onClick={openNew}>
                 <Plus className="h-4 w-4" />
                 手工新增
@@ -429,6 +509,23 @@ export function ShotsPage() {
                 <WandSparkles className="h-4 w-4" />
                 {shots.length ? "重新提取全部" : "提取分镜"}
               </Button>
+              <Button
+                variant="secondary"
+                busy={continuityFixMutation.isPending}
+                disabled={!shots.length}
+                title="把相邻分镜的起止状态与旁白交给文字模型逐对审校并自动修正源字段；完成后需重新生成提示词才会生效"
+                onClick={() => continuityFixMutation.mutate()}
+              >
+                <Link2 className="h-4 w-4" />
+                剧情连贯审校
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() => setContinuityOpen(true)}
+              >
+                <Clapperboard className="h-4 w-4" />
+                连贯性检查
+              </Button>
               <Button busy={exporting} onClick={() => void exportZip()}>
                 <Archive className="h-4 w-4" />
                 导出当前版本 ZIP
@@ -436,6 +533,44 @@ export function ShotsPage() {
             </>
           }
         />
+
+        {qualityIssues.length > 0 && (
+          <Card className="mb-5 border-amber-300/60 bg-amber-50/60 p-4 dark:border-amber-500/30 dark:bg-amber-500/5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 text-sm font-medium text-amber-900 dark:text-amber-200">
+                  <TriangleAlert className="h-4 w-4 shrink-0" />
+                  {qualityIssues.length} 个分镜存在质量问题
+                </div>
+                <ul className="mt-2 space-y-1 text-xs text-amber-800/90 dark:text-amber-200/80">
+                  {qualityIssues.slice(0, 4).map((issue) => (
+                    <li key={issue.shot_id}>
+                      <span className="font-medium">
+                        {issue.chapter_no ? `第${issue.chapter_no}章 ` : ""}
+                        镜 {issue.shot_no}
+                      </span>
+                      （{issue.duration_sec}秒）：{issue.warnings[0]}
+                    </li>
+                  ))}
+                  {qualityIssues.length > 4 && (
+                    <li className="opacity-70">
+                      还有 {qualityIssues.length - 4} 个分镜存在问题…
+                    </li>
+                  )}
+                </ul>
+              </div>
+              <Button
+                variant="secondary"
+                busy={qualityFixMutation.isPending}
+                title="调用文字模型逐个修复：优先延长时长并补齐时间轴，不改动剧情内容"
+                onClick={() => qualityFixMutation.mutate()}
+              >
+                <Wrench className="h-4 w-4" />
+                一键修复
+              </Button>
+            </div>
+          </Card>
+        )}
 
         <Card className="mb-5 overflow-hidden">
           <div className="grid gap-4 p-4 lg:grid-cols-[minmax(280px,1fr)_auto] lg:items-end">
@@ -569,6 +704,31 @@ export function ShotsPage() {
                     ? "生成当前场次视频"
                     : "生成全部视频"}
               </Button>
+              <Button
+                variant="secondary"
+                busy={optimizeAllMutation.isPending}
+                disabled={batchDisabled}
+                onClick={() => {
+                  const rangeLabel = selected.size
+                    ? `所选 ${selected.size} 个分镜`
+                    : scope === "scene"
+                      ? "当前场次分镜"
+                      : "全部分镜";
+                  const confirmed = window.confirm(
+                    `一键优化${rangeLabel}的视频提示词？\n\n` +
+                      "将调用文字模型逐个优化并自动写入各分镜（覆盖已保存的自定义提示词），" +
+                      "无提示词的分镜自动跳过。",
+                  );
+                  if (confirmed) optimizeAllMutation.mutate();
+                }}
+              >
+                <WandSparkles className="h-4 w-4" />
+                {selected.size
+                  ? `一键优化所选提示词（${selected.size}）`
+                  : scope === "scene"
+                    ? "一键优化当前场次提示词"
+                    : "一键优化全部提示词"}
+              </Button>
             </div>
           </div>
         </Card>
@@ -599,8 +759,13 @@ export function ShotsPage() {
           />
         ) : null}
 
-        <div className="space-y-4">
+        <div className="space-y-0">
           {shots.map((shot, index) => {
+            const connectsToPrevious =
+              shots[index].transition_from_prev === "continuous";
+            const cardSpacing =
+              index === 0 ? "" : connectsToPrevious ? "" : "mt-4";
+            const cardShape = connectsToPrevious ? "rounded-none border-t-0" : "";
             const characterIds = idList(shot.character_ids_json);
             const propIds = idList(shot.prop_ids_json);
             const referenceBindings = parseJson<ReferenceBinding[]>(
@@ -668,12 +833,12 @@ export function ShotsPage() {
               shot.is_stale ||
               (shot.source_type === "novel" &&
                 shot.source_signature &&
-                shot.source_signature !== activeProject?.source_signature);
+                shot.source_signature !== activeChapter?.source_signature);
 
             return (
               <Card
                 key={shot.id}
-                className="overflow-hidden"
+                className={`overflow-hidden ${cardSpacing} ${cardShape}`}
                 draggable
                 onDragStart={() => setDraggedId(shot.id)}
                 onDragEnd={() => setDraggedId("")}
@@ -711,6 +876,10 @@ export function ShotsPage() {
                           <StatusBadge status={shot.status} />
                           <Badge>
                             {shot.duration_sec}s · {shot.shot_type || "未定景别"}
+                          </Badge>
+                          <Badge>
+                            {transitionLabels[shot.transition_from_prev] ??
+                              "场景切换"}
                           </Badge>
                           {stale ? (
                             <Badge className="border-[#e2aa88] bg-[#fff3e9] text-[#833f24]">
@@ -961,25 +1130,6 @@ export function ShotsPage() {
                         ) : null}
                       </div>
                       <div className="flex gap-1">
-                        {shot.status !== "confirmed" ? (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            busy={
-                              updateMutation.isPending &&
-                              updateMutation.variables?.id === shot.id
-                            }
-                            onClick={() =>
-                              updateMutation.mutate({
-                                id: shot.id,
-                                patch: { status: "confirmed" },
-                              })
-                            }
-                          >
-                            <Check className="h-4 w-4" />
-                            确认
-                          </Button>
-                        ) : null}
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1318,6 +1468,30 @@ export function ShotsPage() {
               </div>
             </div>
 
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <Label>与上一镜衔接</Label>
+                <Select
+                  value={form.transition_from_prev || "scene_change"}
+                  onChange={(event) =>
+                    setForm((current) => ({
+                      ...current,
+                      transition_from_prev: event.target
+                        .value as ShotTransitionFromPrev,
+                    }))
+                  }
+                >
+                  <option value="continuous">连续承接（使用上一镜末帧）</option>
+                  <option value="elliptical">省略承接</option>
+                  <option value="same_scene_cut">同场切镜</option>
+                  <option value="scene_change">场景切换</option>
+                </Select>
+                <p className="mt-2 text-xs leading-5 text-muted">
+                  选“连续承接”时，前端列表会与上一镜紧贴，视频生成会引用上一镜最后一帧。
+                </p>
+              </div>
+            </div>
+
             <div className="grid gap-4 lg:grid-cols-2">
               <JsonEditor
                 label="人物站位"
@@ -1437,7 +1611,18 @@ export function ShotsPage() {
             />
           </div>
         </Modal>
+
+        <Modal
+          open={continuityOpen}
+          onClose={() => setContinuityOpen(false)}
+          title="连贯性检查"
+          description="连播预览整场视频，或用相邻镜头首末帧对比检查视觉衔接是否突兀。"
+          wide
+        >
+          <ContinuityCheck shots={shots} />
+        </Modal>
       </div>
+      </ChapterRequired>
     </ProjectRequired>
   );
 }

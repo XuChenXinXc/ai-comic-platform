@@ -15,13 +15,13 @@ from app.services.asset_service import AssetService
 router = APIRouter(tags=["assets"])
 
 
-@router.post("/projects/{project_id}/assets/extract", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/chapters/{chapter_id}/assets/extract", status_code=status.HTTP_202_ACCEPTED)
 def extract_assets(
-    project_id: str,
+    chapter_id: str,
     body: AssetExtractRequest,
     service: AssetService = Depends(get_asset_service),
 ) -> dict:
-    return service.queue_extract(project_id, body.model_dump())
+    return service.queue_extract(chapter_id, body.model_dump())
 
 
 @router.get("/projects/{project_id}/assets")

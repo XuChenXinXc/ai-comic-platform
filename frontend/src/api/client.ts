@@ -1,4 +1,5 @@
 import type {
+  Chapter,
   ApiProvider,
   Asset,
   AssetType,
@@ -13,6 +14,7 @@ import type {
   ProviderInput,
   ScreenplayContent,
   Shot,
+  ShotQualityReport,
 } from "../types/api";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "/api").replace(/\/$/, "");
@@ -100,6 +102,7 @@ function assetPayload(body: Partial<Asset>, includeType: boolean) {
     name: body.name,
     profile: body.profile_json ?? body.profile,
     prompt: body.prompt,
+    prompt_override: body.prompt_override,
     negative_prompt: body.negative_prompt,
     consistency_keywords:
       body.consistency_json ?? body.consistency_keywords,
@@ -133,6 +136,7 @@ function shotPayload(body: Partial<Shot>, includeCreateFields: boolean) {
     duration_sec: body.duration_sec,
     end_state: body.end_state,
     next_hook: body.next_hook,
+    transition_from_prev: body.transition_from_prev,
     frame_description: body.frame_description,
     image_prompt: body.image_prompt,
     image_prompt_override: body.image_prompt_override,
@@ -243,38 +247,61 @@ export const api = {
     exportVideos: (id: string, filename: string) =>
       download(`/projects/${id}/videos/export`, filename),
   },
-  analysis: {
-    get: (projectId: string) =>
-      request<ContentRecord>(`/projects/${projectId}/analysis`),
-    generate: (projectId: string, body: Record<string, unknown> = {}) =>
-      request<Job>(`/projects/${projectId}/analysis/generate`, json("POST", body)),
+  chapters: {
+    list: (projectId: string) => request<Chapter[]>(`/projects/${projectId}/chapters`),
+    get: (chapterId: string) => request<Chapter>(`/chapters/${chapterId}`),
+    create: (projectId: string, body: { title?: string; source_text?: string } = {}) =>
+      request<Chapter>(`/projects/${projectId}/chapters`, json("POST", body)),
     update: (
-      projectId: string,
+      chapterId: string,
+      body: { title?: string; source_text?: string; status?: string },
+    ) => request<Chapter>(`/chapters/${chapterId}`, json("PUT", body)),
+    deletePreview: (chapterId: string) =>
+      request<{
+        chapter_no: number;
+        title: string;
+        shot_count: number;
+        keyframe_count: number;
+        video_count: number;
+        note: string;
+      }>(`/chapters/${chapterId}/delete-preview`),
+    remove: (chapterId: string) =>
+      request<void>(`/chapters/${chapterId}`, json("DELETE")),
+    reorder: (projectId: string, ids: string[]) =>
+      request<Chapter[]>(`/projects/${projectId}/chapters/reorder`, json("POST", { ids })),
+  },
+  analysis: {
+    get: (chapterId: string) =>
+      request<ContentRecord>(`/chapters/${chapterId}/analysis`),
+    generate: (chapterId: string, body: Record<string, unknown> = {}) =>
+      request<Job>(`/chapters/${chapterId}/analysis/generate`, json("POST", body)),
+    update: (
+      chapterId: string,
       body: { content_json?: unknown; content?: unknown; status?: string },
-    ) => request<ContentRecord>(`/projects/${projectId}/analysis`, json("PUT", body)),
+    ) => request<ContentRecord>(`/chapters/${chapterId}/analysis`, json("PUT", body)),
   },
   screenplay: {
-    get: (projectId: string) =>
+    get: (chapterId: string) =>
       request<ContentRecord<ScreenplayContent>>(
-        `/projects/${projectId}/screenplay`,
+        `/chapters/${chapterId}/screenplay`,
       ),
-    generate: (projectId: string, body: Record<string, unknown> = {}) =>
-      request<Job>(`/projects/${projectId}/screenplay/generate`, json("POST", body)),
+    generate: (chapterId: string, body: Record<string, unknown> = {}) =>
+      request<Job>(`/chapters/${chapterId}/screenplay/generate`, json("POST", body)),
     regenerateScene: (
-      projectId: string,
+      chapterId: string,
       sceneNo: number,
       body: Record<string, unknown> = {},
     ) =>
       request<Job>(
-        `/projects/${projectId}/screenplay/scenes/${sceneNo}/generate`,
+        `/chapters/${chapterId}/screenplay/scenes/${sceneNo}/generate`,
         json("POST", body),
       ),
     update: (
-      projectId: string,
+      chapterId: string,
       body: { content_json?: unknown; content?: unknown; status?: string },
     ) =>
       request<ContentRecord<ScreenplayContent>>(
-        `/projects/${projectId}/screenplay`,
+        `/chapters/${chapterId}/screenplay`,
         json("PUT", body),
       ),
   },
@@ -286,10 +313,10 @@ export const api = {
         ),
       ),
     extract: (
-      projectId: string,
+      chapterId: string,
       body: { asset_types?: AssetType[] } = {},
     ) => request<Job | BatchResponse>(
-      `/projects/${projectId}/assets/extract`,
+      `/chapters/${chapterId}/assets/extract`,
       json("POST", body),
     ),
     create: (projectId: string, body: Partial<Asset>) =>
@@ -347,55 +374,112 @@ export const api = {
     },
   },
   shots: {
-    list: async (projectId: string) =>
+    list: async (chapterId: string) =>
       asList(
         await request<Shot[] | { items: Shot[] }>(
-          `/projects/${projectId}/shots`,
+          `/chapters/${chapterId}/shots`,
         ),
       ),
     extract: (
-      projectId: string,
+      chapterId: string,
       body: {
         scope?: "all" | "scene";
         scene_no?: number;
       },
     ) =>
       request<Job | BatchResponse>(
-        `/projects/${projectId}/shots/extract`,
+        `/chapters/${chapterId}/shots/extract`,
         json("POST", body),
       ),
-    create: (projectId: string, body: Partial<Shot>) =>
+    create: (chapterId: string, body: Partial<Shot>) =>
       request<Shot>(
-        `/projects/${projectId}/shots`,
+        `/chapters/${chapterId}/shots`,
         json("POST", shotPayload(body, true)),
       ),
     update: (id: string, body: Partial<Shot>) =>
       request<Shot>(`/shots/${id}`, json("PUT", shotPayload(body, false))),
     remove: (id: string) => request<void>(`/shots/${id}`, json("DELETE")),
-    reorder: (projectId: string, ids: string[]) =>
+    reorder: (chapterId: string, ids: string[]) =>
       request<Shot[]>(
-        `/projects/${projectId}/shots/reorder`,
+        `/chapters/${chapterId}/shots/reorder`,
         json("POST", { ids }),
       ),
     split: (id: string) =>
       request<Shot[]>(`/shots/${id}/split`, json("POST", {})),
     copy: (id: string) =>
       request<Shot>(`/shots/${id}/copy`, json("POST", {})),
-    merge: (projectId: string, ids: string[]) =>
+    merge: (chapterId: string, ids: string[]) =>
       request<Shot>(
-        `/projects/${projectId}/shots/merge`,
+        `/chapters/${chapterId}/shots/merge`,
         json("POST", { ids }),
       ),
     generateImagePrompt: (id: string, body: Record<string, unknown> = {}) =>
       request<Job>(`/shots/${id}/image-prompt/generate`, json("POST", body)),
     generateVideoPrompt: (id: string, body: Record<string, unknown> = {}) =>
       request<Job>(`/shots/${id}/video-prompt/generate`, json("POST", body)),
-    batchPrompts: (
+    optimizeVideoPrompt: (
+      id: string,
+      body: { prompt: string; provider_id?: string | null; params?: Record<string, unknown> },
+    ) =>
+      request<{ shot_id: string; original: string; prompt: string }>(
+        `/shots/${id}/video-prompt/optimize`,
+        json("POST", body),
+      ),
+    optimizeVideoPromptsAll: (
       projectId: string,
+      body: { ids?: string[]; provider_id?: string | null; params?: Record<string, unknown> } = {},
+    ) =>
+      request<BatchResponse>(
+        `/projects/${projectId}/video-prompts/optimize-all`,
+        json("POST", body),
+      ),
+    batchPrompts: (
+      chapterId: string,
       body: { ids?: string[]; prompt_types?: Array<"image" | "video"> } = {},
     ) =>
       request<BatchResponse>(
-        `/projects/${projectId}/shots/prompts/batch`,
+        `/chapters/${chapterId}/shots/prompts/batch`,
+        json("POST", body),
+      ),
+    checkContinuity: (
+      projectId: string,
+      body: {
+        ids?: string[];
+        apply_fixes?: boolean;
+        insert_transitions?: boolean;
+        provider_id?: string | null;
+        params?: Record<string, unknown>;
+      } = {},
+    ) =>
+      request<Job>(
+        `/projects/${projectId}/shots/continuity/check`,
+        json("POST", body),
+      ),
+    refinePrompts: (
+      projectId: string,
+      body: {
+        prompt_types?: Array<"image" | "video">;
+        chunk_size?: number;
+        provider_id?: string | null;
+        params?: Record<string, unknown>;
+      } = {},
+    ) =>
+      request<Job>(
+        `/projects/${projectId}/shots/prompts/refine`,
+        json("POST", body),
+      ),
+    qualityReport: (projectId: string) =>
+      request<ShotQualityReport>(`/projects/${projectId}/shots/quality-report`),
+    fixQuality: (
+      projectId: string,
+      body: {
+        ids?: string[];
+        provider_id?: string | null;
+        params?: Record<string, unknown>;
+      } = {},
+    ) =>
+      request<Job>(
+        `/projects/${projectId}/shots/quality-fix`,
         json("POST", body),
       ),
     keyframes: {
@@ -408,11 +492,11 @@ export const api = {
       generate: (shotId: string, body: Record<string, unknown> = {}) =>
         request<Job>(`/shots/${shotId}/keyframes/generate`, json("POST", body)),
       batch: (
-        projectId: string,
+        chapterId: string,
         body: { ids?: string[]; scene_no?: number } = {},
       ) =>
         request<BatchResponse>(
-          `/projects/${projectId}/keyframes/batch`,
+          `/chapters/${chapterId}/keyframes/batch`,
           json("POST", body),
         ),
       upload: (shotId: string, file: File) => {
@@ -438,11 +522,11 @@ export const api = {
       generate: (shotId: string, body: Record<string, unknown> = {}) =>
         request<Job>(`/shots/${shotId}/videos/generate`, json("POST", body)),
       batch: (
-        projectId: string,
+        chapterId: string,
         body: { ids?: string[]; scene_no?: number } = {},
       ) =>
         request<BatchResponse>(
-          `/projects/${projectId}/videos/batch`,
+          `/chapters/${chapterId}/videos/batch`,
           json("POST", body),
         ),
       upload: (shotId: string, file: File) => {

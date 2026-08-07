@@ -1,6 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Check,
   ImagePlus,
   ImageOff,
   Merge,
@@ -13,6 +12,8 @@ import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { api, mediaUrl, queryKeys } from "../api/client";
 import { AssetImagePanel } from "./AssetImagesPage";
+import { ChapterRequired } from "../components/chapter-required";
+import { ChapterSelector } from "../components/chapter-selector";
 import { ImagePreview } from "../components/image-preview";
 import { JsonEditor } from "../components/json-editor";
 import { ProjectRequired } from "../components/project-required";
@@ -35,6 +36,7 @@ import {
   Tabs,
   Textarea,
 } from "../components/ui";
+import { useChapter } from "../hooks/use-chapter";
 import { useProject } from "../hooks/use-project";
 import { formatError, parseJson } from "../lib/utils";
 import type { Asset, AssetType } from "../types/api";
@@ -84,7 +86,8 @@ function blankAsset(projectId: string, type: AssetType): Partial<Asset> {
 
 export function AssetsPage() {
   const queryClient = useQueryClient();
-  const { activeProject, activeProjectId } = useProject();
+  const { activeProjectId } = useProject();
+  const { activeChapterId } = useChapter();
   const [type, setType] = useState<AssetType>("character");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [editing, setEditing] = useState<Asset | "new" | null>(null);
@@ -117,8 +120,10 @@ export function AssetsPage() {
     }: {
       action: "extractCurrent" | "extractAll";
     }) => {
-      if (action === "extractAll") return api.assets.extract(activeProjectId);
-      return api.assets.extract(activeProjectId, { asset_types: [type] });
+      if (action === "extractAll") {
+        return api.assets.extract(activeChapterId);
+      }
+      return api.assets.extract(activeChapterId, { asset_types: [type] });
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({
@@ -171,21 +176,6 @@ export function AssetsPage() {
     onError: (error) => toast.error(formatError(error)),
   });
 
-  const updateMutation = useMutation({
-    mutationFn: ({
-      id,
-      patch,
-    }: {
-      id: string;
-      patch: Partial<Asset>;
-    }) => api.assets.update(id, patch),
-    onSuccess: async () => {
-      await invalidate();
-      toast.success("素材状态已更新");
-    },
-    onError: (error) => toast.error(formatError(error)),
-  });
-
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.assets.remove(id),
     onSuccess: async () => {
@@ -225,6 +215,7 @@ export function AssetsPage() {
 
   return (
     <ProjectRequired>
+      <ChapterRequired>
       <div>
         <PageHeader
           eyebrow="Step 03 / Asset library"
@@ -232,6 +223,7 @@ export function AssetsPage() {
           description="提取小说中的角色、场景与物品后自动补齐最终提示词，并在同一页面管理素材图片和历史版本。"
           actions={
             <>
+              <ChapterSelector />
               <Button onClick={openNew}>
                 <Plus className="h-4 w-4" />
                 新增{labels[type].single}
@@ -346,10 +338,7 @@ export function AssetsPage() {
               .flatMap(profileSummaryValues)
               .slice(0, 3)
               .join(" · ");
-            const stale =
-              asset.is_stale ||
-              (asset.source_signature &&
-                asset.source_signature !== activeProject?.source_signature);
+            const stale = Boolean(asset.is_stale);
             return (
               <Card key={asset.id} className="overflow-hidden">
                 <div className="grid sm:grid-cols-[150px_minmax(0,1fr)]">
@@ -425,27 +414,6 @@ export function AssetsPage() {
                       <p className="mt-2 max-h-44 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
                         {asset.compiled_prompt || asset.prompt}
                       </p>
-                    </div>
-                    <div className="mt-4 flex flex-wrap gap-2">
-                      {asset.status !== "confirmed" ? (
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          busy={
-                            updateMutation.isPending &&
-                            updateMutation.variables?.id === asset.id
-                          }
-                          onClick={() =>
-                            updateMutation.mutate({
-                              id: asset.id,
-                              patch: { status: "confirmed" },
-                            })
-                          }
-                        >
-                          <Check className="h-4 w-4" />
-                          确认
-                        </Button>
-                      ) : null}
                     </div>
                   </div>
                 </div>
@@ -611,6 +579,7 @@ export function AssetsPage() {
           </div>
         </Modal>
       </div>
+      </ChapterRequired>
     </ProjectRequired>
   );
 }

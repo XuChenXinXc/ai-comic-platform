@@ -1,7 +1,10 @@
 from fastapi import APIRouter, Depends, Response, status
 
 from app.api.schemas import (
+    ContinuityCheckRequest,
     GenerateRequest,
+    QualityFixRequest,
+    RefinePromptsRequest,
     ShotCopyRequest,
     ShotCreate,
     ShotExtractRequest,
@@ -10,6 +13,8 @@ from app.api.schemas import (
     ShotReorderRequest,
     ShotSplitRequest,
     ShotUpdate,
+    VideoPromptOptimizeAllRequest,
+    VideoPromptOptimizeRequest,
 )
 from app.dependencies import get_shot_service
 from app.services.shot_service import ShotService
@@ -17,30 +22,30 @@ from app.services.shot_service import ShotService
 router = APIRouter(tags=["shots"])
 
 
-@router.post("/projects/{project_id}/shots/extract", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/chapters/{chapter_id}/shots/extract", status_code=status.HTTP_202_ACCEPTED)
 def extract_shots(
-    project_id: str,
+    chapter_id: str,
     body: ShotExtractRequest,
     service: ShotService = Depends(get_shot_service),
 ) -> dict:
-    return service.queue_extract(project_id, body.model_dump())
+    return service.queue_extract(chapter_id, body.model_dump())
 
 
-@router.get("/projects/{project_id}/shots")
+@router.get("/chapters/{chapter_id}/shots")
 def list_shots(
-    project_id: str,
+    chapter_id: str,
     service: ShotService = Depends(get_shot_service),
 ) -> list[dict]:
-    return service.list(project_id)
+    return service.list(chapter_id)
 
 
-@router.post("/projects/{project_id}/shots", status_code=status.HTTP_201_CREATED)
+@router.post("/chapters/{chapter_id}/shots", status_code=status.HTTP_201_CREATED)
 def create_shot(
-    project_id: str,
+    chapter_id: str,
     body: ShotCreate,
     service: ShotService = Depends(get_shot_service),
 ) -> dict:
-    return service.create(project_id, body.model_dump())
+    return service.create(chapter_id, body.model_dump())
 
 
 @router.put("/shots/{shot_id}")
@@ -61,13 +66,13 @@ def delete_shot(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/projects/{project_id}/shots/reorder")
+@router.post("/chapters/{chapter_id}/shots/reorder")
 def reorder_shots(
-    project_id: str,
+    chapter_id: str,
     body: ShotReorderRequest,
     service: ShotService = Depends(get_shot_service),
 ) -> list[dict]:
-    return service.reorder(project_id, body.ids or [])
+    return service.reorder(chapter_id, body.ids or [])
 
 
 @router.post("/shots/{shot_id}/split")
@@ -97,13 +102,13 @@ def merge_shots(
     return service.merge(shot_id, body.ids or [])
 
 
-@router.post("/projects/{project_id}/shots/merge")
-def merge_project_shots(
-    project_id: str,
+@router.post("/chapters/{chapter_id}/shots/merge")
+def merge_chapter_shots(
+    chapter_id: str,
     body: ShotMergeRequest,
     service: ShotService = Depends(get_shot_service),
 ) -> dict:
-    return service.merge_many(project_id, body.ids or [])
+    return service.merge_many(chapter_id, body.ids or [])
 
 
 @router.post("/shots/{shot_id}/image-prompt/generate", status_code=status.HTTP_202_ACCEPTED)
@@ -124,13 +129,83 @@ def generate_shot_video_prompt(
     return service.queue_prompt(shot_id, "video", body.model_dump())
 
 
+@router.post("/shots/{shot_id}/video-prompt/optimize")
+async def optimize_shot_video_prompt(
+    shot_id: str,
+    body: VideoPromptOptimizeRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return await service.optimize_video_prompt(
+        shot_id,
+        prompt=body.prompt,
+        provider_id=body.provider_id,
+        params=body.params,
+    )
+
+
 @router.post(
-    "/projects/{project_id}/shots/prompts/batch",
+    "/projects/{project_id}/video-prompts/optimize-all",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def optimize_project_video_prompts(
+    project_id: str,
+    body: VideoPromptOptimizeAllRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return service.queue_video_prompt_optimize_batch(project_id, body.model_dump())
+
+
+@router.post(
+    "/chapters/{chapter_id}/shots/prompts/batch",
     status_code=status.HTTP_202_ACCEPTED,
 )
 def generate_shot_prompts_batch(
-    project_id: str,
+    chapter_id: str,
     body: ShotPromptBatchRequest,
     service: ShotService = Depends(get_shot_service),
 ) -> dict:
-    return service.queue_prompt_batch(project_id, body.model_dump())
+    return service.queue_prompt_batch(chapter_id, body.model_dump())
+
+
+@router.post(
+    "/projects/{project_id}/shots/continuity/check",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def check_shot_continuity(
+    project_id: str,
+    body: ContinuityCheckRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return service.queue_continuity_check(project_id, body.model_dump())
+
+
+@router.post(
+    "/projects/{project_id}/shots/prompts/refine",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def refine_shot_prompts(
+    project_id: str,
+    body: RefinePromptsRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return service.queue_refine_prompts(project_id, body.model_dump())
+
+
+@router.get("/projects/{project_id}/shots/quality-report")
+def shot_quality_report(
+    project_id: str,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return service.quality_report(project_id)
+
+
+@router.post(
+    "/projects/{project_id}/shots/quality-fix",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def fix_shot_quality(
+    project_id: str,
+    body: QualityFixRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return service.queue_quality_fix(project_id, body.model_dump())
