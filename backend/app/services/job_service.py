@@ -90,6 +90,7 @@ class JobService:
         *,
         project_id: str,
         job_type: str,
+        chapter_id: str | None = None,
         target_type: str = "",
         target_id: str | None = None,
         provider_kind: str = "",
@@ -101,6 +102,7 @@ class JobService:
         record = self.repository.create_job(
             JobCreate(
                 project_id=project_id,
+                chapter_id=chapter_id,
                 job_type=job_type,
                 target_type=target_type,
                 target_id=target_id,
@@ -227,12 +229,17 @@ class JobService:
         else:
             return
 
+        # 写作类目标（分析/剧本）自多章节改造起归属章节，
+        # 并发检查与状态回写都必须限定在同一章节内，否则会误伤其他章节。
+        chapter_id = record.get("chapter_id")
+        if not chapter_id:
+            return
         for table, related_job_types in targets:
             other_active = connection.execute(
                 select(job.c.id)
                 .where(
                     job.c.id != record["id"],
-                    job.c.project_id == record["project_id"],
+                    job.c.chapter_id == chapter_id,
                     job.c.job_type.in_(related_job_types),
                     job.c.status.in_(NON_TERMINAL_STATUSES),
                 )
@@ -243,7 +250,7 @@ class JobService:
             connection.execute(
                 update(table)
                 .where(
-                    table.c.project_id == record["project_id"],
+                    table.c.chapter_id == chapter_id,
                     table.c.status == "generating",
                 )
                 .values(

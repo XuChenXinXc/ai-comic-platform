@@ -105,6 +105,18 @@ def generate_keyframes_batch(
     return service.queue_keyframe_batch(project_id, body.model_dump())
 
 
+@router.post(
+    "/chapters/{chapter_id}/keyframes/batch",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def generate_keyframes_batch_chapter(
+    chapter_id: str,
+    body: MediaBatchRequest,
+    service: MediaService = Depends(get_media_service),
+) -> dict:
+    return service.queue_keyframe_batch_chapter(chapter_id, body.model_dump())
+
+
 @router.post("/shots/{shot_id}/keyframes/upload", status_code=status.HTTP_201_CREATED)
 async def upload_keyframe(
     shot_id: str,
@@ -166,6 +178,18 @@ def generate_videos_batch(
     service: MediaService = Depends(get_media_service),
 ) -> dict:
     return service.queue_video_batch(project_id, body.model_dump())
+
+
+@router.post(
+    "/chapters/{chapter_id}/videos/batch",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def generate_videos_batch_chapter(
+    chapter_id: str,
+    body: MediaBatchRequest,
+    service: MediaService = Depends(get_media_service),
+) -> dict:
+    return service.queue_video_batch_chapter(chapter_id, body.model_dump())
 
 
 @router.post("/shots/{shot_id}/videos/upload", status_code=status.HTTP_201_CREATED)

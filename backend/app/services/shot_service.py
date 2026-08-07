@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -10,6 +11,7 @@ from app.db import Database, db
 from app.models.tables import (
     asset,
     asset_image,
+    chapter,
     job,
     keyframe_version,
     project,
@@ -23,6 +25,8 @@ from app.schemas import (
     ShotContinuityPairOutput,
     ShotExtractionOutput,
     ShotImagePromptOutput,
+    ShotOutput,
+    ShotQualityFixOutput,
     ShotVideoPromptOptimizeOutput,
     ShotVideoPromptOutput,
 )
@@ -74,6 +78,7 @@ _SIGNATURE_FIELDS = (
     "duration_sec",
     "end_state",
     "next_hook",
+    "transition_from_prev",
     "frame_description",
     "image_prompt",
     "image_prompt_override",
@@ -113,6 +118,15 @@ class ShotService:
             )
         if record is None:
             raise not_found("项目")
+        return record
+
+    def _chapter(self, chapter_id: str) -> dict[str, Any]:
+        with self.database.engine.connect() as connection:
+            record = row_dict(
+                connection.execute(select(chapter).where(chapter.c.id == chapter_id)).first()
+            )
+        if record is None:
+            raise not_found("章节")
         return record
 
     @staticmethod
@@ -215,10 +229,9 @@ class ShotService:
     ) -> None:
         prev_end_state = ""
         if prev_shot:
-            # 仅同场景时交代前情：跨场景时上一镜结束位置与本镜起点无空间关联，
-            # 交代反而会让模型把两个场景混在同一画面里
-            same_scene = prev_shot.get("scene_asset_id") == current.get("scene_asset_id")
-            if same_scene:
+            # 文字前情只在动作确有承接时交代（continuous / elliptical）。
+            # 独立机位或换场景时交代上一镜结束位置，会让模型把两个画面混在一起。
+            if current.get("transition_from_prev") in {"continuous", "elliptical"}:
                 prev_end_state = str(
                     prev_shot.get("end_state") or prev_shot.get("next_hook") or ""
                 ).strip()
@@ -249,15 +262,38 @@ class ShotService:
         current["final_image_prompt"] = (
             str(current["image_prompt_override"] or "").strip() or current["compiled_image_prompt"]
         )
+
+        # 预览用的 @Image 编号必须与 media_service.queue_video 实际下发的顺序一致：
+        # 关键帧固定 @Image1，上一镜末帧（仅 continuous 且已生成）次之，其余素材顺延
+        has_prev_end_frame = False
+        if prev_shot and current.get("transition_from_prev") == "continuous":
+            has_prev_end_frame = bool(
+                connection.execute(
+                    select(video_version.c.end_frame_path)
+                    .where(
+                        video_version.c.shot_id == prev_shot["id"],
+                        video_version.c.is_current.is_(True),
+                        video_version.c.status == "completed",
+                        video_version.c.end_frame_path.isnot(None),
+                    )
+                    .limit(1)
+                ).scalar()
+            )
+
+        video_anchors = ["@Image1：当前分镜关键帧，锁定构图、人物左右关系和起始站位。"]
+        if has_prev_end_frame:
+            video_anchors.append("@Image2：上一镜结束帧，仅用于衔接连贯，不是本镜起始画面。")
+        base_index = len(video_anchors) + 1
+        video_anchors.extend(
+            f"@Image{base_index + index}：{label}。" for index, label in enumerate(labels)
+        )
+
         current["compiled_video_prompt"] = compile_video_prompt(
             style_prompt=current_project["style_prompt"],
             aspect_ratio=current_project["aspect_ratio"],
             video_prompt=video_prompt,
             duration_sec=current["duration_sec"],
-            anchors=[
-                "@Image1：当前分镜关键帧，锁定构图、人物左右关系和起始站位。",
-                *[f"@Image{index}：{label}。" for index, label in enumerate(labels, start=2)],
-            ],
+            anchors=video_anchors,
             shot_context=context,
             negative_prompt=current["negative_prompt"],
         )
@@ -265,11 +301,13 @@ class ShotService:
             str(current["video_prompt_override"] or "").strip() or current["compiled_video_prompt"]
         )
 
-    def list(self, project_id: str) -> list[dict[str, Any]]:
+    def list(self, chapter_id: str) -> list[dict[str, Any]]:
+        current_chapter = self._chapter(chapter_id)
+        project_id = current_chapter["project_id"]
         current_project = self._project(project_id)
         statement = (
             select(shot)
-            .where(shot.c.project_id == project_id)
+            .where(shot.c.chapter_id == chapter_id)
             .order_by(shot.c.shot_order, shot.c.shot_no)
         )
         with self.database.engine.connect() as connection:
@@ -279,7 +317,7 @@ class ShotService:
             for row in connection.execute(statement):
                 record = self._decode(dict(row._mapping))
                 source_now = self._current_source_signature(
-                    connection, current_project, record["source_type"]
+                    connection, current_chapter, record["source_type"]
                 )
                 record["is_stale"] = bool(
                     record["source_signature"] and record["source_signature"] != source_now
@@ -294,7 +332,26 @@ class ShotService:
             for i, record in enumerate(raw_records):
                 prev = raw_records[i - 1] if i > 0 else None
                 self._add_compiled_prompts(connection, current_project, record, prev)
+        for record in raw_records:
+            record["chapter_no"] = current_chapter["chapter_no"]
+            record["chapter_title"] = current_chapter["title"]
         return raw_records
+
+    def list_project(self, project_id: str) -> list[dict[str, Any]]:
+        """全书分镜，按章节序 + 镜序排列。供跨章节的审校、精修与质量报告使用。"""
+        self._project(project_id)
+        with self.database.engine.connect() as connection:
+            chapter_ids = list(
+                connection.execute(
+                    select(chapter.c.id)
+                    .where(chapter.c.project_id == project_id)
+                    .order_by(chapter.c.chapter_no)
+                ).scalars()
+            )
+        records: list[dict[str, Any]] = []
+        for chapter_id in chapter_ids:
+            records.extend(self.list(chapter_id))
+        return records
 
     def get(self, shot_id: str) -> dict[str, Any]:
         with self.database.engine.connect() as connection:
@@ -312,14 +369,14 @@ class ShotService:
     @staticmethod
     def _adjacent_shot_data(
         connection: Any,
-        project_id: str,
+        chapter_id: str,
         shot_id: str,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """返回上一镜和下一镜的轻量数据，供提示词生成时注入衔接信息。"""
         ordered_ids = list(
             connection.execute(
                 select(shot.c.id)
-                .where(shot.c.project_id == project_id)
+                .where(shot.c.chapter_id == chapter_id)
                 .order_by(shot.c.shot_order, shot.c.shot_no)
             ).scalars()
         )
@@ -355,25 +412,25 @@ class ShotService:
     def _current_source_signature(
         self,
         connection: Any,
-        project_record: dict[str, Any],
+        chapter_record: dict[str, Any],
         source_type: str,
     ) -> str:
         if source_type == "novel":
-            return project_record["source_signature"]
+            return chapter_record["source_signature"]
         return (
             connection.execute(
                 select(screenplay.c.own_signature).where(
-                    screenplay.c.project_id == project_record["id"]
+                    screenplay.c.chapter_id == chapter_record["id"]
                 )
             ).scalar()
             or ""
         )
 
-    def _source_signature(self, project_record: dict[str, Any], source_type: str) -> str:
+    def _source_signature(self, chapter_record: dict[str, Any], source_type: str) -> str:
         with self.database.engine.connect() as connection:
-            signature = self._current_source_signature(connection, project_record, source_type)
+            signature = self._current_source_signature(connection, chapter_record, source_type)
         if source_type == "screenplay" and not signature:
-            raise conflict("当前项目还没有可用剧本")
+            raise conflict("当前章节还没有可用剧本")
         return signature
 
     def _signature(self, values: dict[str, Any]) -> str:
@@ -474,24 +531,25 @@ class ShotService:
                 else:
                     raise bad_request(f"未知参考图职责：{role}")
 
-    def _next_numbers(self, connection: Any, project_id: str) -> tuple[int, int]:
+    def _next_numbers(self, connection: Any, chapter_id: str) -> tuple[int, int]:
         row = connection.execute(
             select(
                 func.max(shot.c.shot_no),
                 func.max(shot.c.shot_order),
-            ).where(shot.c.project_id == project_id)
+            ).where(shot.c.chapter_id == chapter_id)
         ).one()
         return (row[0] or 0) + 1, (row[1] or 0) + 1
 
-    def create(self, project_id: str, values: dict[str, Any]) -> dict[str, Any]:
-        current_project = self._project(project_id)
+    def create(self, chapter_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        current_chapter = self._chapter(chapter_id)
+        project_id = current_chapter["project_id"]
         if values.get("duration_sec") is None:
             raise bad_request("必须提供分镜时长")
         source_type = "screenplay"
         with self.database.engine.connect() as connection:
             source_signature = self._current_source_signature(
                 connection,
-                current_project,
+                current_chapter,
                 source_type,
             )
         self._validate_asset_ids(
@@ -507,6 +565,9 @@ class ShotService:
         semantic["duration_sec"] = values["duration_sec"]
         semantic.setdefault("image_prompt_override", "")
         semantic.setdefault("video_prompt_override", "")
+        # 该列 NOT NULL；调用方未指定时取安全侧默认（不引用上一镜末帧）
+        if not semantic.get("transition_from_prev"):
+            semantic["transition_from_prev"] = "scene_change"
         if not values.get("reference_bindings"):
             auto_bindings, _ = self._current_reference_bindings(
                 {
@@ -518,10 +579,11 @@ class ShotService:
             )
             semantic["reference_bindings"] = auto_bindings
         with self.database.engine.begin() as connection:
-            next_no, next_order = self._next_numbers(connection, project_id)
+            next_no, next_order = self._next_numbers(connection, chapter_id)
             record: dict[str, Any] = {
                 "id": new_id("shot"),
                 "project_id": project_id,
+                "chapter_id": chapter_id,
                 "shot_no": values.get("shot_no") or next_no,
                 "shot_order": values.get("shot_order") or next_order,
                 "source_signature": source_signature,
@@ -643,17 +705,17 @@ class ShotService:
         return self.get(shot_id)
 
     @staticmethod
-    def _temporary_number_start(connection: Any, project_id: str) -> int:
+    def _temporary_number_start(connection: Any, chapter_id: str) -> int:
         row = connection.execute(
             select(
                 func.max(shot.c.shot_no),
                 func.max(shot.c.shot_order),
-            ).where(shot.c.project_id == project_id)
+            ).where(shot.c.chapter_id == chapter_id)
         ).one()
         return max(row[0] or 0, row[1] or 0) + 1
 
-    def _renumber(self, connection: Any, project_id: str, ids: list[str]) -> None:
-        temporary_start = self._temporary_number_start(connection, project_id)
+    def _renumber(self, connection: Any, chapter_id: str, ids: list[str]) -> None:
+        temporary_start = self._temporary_number_start(connection, chapter_id)
         for offset, shot_id in enumerate(ids):
             connection.execute(
                 update(shot)
@@ -764,11 +826,11 @@ class ShotService:
             remaining = list(
                 connection.execute(
                     select(shot.c.id)
-                    .where(shot.c.project_id == current["project_id"])
+                    .where(shot.c.chapter_id == current["chapter_id"])
                     .order_by(shot.c.shot_order)
                 ).scalars()
             )
-            self._renumber(connection, current["project_id"], remaining)
+            self._renumber(connection, current["chapter_id"], remaining)
         for path in media_paths:
             file_service.delete_file(current["project_id"], path)
 
@@ -786,20 +848,29 @@ class ShotService:
                     )
                 ).scalars()
             )
+            if table is video_version:
+                paths.extend(
+                    connection.execute(
+                        select(table.c.end_frame_path).where(
+                            table.c.shot_id.in_(shot_ids),
+                            table.c.end_frame_path.is_not(None),
+                        )
+                    ).scalars()
+                )
         return paths
 
-    def reorder(self, project_id: str, ids: list[str]) -> list[dict[str, Any]]:
-        self._project(project_id)
+    def reorder(self, chapter_id: str, ids: list[str]) -> list[dict[str, Any]]:
+        self._chapter(chapter_id)
         with self.database.engine.begin() as connection:
             actual = list(
                 connection.execute(
-                    select(shot.c.id).where(shot.c.project_id == project_id)
+                    select(shot.c.id).where(shot.c.chapter_id == chapter_id)
                 ).scalars()
             )
             if len(ids) != len(actual) or set(ids) != set(actual):
-                raise bad_request("ids 必须包含当前项目的全部分镜且不能包含其他分镜")
-            self._renumber(connection, project_id, ids)
-        return self.list(project_id)
+                raise bad_request("ids 必须包含当前章节的全部分镜且不能包含其他分镜")
+            self._renumber(connection, chapter_id, ids)
+        return self.list(chapter_id)
 
     @staticmethod
     def _split_action(action: str) -> tuple[str, str]:
@@ -828,6 +899,7 @@ class ShotService:
                     "start_state": "承接上一镜结束状态",
                     "end_state": current["end_state"],
                     "duration_sec": max(current["duration_sec"] - first_duration, 0.1),
+                    "transition_from_prev": "continuous",
                 },
             ]
         parts = [
@@ -837,6 +909,18 @@ class ShotService:
                 "video_prompt_override": "",
             }
             for part in parts
+        ]
+        # 拆分后的后半镜默认与前半镜连续承接；用户可在编辑中再调整
+        parts = [
+            {
+                **part,
+                **(
+                    {"transition_from_prev": "continuous"}
+                    if index > 0 and "transition_from_prev" not in part
+                    else {}
+                ),
+            }
+            for index, part in enumerate(parts)
         ]
         self.update(shot_id, parts[0])
         created_ids = [shot_id]
@@ -854,25 +938,33 @@ class ShotService:
         overrides: dict[str, Any],
     ) -> dict[str, Any]:
         project_id = current["project_id"]
+        chapter_id = current["chapter_id"]
         with self.database.engine.begin() as connection:
             ordered = list(
                 connection.execute(
                     select(shot.c.id)
-                    .where(shot.c.project_id == project_id)
+                    .where(shot.c.chapter_id == chapter_id)
                     .order_by(shot.c.shot_order)
                 ).scalars()
             )
             try:
                 index = ordered.index(after_shot_id) + 1
             except ValueError as exc:
-                raise bad_request("插入位置不属于当前项目") from exc
+                raise bad_request("插入位置不属于当前章节") from exc
             new_id_value = new_id("shot")
             ordered.insert(index, new_id_value)
-            semantic = {key: overrides.get(key, current.get(key)) for key in _SIGNATURE_FIELDS}
+            semantic = {
+                key: overrides.get(
+                    key,
+                    "scene_change" if key == "transition_from_prev" else current.get(key),
+                )
+                for key in _SIGNATURE_FIELDS
+            }
             now = utc_now()
             record = {
                 "id": new_id_value,
                 "project_id": project_id,
+                "chapter_id": chapter_id,
                 "shot_no": 100000 + len(ordered),
                 "shot_order": 100000 + len(ordered),
                 "source_signature": current["source_signature"],
@@ -887,7 +979,7 @@ class ShotService:
                     value = semantic.get(key)
                     record[column] = json_dumps(value or []) if column.endswith("_json") else value
             connection.execute(insert(shot).values(**record))
-            self._renumber(connection, project_id, ordered)
+            self._renumber(connection, chapter_id, ordered)
         return self.get(new_id_value)
 
     def copy(self, shot_id: str, after_shot_id: str | None = None) -> dict[str, Any]:
@@ -900,8 +992,8 @@ class ShotService:
             return self.get(target_id)
         target = self.get(target_id)
         records = [target, *(self.get(item) for item in source_ids)]
-        if any(item["project_id"] != target["project_id"] for item in records):
-            raise bad_request("只能合并同一项目的分镜")
+        if any(item["chapter_id"] != target["chapter_id"] for item in records):
+            raise bad_request("只能合并同一章节的分镜")
         affected_ids = {item["id"] for item in records}
         records.sort(key=lambda item: item["shot_order"])
         merged = {
@@ -943,27 +1035,29 @@ class ShotService:
             remaining = list(
                 connection.execute(
                     select(shot.c.id)
-                    .where(shot.c.project_id == target["project_id"])
+                    .where(shot.c.chapter_id == target["chapter_id"])
                     .order_by(shot.c.shot_order)
                 ).scalars()
             )
-            self._renumber(connection, target["project_id"], remaining)
+            self._renumber(connection, target["chapter_id"], remaining)
         for path in media_paths:
             file_service.delete_file(target["project_id"], path)
         return self.get(target_id)
 
-    def merge_many(self, project_id: str, ids: list[str]) -> dict[str, Any]:
+    def merge_many(self, chapter_id: str, ids: list[str]) -> dict[str, Any]:
         if len(ids) < 2:
             raise bad_request("至少选择两个分镜")
         target = self.get(ids[0])
-        if target["project_id"] != project_id:
-            raise bad_request("分镜不属于当前项目")
+        if target["chapter_id"] != chapter_id:
+            raise bad_request("分镜不属于当前章节")
         return self.merge(ids[0], ids[1:])
 
-    def queue_extract(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
+    def queue_extract(self, chapter_id: str, options: dict[str, Any]) -> dict[str, Any]:
+        current_chapter = self._chapter(chapter_id)
+        project_id = current_chapter["project_id"]
         current_project = self._project(project_id)
         source_type = "screenplay"
-        self._source_signature(current_project, source_type)
+        self._source_signature(current_chapter, source_type)
         with self.database.engine.connect() as connection:
             scene_count = connection.execute(
                 select(func.count())
@@ -977,9 +1071,10 @@ class ShotService:
             raise conflict("请先提取场景素材，再提取分镜")
         return self.jobs.create(
             project_id=project_id,
+            chapter_id=chapter_id,
             job_type="extract_shots",
-            target_type="project",
-            target_id=project_id,
+            target_type="chapter",
+            target_id=chapter_id,
             provider_kind="text",
             provider_id=options.get("provider_id") or current_project["default_text_provider_id"],
             input_data={
@@ -1003,6 +1098,7 @@ class ShotService:
         )
         return self.jobs.create(
             project_id=current["project_id"],
+            chapter_id=current["chapter_id"],
             job_type=job_type,
             target_type="shot",
             target_id=shot_id,
@@ -1015,9 +1111,11 @@ class ShotService:
             ),
         )
 
-    def queue_prompt_batch(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
+    def queue_prompt_batch(self, chapter_id: str, options: dict[str, Any]) -> dict[str, Any]:
+        current_chapter = self._chapter(chapter_id)
+        project_id = current_chapter["project_id"]
         current_project = self._project(project_id)
-        statement = select(shot).where(shot.c.project_id == project_id)
+        statement = select(shot).where(shot.c.chapter_id == chapter_id)
         if options.get("ids"):
             statement = statement.where(shot.c.id.in_(options["ids"]))
         with self.database.engine.connect() as connection:
@@ -1033,6 +1131,7 @@ class ShotService:
                 items.append(
                     {
                         "project_id": project_id,
+                        "chapter_id": chapter_id,
                         "job_type": f"generate_shot_{prompt_type}_prompt",
                         "target_type": "shot",
                         "target_id": record["id"],
@@ -1049,40 +1148,153 @@ class ShotService:
         return self.jobs.create_batch(items)
 
     async def handle_extract(self, job: dict[str, Any]) -> dict[str, Any]:
-        current_project = self._project(job["project_id"])
+        current_chapter = self._chapter(job["chapter_id"])
+        current_project = self._project(current_chapter["project_id"])
         input_data = json_loads(job.get("input_json"), {})
         source_type = "screenplay"
         with self.database.engine.connect() as connection:
             content_raw = connection.execute(
                 select(screenplay.c.content_json).where(
-                    screenplay.c.project_id == current_project["id"]
+                    screenplay.c.chapter_id == current_chapter["id"]
                 )
             ).scalar()
         if not content_raw:
-            raise conflict("当前项目还没有可用剧本")
-        source_content = content_raw
+            raise conflict("当前章节还没有可用剧本")
+        screenplay_content = json_loads(content_raw, {})
+        scenes = (
+            screenplay_content.get("scenes")
+            if isinstance(screenplay_content, dict)
+            else None
+        )
         asset_catalog = self._asset_catalog(current_project["id"])
         if not any(item["asset_type"] == "scene" for item in asset_catalog):
             raise conflict("请先提取场景素材，再提取分镜")
         provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
-        output = await provider.generate_json(
-            system_prompt=load_prompt("shot_extract"),
-            user_prompt=(
-                f"来源类型：{source_type}\n"
-                f"范围：{input_data['scope']}\n"
-                f"目标场次：{input_data.get('scene_no') or '全部'}\n"
-                f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
-                f"来源内容：\n{source_content}"
-            ),
-            schema=ShotExtractionOutput,
-            params={**config["params"], **input_data.get("params", {})},
-        )
+        all_shots: list[dict[str, Any]] = []
+        all_warnings: list[dict[str, Any]] = []
+
+        # 对话多的剧本一次全量提取容易截断/漏镜，按场次逐个调用，任一场失败则整批不落库。
+        if isinstance(scenes, list) and scenes:
+            if input_data.get("scope") == "scene":
+                target_index = next(
+                    (
+                        index
+                        for index, scene in enumerate(scenes)
+                        if scene.get("scene_no") == input_data.get("scene_no")
+                    ),
+                    -1,
+                )
+                if target_index < 0:
+                    raise not_found("剧本场次")
+                scene_chunks = [scenes[target_index]]
+                prev_scene = scenes[target_index - 1] if target_index > 0 else None
+            else:
+                scene_chunks = scenes
+                prev_scene = None
+            total_scenes = len(scene_chunks)
+            for scene_index, scene in enumerate(scene_chunks, start=1):
+                scene_no = int(scene.get("scene_no") or 0)
+                continuity_context = ""
+                if prev_scene is not None:
+                    prev_transition = str(prev_scene.get("transition_to_next") or "").strip()
+                    continuity_context = (
+                        "\n\n上一场衔接信息（仅供本场首镜承接，不影响本场内容）："
+                        f"上一场「{prev_scene.get('scene_name') or ''}」结束时："
+                        f"{prev_transition or '无明确交代'}"
+                    )
+                scene_payload = json_dumps(
+                    {
+                        "title": screenplay_content.get("title", ""),
+                        "logline": screenplay_content.get("logline", ""),
+                        "scene": scene,
+                    }
+                )
+                output = await provider.generate_json(
+                    system_prompt=load_prompt("shot_extract"),
+                    user_prompt=(
+                        f"来源类型：{source_type}\n"
+                        f"范围：{input_data.get('scope', 'all')}\n"
+                        f"目标场次：{scene_no}\n"
+                        f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
+                        f"来源内容：\n{scene_payload}"
+                        f"{continuity_context}"
+                    ),
+                    schema=ShotExtractionOutput,
+                    params={**config["params"], **input_data.get("params", {})},
+                )
+                shots, warnings = self._collect_extraction_result(output)
+                if not shots:
+                    raise conflict(
+                        f"场次 {scene_no} 未提取到分镜，已中止整批提取，避免覆盖旧分镜"
+                    )
+                for shot in shots:
+                    shot["scene_no"] = scene_no
+                    if scene_no and not str(shot.get("source_ref") or "").strip():
+                        shot["source_ref"] = f"scene:{scene_no}"
+                all_shots.extend(shots)
+                all_warnings.extend(warnings)
+                prev_scene = scene
+                update_progress = getattr(self.jobs, "update_progress", None)
+                if update_progress is not None:
+                    update_progress(
+                        job["id"],
+                        scene_index,
+                        total_scenes,
+                        message=f"提取场次 {scene_no}（{scene_index}/{total_scenes}）",
+                    )
+        else:
+            # 旧格式/无 scenes 结构：整份内容单次提取，保持兼容
+            output = await provider.generate_json(
+                system_prompt=load_prompt("shot_extract"),
+                user_prompt=(
+                    f"来源类型：{source_type}\n"
+                    f"范围：{input_data.get('scope', 'all')}\n"
+                    f"目标场次：{input_data.get('scene_no') or '全部'}\n"
+                    f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
+                    f"来源内容：\n{content_raw}"
+                ),
+                schema=ShotExtractionOutput,
+                params={**config["params"], **input_data.get("params", {})},
+            )
+            all_shots, all_warnings = self._collect_extraction_result(output)
         return self._save_extracted(
-            current_project,
+            current_chapter,
             source_type,
             input_data,
-            output.model_dump(mode="json")["shots"],
+            all_shots,
+            all_warnings,
         )
+
+    @staticmethod
+    def _collect_extraction_result(
+        output: Any,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """把 provider 返回的分镜结果统一成 dict 列表，并收集质量警告。
+
+        output.shots 在真实链路是 ShotOutput 列表，测试替身里可能是 dict 列表，
+        这里两种都兼容；无法解析的项保留原 dict 交给 _save_extracted 处理。
+        """
+        raw_shots = output.shots
+        if isinstance(raw_shots, dict):
+            raw_shots = raw_shots.get("shots", [])
+        shots: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        for item in raw_shots:
+            checked = item if isinstance(item, ShotOutput) else None
+            if isinstance(item, dict):
+                shots.append(dict(item))
+                if checked is None:
+                    try:
+                        checked = ShotOutput.model_validate(item)
+                    except Exception:
+                        continue
+            elif checked is not None:
+                shots.append(checked.model_dump(mode="json"))
+            else:
+                continue
+            for message in checked.quality_warnings():
+                warnings.append({"shot_no": checked.shot_no, "message": message})
+        return shots, warnings
 
     def _asset_catalog(self, project_id: str) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -1204,13 +1416,17 @@ class ShotService:
 
     def _save_extracted(
         self,
-        current_project: dict[str, Any],
+        current_chapter: dict[str, Any],
         source_type: str,
         input_data: dict[str, Any],
         extracted_shots: list[dict[str, Any]],
+        quality_warnings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        asset_lookup = self._asset_lookup(current_project["id"])
-        source_signature = self._source_signature(current_project, source_type)
+        project_id = current_chapter["project_id"]
+        chapter_id = current_chapter["id"]
+        # 素材查找按项目（全书共用），分镜落库按章节
+        asset_lookup = self._asset_lookup(project_id)
+        source_signature = self._source_signature(current_chapter, source_type)
         normalized: list[dict[str, Any]] = []
         binding_errors: list[str] = []
         for extracted in extracted_shots:
@@ -1265,6 +1481,8 @@ class ShotService:
                 **item,
                 "image_prompt_override": "",
                 "video_prompt_override": "",
+                # LLM 未给出时兜底：该列 NOT NULL，且默认不引用上一镜末帧
+                "transition_from_prev": item.get("transition_from_prev") or "scene_change",
                 "reference_bindings": [],
                 "status": "ready",
             }
@@ -1281,9 +1499,7 @@ class ShotService:
         obsolete_paths: list[str] = []
         with self.database.engine.begin() as connection:
             existing_rows = connection.execute(
-                select(shot)
-                .where(shot.c.project_id == current_project["id"])
-                .order_by(shot.c.shot_order)
+                select(shot).where(shot.c.chapter_id == chapter_id).order_by(shot.c.shot_order)
             ).all()
             if scope_scene is None:
                 selected_existing = list(existing_rows)
@@ -1292,15 +1508,14 @@ class ShotService:
                 selected_existing = [
                     row for row in existing_rows if row.source_ref.startswith(prefix)
                 ]
+            if scope_scene is None and not normalized and selected_existing:
+                raise bad_request("提取结果为空，已保留现有分镜，未做覆盖删除")
             selected_ids = {row.id for row in selected_existing}
             self._ensure_no_active_jobs(
                 connection,
                 selected_ids,
             )
-            temporary_start = self._temporary_number_start(
-                connection,
-                current_project["id"],
-            )
+            temporary_start = self._temporary_number_start(connection, chapter_id)
             saved_ids: list[str] = []
             for index, semantic in enumerate(normalized):
                 record_id = (
@@ -1328,7 +1543,8 @@ class ShotService:
                     connection.execute(
                         insert(shot).values(
                             id=record_id,
-                            project_id=current_project["id"],
+                            project_id=project_id,
+                            chapter_id=chapter_id,
                             shot_no=temporary_start + index,
                             shot_order=temporary_start + index,
                             revision=1,
@@ -1350,7 +1566,7 @@ class ShotService:
                 )
                 self._remove_previous_keyframe_bindings(
                     connection,
-                    project_id=current_project["id"],
+                    project_id=project_id,
                     keyframe_ids=obsolete_keyframe_ids,
                 )
                 connection.execute(delete(shot).where(shot.c.id.in_([row.id for row in obsolete])))
@@ -1369,13 +1585,13 @@ class ShotService:
                     ordered_ids.append(row.id)
                 if not inserted:
                     ordered_ids.extend(saved_ids)
-            self._renumber(connection, current_project["id"], ordered_ids)
+            self._renumber(connection, chapter_id, ordered_ids)
         for path in obsolete_paths:
-            file_service.delete_file(current_project["id"], path)
+            file_service.delete_file(project_id, path)
         return {
             "shot_ids": saved_ids,
             "count": len(saved_ids),
-            "warnings": [],
+            "warnings": quality_warnings or [],
         }
 
     def _current_reference_bindings(
@@ -1411,19 +1627,16 @@ class ShotService:
                     warnings.append(f"素材 {asset_id} 缺少当前参考图，将使用纯文字降级")
         return bindings, warnings
 
-    def _prev_keyframe_binding(
-        self, current: dict[str, Any]
-    ) -> dict[str, Any] | None:
+    def _prev_keyframe_binding(self, current: dict[str, Any]) -> dict[str, Any] | None:
         """查询上一镜的已完成关键帧，返回 previous_keyframe binding；无则返回 None。
 
         结果不写库，仅在生成关键帧提示词时临时注入，用于图生图锁定前镜构图连续性。
         """
-        project_id = current["project_id"]
         with self.database.engine.connect() as connection:
             ordered_ids = list(
                 connection.execute(
                     select(shot.c.id)
-                    .where(shot.c.project_id == project_id)
+                    .where(shot.c.chapter_id == current["chapter_id"])
                     .order_by(shot.c.shot_order, shot.c.shot_no)
                 ).scalars()
             )
@@ -1431,6 +1644,7 @@ class ShotService:
                 idx = ordered_ids.index(current["id"])
             except ValueError:
                 return None
+            # 本章首镜没有可承接的前帧
             if idx == 0:
                 return None
             prev_id = ordered_ids[idx - 1]
@@ -1484,7 +1698,7 @@ class ShotService:
         # 方案B：注入前后镜衔接信息，让 LLM 感知剧情节点
         with self.database.engine.connect() as connection:
             prev_data, next_data = self._adjacent_shot_data(
-                connection, current["project_id"], current["id"]
+                connection, current["chapter_id"], current["id"]
             )
         adjacent_context = self._adjacent_context_text(prev_data, next_data)
         output = await provider.generate_json(
@@ -1540,7 +1754,7 @@ class ShotService:
         # 方案B：注入前后镜衔接信息
         with self.database.engine.connect() as connection:
             prev_data, next_data = self._adjacent_shot_data(
-                connection, current["project_id"], current["id"]
+                connection, current["chapter_id"], current["id"]
             )
         adjacent_context = self._adjacent_context_text(prev_data, next_data)
         output = await provider.generate_json(
@@ -1589,7 +1803,7 @@ class ShotService:
             asset_names = self._asset_names(connection, current)
             # 传入前后镜衔接信息，避免优化时把承接句当作重复描述删除
             prev_data, next_data = self._adjacent_shot_data(
-                connection, current["project_id"], current["id"]
+                connection, current["chapter_id"], current["id"]
             )
         context = shot_template_context(current, asset_names)
         adjacent_context = self._adjacent_context_text(prev_data, next_data)
@@ -1713,7 +1927,7 @@ class ShotService:
         provider_id = job.get("provider_id")
         params = input_data.get("params", {})
         requested_ids = {str(item) for item in (input_data.get("ids") or [])}
-        shots = self.list(project_id)
+        shots = self.list_project(project_id)
         targets = [
             item
             for item in shots
@@ -1847,39 +2061,140 @@ class ShotService:
         return None
 
     def _shots_lightweight(self, project_id: str) -> list[dict[str, Any]]:
-        """按顺序返回分镜轻量数据，只取连续性审校所需字段，避免全量编译提示词。"""
+        """按顺序返回分镜轻量数据，只取连续性审校所需字段，避免全量编译提示词。
+
+        字段集需与 shot_continuity.md 的审校维度保持一致：缺字段会让对应维度
+        无法判断（模型看不到依据只能跳过），因此新增审校维度时必须同步这里。
+        """
         with self.database.engine.connect() as connection:
             rows = connection.execute(
                 select(
                     shot.c.id,
                     shot.c.shot_no,
                     shot.c.shot_order,
+                    shot.c.chapter_id,
                     shot.c.source_type,
                     shot.c.source_ref,
                     shot.c.scene_asset_id,
                     shot.c.character_ids_json,
                     shot.c.prop_ids_json,
+                    shot.c.positions_json,
+                    shot.c.expressions_json,
+                    shot.c.dialogue_json,
+                    shot.c.narration,
                     shot.c.action,
                     shot.c.start_state,
                     shot.c.end_state,
                     shot.c.next_hook,
+                    shot.c.transition_from_prev,
                     shot.c.shot_type,
                     shot.c.camera_angle,
                     shot.c.camera_move,
                     shot.c.duration_sec,
+                    shot.c.video_prompt,
+                    shot.c.video_prompt_override,
                     shot.c.revision,
                 )
                 .where(shot.c.project_id == project_id)
                 .order_by(shot.c.shot_order, shot.c.shot_no)
             ).all()
+            chapter_meta = {
+                row.id: (row.chapter_no, row.title)
+                for row in connection.execute(
+                    select(chapter.c.id, chapter.c.chapter_no, chapter.c.title).where(
+                        chapter.c.project_id == project_id
+                    )
+                )
+            }
+            asset_names = {
+                row.id: row.name
+                for row in connection.execute(
+                    select(asset.c.id, asset.c.name).where(asset.c.project_id == project_id)
+                )
+            }
         result = []
         for row in rows:
             item = dict(row._mapping)
             item["character_ids"] = json_loads(item.pop("character_ids_json", "[]"), [])
             item["prop_ids"] = json_loads(item.pop("prop_ids_json", "[]"), [])
+            item["positions"] = json_loads(item.pop("positions_json", "[]"), [])
+            item["expressions"] = json_loads(item.pop("expressions_json", "[]"), [])
+            item["dialogue"] = json_loads(item.pop("dialogue_json", "[]"), [])
+            # 审校时模型需要看到可读名称而不是素材 ID
+            item["prop_names"] = [asset_names[i] for i in item["prop_ids"] if i in asset_names]
+            item["scene_name"] = asset_names.get(item.get("scene_asset_id") or "", "")
             item["project_id"] = project_id
+            meta = chapter_meta.get(item.get("chapter_id") or "", (0, ""))
+            item["chapter_no"], item["chapter_title"] = meta
             result.append(item)
+        # 审校按「章节序 → 镜序」排列，使章节交界处的相邻镜也能被两两比对
+        result.sort(key=lambda x: (x["chapter_no"], x["shot_order"], x["shot_no"]))
         return result
+
+    @staticmethod
+    def _continuity_shot_brief(current: dict[str, Any], *, is_previous: bool) -> str:
+        """把单镜数据渲染成审校用的可读文本，字段与 shot_continuity.md 维度对应。"""
+        lines = [
+            f"景别/机位：{current.get('shot_type') or '未填'} / "
+            f"{current.get('camera_angle') or '未填'}",
+            f"场景：{current.get('scene_name') or '未绑定'}",
+            f"时长：{current.get('duration_sec')} 秒",
+            f"action: {current.get('action') or ''}",
+        ]
+        if is_previous:
+            lines.append(f"end_state: {current.get('end_state') or ''}")
+            lines.append(f"next_hook: {current.get('next_hook') or ''}")
+        else:
+            lines.append(f"start_state: {current.get('start_state') or ''}")
+            # 后一镜才有衔接类型语义：它描述的是「与上一镜的关系」
+            lines.append(
+                f"transition_from_prev: {current.get('transition_from_prev') or 'scene_change'}"
+            )
+        positions = "；".join(
+            f"{item.get('character', '角色')}：{item.get('position', '')}"
+            f"{'，朝向' + item['facing'] if item.get('facing') else ''}"
+            for item in current.get("positions", [])
+            if isinstance(item, dict)
+        )
+        expressions = "；".join(
+            f"{item.get('character', '角色')}：{item.get('expression', '')}"
+            for item in current.get("expressions", [])
+            if isinstance(item, dict)
+        )
+        dialogue = "；".join(
+            f"{item.get('speaker', '角色')}「{item.get('text', '')}」"
+            for item in current.get("dialogue", [])
+            if isinstance(item, dict)
+        )
+        lines.append(f"positions: {positions or '（无）'}")
+        lines.append(f"expressions: {expressions or '（无）'}")
+        lines.append(f"dialogue: {dialogue or '（无画面内对白）'}")
+        lines.append(f"narration: {current.get('narration') or '（无）'}")
+        lines.append(f"持有道具: {'、'.join(current.get('prop_names', [])) or '（无绑定道具）'}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _resolve_fix_target(
+        prev_s: dict[str, Any],
+        next_s: dict[str, Any],
+        shot_no: Any,
+        field: str,
+    ) -> str | None:
+        """把审校 fix 定位到具体分镜，避免跨章节同 shot_no 改错对象。
+
+        end_state/next_hook 只属于上一镜，start_state/transition_from_prev 只属于下一镜；
+        其余字段按 shot_no 在两镜中匹配，匹配不到就放弃（不落到其他章节）。
+        """
+        if field in ("end_state", "next_hook"):
+            candidates = (prev_s,)
+        elif field in ("start_state", "transition_from_prev"):
+            candidates = (next_s,)
+        else:
+            candidates = (prev_s, next_s)
+        for candidate in candidates:
+            if candidate["shot_no"] == shot_no:
+                return candidate["id"]
+        return None
 
     def queue_continuity_check(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
         """入队连续性审校任务；progress_total 按分镜对数估算。"""
@@ -1929,7 +2244,7 @@ class ShotService:
                 if all_shots[i]["id"] in requested_ids or all_shots[i + 1]["id"] in requested_ids
             ]
         else:
-            pairs = list(zip(all_shots[:-1], all_shots[1:]))
+            pairs = list(zip(all_shots[:-1], all_shots[1:], strict=True))
         if not pairs:
             return {
                 "total_pairs": 0,
@@ -1946,44 +2261,76 @@ class ShotService:
         raw_results: list[dict[str, Any]] = []
         for index, (prev_s, next_s) in enumerate(pairs, start=1):
             try:
+                same_scene_label = (
+                    "是"
+                    if prev_s.get("scene_asset_id") == next_s.get("scene_asset_id")
+                    else "否（发生场景切换）"
+                )
                 output = await provider.generate_json(
                     system_prompt=load_prompt("shot_continuity"),
                     user_prompt=(
-                        f"上一镜（镜{prev_s['shot_no']}）：\n"
-                        f"action: {prev_s.get('action', '')}\n"
-                        f"end_state: {prev_s.get('end_state', '')}\n"
-                        f"next_hook: {prev_s.get('next_hook', '')}\n\n"
-                        f"下一镜（镜{next_s['shot_no']}）：\n"
-                        f"action: {next_s.get('action', '')}\n"
-                        f"start_state: {next_s.get('start_state', '')}\n"
-                        f"同场景: {'是' if prev_s.get('scene_asset_id') == next_s.get('scene_asset_id') else '否'}"
+                        f"上一镜（第{prev_s.get('chapter_no')}章 镜{prev_s['shot_no']}）：\n"
+                        f"{self._continuity_shot_brief(prev_s, is_previous=True)}\n\n"
+                        f"下一镜（第{next_s.get('chapter_no')}章 镜{next_s['shot_no']}）：\n"
+                        f"{self._continuity_shot_brief(next_s, is_previous=False)}\n\n"
+                        f"两镜是否同场景：{same_scene_label}"
+                        + (
+                            f"\n\n【跨章节衔接】上一镜属于第{prev_s.get('chapter_no')}章"
+                            f"「{prev_s.get('chapter_title') or ''}」，"
+                            f"下一镜属于第{next_s.get('chapter_no')}章"
+                            f"「{next_s.get('chapter_title') or ''}」。"
+                            "章节之间的时间与地点跳跃属于正常叙事切换，不要报为断层；"
+                            "只检查人物状态是否矛盾、关键道具是否无故消失。"
+                            if prev_s.get("chapter_id") != next_s.get("chapter_id")
+                            else ""
+                        )
                     ),
                     schema=ShotContinuityPairOutput,
                     params={**config["params"], **params},
                 )
                 raw_results.append(output.model_dump(mode="json"))
             except Exception as exc:
-                raw_results.append({
-                    "prev_shot_no": prev_s["shot_no"],
-                    "next_shot_no": next_s["shot_no"],
-                    "is_continuous": True,
-                    "issues": [],
-                    "fixes": [],
-                    "transition": None,
-                    "error": sanitize_error_message(exc),
-                })
+                raw_results.append(
+                    {
+                        "prev_shot_no": prev_s["shot_no"],
+                        "next_shot_no": next_s["shot_no"],
+                        "is_continuous": True,
+                        "issues": [],
+                        "fixes": [],
+                        "transition": None,
+                        "error": sanitize_error_message(exc),
+                    }
+                )
             self.jobs.update_progress(
                 job["id"], index, len(pairs), message=f"审校 {index}/{len(pairs)} 对"
             )
         # ── 第二轮：应用字段修正 ──────────────────────────────────────────
-        shot_no_map = {s["shot_no"]: s["id"] for s in all_shots}
         total_fixes = 0
         if apply_fixes:
-            for pair_result in raw_results:
+            for (prev_s, next_s), pair_result in zip(
+                pairs,
+                raw_results,
+                strict=True,
+            ):
                 for fix in pair_result.get("fixes", []):
-                    target_id = shot_no_map.get(fix.get("shot_no"))
                     field = fix.get("field")
-                    if target_id and field in ("end_state", "start_state", "next_hook", "action", "narration"):
+                    allowed_fields = (
+                        "end_state",
+                        "start_state",
+                        "next_hook",
+                        "action",
+                        "narration",
+                        "transition_from_prev",
+                    )
+                    if field not in allowed_fields:
+                        continue
+                    target_id = self._resolve_fix_target(
+                        prev_s,
+                        next_s,
+                        fix.get("shot_no"),
+                        field,
+                    )
+                    if target_id:
                         try:
                             self.update(target_id, {field: fix["suggested_value"]})
                             total_fixes += 1
@@ -2013,6 +2360,7 @@ class ShotService:
                             "image_prompt_override": "",
                             "video_prompt_override": "",
                             "next_hook": next_s.get("start_state", ""),
+                            "transition_from_prev": "continuous",
                             "frame_description": (
                                 f"镜{prev_s['shot_no']}至镜{next_s['shot_no']}的过渡动作"
                             ),
@@ -2078,7 +2426,7 @@ class ShotService:
         source_field = f"final_{prompt_type}_prompt"
         target_field = f"{prompt_type}_prompt_override"
         type_label = "关键帧图片提示词" if prompt_type == "image" else "视频提示词"
-        shots = self.list(current_project["id"])
+        shots = self.list_project(current_project["id"])
         targets = [item for item in shots if str(item.get(source_field) or "").strip()]
         if len(targets) < 2:
             return {
@@ -2087,9 +2435,7 @@ class ShotService:
                 "applied": 0,
                 "skipped": len(targets),
                 "changes": [],
-                "failures": [
-                    {"error": f"至少需要两个已有{type_label}的分镜，本类型跳过"}
-                ],
+                "failures": [{"error": f"至少需要两个已有{type_label}的分镜，本类型跳过"}],
             }
         provider, config = self.providers.resolve(
             kind="text",
@@ -2146,7 +2492,7 @@ class ShotService:
                     )
                     skipped += len(block)
                 else:
-                    for item, text in zip(block, refined):
+                    for item, text in zip(block, refined, strict=True):
                         try:
                             self.update(
                                 item["id"],
@@ -2203,7 +2549,8 @@ class ShotService:
         input_data = json_loads(job.get("input_json"), {})
         chunk_size = max(2, int(input_data.get("chunk_size") or 6))
         prompt_types = [
-            item for item in (input_data.get("prompt_types") or ["video"])
+            item
+            for item in (input_data.get("prompt_types") or ["video"])
             if item in ("image", "video")
         ] or ["video"]
         params = input_data.get("params", {})
@@ -2233,6 +2580,199 @@ class ShotService:
             "changes": [change for item in per_type for change in item["changes"]],
             "failures": [failure for item in per_type for failure in item["failures"]],
             "per_type": per_type,
+        }
+
+    @staticmethod
+    def _shot_quality_warnings(current: dict[str, Any]) -> list[str]:
+        """对已入库的分镜复算质量警告，复用 ShotOutput 的判定逻辑。
+
+        入库记录字段与 ShotOutput 不完全一致（如 dialogue 为 dict 列表），
+        因此这里构造一个仅含判定所需字段的临时对象。
+        """
+        posture_verbs = ShotOutput.POSTURE_VERBS
+        unfinished = ShotOutput.UNFINISHED_MARKERS
+        warnings: list[str] = []
+        end_state = str(current.get("end_state") or "")
+        video_prompt = str(current.get("video_prompt_override") or "") or str(
+            current.get("video_prompt") or ""
+        )
+        hit = [verb for verb in posture_verbs if verb in end_state]
+        if (
+            hit
+            and not any(verb in video_prompt for verb in posture_verbs)
+            and not any(marker in end_state for marker in unfinished)
+        ):
+            warnings.append(
+                f"end_state 含姿态动词「{hit[0]}」，但 video_prompt 时间轴没有对应调度。"
+                f"建议在时间轴补一段该动作（并相应增加 duration_sec），"
+                f"或把 end_state 改为「仍…，准备{hit[0]}」的未完成表述。"
+            )
+        dialogue = [item for item in current.get("dialogue", []) if isinstance(item, dict)]
+        duration = float(current.get("duration_sec") or 0)
+        if dialogue and 0 < duration < 12:
+            total = sum(len(str(item.get("text") or "")) for item in dialogue)
+            dialogue_focused = ShotOutput._is_dialogue_focused(current.get("action"))
+            usable_rate = 2.5 if dialogue_focused else 2 * 0.8
+            threshold = int(duration * usable_rate)
+            if total > threshold:
+                recommended_sec = math.ceil(total / usable_rate)
+                rate_label = (
+                    "2.5字/秒（纯对白）"
+                    if dialogue_focused
+                    else "2字/秒+20%动作余量"
+                )
+                warnings.append(
+                    f"{duration:g}秒内台词共{total}字，超出建议阈值{threshold}字"
+                    f"（按{rate_label}计算）。"
+                    f"建议延长时长至{recommended_sec}秒以上，或压缩台词。"
+                )
+        timeline_warning = ShotOutput.timeline_conflict_warning(video_prompt)
+        if timeline_warning:
+            warnings.append(timeline_warning)
+        return warnings
+
+    def quality_report(self, project_id: str) -> dict[str, Any]:
+        """扫描全部分镜，返回存在质量问题的分镜清单，供前端展示与触发修复。"""
+        self._project(project_id)
+        items: list[dict[str, Any]] = []
+        for current in self._shots_lightweight(project_id):
+            warnings = self._shot_quality_warnings(current)
+            if warnings:
+                items.append(
+                    {
+                        "shot_id": current["id"],
+                        "shot_no": current["shot_no"],
+                        "chapter_no": current.get("chapter_no", 0),
+                        "chapter_title": current.get("chapter_title", ""),
+                        "duration_sec": current["duration_sec"],
+                        "warnings": warnings,
+                    }
+                )
+        return {"total": len(items), "items": items}
+
+    def queue_quality_fix(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
+        """入队质量修复任务：只处理存在警告的分镜。"""
+        current_project = self._project(project_id)
+        report = self.quality_report(project_id)
+        requested = {str(item) for item in (options.get("ids") or [])}
+        targets = [
+            item for item in report["items"] if not requested or item["shot_id"] in requested
+        ]
+        if not targets:
+            raise bad_request("当前没有需要修复的分镜")
+        return self.jobs.create(
+            project_id=project_id,
+            job_type="fix_shot_quality",
+            target_type="project",
+            target_id=project_id,
+            provider_kind="text",
+            provider_id=options.get("provider_id") or current_project["default_text_provider_id"],
+            input_data={
+                "ids": [item["shot_id"] for item in targets],
+                "params": options.get("params", {}),
+            },
+            progress_total=len(targets),
+        )
+
+    async def handle_quality_fix(self, job: dict[str, Any]) -> dict[str, Any]:
+        """逐个修复存在质量警告的分镜，只写回模型声明修改的字段。"""
+        project_id = str(job["target_id"])
+        current_project = self._project(project_id)
+        input_data = json_loads(job.get("input_json"), {})
+        requested = [str(item) for item in (input_data.get("ids") or [])]
+        params = input_data.get("params", {})
+        provider, config = self.providers.resolve(
+            kind="text",
+            provider_id=job.get("provider_id") or current_project["default_text_provider_id"],
+        )
+        fixed = 0
+        skipped = 0
+        failures: list[dict[str, Any]] = []
+        changes: list[dict[str, Any]] = []
+        total = len(requested)
+        for index, shot_id in enumerate(requested, start=1):
+            try:
+                current = self.get(shot_id)
+            except ServiceError:
+                skipped += 1
+                failures.append({"shot_id": shot_id, "error": "分镜已被删除，跳过"})
+                self.jobs.update_progress(job["id"], index, total)
+                continue
+            warnings = self._shot_quality_warnings(current)
+            if not warnings:
+                # 期间已被手动改好
+                skipped += 1
+                self.jobs.update_progress(job["id"], index, total)
+                continue
+            try:
+                effective_video_prompt = str(
+                    current.get("video_prompt_override") or current.get("video_prompt") or ""
+                )
+                output = await provider.generate_json(
+                    system_prompt=load_prompt("shot_quality_fix"),
+                    user_prompt=(
+                        f"分镜编号：镜{current['shot_no']}\n"
+                        f"duration_sec：{current['duration_sec']}\n"
+                        f"action：{current.get('action') or ''}\n"
+                        f"start_state：{current.get('start_state') or ''}\n"
+                        f"end_state：{current.get('end_state') or ''}\n"
+                        f"video_prompt：{effective_video_prompt}\n"
+                        f"dialogue：{json_dumps(current.get('dialogue', []))}\n\n"
+                        "需要修复的问题：\n" + "\n".join(f"- {item}" for item in warnings)
+                    ),
+                    schema=ShotQualityFixOutput,
+                    params={**config["params"], **params},
+                )
+                result = output.model_dump(mode="json", exclude_none=True)
+                updates = {
+                    name: result[name]
+                    for name in result.get("changed_fields", [])
+                    if name in result
+                }
+                if not updates:
+                    skipped += 1
+                    failures.append({"shot_id": shot_id, "error": "模型未返回任何修改"})
+                else:
+                    self.update(shot_id, updates, expected_revision=current["revision"])
+                    fixed += 1
+                    changes.append(
+                        {
+                            "shot_id": shot_id,
+                            "shot_no": current["shot_no"],
+                            "changed_fields": result.get("changed_fields", []),
+                            "reason": result.get("reason", ""),
+                        }
+                    )
+            except ServiceError as exc:
+                if exc.status_code not in {404, 409}:
+                    raise
+                skipped += 1
+                failures.append(
+                    {
+                        "shot_id": shot_id,
+                        "shot_no": current["shot_no"],
+                        "error": (
+                            "分镜已被其他请求更新，本次跳过"
+                            if exc.status_code == 409
+                            else "分镜已被删除，跳过"
+                        ),
+                    }
+                )
+            except Exception as exc:
+                failures.append(
+                    {
+                        "shot_id": shot_id,
+                        "shot_no": current["shot_no"],
+                        "error": sanitize_error_message(exc),
+                    }
+                )
+            self.jobs.update_progress(job["id"], index, total, message=f"修复中 {index}/{total}")
+        return {
+            "total": total,
+            "fixed": fixed,
+            "skipped": skipped,
+            "changes": changes,
+            "failures": failures,
         }
 
     @staticmethod

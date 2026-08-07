@@ -35,6 +35,7 @@ def register_handlers(
         "generate_shot_video_prompt": shots.handle_video_prompt,
         "optimize_shot_video_prompts": shots.handle_optimize_video_prompts,
         "check_shot_continuity": shots.handle_continuity_check,
+        "fix_shot_quality": shots.handle_quality_fix,
         "refine_prompts_continuity": shots.handle_refine_prompts,
         "generate_asset_image": media.handle_asset_image,
         "generate_keyframe": media.handle_keyframe,

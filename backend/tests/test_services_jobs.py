@@ -23,6 +23,7 @@ from app.models.tables import (
 )
 from app.schemas import ProviderSubmission
 from app.services.asset_service import AssetService
+from app.services.chapter_service import ChapterService
 from app.services.errors import ServiceError
 from app.services.file_service import FileService, FileServiceError, file_service
 from app.services.job_service import JobService
@@ -49,13 +50,15 @@ def _shot_create(**values: Any) -> ShotCreate:
 def job_service(tmp_path: Path) -> JobService:
     database = Database(f"sqlite:///{(tmp_path / 'jobs.db').as_posix()}")
     database.initialize(seed_mock_providers=True)
-    project = ProjectService(database, FileService(tmp_path)).create(
-        {"name": "任务测试", "source_text": ""}
+    project = ProjectService(database, FileService(tmp_path)).create({"name": "任务测试"})
+    chapter = ChapterService(database, FileService(tmp_path)).create(
+        project["id"], {"title": "第一章"}
     )
     repository = JobRepository(database)
     runner = JobRunner(repository, {"text": 1, "image": 1, "video": 1})
     service = JobService(database, repository=repository, runner=runner)
     service.project_id = project["id"]  # type: ignore[attr-defined]
+    service.chapter_id = chapter["id"]  # type: ignore[attr-defined]
     yield service
     runner.shutdown()
     database.dispose()
@@ -74,7 +77,8 @@ def media_job_services(
     repository = JobRepository(database)
     runner = JobRunner(repository, {"text": 1, "image": 1, "video": 1})
     jobs = JobService(database, repository=repository, runner=runner)
-    project = ProjectService(database).create({"name": "媒体任务测试", "source_text": ""})
+    project = ProjectService(database).create({"name": "媒体任务测试"})
+    chapter = ChapterService(database).create(project["id"], {"title": "第一章"})
     media = MediaService(database, jobs)
     scene = AssetService(database, jobs).create(
         project["id"],
@@ -88,6 +92,7 @@ def media_job_services(
         "jobs": jobs,
         "media": media,
         "project": project,
+        "chapter": chapter,
         "scene": scene,
         "scene_image": scene_image,
     }
@@ -161,7 +166,7 @@ def test_gpt_image_2_generation_params_use_target_size(
 
     if target_type == "keyframe":
         current = ShotService(database, jobs).create(
-            project["id"],
+            media_job_services["chapter"]["id"],
             _shot_create(
                 scene_asset_id=media_job_services["scene"]["id"],
                 action="主角走入画面",
@@ -238,9 +243,9 @@ def test_keyframe_queue_without_explicit_image_prompt_returns_bad_request(
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     current = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(frame_description="主角站在门口", image_prompt="").model_dump(),
     )
 
@@ -258,9 +263,9 @@ def test_video_queue_without_explicit_video_prompt_returns_bad_request(
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     current = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             start_state="主角站在门口",
             action="主角推门",
@@ -286,16 +291,17 @@ def test_shot_prompt_batch_with_image_and_video_updates_both_prompts(
     repository = media_job_services["repository"]
     runner = media_job_services["runner"]
     jobs = media_job_services["jobs"]
-    project = media_job_services["project"]
+    media_job_services["project"]
+    chapter = media_job_services["chapter"]
     shots = ShotService(database, jobs)
     current = shots.create(
-        project["id"],
+        chapter["id"],
         _shot_create(action="主角推开房门").model_dump(),
     )
     monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
 
     batch = shots.queue_prompt_batch(
-        project["id"],
+        chapter["id"],
         {
             "ids": [current["id"]],
             "prompt_types": ["image", "video"],
@@ -320,10 +326,10 @@ def test_keyframe_queue_uses_saved_final_prompt_override_verbatim(
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     override = "用户编辑后的最终关键帧提示词\n保持原样，不再套用模板。"
     current = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             image_prompt="",
@@ -347,9 +353,9 @@ def test_keyframe_after_provider_model_change_returns_stale_with_later_version_t
     runner = media_job_services["runner"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     current = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             image_prompt="主角站在房门前",
@@ -381,10 +387,10 @@ def test_video_queue_uses_saved_final_prompt_override_verbatim(
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     override = "用户编辑后的最终视频提示词\n严格按此文本执行。"
     current = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             video_prompt="",
@@ -407,10 +413,10 @@ def test_uploaded_keyframe_uses_saved_final_prompt_override(
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     override = "上传关键帧使用的最终提示词"
     current = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             image_prompt_override=override,
@@ -523,10 +529,10 @@ def test_uploaded_video_uses_saved_final_prompt_override(
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     override = "上传视频使用的最终提示词"
     current = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             video_prompt_override=override,
@@ -548,9 +554,9 @@ def test_keyframe_queue_without_scene_binding_returns_conflict_before_provider_r
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     current = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(image_prompt="主角站在画面中央").model_dump(),
     )
     monkeypatch.setattr(
@@ -574,9 +580,9 @@ def test_video_queue_without_scene_binding_returns_conflict_before_provider_reso
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     current = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(video_prompt="主角缓慢转身并停稳").model_dump(),
     )
     media.upload_keyframe(current["id"], "frame.png", "image/png", _PNG)
@@ -601,9 +607,9 @@ def test_grok_video_queue_rounds_fractional_duration_up_consistently(
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             action="主角转身",
@@ -658,7 +664,7 @@ def test_keyframe_job_auto_binds_current_asset_image_as_reference(
         },
     )
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             character_ids=[character["id"]],
@@ -752,7 +758,7 @@ def test_keyframe_queued_with_missing_asset_image_file_reports_error(
     for path in [path for path in project_dir.rglob("*") if path.is_file()]:
         path.unlink()
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             character_ids=[character["id"]],
@@ -776,9 +782,9 @@ def test_keyframe_execution_with_reference_files_deleted_reports_error(
     runner = media_job_services["runner"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             action="主角走入画面",
@@ -828,7 +834,7 @@ def test_keyframe_job_with_invalid_download_removes_target_file(
     media = media_job_services["media"]
     project = media_job_services["project"]
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             action="主角走入画面",
@@ -881,9 +887,9 @@ def test_keyframe_job_with_failed_target_cleanup_marks_version_failed(
     runner = media_job_services["runner"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             image_prompt="主角站在画面中央",
@@ -937,7 +943,7 @@ def test_keyframe_job_with_staged_cleanup_failure_keeps_completed_media(
     media = media_job_services["media"]
     project = media_job_services["project"]
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             image_prompt="主角站在画面中央",
@@ -995,7 +1001,7 @@ def test_asset_image_completion_auto_binds_existing_shot_reference(
         {"asset_type": "character", "name": "林风", "prompt": "黑发少年剑修"},
     )
     shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(character_ids=[asset["id"]], image_prompt="林风站在山门前").model_dump(),
     )
 
@@ -1027,7 +1033,7 @@ def test_keyframe_queue_with_referenced_asset_missing_image_returns_conflict(
         },
     )
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             character_ids=[character["id"]],
@@ -1084,7 +1090,7 @@ def test_keyframe_queue_with_empty_current_asset_file_returns_conflict(
         character_image["file_path"],
     ).write_bytes(b"")
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             character_ids=[character["id"]],
@@ -1120,7 +1126,7 @@ def test_keyframe_queue_with_missing_previous_keyframe_file_returns_conflict(
     media = media_job_services["media"]
     project = media_job_services["project"]
     previous_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(image_prompt="上一镜稳定末帧").model_dump(),
     )
     previous_keyframe = media.upload_keyframe(
@@ -1134,7 +1140,7 @@ def test_keyframe_queue_with_missing_previous_keyframe_file_returns_conflict(
         previous_keyframe["file_path"],
     ).unlink()
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             image_prompt="当前镜头起始画面",
             reference_bindings=[
@@ -1194,7 +1200,7 @@ def test_keyframe_queue_with_concurrent_manual_binding_preserves_binding(
         _PNG,
     )
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             character_ids=[character["id"]],
@@ -1302,9 +1308,9 @@ def test_video_job_with_provider_resolve_failure_marks_version_failed(
     runner = media_job_services["runner"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             source_ref="manual-provider-failure-test",
@@ -1357,7 +1363,7 @@ def test_video_job_prepares_current_keyframe_and_bound_reference_images(
         },
     )
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             source_ref="scene:1|古寺门口",
@@ -1426,6 +1432,357 @@ def test_video_job_prepares_current_keyframe_and_bound_reference_images(
     assert media.list_videos(current_shot["id"])[0]["is_stale"] is True
 
 
+def test_video_job_with_previous_end_frame_keeps_keyframe_first_and_anchor_order(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """上一镜末帧参与时，@Image 编号必须与实际下发的图片顺序逐一对应。
+
+    关键帧必须排首位：单图 Provider 只取 values[0]，若被末帧顶掉，
+    视频会从上一镜画面开始生成。
+    """
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    scene_id = media_job_services["scene"]["id"]
+    chapter_id = media_job_services["chapter"]["id"]
+    shots = ShotService(database, jobs)
+
+    previous_shot = shots.create(
+        chapter_id,
+        _shot_create(scene_asset_id=scene_id, action="林雪走到门前").model_dump(),
+    )
+    current_shot = shots.create(
+        chapter_id,
+        _shot_create(
+            scene_asset_id=scene_id,
+            action="林雪推开木门",
+            video_prompt="林雪缓慢推开木门。",
+            transition_from_prev="continuous",
+        ).model_dump(),
+    )
+
+    # 上一镜已生成视频并留下末帧（直接落库，避免依赖真实 ffprobe 解码）
+    end_frame_relative = "分镜视频/prev-end.jpg"
+    file_service.write_bytes_atomic(
+        media_job_services["project"]["id"],
+        end_frame_relative,
+        _PNG,
+    )
+    now = utc_now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(video_version).values(
+                id="video-prev-end",
+                shot_id=previous_shot["id"],
+                version_no=1,
+                file_path="分镜视频/prev.mp4",
+                end_frame_path=end_frame_relative,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                requested_duration_sec=6,
+                model="multi",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="",
+                source="generated",
+                error="",
+                created_at=now,
+            )
+        )
+
+    media.upload_keyframe(current_shot["id"], "frame.png", "image/png", _PNG)
+    captured: dict[str, Any] = {}
+
+    class FakeVideoProvider:
+        supports_multiple_input_images = True
+
+        async def prepare_input_images(self, paths: list[Path]) -> dict[str, Any]:
+            captured["paths"] = list(paths)
+            return {"values": [f"image-{index}" for index in range(len(paths))]}
+
+        async def submit(self, **_kwargs: Any) -> ProviderSubmission:
+            return ProviderSubmission(status="completed")
+
+    async def fake_download(_provider: Any, _result: Any, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"video-data")
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            FakeVideoProvider(),
+            {"id": "mock-video", "model": "multi", "params": {}, "timeout_sec": 60},
+        ),
+    )
+    monkeypatch.setattr(media, "_download_provider_result", fake_download)
+    monkeypatch.setattr(media, "_verify_video", lambda _path: 6.0)
+    monkeypatch.setattr(media, "_extract_last_frame", lambda _src, _dst: None)
+
+    queued = media.queue_video(current_shot["id"], {})
+    prompt = repository.require(queued["id"])
+    asyncio.run(media.handle_video(prompt))
+
+    keyframe_path = file_service.resolve_project_path(
+        media_job_services["project"]["id"],
+        media.list_keyframes(current_shot["id"])[0]["file_path"],
+    )
+    prev_frame_path = file_service.resolve_project_path(
+        media_job_services["project"]["id"],
+        end_frame_relative,
+    )
+
+    # 关键帧第一、末帧第二，与 prompt 中的 @Image1/@Image2 声明一致
+    assert captured["paths"][0] == keyframe_path
+    assert captured["paths"][1] == prev_frame_path
+    snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
+    assert "@Image1：当前分镜关键帧" in snapshot
+    assert "@Image2：上一镜结束帧" in snapshot
+
+
+def test_video_queue_across_scene_change_omits_previous_end_frame(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """跨场景时不引用上一镜末帧：图片暗示比文字更强，会把上一场景混进本镜画面。"""
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    chapter_id = media_job_services["chapter"]["id"]
+    shots = ShotService(database, jobs)
+
+    other_scene = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "scene", "name": "另一个场景", "prompt": "另一处场景设定"},
+    )
+    media.upload_asset_image(other_scene["id"], "scene2.png", "image/png", _PNG)
+
+    previous_shot = shots.create(
+        chapter_id,
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            action="林雪离开旧屋",
+        ).model_dump(),
+    )
+    current_shot = shots.create(
+        chapter_id,
+        _shot_create(
+            scene_asset_id=other_scene["id"],
+            action="林雪走进新场景",
+            video_prompt="林雪走进新场景。",
+            transition_from_prev="scene_change",
+        ).model_dump(),
+    )
+
+    end_frame_relative = "分镜视频/prev-cross-end.jpg"
+    file_service.write_bytes_atomic(project["id"], end_frame_relative, _PNG)
+    now = utc_now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(video_version).values(
+                id="video-prev-cross",
+                shot_id=previous_shot["id"],
+                version_no=1,
+                file_path="分镜视频/prev-cross.mp4",
+                end_frame_path=end_frame_relative,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                requested_duration_sec=6,
+                model="multi",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="",
+                source="generated",
+                error="",
+                created_at=now,
+            )
+        )
+
+    media.upload_keyframe(current_shot["id"], "frame.png", "image/png", _PNG)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            object(),
+            {"id": "mock-video", "model": "single", "params": {}, "timeout_sec": 60},
+        ),
+    )
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    queued = media.queue_video(current_shot["id"], {})
+
+    assert queued["input_data"]["prev_end_frame_path"] is None
+    snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
+    assert "上一镜结束帧" not in snapshot
+    assert "@Image1：当前分镜关键帧" in snapshot
+
+
+def test_video_queue_same_scene_cut_omits_previous_end_frame(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同场景但属于独立机位（对切/景别切换）时不引用末帧。
+
+    「同场景」不等于「动作连续」：对切、反打、时间跳跃都发生在同一场景内，
+    此时把上一镜画面当参考会让模型复制错误的构图。
+    """
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    scene_id = media_job_services["scene"]["id"]
+    chapter_id = media_job_services["chapter"]["id"]
+    shots = ShotService(database, jobs)
+
+    previous_shot = shots.create(
+        chapter_id,
+        _shot_create(scene_asset_id=scene_id, action="陈鑫中景说话").model_dump(),
+    )
+    current_shot = shots.create(
+        chapter_id,
+        _shot_create(
+            scene_asset_id=scene_id,
+            action="张桂芬特写反应",
+            video_prompt="张桂芬皱眉。",
+            transition_from_prev="same_scene_cut",
+        ).model_dump(),
+    )
+
+    end_frame_relative = "分镜视频/prev-cut-end.jpg"
+    file_service.write_bytes_atomic(project["id"], end_frame_relative, _PNG)
+    now = utc_now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(video_version).values(
+                id="video-prev-cut",
+                shot_id=previous_shot["id"],
+                version_no=1,
+                file_path="分镜视频/prev-cut.mp4",
+                end_frame_path=end_frame_relative,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                requested_duration_sec=6,
+                model="multi",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="",
+                source="generated",
+                error="",
+                created_at=now,
+            )
+        )
+
+    media.upload_keyframe(current_shot["id"], "frame.png", "image/png", _PNG)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            object(),
+            {"id": "mock-video", "model": "single", "params": {}, "timeout_sec": 60},
+        ),
+    )
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    queued = media.queue_video(current_shot["id"], {})
+
+    # 末帧文件确实存在且同场景，但衔接类型不是 continuous，因此不引用
+    assert queued["input_data"]["prev_end_frame_path"] is None
+    snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
+    assert "@Image2：上一镜结束帧" not in snapshot
+    assert "独立机位" in snapshot
+
+
+def test_video_execution_with_deleted_previous_end_frame_reports_error(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt 已声明末帧但文件在执行前消失时必须失败，避免 @Image 编号整体错位。"""
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    scene_id = media_job_services["scene"]["id"]
+    chapter_id = media_job_services["chapter"]["id"]
+    shots = ShotService(database, jobs)
+
+    previous_shot = shots.create(
+        chapter_id,
+        _shot_create(scene_asset_id=scene_id, action="林雪走到门前").model_dump(),
+    )
+    current_shot = shots.create(
+        chapter_id,
+        _shot_create(
+            scene_asset_id=scene_id,
+            action="林雪推开木门",
+            video_prompt="林雪缓慢推开木门。",
+            transition_from_prev="continuous",
+        ).model_dump(),
+    )
+
+    end_frame_relative = "分镜视频/prev-vanish-end.jpg"
+    file_service.write_bytes_atomic(project["id"], end_frame_relative, _PNG)
+    now = utc_now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(video_version).values(
+                id="video-prev-vanish",
+                shot_id=previous_shot["id"],
+                version_no=1,
+                file_path="分镜视频/prev-vanish.mp4",
+                end_frame_path=end_frame_relative,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                requested_duration_sec=6,
+                model="multi",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="",
+                source="generated",
+                error="",
+                created_at=now,
+            )
+        )
+
+    media.upload_keyframe(current_shot["id"], "frame.png", "image/png", _PNG)
+
+    class FakeVideoProvider:
+        supports_multiple_input_images = True
+
+        async def prepare_input_images(self, _paths: list[Path]) -> dict[str, Any]:
+            raise AssertionError("末帧缺失时不应调用 prepare_input_images")
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            FakeVideoProvider(),
+            {"id": "mock-video", "model": "multi", "params": {}, "timeout_sec": 60},
+        ),
+    )
+
+    queued = media.queue_video(current_shot["id"], {})
+    # prompt 快照完成后文件被删：编号已固化，不能静默降级
+    file_service.delete_file(project["id"], end_frame_relative)
+
+    with pytest.raises(ServiceError) as exc_info:
+        asyncio.run(media.handle_video(repository.require(queued["id"])))
+
+    assert exc_info.value.status_code == 409
+    assert "上一镜结束帧" in exc_info.value.detail
+
+
 def test_video_queue_with_missing_current_keyframe_file_returns_conflict(
     media_job_services: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -1435,7 +1792,7 @@ def test_video_queue_with_missing_current_keyframe_file_returns_conflict(
     media = media_job_services["media"]
     project = media_job_services["project"]
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             action="林风转身",
             video_prompt="林风缓慢转身。",
@@ -1490,7 +1847,7 @@ def test_video_prompt_with_single_image_provider_omits_extra_reference_anchors(
         _PNG,
     )
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             character_ids=[character["id"]],
@@ -1530,9 +1887,9 @@ def test_video_with_template_context_change_is_marked_stale(
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    project = media_job_services["project"]
+    media_job_services["project"]
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             action="林雪缓慢推开木门",
@@ -1634,7 +1991,7 @@ def test_keyframe_with_referenced_asset_rename_is_marked_stale(
         _PNG,
     )
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             character_ids=[character["id"]],
@@ -1695,7 +2052,7 @@ def test_video_with_binding_only_asset_rename_is_marked_stale(
         _PNG,
     )
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             action="木门缓慢打开",
@@ -1834,19 +2191,21 @@ def test_cancel_queued_writing_job_marks_generating_target_failed(
     target_suffix: str,
 ) -> None:
     project_id = job_service.project_id  # type: ignore[attr-defined]
+    chapter_id = job_service.chapter_id  # type: ignore[attr-defined]
     with job_service.repository.engine.begin() as connection:
         connection.execute(
             insert(table).values(
-                project_id=project_id,
+                chapter_id=chapter_id,
                 status="generating",
                 updated_at=utc_now(),
             )
         )
     record = job_service.repository.create_job(
         project_id=project_id,
+        chapter_id=chapter_id,
         job_type=job_type,
         target_type=target_type,
-        target_id=f"{project_id}{target_suffix}",
+        target_id=f"{chapter_id}{target_suffix}",
         provider_kind="text",
     )
 
@@ -1854,7 +2213,7 @@ def test_cancel_queued_writing_job_marks_generating_target_failed(
 
     with job_service.repository.engine.connect() as connection:
         target = connection.execute(
-            select(table.c.status, table.c.error).where(table.c.project_id == project_id)
+            select(table.c.status, table.c.error).where(table.c.chapter_id == chapter_id)
         ).one()
     assert target.status == "failed"
     assert target.error == "关联任务已取消"
@@ -1864,20 +2223,22 @@ def test_cancel_queued_screenplay_job_marks_hidden_analysis_failed(
     job_service: JobService,
 ) -> None:
     project_id = job_service.project_id  # type: ignore[attr-defined]
+    chapter_id = job_service.chapter_id  # type: ignore[attr-defined]
     with job_service.repository.engine.begin() as connection:
         for table in (novel_analysis, screenplay):
             connection.execute(
                 insert(table).values(
-                    project_id=project_id,
+                    chapter_id=chapter_id,
                     status="generating",
                     updated_at=utc_now(),
                 )
             )
     record = job_service.repository.create_job(
         project_id=project_id,
+        chapter_id=chapter_id,
         job_type="generate_screenplay",
         target_type="screenplay",
-        target_id=project_id,
+        target_id=chapter_id,
         provider_kind="text",
     )
 
@@ -1886,7 +2247,7 @@ def test_cancel_queued_screenplay_job_marks_hidden_analysis_failed(
     with job_service.repository.engine.connect() as connection:
         analysis_target = connection.execute(
             select(novel_analysis.c.status, novel_analysis.c.error).where(
-                novel_analysis.c.project_id == project_id
+                novel_analysis.c.chapter_id == chapter_id
             )
         ).one()
     assert analysis_target.status == "failed"
@@ -1958,7 +2319,7 @@ def test_video_execution_with_reference_files_deleted_reports_error(
     )
     media.upload_asset_image(character["id"], "character.png", "image/png", _PNG)
     current_shot = ShotService(database, jobs).create(
-        project["id"],
+        media_job_services["chapter"]["id"],
         _shot_create(
             scene_asset_id=media_job_services["scene"]["id"],
             character_ids=[character["id"]],

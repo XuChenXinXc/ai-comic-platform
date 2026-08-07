@@ -4,6 +4,7 @@ from fastapi import Depends
 
 from app.db import Database, get_database
 from app.services.asset_service import AssetService
+from app.services.chapter_service import ChapterService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
 from app.services.project_service import ProjectService
@@ -17,6 +18,12 @@ def get_project_service(
     database: Annotated[Database, Depends(get_database)],
 ) -> ProjectService:
     return ProjectService(database)
+
+
+def get_chapter_service(
+    database: Annotated[Database, Depends(get_database)],
+) -> ChapterService:
+    return ChapterService(database)
 
 
 def get_job_service(

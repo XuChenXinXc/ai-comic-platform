@@ -6,7 +6,7 @@ from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db import Database, db
-from app.models.tables import asset, asset_image, job, project, shot
+from app.models.tables import asset, asset_image, chapter, job, project, shot
 from app.prompts import load_prompt
 from app.schemas import AssetExtractionOutput, AssetPromptOutput
 from app.services.errors import bad_request, conflict, not_found
@@ -119,10 +119,8 @@ class AssetService:
             records = []
             for row in connection.execute(statement):
                 record = self._decode(dict(row._mapping))
-                record["is_stale"] = bool(
-                    record["source_signature"]
-                    and record["source_signature"] != current_project["source_signature"]
-                )
+                # 素材库属于整本小说，跨章节共用，不再用已废弃的 project.source_signature 判旧
+                record["is_stale"] = False
                 record["compiled_prompt"] = self._compiled_prompt(current_project, record)
                 record["current_image"] = self._current_image(connection, record["id"], project_id)
                 records.append(record)
@@ -137,10 +135,8 @@ class AssetService:
             raise not_found("素材")
         result = self._decode(record)
         current_project = self._project(result["project_id"])
-        result["is_stale"] = bool(
-            result["source_signature"]
-            and result["source_signature"] != current_project["source_signature"]
-        )
+        # 素材库属于整本小说，跨章节共用，不再用已废弃的 project.source_signature 判旧
+        result["is_stale"] = False
         result["compiled_prompt"] = self._compiled_prompt(current_project, result)
         with self.database.engine.connect() as connection:
             result["current_image"] = self._current_image(
@@ -485,13 +481,45 @@ class AssetService:
             raise bad_request("素材不属于当前项目")
         return self.merge(ids[0], ids[1:])
 
-    def queue_extract(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
+    def _chapter(self, chapter_id: str) -> dict[str, Any]:
+        with self.database.engine.connect() as connection:
+            record = row_dict(
+                connection.execute(select(chapter).where(chapter.c.id == chapter_id)).first()
+            )
+        if record is None:
+            raise not_found("章节")
+        return record
+
+    def _existing_catalog(self, project_id: str) -> list[dict[str, Any]]:
+        """全书已有素材摘要，供提取时去重：同一对象跨章节只保留一份素材。"""
+        result: list[dict[str, Any]] = []
+        with self.database.engine.connect() as connection:
+            for row in connection.execute(
+                select(asset.c.asset_type, asset.c.name, asset.c.profile_json).where(
+                    asset.c.project_id == project_id
+                )
+            ):
+                profile = json_loads(row.profile_json, {})
+                aliases = profile.get("aliases", [])
+                result.append(
+                    {
+                        "asset_type": row.asset_type,
+                        "name": row.name,
+                        "aliases": aliases if isinstance(aliases, list) else [],
+                    }
+                )
+        return result
+
+    def queue_extract(self, chapter_id: str, options: dict[str, Any]) -> dict[str, Any]:
+        current_chapter = self._chapter(chapter_id)
+        project_id = current_chapter["project_id"]
         current_project = self._project(project_id)
         return self.jobs.create(
             project_id=project_id,
+            chapter_id=chapter_id,
             job_type="extract_assets",
-            target_type="project",
-            target_id=project_id,
+            target_type="chapter",
+            target_id=chapter_id,
             provider_kind="text",
             provider_id=options.get("provider_id") or current_project["default_text_provider_id"],
             input_data={
@@ -540,13 +568,20 @@ class AssetService:
         return self.jobs.create_batch(items)
 
     async def handle_extract(self, job: dict[str, Any]) -> dict[str, Any]:
-        current_project = self._project(job["project_id"])
+        chapter_id = job.get("chapter_id") or job.get("target_id")
+        current_chapter = self._chapter(chapter_id)
+        current_project = self._project(current_chapter["project_id"])
         input_data = json_loads(job.get("input_json"), {})
         selected_types = set(input_data["asset_types"])
         provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
+        existing_catalog = self._existing_catalog(current_project["id"])
         output = await provider.generate_json(
             system_prompt=load_prompt("asset_extract"),
-            user_prompt=f"小说正文：\n{current_project['source_text']}",
+            user_prompt=(
+                f"本章正文：\n{current_chapter['source_text']}\n\n"
+                f"已有素材目录（已存在，本章若出现同一对象请勿重复提取）：\n"
+                f"{json_dumps(existing_catalog)}"
+            ),
             schema=AssetExtractionOutput,
             params={**config["params"], **input_data.get("params", {})},
         )
@@ -608,9 +643,9 @@ class AssetService:
                 }
                 saved_prompt = existing["prompt"] or prompt
                 saved_negative_prompt = existing["negative_prompt"] or negative_prompt
-                saved_consistency = json_loads(
-                    existing["consistency_json"], []
-                ) or consistency_keywords
+                saved_consistency = (
+                    json_loads(existing["consistency_json"], []) or consistency_keywords
+                )
                 saved_composition = existing["composition"] or composition
                 connection.execute(
                     update(asset)

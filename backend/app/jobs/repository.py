@@ -95,6 +95,7 @@ class JobRepository:
         values = {
             "id": parsed.id or f"job-{uuid4().hex}",
             "project_id": parsed.project_id,
+            "chapter_id": parsed.chapter_id,
             "job_type": parsed.job_type,
             "target_type": parsed.target_type,
             "target_id": parsed.target_id,
@@ -387,9 +388,7 @@ class JobRepository:
                 updated_at=now,
             )
         )
-        current = self._decode(
-            connection.execute(select(job).where(job.c.id == job_id)).first()
-        )
+        current = self._decode(connection.execute(select(job).where(job.c.id == job_id)).first())
         if result.rowcount != 1:
             if current is None:
                 raise JobNotFoundError(f"任务不存在：{job_id}")

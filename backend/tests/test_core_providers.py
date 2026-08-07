@@ -29,13 +29,12 @@ from app.schemas import (
     ScreenplayOutput,
     ShotExtractionOutput,
     ShotImagePromptOutput,
+    ShotVideoPromptOptimizeOutput,
     ShotVideoPromptOutput,
-    VisualStyleOutput,
 )
 
 OUTPUT_SCHEMAS = (
     NovelAnalysisOutput,
-    VisualStyleOutput,
     ScreenplayOutput,
     AssetExtractionOutput,
     AssetPromptOutput,
@@ -569,7 +568,7 @@ def test_openai_compatible_text_repair_request_keeps_high_reasoning(
     assert [payload["reasoning_effort"] for payload in payloads] == ["high", "high"]
 
 
-def test_openai_compatible_visual_style_keeps_prompts_plain_and_parses_sentence(
+def test_openai_compatible_plain_text_schema_keeps_prompts_plain_and_parses_sentence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = OpenAICompatibleTextProvider(
@@ -581,24 +580,24 @@ def test_openai_compatible_visual_style_keeps_prompts_plain_and_parses_sentence(
             model="test-model",
         )
     )
-    style_prompt = "冷峻悬疑二维国漫，利落轮廓，低饱和冷色，分层暗光"
+    plain_text = "0-2秒：走向窗边；2-4秒：抹去薄霜。"
     payloads: list[dict[str, Any]] = []
 
     async def fake_request(*_args: Any, **kwargs: Any) -> dict[str, Any]:
         payloads.append(kwargs["json"])
-        return {"choices": [{"message": {"content": style_prompt}}]}
+        return {"choices": [{"message": {"content": plain_text}}]}
 
     monkeypatch.setattr(provider, "_request_json", fake_request)
     result = asyncio.run(
         provider.generate_json(
             system_prompt="完整系统提示词",
             user_prompt="完整用户提示词\n\n小说正文",
-            schema=VisualStyleOutput,
+            schema=ShotVideoPromptOptimizeOutput,
             params={"response_format": {"type": "json_object"}},
         )
     )
 
-    assert result.style_prompt == style_prompt
+    assert result.prompt == plain_text
     assert payloads == [
         {
             "model": "test-model",
@@ -609,48 +608,6 @@ def test_openai_compatible_visual_style_keeps_prompts_plain_and_parses_sentence(
             "reasoning_effort": "high",
         }
     ]
-
-
-def test_openai_compatible_visual_style_repairs_invalid_length_as_plain_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = OpenAICompatibleTextProvider(
-        ProviderConfig(
-            id="text-real",
-            kind="text",
-            adapter="openai_compatible",
-            base_url="https://example.invalid/v1",
-            model="test-model",
-        )
-    )
-    style_prompt = "都市温情二维国漫，克制线条，暖灰色调，柔和光影"
-    responses = ["画" * 33, style_prompt]
-    payloads: list[dict[str, Any]] = []
-
-    async def fake_request(*_args: Any, **kwargs: Any) -> dict[str, Any]:
-        payloads.append(kwargs["json"])
-        return {"choices": [{"message": {"content": responses.pop(0)}}]}
-
-    monkeypatch.setattr(provider, "_request_json", fake_request)
-    result = asyncio.run(
-        provider.generate_json(
-            system_prompt="完整系统提示词",
-            user_prompt="完整用户提示词\n\n小说正文",
-            schema=VisualStyleOutput,
-            params={"reasoning_effort": "low"},
-        )
-    )
-
-    assert result.style_prompt == style_prompt
-    assert [payload["reasoning_effort"] for payload in payloads] == ["high", "high"]
-    assert all("response_format" not in payload for payload in payloads)
-    assert payloads[1]["messages"][:2] == [
-        {"role": "system", "content": "完整系统提示词"},
-        {"role": "user", "content": "完整用户提示词\n\n小说正文"},
-    ]
-    assert payloads[1]["messages"][-1]["content"].startswith(
-        "上一次输出无法通过校验。请只返回修复后的一句纯文本"
-    )
 
 
 def test_http_image_with_custom_paths_maps_async_submission_and_poll(
@@ -1288,9 +1245,7 @@ def test_doubao_video_accepts_exactly_nine_reference_images(
     asyncio.run(
         provider.submit(
             prompt="让画面动起来",
-            input_image={
-                "values": [f"data:image/png;base64,{index}" for index in range(9)]
-            },
+            input_image={"values": [f"data:image/png;base64,{index}" for index in range(9)]},
             duration_sec=5.0,
             params={},
         )
@@ -1322,11 +1277,7 @@ def test_doubao_video_rejects_more_than_nine_reference_images(
         asyncio.run(
             provider.submit(
                 prompt="让画面动起来",
-                input_image={
-                    "values": [
-                        f"data:image/png;base64,{index}" for index in range(10)
-                    ]
-                },
+                input_image={"values": [f"data:image/png;base64,{index}" for index in range(10)]},
                 duration_sec=5.0,
                 params={},
             )
@@ -1398,7 +1349,7 @@ def test_grok_video_upload_retries_transient_status_with_complete_content(
         if len(sent_contents) == 1:
             response = requests.Response()
             response.status_code = 503
-            response._content = b''
+            response._content = b""
             return response
         response = requests.Response()
         response.status_code = 200

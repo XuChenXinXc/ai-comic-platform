@@ -9,6 +9,7 @@ import pytest
 from app.db import Database
 from app.schemas import AssetExtractionOutput
 from app.services.asset_service import AssetService
+from app.services.chapter_service import ChapterService
 from app.services.file_service import FileService
 from app.services.project_service import ProjectService
 from app.services.utils import json_dumps
@@ -16,14 +17,17 @@ from app.services.writing_service import WritingService
 
 
 @pytest.fixture
-def asset_extraction_services(tmp_path: Path) -> tuple[Database, AssetService, dict[str, object]]:
+def asset_extraction_services(
+    tmp_path: Path,
+) -> tuple[Database, AssetService, dict[str, object], dict[str, object]]:
     database = Database(f"sqlite:///{(tmp_path / 'asset-extraction.db').as_posix()}")
     database.initialize(seed_mock_providers=True)
-    project = ProjectService(database, FileService(tmp_path)).create(
-        {"name": "素材提取", "source_text": "小明换上灰色风衣走进旧剧院。"}
+    project = ProjectService(database, FileService(tmp_path)).create({"name": "素材提取"})
+    chapter = ChapterService(database, FileService(tmp_path)).create(
+        project["id"], {"title": "第一章", "source_text": "小明换上灰色风衣走进旧剧院。"}
     )
     service = AssetService(database)
-    yield database, service, project
+    yield database, service, project, chapter
     database.dispose()
 
 
@@ -86,9 +90,10 @@ class SequencedAssetProvider:
         return AssetExtractionOutput.model_validate(self.outputs[len(self.calls) - 1])
 
 
-def _extract_job(project_id: str) -> dict[str, object]:
+def _extract_job(chapter_id: str, project_id: str = "") -> dict[str, object]:
     return {
         "project_id": project_id,
+        "chapter_id": chapter_id,
         "provider_id": "mock-text",
         "input_json": json_dumps(
             {
@@ -100,9 +105,9 @@ def _extract_job(project_id: str) -> dict[str, object]:
 
 
 def test_reextract_ready_asset_keeps_existing_fields_and_fills_missing(
-    asset_extraction_services: tuple[Database, AssetService, dict[str, object]],
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
 ) -> None:
-    _database, service, project = asset_extraction_services
+    _database, service, project, chapter = asset_extraction_services
     existing = service.create(
         str(project["id"]),
         {
@@ -129,10 +134,10 @@ def test_reextract_ready_asset_keeps_existing_fields_and_fills_missing(
 
 
 def test_reextract_asset_merges_fields_keeping_existing_non_empty(
-    asset_extraction_services: tuple[Database, AssetService, dict[str, object]],
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
 ) -> None:
     """同名素材重新提取：现有非空字段（含用户手动编辑）优先保留，新结果只填缺。"""
-    _database, service, project = asset_extraction_services
+    _database, service, project, chapter = asset_extraction_services
     existing = service.create(
         str(project["id"]),
         {
@@ -165,12 +170,12 @@ def test_reextract_asset_merges_fields_keeping_existing_non_empty(
 
 
 def test_extract_assets_with_minor_screenplay_characters_saves_only_key_roles_once(
-    asset_extraction_services: tuple[Database, AssetService, dict[str, object]],
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database, service, project = asset_extraction_services
+    database, service, project, chapter = asset_extraction_services
     WritingService(database).update_screenplay(
-        str(project["id"]),
+        str(chapter["id"]),
         {
             "content": _screenplay(
                 characters=["小明", "律师", "前台", "张助理（电话音）", "众人"],
@@ -193,10 +198,15 @@ def test_extract_assets_with_minor_screenplay_characters_saves_only_key_roles_on
         lambda **_values: (provider, {"params": {}}),
     )
 
-    result = asyncio.run(service.handle_extract(_extract_job(str(project["id"]))))
+    result = asyncio.run(
+        service.handle_extract(_extract_job(str(chapter["id"]), str(project["id"])))
+    )
 
     characters = service.list(str(project["id"]), "character")
     assert len(provider.calls) == 1
-    assert provider.calls[0]["user_prompt"] == f"小说正文：\n{project['source_text']}"
+    assert provider.calls[0]["user_prompt"] == (
+        f"本章正文：\n{chapter['source_text']}\n\n"
+        "已有素材目录（已存在，本章若出现同一对象请勿重复提取）：\n[]"
+    )
     assert {item["name"] for item in characters} == {"小明"}
     assert result["count"] == 1

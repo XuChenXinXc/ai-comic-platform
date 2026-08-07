@@ -1,5 +1,11 @@
 export type ProviderKind = "text" | "image" | "video";
 export type AssetType = "character" | "scene" | "prop";
+/** 分镜与上一镜的衔接类型：只有 continuous 会引用上一镜视频末帧作为参考图。 */
+export type ShotTransitionFromPrev =
+  | "continuous"
+  | "elliptical"
+  | "same_scene_cut"
+  | "scene_change";
 export type ContentStatus =
   | "draft"
   | "generating"
@@ -68,7 +74,9 @@ export interface ProjectStorageSelection extends ProjectStorageSetting {
 }
 
 export interface ContentRecord<T = Record<string, unknown>> {
+  id: string;
   project_id: string;
+  chapter_id: string;
   content_json: T | string;
   content?: T;
   status: ContentStatus;
@@ -176,6 +184,7 @@ export interface ReferenceBinding {
 export interface Shot {
   id: string;
   project_id: string;
+  chapter_id: string;
   shot_no: number;
   shot_order: number;
   scene_no?: number | null;
@@ -203,6 +212,7 @@ export interface Shot {
   duration_sec: number;
   end_state: string;
   next_hook: string;
+  transition_from_prev: ShotTransitionFromPrev;
   frame_description: string;
   image_prompt: string;
   image_prompt_override?: string | null;
@@ -325,4 +335,32 @@ export interface BatchResponse {
 export interface ListResponse<T> {
   items: T[];
   total?: number;
+}
+
+export interface ShotQualityIssue {
+  shot_id: string;
+  shot_no: number;
+  chapter_no?: number;
+  chapter_title?: string;
+  duration_sec: number;
+  warnings: string[];
+}
+
+export interface ShotQualityReport {
+  total: number;
+  items: ShotQualityIssue[];
+}
+
+export interface Chapter {
+  id: string;
+  project_id: string;
+  chapter_no: number;
+  title: string;
+  source_text: string;
+  source_signature: string;
+  source_revision: number;
+  status: string;
+  shot_count?: number;
+  created_at: string;
+  updated_at: string;
 }

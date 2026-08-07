@@ -11,7 +11,6 @@ import {
 import {
   useEffect,
   useLayoutEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
@@ -35,6 +34,7 @@ import {
   Tabs,
   Textarea,
 } from "../components/ui";
+import { useChapter } from "../hooks/use-chapter";
 import { useProject } from "../hooks/use-project";
 import { formatError, parseJson } from "../lib/utils";
 import type {
@@ -42,6 +42,8 @@ import type {
   ScreenplayContent,
   ScreenplayScene,
 } from "../types/api";
+import { ChapterRequired } from "../components/chapter-required";
+import { ChapterSelector } from "../components/chapter-selector";
 
 async function nullable<T>(promise: Promise<T>) {
   try {
@@ -89,6 +91,7 @@ function screenplayContent(
 export function WritingPage() {
   const queryClient = useQueryClient();
   const { activeProject, activeProjectId } = useProject();
+  const { activeChapterId, activeChapter } = useChapter();
   const [tab, setTab] = useState<WritingTab>("screenplay");
   const [analysis, setAnalysis] = useState<unknown>({});
   const [analysisValid, setAnalysisValid] = useState(true);
@@ -96,6 +99,8 @@ export function WritingPage() {
     useState<ScreenplayContent>(emptyScreenplay);
   const [stylePrompt, setStylePrompt] = useState("");
   const [stylePromptDirty, setStylePromptDirty] = useState(false);
+  const [chapterSource, setChapterSource] = useState("");
+  const [chapterSourceDirty, setChapterSourceDirty] = useState(false);
   const [dirty, setDirty] = useState<Record<WritingTab, boolean>>({
     analysis: false,
     screenplay: false,
@@ -119,14 +124,14 @@ export function WritingPage() {
   activeProjectIdRef.current = activeProjectId;
 
   const analysisQuery = useQuery({
-    queryKey: queryKeys.analysis(activeProjectId),
-    queryFn: () => nullable(api.analysis.get(activeProjectId)),
-    enabled: Boolean(activeProjectId && tab === "analysis"),
+    queryKey: queryKeys.analysis(activeChapterId),
+    queryFn: () => nullable(api.analysis.get(activeChapterId)),
+    enabled: Boolean(activeChapterId && tab === "analysis"),
   });
   const screenplayQuery = useQuery({
-    queryKey: queryKeys.screenplay(activeProjectId),
-    queryFn: () => nullable(api.screenplay.get(activeProjectId)),
-    enabled: Boolean(activeProjectId),
+    queryKey: queryKeys.screenplay(activeChapterId),
+    queryFn: () => nullable(api.screenplay.get(activeChapterId)),
+    enabled: Boolean(activeChapterId),
   });
 
   useLayoutEffect(() => {
@@ -148,10 +153,15 @@ export function WritingPage() {
   }, [activeProject?.style_prompt, stylePromptDirty]);
 
   useEffect(() => {
+    setChapterSource(activeChapter?.source_text || "");
+    setChapterSourceDirty(false);
+  }, [activeChapter?.id, activeChapter?.source_text]);
+
+  useEffect(() => {
     if (
-      !activeProjectId ||
-      (analysisQuery.data &&
-        analysisQuery.data.project_id !== activeProjectId)
+      !activeChapterId ||
+      (analysisQuery.data?.chapter_id &&
+        analysisQuery.data.chapter_id !== activeChapterId)
     ) {
       return;
     }
@@ -172,13 +182,13 @@ export function WritingPage() {
     setServerUpdateAvailable((current) =>
       current.analysis ? { ...current, analysis: false } : current,
     );
-  }, [activeProjectId, analysisQuery.data, dirty.analysis]);
+  }, [activeChapterId, analysisQuery.data, dirty.analysis]);
 
   useEffect(() => {
     if (
-      !activeProjectId ||
-      (screenplayQuery.data &&
-        screenplayQuery.data.project_id !== activeProjectId)
+      !activeChapterId ||
+      (screenplayQuery.data?.chapter_id &&
+        screenplayQuery.data.chapter_id !== activeChapterId)
     ) {
       return;
     }
@@ -199,7 +209,7 @@ export function WritingPage() {
     setServerUpdateAvailable((current) =>
       current.screenplay ? { ...current, screenplay: false } : current,
     );
-  }, [activeProjectId, dirty.screenplay, screenplayQuery.data]);
+  }, [activeChapterId, dirty.screenplay, screenplayQuery.data]);
 
   const currentRecord =
     tab === "analysis" ? analysisQuery.data : screenplayQuery.data;
@@ -219,7 +229,7 @@ export function WritingPage() {
     currentRecord &&
       (currentRecord.is_stale ||
         (currentRecord.source_signature &&
-          currentRecord.source_signature !== activeProject?.source_signature)),
+          currentRecord.source_signature !== activeChapter?.source_signature)),
   );
 
   const stylePromptMutation = useMutation({
@@ -242,18 +252,19 @@ export function WritingPage() {
 
   const generateMutation = useMutation({
     mutationFn: ({
-      projectId,
+      chapterId,
       contentType,
     }: {
-      projectId: string;
+      chapterId: string;
       contentType: WritingTab;
     }) =>
       contentType === "analysis"
-        ? api.analysis.generate(projectId)
-        : api.screenplay.generate(projectId),
-    onSuccess: async (_record, { projectId, contentType }) => {
+        ? api.analysis.generate(chapterId)
+        : api.screenplay.generate(chapterId),
+    onSuccess: async (result, { contentType }) => {
+      void result;
       await queryClient.invalidateQueries({
-        queryKey: queryKeys.jobs(projectId),
+        queryKey: queryKeys.jobs(activeProjectId),
       });
       toast.success(
         contentType === "analysis"
@@ -266,39 +277,39 @@ export function WritingPage() {
 
   const saveMutation = useMutation({
     mutationFn: ({
-      projectId,
+      chapterId,
       status,
       contentType,
       content,
     }: {
-      projectId: string;
+      chapterId: string;
       status: "ready" | "confirmed";
       contentType: WritingTab;
       content: unknown;
       editRevision: number;
     }) =>
       contentType === "analysis"
-        ? api.analysis.update(projectId, {
+        ? api.analysis.update(chapterId, {
             content_json: content,
             status,
           })
-        : api.screenplay.update(projectId, {
+        : api.screenplay.update(chapterId, {
             content_json: content,
             status,
           }),
     onSuccess: async (
       record,
-      { projectId, status, contentType, editRevision: submittedRevision },
+      { chapterId, status, contentType, editRevision: submittedRevision },
     ) => {
       const queryKey =
         contentType === "analysis"
-          ? queryKeys.analysis(projectId)
-          : queryKeys.screenplay(projectId);
-      const isCurrentProject = activeProjectIdRef.current === projectId;
+          ? queryKeys.analysis(chapterId)
+          : queryKeys.screenplay(chapterId);
+      const isCurrentChapter = activeChapterId === chapterId;
       const hasNewerEdits =
         editRevision.current[contentType] !== submittedRevision;
 
-      if (isCurrentProject) {
+      if (isCurrentChapter) {
         hydratedVersion.current[contentType] = recordVersion(record);
         if (!hasNewerEdits) {
           if (contentType === "analysis") {
@@ -333,15 +344,15 @@ export function WritingPage() {
 
   const sceneMutation = useMutation({
     mutationFn: ({
-      projectId,
+      chapterId,
       sceneNo,
     }: {
-      projectId: string;
+      chapterId: string;
       sceneNo: number;
-    }) => api.screenplay.regenerateScene(projectId, sceneNo),
-    onSuccess: async (_record, { projectId }) => {
+    }) => api.screenplay.regenerateScene(chapterId, sceneNo),
+    onSuccess: async () => {
       await queryClient.invalidateQueries({
-        queryKey: queryKeys.jobs(projectId),
+        queryKey: queryKeys.jobs(activeProjectId),
       });
       toast.success("单场重生成已进入任务队列");
     },
@@ -378,7 +389,7 @@ export function WritingPage() {
       return;
     }
     saveMutation.mutate({
-      projectId: activeProjectId,
+      chapterId: activeChapterId,
       status,
       contentType: tab,
       content: tab === "analysis" ? analysis : screenplay,
@@ -389,7 +400,7 @@ export function WritingPage() {
   const generateCurrent = async () => {
     if (!(await persistStylePrompt())) return;
     generateMutation.mutate({
-      projectId: activeProjectId,
+      chapterId: activeChapterId,
       contentType: tab,
     });
   };
@@ -452,13 +463,24 @@ export function WritingPage() {
     }));
   };
 
-  const sourcePreview = useMemo(
-    () => activeProject?.source_text || "",
-    [activeProject?.source_text],
-  );
+  const chapterSourceMutation = useMutation({
+    mutationFn: () =>
+      api.chapters.update(activeChapterId, {
+        source_text: chapterSource,
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: ["chapters", activeProjectId],
+      });
+      setChapterSourceDirty(false);
+      toast.success("章节正文已保存");
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
 
   return (
     <ProjectRequired>
+      <ChapterRequired>
       <div>
         <PageHeader
           eyebrow="Step 02 / Writing"
@@ -466,11 +488,12 @@ export function WritingPage() {
           description="生成剧本时会在后台自动完成小说分析，再使用本次分析结果生成结构化场次剧本。"
           actions={
             <>
+              <ChapterSelector />
               <Button
                 busy={
                   stylePromptMutation.isPending ||
                   (generateMutation.isPending &&
-                    generateMutation.variables?.projectId === activeProjectId &&
+                    generateMutation.variables?.chapterId === activeChapterId &&
                     generateMutation.variables.contentType === tab)
                 }
                 onClick={() => void generateCurrent()}
@@ -486,7 +509,7 @@ export function WritingPage() {
                 busy={
                   stylePromptMutation.isPending ||
                   (saveMutation.isPending &&
-                    saveMutation.variables?.projectId === activeProjectId &&
+                    saveMutation.variables?.chapterId === activeChapterId &&
                     saveMutation.variables?.status === "ready" &&
                     saveMutation.variables.contentType === tab)
                 }
@@ -562,16 +585,34 @@ export function WritingPage() {
               <div>
                 <h2 className="font-bold">小说原文</h2>
                 <p className="mt-1 text-xs text-muted">
-                  只读 · 修订 R{activeProject?.source_revision}
+                  章节正文 · 修订 R{activeChapter?.source_revision ?? 0}
                 </p>
               </div>
-              <span className="text-xs text-muted">
-                {sourcePreview.length.toLocaleString("zh-CN")} 字符
-              </span>
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-muted">
+                  {chapterSource.length.toLocaleString("zh-CN")} 字符
+                </span>
+                <Button
+                  size="sm"
+                  busy={chapterSourceMutation.isPending}
+                  disabled={!chapterSourceDirty}
+                  onClick={() => chapterSourceMutation.mutate()}
+                >
+                  <Save className="h-4 w-4" />
+                  保存正文
+                </Button>
+              </div>
             </div>
-            <div className="max-h-[70vh] overflow-y-auto whitespace-pre-wrap px-5 py-5 text-sm leading-7 text-[#3f423d]">
-              {sourcePreview}
-            </div>
+            <Textarea
+              rows={18}
+              className="max-h-[70vh] resize-y rounded-none border-0 border-b border-line bg-transparent px-5 py-5 text-sm leading-7 text-[#3f423d]"
+              value={chapterSource}
+              placeholder="粘贴本章小说原文…"
+              onChange={(event) => {
+                setChapterSource(event.target.value);
+                setChapterSourceDirty(true);
+              }}
+            />
           </Card>
 
           <div className="min-w-0">
@@ -601,7 +642,7 @@ export function WritingPage() {
                             busy={
                               stylePromptMutation.isPending ||
                               (generateMutation.isPending &&
-                                generateMutation.variables?.projectId ===
+                                generateMutation.variables?.chapterId ===
                                   activeProjectId &&
                                 generateMutation.variables.contentType === tab)
                             }
@@ -706,7 +747,7 @@ export function WritingPage() {
                               busy={
                                 stylePromptMutation.isPending ||
                                 (generateMutation.isPending &&
-                                  generateMutation.variables?.projectId ===
+                                  generateMutation.variables?.chapterId ===
                                     activeProjectId &&
                                   generateMutation.variables.contentType === tab)
                               }
@@ -907,14 +948,14 @@ export function WritingPage() {
                                   size="sm"
                                   busy={
                                     sceneMutation.isPending &&
-                                    sceneMutation.variables?.projectId ===
+                                    sceneMutation.variables?.chapterId ===
                                       activeProjectId &&
                                     sceneMutation.variables.sceneNo ===
                                       scene.scene_no
                                   }
                                   onClick={() =>
                                     sceneMutation.mutate({
-                                      projectId: activeProjectId,
+                                      chapterId: activeChapterId,
                                       sceneNo: scene.scene_no,
                                     })
                                   }
@@ -978,6 +1019,7 @@ export function WritingPage() {
           </div>
         </div>
       </div>
+      </ChapterRequired>
     </ProjectRequired>
   );
 }

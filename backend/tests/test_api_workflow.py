@@ -10,10 +10,11 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from sqlalchemy import update
 
-from app.api import assets, jobs, media, projects, providers, shots, writing
+from app.api import assets, chapters, jobs, media, projects, providers, shots, writing
 from app.db import Database
 from app.dependencies import (
     get_asset_service,
+    get_chapter_service,
     get_job_service,
     get_media_service,
     get_project_service,
@@ -25,6 +26,7 @@ from app.jobs.repository import JobRepository
 from app.jobs.runner import JobRunner
 from app.models.tables import api_provider
 from app.services.asset_service import AssetService
+from app.services.chapter_service import ChapterService
 from app.services.errors import ServiceError
 from app.services.file_service import file_service
 from app.services.job_service import JobService
@@ -64,6 +66,7 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
     job_service = JobService(database, repository=repository, runner=runner)
     services = {
         get_project_service: ProjectService(database),
+        get_chapter_service: ChapterService(database),
         get_job_service: job_service,
         get_writing_service: WritingService(database, job_service),
         get_asset_service: AssetService(database, job_service),
@@ -85,6 +88,7 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
 
     for router in (
         projects.router,
+        chapters.router,
         writing.router,
         assets.router,
         shots.router,
@@ -132,11 +136,20 @@ def _create_project(client: TestClient) -> dict[str, Any]:
         "/api/projects",
         json={
             "name": "测试漫剧",
-            "source_text": "主角走进旧屋，发现桌上的戒指。",
             "style_prompt": "二维国风漫剧",
         },
     )
     assert response.status_code == 201
+    return response.json()
+
+
+def _create_chapter(client: TestClient, project_id: str, **overrides: Any) -> dict[str, Any]:
+    payload = {
+        "title": overrides.get("title", "第一章"),
+        "source_text": overrides.get("source_text", "主角走进旧屋，发现桌上的戒指。"),
+    }
+    response = client.post(f"/api/projects/{project_id}/chapters", json=payload)
+    assert response.status_code == 201, response.text
     return response.json()
 
 
@@ -174,21 +187,27 @@ def _create_text_provider(client: TestClient, name: str) -> dict[str, Any]:
     return response.json()
 
 
-def test_screenplay_generation_updates_style_for_future_asset_prompts(
+def test_manual_style_prompt_survives_screenplay_and_reaches_asset_prompts(
     api_client: TestClient,
 ) -> None:
+    """画风只允许用户手动设置：生成剧本不得改写它，且必须流入后续素材提示词。"""
     project = _create_project(api_client)
     project_id = project["id"]
+    chapter_id = _create_chapter(api_client, project_id)["id"]
+    expected_style_prompt = "用户手动设定的画风，克制线条，低饱和色调"
+    manual = api_client.put(
+        f"/api/projects/{project_id}", json={"style_prompt": expected_style_prompt}
+    )
+    assert manual.status_code == 200
 
-    screenplay_job = api_client.post(f"/api/projects/{project_id}/screenplay/generate", json={})
+    screenplay_job = api_client.post(f"/api/chapters/{chapter_id}/screenplay/generate", json={})
     assert screenplay_job.status_code == 202
     assert _wait_job(api_client, screenplay_job.json()["id"])["status"] == "completed"
-    expected_style_prompt = "冷峻悬疑二维国漫，利落轮廓，低饱和冷色，分层暗光"
     updated_project = api_client.get(f"/api/projects/{project_id}")
     assert updated_project.status_code == 200
     assert updated_project.json()["style_prompt"] == expected_style_prompt
 
-    extract_job = api_client.post(f"/api/projects/{project_id}/assets/extract", json={})
+    extract_job = api_client.post(f"/api/chapters/{chapter_id}/assets/extract", json={})
     assert extract_job.status_code == 202
     assert _wait_job(api_client, extract_job.json()["id"])["status"] == "completed"
     extracted_assets = api_client.get(f"/api/projects/{project_id}/assets").json()
@@ -202,12 +221,13 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
 ) -> None:
     project = _create_project(api_client)
     project_id = project["id"]
+    chapter_id = _create_chapter(api_client, project_id)["id"]
 
-    screenplay_job = api_client.post(f"/api/projects/{project_id}/screenplay/generate", json={})
+    screenplay_job = api_client.post(f"/api/chapters/{chapter_id}/screenplay/generate", json={})
     assert screenplay_job.status_code == 202
     assert _wait_job(api_client, screenplay_job.json()["id"])["status"] == "completed"
 
-    extract_job = api_client.post(f"/api/projects/{project_id}/assets/extract", json={})
+    extract_job = api_client.post(f"/api/chapters/{chapter_id}/assets/extract", json={})
     assert extract_job.status_code == 202
     assert _wait_job(api_client, extract_job.json()["id"])["status"] == "completed"
     extracted_assets = api_client.get(f"/api/projects/{project_id}/assets").json()
@@ -239,19 +259,20 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
         )
 
     shot_job = api_client.post(
-        f"/api/projects/{project_id}/shots/extract",
+        f"/api/chapters/{chapter_id}/shots/extract",
         json={"source_type": "screenplay", "scope": "all"},
     )
     assert shot_job.status_code == 202
     assert _wait_job(api_client, shot_job.json()["id"])["status"] == "completed"
-    current_shots = api_client.get(f"/api/projects/{project_id}/shots").json()
+    current_shots = api_client.get(f"/api/chapters/{chapter_id}/shots").json()
     assert len(current_shots) == 1
     shot_id = current_shots[0]["id"]
     assert current_shots[0]["image_prompt"]
     assert current_shots[0]["video_prompt"]
     assert current_shots[0]["negative_prompt"]
     assert "【参考】" in current_shots[0]["compiled_image_prompt"]
-    assert "【镜头与声音】" in current_shots[0]["compiled_video_prompt"]
+    assert "【镜头】" in current_shots[0]["compiled_video_prompt"]
+    assert "【声音】" in current_shots[0]["compiled_video_prompt"]
     assert current_shots[0]["reference_bindings"]
     keyframe_job = api_client.post(f"/api/shots/{shot_id}/keyframes/generate", json={})
     assert keyframe_job.status_code == 202
@@ -263,7 +284,7 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     assert "【参考】" in keyframes[0]["prompt_snapshot"]
     assert "negative prompt:" in keyframes[0]["prompt_snapshot"]
     assert keyframes[0]["prompt_snapshot"] == current_shots[0]["compiled_image_prompt"]
-    assert keyframes[0]["file_path"].startswith("分镜图/")
+    assert keyframes[0]["file_path"].startswith("第01章-第一章/分镜图/")
 
     video_job = api_client.post(f"/api/shots/{shot_id}/videos/generate", json={})
     assert video_job.status_code == 202
@@ -271,9 +292,10 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     videos = api_client.get(f"/api/shots/{shot_id}/videos").json()
     assert len(videos) == 1
     assert videos[0]["is_current"] is True
-    assert "【镜头与声音】" in videos[0]["prompt_snapshot"]
-    assert "补充禁止事项：" in videos[0]["prompt_snapshot"]
-    assert videos[0]["file_path"].startswith("分镜视频/")
+    assert "【镜头】" in videos[0]["prompt_snapshot"]
+    assert "【声音】" in videos[0]["prompt_snapshot"]
+    assert videos[0]["negative_prompt_snapshot"]  # 负面提示词存在
+    assert videos[0]["file_path"].startswith("第01章-第一章/分镜视频/")
     assert api_client.get(f"/api/videos/{videos[0]['id']}/download").status_code == 200
     exported = api_client.get(f"/api/projects/{project_id}/videos/export")
     assert exported.status_code == 200
@@ -368,16 +390,17 @@ def test_shot_split_copy_merge_and_reorder_preserve_contiguous_numbers(
     api_client: TestClient,
 ) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     first = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={"action": "主角走入房间，然后停下观察。", "duration_sec": 4},
     ).json()
     second = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={"action": "主角拿起戒指。", "duration_sec": 3},
     ).json()
     reordered = api_client.post(
-        f"/api/projects/{project['id']}/shots/reorder",
+        f"/api/chapters/{chapter['id']}/shots/reorder",
         json={"ids": [second["id"], first["id"]]},
     )
     assert reordered.status_code == 200
@@ -388,20 +411,21 @@ def test_shot_split_copy_merge_and_reorder_preserve_contiguous_numbers(
     split = api_client.post(f"/api/shots/{second['id']}/split", json={})
     assert split.status_code == 200
     assert len(split.json()) == 2
-    ids = [item["id"] for item in api_client.get(f"/api/projects/{project['id']}/shots").json()]
+    ids = [item["id"] for item in api_client.get(f"/api/chapters/{chapter['id']}/shots").json()]
     merged = api_client.post(
-        f"/api/projects/{project['id']}/shots/merge",
+        f"/api/chapters/{chapter['id']}/shots/merge",
         json={"ids": ids[:2]},
     )
     assert merged.status_code == 200
-    final_shots = api_client.get(f"/api/projects/{project['id']}/shots").json()
+    final_shots = api_client.get(f"/api/chapters/{chapter['id']}/shots").json()
     assert [item["shot_no"] for item in final_shots] == list(range(1, len(final_shots) + 1))
 
 
 def test_shot_split_clears_prompt_overrides(api_client: TestClient) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     current = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={
             "action": "主角走入房间，然后停下观察。",
             "duration_sec": 4,
@@ -419,8 +443,9 @@ def test_shot_split_clears_prompt_overrides(api_client: TestClient) -> None:
 
 def test_shot_merge_clears_prompt_overrides(api_client: TestClient) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     target = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={
             "action": "主角走入房间。",
             "duration_sec": 2,
@@ -429,12 +454,12 @@ def test_shot_merge_clears_prompt_overrides(api_client: TestClient) -> None:
         },
     ).json()
     source = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={"action": "主角停下观察。", "duration_sec": 2},
     ).json()
 
     response = api_client.post(
-        f"/api/projects/{project['id']}/shots/merge",
+        f"/api/chapters/{chapter['id']}/shots/merge",
         json={"ids": [target["id"], source["id"]]},
     )
 
@@ -447,13 +472,14 @@ def test_shot_create_requires_duration_and_forces_screenplay_source(
     api_client: TestClient,
 ) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
 
     missing_duration = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={"action": "主角进入房间。"},
     )
     created = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={
             "source_type": "novel",
             "action": "主角进入房间。",
@@ -471,9 +497,10 @@ def test_shot_create_with_legacy_nested_fields_normalizes_aliases(
     api_client: TestClient,
 ) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
 
     created = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={
             "duration_sec": 3,
             "positions": [
@@ -518,8 +545,9 @@ def test_shot_update_with_legacy_nested_fields_updates_duration(
     api_client: TestClient,
 ) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     created = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={"duration_sec": 3},
     )
     assert created.status_code == 201
@@ -542,9 +570,10 @@ def test_video_batch_keeps_valid_item_when_another_shot_lacks_keyframe(
     api_client: TestClient,
 ) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     scene = _create_ready_scene(api_client, project["id"])
     first = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={
             "scene_asset_id": scene["id"],
             "action": "第一镜",
@@ -553,7 +582,7 @@ def test_video_batch_keeps_valid_item_when_another_shot_lacks_keyframe(
         },
     ).json()
     second = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={
             "scene_asset_id": scene["id"],
             "action": "第二镜",
@@ -581,8 +610,9 @@ def test_keyframe_without_image_prompt_returns_400_even_with_frame_description(
     api_client: TestClient,
 ) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     created = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={
             "action": "主角推开房门。",
             "frame_description": "主角站在旧屋门口，右手按住木门。",
@@ -605,8 +635,9 @@ def test_keyframe_without_visual_description_returns_400(
     api_client: TestClient,
 ) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     created = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={"action": "主角推开房门。", "duration_sec": 3},
     )
     assert created.status_code == 201
@@ -624,8 +655,9 @@ def test_video_without_video_prompt_returns_400_even_with_shot_action(
     api_client: TestClient,
 ) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     created = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={
             "start_state": "主角站在门外。",
             "action": "主角推开房门并向屋内迈出一步。",
@@ -655,8 +687,9 @@ def test_video_without_action_description_returns_400(
     api_client: TestClient,
 ) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     created = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={"frame_description": "主角站在旧屋门口。", "duration_sec": 3},
     )
     assert created.status_code == 201
@@ -678,8 +711,9 @@ def test_video_without_action_description_returns_400(
 
 def test_video_upload_with_undecodable_mp4_returns_400(api_client: TestClient) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     current_shot = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={
             "action": "主角向前走。",
             "video_prompt": "0-6秒：镜头跟随主角。",
@@ -700,9 +734,10 @@ def test_video_generation_with_undecodable_result_marks_job_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
     scene = _create_ready_scene(api_client, project["id"])
     current_shot = api_client.post(
-        f"/api/projects/{project['id']}/shots",
+        f"/api/chapters/{chapter['id']}/shots",
         json={
             "scene_asset_id": scene["id"],
             "action": "主角向前走。",

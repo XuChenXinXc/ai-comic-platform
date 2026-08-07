@@ -150,9 +150,7 @@ def test_job_runner_with_signed_url_error_persists_redacted_error(tmp_path: Path
     runner = JobRunner(repository, {"text": 1, "image": 1, "video": 1})
 
     def handler(_record: dict[str, Any]) -> None:
-        raise RuntimeError(
-            "Provider 下载失败：https://cdn.invalid/video.mp4?token=secret-token"
-        )
+        raise RuntimeError("Provider 下载失败：https://cdn.invalid/video.mp4?token=secret-token")
 
     runner.register_handler("generate_video", handler)
     record = _create(repository, "generate_video")

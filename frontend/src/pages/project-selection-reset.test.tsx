@@ -9,7 +9,7 @@ import type { Asset, Shot } from "../types/api";
 import { AssetsPage } from "./AssetsPage";
 import { ShotsPage } from "./ShotsPage";
 
-const projectState = vi.hoisted(() => ({ id: "project-1" }));
+const projectState = vi.hoisted(() => ({ id: "chapter-1" }));
 
 vi.mock("sonner", () => ({
   toast: { error: vi.fn(), success: vi.fn(), warning: vi.fn() },
@@ -29,6 +29,35 @@ vi.mock("../hooks/use-project", () => ({
 }));
 vi.mock("../components/project-required", () => ({
   ProjectRequired: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("../hooks/use-chapter", () => ({
+  useChapter: () => {
+    const chapterId = projectState.id === "chapter-1" ? "chapter-1" : "chapter-2";
+    return {
+      chapters: [
+        { id: "chapter-1", project_id: "project-1", chapter_no: 1, title: "第一章" },
+        { id: "chapter-2", project_id: "project-2", chapter_no: 1, title: "第一章" },
+      ],
+      activeChapter: {
+        id: chapterId,
+        project_id: projectState.id,
+        chapter_no: 1,
+        title: "第一章",
+        source_signature: "source-1",
+      },
+      activeChapterId: chapterId,
+      selectChapter: vi.fn(),
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    };
+  },
+}));
+vi.mock("../components/chapter-required", () => ({
+  ChapterRequired: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("../components/chapter-selector", () => ({
+  ChapterSelector: () => null,
 }));
 vi.mock("../components/shot-media-card", () => ({
   ShotMediaCard: ({
@@ -53,7 +82,7 @@ vi.mock("../components/shot-media-card", () => ({
 
 const asset = {
   id: "asset-1",
-  project_id: "project-1",
+  project_id: "chapter-1",
   asset_type: "character",
   name: "林昭",
   prompt: "角色提示词",
@@ -61,7 +90,7 @@ const asset = {
 } as Asset;
 const shot = {
   id: "shot-1",
-  project_id: "project-1",
+  project_id: "chapter-1",
   shot_no: 1,
   shot_order: 1,
   action: "推开旧剧院的门",
@@ -84,12 +113,12 @@ function renderPage(page: ReactNode) {
 
 beforeEach(() => {
   vi.restoreAllMocks();
-  projectState.id = "project-1";
+  projectState.id = "chapter-1";
   vi.spyOn(api.assets, "list").mockImplementation(async (projectId) =>
-    projectId === "project-1" ? [asset] : [],
+    projectId === "chapter-1" ? [asset] : [],
   );
   vi.spyOn(api.shots, "list").mockImplementation(async (projectId) =>
-    projectId === "project-1" ? [shot] : [],
+    projectId === "chapter-1" ? [shot] : [],
   );
   vi.spyOn(api.assets.images, "list").mockResolvedValue([]);
 });

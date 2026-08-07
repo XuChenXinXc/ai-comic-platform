@@ -139,10 +139,7 @@ def test_file_service_write_bytes_atomic_saves_relative_project_file(
 def test_project_media_url_with_reserved_characters_returns_encoded_url() -> None:
     result = project_media_url("project-1", "项目#1-角色/a%1.png")
 
-    assert result == (
-        "/media/project-1/"
-        "%E9%A1%B9%E7%9B%AE%231-%E8%A7%92%E8%89%B2/a%251.png"
-    )
+    assert result == ("/media/project-1/%E9%A1%B9%E7%9B%AE%231-%E8%A7%92%E8%89%B2/a%251.png")
 
 
 def test_file_service_initialize_project_creates_named_media_directories(
@@ -184,9 +181,7 @@ def test_file_service_asset_image_path_with_storage_name_uses_named_folder(
         storage_name="项目一",
     )
 
-    assert service.relative_project_path("project-1", target) == (
-        f"{folder}/asset-1/v001.png"
-    )
+    assert service.relative_project_path("project-1", target) == (f"{folder}/asset-1/v001.png")
 
 
 def test_file_service_keyframe_path_with_storage_name_uses_named_folder(
@@ -218,9 +213,7 @@ def test_file_service_video_path_with_storage_name_uses_named_folder(
         storage_name="项目一",
     )
 
-    assert service.relative_project_path("project-1", target) == (
-        "项目一-分镜视频/shot-1/v001.mp4"
-    )
+    assert service.relative_project_path("project-1", target) == ("项目一-分镜视频/shot-1/v001.mp4")
 
 
 @pytest.mark.parametrize(
@@ -297,9 +290,7 @@ def test_project_service_create_initializes_storage_and_returns_path(
     database.create_all()
     storage = FileService(tmp_path / "files")
 
-    record = ProjectService(database, storage).create(
-        {"name": "项目一", "source_text": "测试小说"}
-    )
+    record = ProjectService(database, storage).create({"name": "项目一", "source_text": "测试小说"})
 
     assert record["storage_path"] == str(storage.project_dir(record["id"]))
     database.dispose()

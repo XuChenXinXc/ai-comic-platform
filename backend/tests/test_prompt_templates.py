@@ -418,24 +418,27 @@ def test_compile_video_prompt_uses_v2_template_and_reference_order() -> None:
         },
     )
 
-    assert "【参考】" in prompt
+    assert "【角色锁定】" in prompt
+    assert "@Image2：林雪，锁定角色身份与服装。" in prompt
+    assert "【物品锁定】" in prompt
+    assert "铜制罗盘" in prompt
+    assert "【场景锁定】" in prompt
+    assert "古寺偏殿" in prompt
+    assert "【本镜唯一开始状态】" in prompt
     assert "@Image1：当前分镜关键帧" in prompt
-    assert "【执行】" in prompt
-    assert "结束状态：木门打开一条缝，林雪停住，末0.5秒保持稳定" in prompt
-    assert "【镜头与声音】" in prompt
-    assert "【保持】" in prompt
-    assert "补充禁止事项：身份漂移、道具穿模、文字水印。" in prompt
-    assert "东方奇幻二维动画，6秒，16:9。" in prompt
-    assert "画面比例：9:16。" not in prompt
-    # 新行为：优先级段、参考图冲突裁决、机位二选一、口型、删音乐、禁止项压缩、道具锁定
-    assert "【最高优先级】" in prompt
-    assert "以参考图中的人物外观、服装、道具和空间关系为准" in prompt
-    assert "缓慢跟随人物运动，不切换机位。" in prompt
-    assert "固定机位，画面变化由人物动作推动" not in prompt
-    assert "音乐" not in prompt
-    assert "禁止出现：人物变形、服装变化、新增人物、字幕文字、物体瞬移。" in prompt
-    assert "重点道具（铜制罗盘）的外观、尺寸、颜色" in prompt
-    assert "不新增角色、手臂、手指、道具或其他物体" not in prompt
+    assert "【核心动作】" in prompt
+    assert "林雪缓慢推开木门，门缝透出暖光。" in prompt
+    assert "【镜头】" in prompt
+    assert "【声音】" in prompt
+    assert "【结束状态】" in prompt
+    assert "木门打开一条缝，林雪停住。" in prompt
+    assert "【禁止项】" in prompt
+    assert "身份漂移、道具穿模、文字水印" in prompt
+    assert "画面比例：16:9，总时长：6秒。" in prompt
+    # 验证新模板的核心特征
+    assert "严格保持每位角色的身份、面部特征、发型、服装、体型、左右位置关系不变" in prompt
+    assert "重点道具的外观、尺寸、颜色和材质保持一致" in prompt
+    assert "其余静止物体不得在动画中移动、旋转或重新生成" in prompt
 
 
 def test_compile_video_prompt_includes_positions_and_expressions() -> None:

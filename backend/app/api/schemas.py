@@ -3,13 +3,19 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.schemas import ScreenplayDialogue
+from app.schemas import ScreenplayDialogue, ShotTransitionFromPrev
 
 AssetType = Literal["character", "scene", "prop"]
 ContentStatus = Literal["draft", "ready", "confirmed", "failed"]
 ProviderKind = Literal["text", "image", "video"]
 ShotSourceType = Literal["novel", "screenplay"]
 ProjectStorageSource = Literal["database", "environment", "default"]
+
+# 项目默认画风：仅作为新建项目的初始值，之后只允许用户手动修改
+DEFAULT_STYLE_PROMPT = (
+    "电影感现实主义二维国漫，稳定自然的半写实人物比例，沉稳细腻线条，"
+    "低饱和冷暖协调色调，真实清晰的微表情，层次分明的电影光影。"
+)
 
 
 def _sensitive_param_path(value: Any, path: str = "params") -> str | None:
@@ -71,7 +77,7 @@ class ApiModel(BaseModel):
 class ProjectCreate(ApiModel):
     name: str = Field(min_length=1, max_length=200)
     source_text: str = ""
-    style_prompt: str = ""
+    style_prompt: str = DEFAULT_STYLE_PROMPT
     aspect_ratio: str = "16:9"
     image_size: str = "1920x1080"
     video_size: str = "16:9"
@@ -317,6 +323,7 @@ class ShotFields(ApiModel):
     duration_sec: float = Field(gt=0)
     end_state: str = ""
     next_hook: str = ""
+    transition_from_prev: ShotTransitionFromPrev = "scene_change"
     frame_description: str = ""
     image_prompt: str = ""
     image_prompt_override: str = ""
@@ -349,6 +356,7 @@ class ShotUpdate(ApiModel):
     duration_sec: float | None = Field(default=None, gt=0)
     end_state: str | None = None
     next_hook: str | None = None
+    transition_from_prev: ShotTransitionFromPrev | None = None
     frame_description: str | None = None
     image_prompt: str | None = None
     image_prompt_override: str | None = None
@@ -448,6 +456,10 @@ class RefinePromptsRequest(GenerateRequest):
         return self
 
 
+class QualityFixRequest(GenerateRequest):
+    ids: list[str] | None = None
+
+
 class MediaBatchRequest(GenerateRequest):
     ids: list[str] | None = None
     scene_no: int | None = Field(default=None, ge=1)
@@ -485,3 +497,27 @@ class ProviderUpdate(ApiModel):
     is_default: bool | None = None
 
     _validate_params = field_validator("params")(_validate_public_params)
+
+
+class ChapterCreate(ApiModel):
+    title: str = Field(default="", max_length=200)
+    source_text: str = ""
+    chapter_no: int | None = Field(default=None, ge=1)
+    status: ContentStatus = "draft"
+
+
+class ChapterUpdate(ApiModel):
+    title: str | None = Field(default=None, max_length=200)
+    source_text: str | None = None
+    chapter_no: int | None = Field(default=None, ge=1)
+    status: ContentStatus | None = None
+
+
+class ChapterReorderRequest(ApiModel):
+    ids: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique(self) -> "ChapterReorderRequest":
+        if len(set(self.ids)) != len(self.ids):
+            raise ValueError("ids 不能重复")
+        return self

@@ -8,6 +8,7 @@ import pytest
 from app.db import Database
 from app.prompts import load_prompt
 from app.schemas import ShotVideoPromptOptimizeOutput
+from app.services.chapter_service import ChapterService
 from app.services.errors import ServiceError
 from app.services.file_service import FileService
 from app.services.job_service import JobService
@@ -57,16 +58,17 @@ class CapturingTextProvider:
 @pytest.fixture
 def optimize_services(
     tmp_path: Path,
-) -> tuple[Database, ShotService, dict[str, Any], dict[str, Any]]:
+) -> tuple[Database, ShotService, dict[str, Any], dict[str, Any], dict[str, Any]]:
     database = Database(f"sqlite:///{(tmp_path / 'optimize.db').as_posix()}")
     database.initialize(seed_mock_providers=True)
-    project = ProjectService(database, FileService(tmp_path)).create(
-        {"name": "优化测试", "source_text": "少年在山巅决定下山。"}
+    project = ProjectService(database, FileService(tmp_path)).create({"name": "优化测试"})
+    chapter = ChapterService(database, FileService(tmp_path)).create(
+        project["id"], {"title": "第一章", "source_text": "少年在山巅决定下山。"}
     )
     jobs = RecordingJobService()
     service = ShotService(database, jobs=jobs)  # type: ignore[arg-type]
     shot = service.create(
-        project["id"],
+        chapter["id"],
         {
             "shot_no": 1,
             "shot_order": 1,
@@ -88,15 +90,15 @@ def optimize_services(
             "status": "ready",
         },
     )
-    yield database, service, project, shot
+    yield database, service, project, chapter, shot
     database.dispose()
 
 
 def test_optimize_video_prompt_calls_text_provider_and_returns_prompt(
-    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any]],
+    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any], dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database, service, project, shot = optimize_services
+    database, service, project, chapter, shot = optimize_services
     provider = CapturingTextProvider()
 
     monkeypatch.setattr(
@@ -135,9 +137,9 @@ def test_optimize_video_prompt_calls_text_provider_and_returns_prompt(
 
 
 def test_optimize_video_prompt_rejects_empty_prompt(
-    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any]],
+    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any], dict[str, Any]],
 ) -> None:
-    database, service, project, shot = optimize_services
+    database, service, project, chapter, shot = optimize_services
 
     import asyncio
 
@@ -160,10 +162,10 @@ def test_shot_video_optimize_prompt_template_loads() -> None:
 
 
 def test_mock_text_provider_returns_optimized_prompt(
-    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any]],
+    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any], dict[str, Any]],
 ) -> None:
     """mock 文字模型对优化 schema 返回非空提示词（演示环境可用）。"""
-    database, service, project, shot = optimize_services
+    database, service, project, chapter, shot = optimize_services
 
     import asyncio
 
@@ -179,13 +181,13 @@ def test_mock_text_provider_returns_optimized_prompt(
 
 
 def test_queue_video_prompt_optimize_batch_creates_job_with_progress(
-    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any]],
+    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any], dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """批量优化：入队单个 batch 任务，progress_total 为有提示词分镜数。"""
-    database, service, project, shot = optimize_services
+    database, service, project, chapter, shot = optimize_services
     shot2 = service.create(
-        project["id"],
+        chapter["id"],
         {
             "shot_no": 2,
             "shot_order": 2,
@@ -236,13 +238,13 @@ def test_queue_video_prompt_optimize_batch_creates_job_with_progress(
 
 
 def test_handle_video_prompt_optimize_batch_writes_overrides(
-    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any]],
+    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any], dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """批量优化执行：优化结果写入 video_prompt_override，进度上报。"""
-    database, service, project, shot = optimize_services
+    database, service, project, chapter, shot = optimize_services
     shot2 = service.create(
-        project["id"],
+        chapter["id"],
         {
             "shot_no": 2,
             "shot_order": 2,
@@ -308,11 +310,11 @@ def test_handle_video_prompt_optimize_batch_writes_overrides(
 
 
 def test_handle_video_prompt_optimize_batch_skips_modified_shot(
-    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any]],
+    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any], dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """批量优化执行：优化期间分镜被修改（revision 变化）则跳过并记录。"""
-    database, service, project, shot = optimize_services
+    database, service, project, chapter, shot = optimize_services
 
     async def fake_optimize(
         current: dict[str, Any],
@@ -325,6 +327,7 @@ def test_handle_video_prompt_optimize_batch_skips_modified_shot(
         # 模拟优化期间其他请求修改了分镜（revision +1）
         service.update(current["id"], {"action": "并发修改。"})
         return "优化后的提示词。"
+
     monkeypatch.setattr(service, "_optimize_video_prompt_once", fake_optimize)
     job = {
         "id": "batch-job",
@@ -352,11 +355,11 @@ def test_handle_video_prompt_optimize_batch_skips_modified_shot(
 
 
 def test_handle_video_prompt_optimize_batch_skips_deleted_shot(
-    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any]],
+    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any], dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """批量优化执行：优化期间分镜被删除（404）则跳过，不中断整个任务。"""
-    database, service, project, shot = optimize_services
+    database, service, project, chapter, shot = optimize_services
 
     async def fake_optimize(
         current: dict[str, Any],
@@ -369,6 +372,7 @@ def test_handle_video_prompt_optimize_batch_skips_deleted_shot(
         # 模拟优化期间分镜被删除
         service.delete(current["id"])
         return "优化后的提示词。"
+
     monkeypatch.setattr(service, "_optimize_video_prompt_once", fake_optimize)
     job = {
         "id": "batch-job",
@@ -392,13 +396,13 @@ def test_handle_video_prompt_optimize_batch_skips_deleted_shot(
 
 
 def test_handle_video_prompt_optimize_batch_respects_requested_ids(
-    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any]],
+    optimize_services: tuple[Database, ShotService, dict[str, Any], dict[str, Any], dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """批量优化执行：入队时指定 ids 只优化所选分镜，不覆盖未选中的。"""
-    database, service, project, shot = optimize_services
+    database, service, project, chapter, shot = optimize_services
     shot2 = service.create(
-        project["id"],
+        chapter["id"],
         {
             "shot_no": 2,
             "shot_order": 2,

@@ -19,6 +19,7 @@ from app.models.tables import (
     video_version,
 )
 from app.services.asset_service import AssetService
+from app.services.chapter_service import ChapterService
 from app.services.errors import ServiceError
 from app.services.file_service import FileService, FileServiceError
 from app.services.project_service import ProjectService
@@ -232,8 +233,11 @@ def test_file_service_migrates_existing_categorized_media_to_flat_readable_paths
         current_project["id"],
         {"asset_type": "character", "name": "林舟"},
     )
+    current_chapter = ChapterService(database, storage).create(
+        current_project["id"], {"title": "第一章"}
+    )
     current_shot = ShotService(database).create(
-        current_project["id"],
+        current_chapter["id"],
         ShotCreate(duration_sec=6).model_dump(),
     )
     old_asset_v1 = f"角色/{current_asset['id']}/v001.png"
@@ -349,8 +353,8 @@ def test_file_service_migrates_existing_categorized_media_to_flat_readable_paths
         (1, "角色/角色-林舟-v001.png"),
         (2, "角色/角色-林舟.png"),
     ]
-    assert keyframe_path == "分镜图/分镜图-001.png"
-    assert video_path == "分镜视频/分镜视频-001.mp4"
+    assert keyframe_path == "第01章-第一章/分镜图/分镜图-001.png"
+    assert video_path == "第01章-第一章/分镜视频/分镜视频-001.mp4"
     assert (
         storage.resolve_project_path(current_project["id"], "角色/角色-林舟-v001.png").read_bytes()
         == b"asset-v1"
@@ -360,12 +364,14 @@ def test_file_service_migrates_existing_categorized_media_to_flat_readable_paths
         == b"asset-v2"
     )
     assert (
-        storage.resolve_project_path(current_project["id"], "分镜图/分镜图-001.png").read_bytes()
+        storage.resolve_project_path(
+            current_project["id"], "第01章-第一章/分镜图/分镜图-001.png"
+        ).read_bytes()
         == b"keyframe"
     )
     assert (
         storage.resolve_project_path(
-            current_project["id"], "分镜视频/分镜视频-001.mp4"
+            current_project["id"], "第01章-第一章/分镜视频/分镜视频-001.mp4"
         ).read_bytes()
         == b"video"
     )

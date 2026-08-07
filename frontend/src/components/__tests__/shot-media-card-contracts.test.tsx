@@ -35,6 +35,7 @@ const sceneBinding: ReferenceBinding = {
 const baseShot: Shot = {
   id: "shot-1",
   project_id: "project-1",
+      chapter_id: "test-chapter",
   shot_no: 1,
   shot_order: 1,
   source_type: "screenplay",
@@ -55,6 +56,7 @@ const baseShot: Shot = {
   duration_sec: 6,
   end_state: "小明进入屋内。",
   next_hook: "",
+  transition_from_prev: "scene_change",
   frame_description: "小明站在旧屋门口。",
   image_prompt: "",
   image_prompt_override: "",

@@ -4,7 +4,8 @@ import { orderedShots, playableShots } from "./continuity-check";
 
 function shot(partial: Partial<Shot> & { id: string; shot_no: number }): Shot {
   return {
-    project_id: "project-1",
+    project_id: "test-project",
+    chapter_id: "test-chapter",
     shot_order: partial.shot_no,
     source_type: "screenplay",
     source_ref: "",
@@ -18,6 +19,7 @@ function shot(partial: Partial<Shot> & { id: string; shot_no: number }): Shot {
     duration_sec: 6,
     end_state: "",
     next_hook: "",
+    transition_from_prev: "scene_change",
     frame_description: "",
     image_prompt: "",
     compiled_image_prompt: "",

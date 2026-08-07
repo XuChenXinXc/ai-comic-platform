@@ -25,6 +25,31 @@ vi.mock("../hooks/use-project", () => ({
 vi.mock("../components/project-required", () => ({
   ProjectRequired: ({ children }: { children: ReactNode }) => children,
 }));
+vi.mock("../hooks/use-chapter", () => ({
+  useChapter: () => ({
+    chapters: [
+      { id: "chapter-1", project_id: "project-1", chapter_no: 1, title: "第一章" },
+    ],
+    activeChapter: {
+      id: "chapter-1",
+      project_id: "project-1",
+      chapter_no: 1,
+      title: "第一章",
+      source_signature: "source-1",
+    },
+    activeChapterId: "chapter-1",
+    selectChapter: vi.fn(),
+    isLoading: false,
+    error: null,
+    refetch: vi.fn(),
+  }),
+}));
+vi.mock("../components/chapter-required", () => ({
+  ChapterRequired: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("../components/chapter-selector", () => ({
+  ChapterSelector: () => null,
+}));
 
 const asset = {
   id: "asset-1",
