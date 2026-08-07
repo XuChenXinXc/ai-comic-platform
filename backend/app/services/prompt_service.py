@@ -1000,7 +1000,15 @@ def _camera_line(camera_move: Any) -> str:
     """
     raw = str(camera_move or "").strip()
     fixed_markers = ("固定", "不动", "静止", "机位不动", "无运镜")
+    move_markers = ("推近", "推进", "横移", "摇镜", "跟随", "缓推", "移动", "升降", "环绕")
     is_fixed = any(marker in raw for marker in fixed_markers) or not raw
+    has_move = any(marker in raw for marker in move_markers)
+    if is_fixed and has_move:
+        move_word = next(
+            (marker for marker in move_markers if marker in raw),
+            "缓推",
+        )
+        return f"固定机位，不切换机位，仅做轻微{move_word}（镜头移动幅度很小）。"
     if is_fixed:
         return "固定机位，画面变化由人物动作推动，摄影机不移动。"
     return f"{raw or '缓慢跟随'}；缓慢跟随人物运动，不切换机位。"
@@ -1124,6 +1132,10 @@ def compile_video_prompt(
             "若剧情要求道具被拿取、移动或放下，位置随人物动作自然变化，"
             "不得复制、消失、变形、穿模或瞬移。"
         )
+        sections.append(
+            "若道具以「隐约」「一角」「不清晰」形式出现，必须保持该可见度，"
+            "不得提前清晰展示、放大或特写。"
+        )
         sections.append("")
 
     # 场景锁定
@@ -1157,6 +1169,9 @@ def compile_video_prompt(
             "必须完整继承上一镜结束时的人物姿态与手持道具；"
             "视线目标变化需在时间轴中明确交代，不得无承接跳变。"
         )
+        sections.append(
+            "人物朝向与机位关系保持承接，不得为了展示角色突然转向镜头。"
+        )
     elif transition == "elliptical":
         sections.append(
             f"{prev_ending}。本镜在此之后，中间省略了一段过程："
@@ -1182,6 +1197,14 @@ def compile_video_prompt(
         sections.append(f"人物站位：{positions}。")
     if expressions and expressions != "当前分镜表情":
         sections.append(f"表情状态：{expressions}。")
+    sections.append(
+        "人物站位必须与起始姿态一致：若起始为蜷缩/躺姿，站位不得写成坐姿；"
+        "动作起点从该姿态自然展开。"
+    )
+    sections.append(
+        "起始朝向不得写成「面向镜头」；应与上一镜保持一致，"
+        "除非动作明确交代转身。"
+    )
     static_objects_rule = (
         "初始帧画面内所有静止物体（背景建筑、家具、地面道具、树木等）的位置、姿态、光影已经固定；"
     )
@@ -1199,6 +1222,7 @@ def compile_video_prompt(
                 f"本镜只执行以下唯一一套时间轴，忽略其他时间描述；"
                 f"时间轴须连续覆盖 0 到 {duration_sec:g} 秒。"
             ),
+            "时间轴内不要重复描述机位；机位以【镜头】段落为准，两者冲突时以【镜头】段落为准。",
             action_timeline,
         ]
     )

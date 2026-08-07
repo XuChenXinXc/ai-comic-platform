@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRight,
   FileText,
+  Film,
   FolderPlus,
   Save,
   Trash2,
@@ -75,6 +76,7 @@ export function ProjectPage() {
       text: [],
       image: [],
       video: [],
+      tts: [],
     };
     (providersQuery.data || [])
       .filter((provider) => provider.enabled)
@@ -134,6 +136,15 @@ export function ProjectPage() {
         description="管理项目配置；小说原文在写作页按章节编辑。"
         actions={
           <>
+            {!creating && activeProjectId && (
+              <Button
+                variant="secondary"
+                onClick={() => navigate(`/composition/${activeProjectId}`)}
+              >
+                <Film className="h-4 w-4" />
+                最终合成
+              </Button>
+            )}
             {!creating ? (
               <Button
                 onClick={() => setSearchParams({ create: "1" })}

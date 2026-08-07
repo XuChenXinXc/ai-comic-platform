@@ -1,4 +1,4 @@
-export type ProviderKind = "text" | "image" | "video";
+export type ProviderKind = "text" | "image" | "video" | "tts";
 export type AssetType = "character" | "scene" | "prop";
 /** 分镜与上一镜的衔接类型：只有 continuous 会引用上一镜视频末帧作为参考图。 */
 export type ShotTransitionFromPrev =

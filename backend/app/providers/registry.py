@@ -9,14 +9,16 @@ from .base import (
     ImageProvider,
     ProviderConfigurationError,
     TextProvider,
+    TTSProvider,
     VideoProvider,
 )
 from .image import HttpImageProvider
-from .mock import MockImageProvider, MockTextProvider, MockVideoProvider
+from .mock import MockImageProvider, MockTextProvider, MockTTSProvider, MockVideoProvider
 from .text import OpenAICompatibleTextProvider
+from .tts import HttpTTSProvider, OpenAITTSProvider
 from .video import HttpVideoProvider
 
-Provider = TextProvider | ImageProvider | VideoProvider
+Provider = TextProvider | ImageProvider | VideoProvider | TTSProvider
 ProviderFactory = Callable[[ProviderConfig], Provider]
 
 
@@ -62,6 +64,10 @@ provider_registry = ProviderRegistry()
 provider_registry.register("text", "mock", MockTextProvider)
 provider_registry.register("image", "mock", MockImageProvider)
 provider_registry.register("video", "mock", MockVideoProvider)
+provider_registry.register("tts", "mock", MockTTSProvider)
 provider_registry.register("text", "openai_compatible", OpenAICompatibleTextProvider)
 provider_registry.register("image", "http_image", HttpImageProvider)
 provider_registry.register("video", "http_video", HttpVideoProvider)
+provider_registry.register("tts", "openai_tts", OpenAITTSProvider)
+provider_registry.register("tts", "http_tts", HttpTTSProvider)
+

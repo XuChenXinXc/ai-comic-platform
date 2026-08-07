@@ -162,18 +162,6 @@ export function ShotMediaCard({
     onError: (error) => toast.error(formatError(error)),
   });
 
-  const optimizeMutation = useMutation({
-    mutationFn: () =>
-      api.shots.optimizeVideoPrompt(shot.id, { prompt: prompt.trim() }),
-    onSuccess: async (result) => {
-      // 只回填编辑框，不更新 baseline：优化结果保持「未保存」状态，
-      // 保存按钮恢复可用，用户检查后点保存才写入 override。
-      setPrompt(result.prompt);
-      toast.success("提示词已优化，请检查后保存");
-    },
-    onError: (error) => toast.error(formatError(error)),
-  });
-
   const uploadMutation = useMutation({
     mutationFn: (file: File) =>
       kind === "keyframe"
@@ -357,22 +345,6 @@ export function ShotMediaCard({
                 {kind === "keyframe" ? "最终关键帧提示词" : "最终视频提示词"}
               </Label>
               <div className="flex items-center gap-2">
-                {kind === "video" ? (
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    busy={optimizeMutation.isPending}
-                    disabled={
-                      promptMutation.isPending ||
-                      generateMutation.isPending ||
-                      promptMissing
-                    }
-                    onClick={() => optimizeMutation.mutate()}
-                  >
-                    <WandSparkles className="h-3.5 w-3.5" />
-                    优化提示词
-                  </Button>
-                ) : null}
                 <Button
                   size="sm"
                   variant="ghost"

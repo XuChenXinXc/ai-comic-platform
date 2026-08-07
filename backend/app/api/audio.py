@@ -1,0 +1,122 @@
+"""音频相关 API
+
+包括配音生成、BGM 管理等。
+"""
+
+from typing import Any
+
+from fastapi import APIRouter, Depends, File, Form, UploadFile
+
+from app.api.schemas import ShotAudioGenerateRequest
+from app.dependencies import get_audio_service
+from app.services.audio_service import AudioService
+
+router = APIRouter(prefix="/audio", tags=["audio"])
+
+
+@router.get("/projects/{project_id}/config")
+def get_audio_config(
+    project_id: str,
+    service: AudioService = Depends(get_audio_service),
+) -> dict[str, Any]:
+    """获取项目音频配置"""
+    return service.get_project_audio_config(project_id)
+
+
+@router.put("/projects/{project_id}/config")
+def update_audio_config(
+    project_id: str,
+    updates: dict[str, Any],
+    service: AudioService = Depends(get_audio_service),
+) -> dict[str, Any]:
+    """更新项目音频配置"""
+    return service.update_project_audio_config(project_id, updates)
+
+
+@router.get("/chapters/{chapter_id}/dialogues")
+def extract_dialogues(
+    chapter_id: str,
+    service: AudioService = Depends(get_audio_service),
+) -> list[dict[str, Any]]:
+    """从剧本提取对话列表"""
+    return service.extract_dialogues_from_screenplay(chapter_id)
+
+
+@router.post("/shots/{shot_id}/audio")
+async def generate_shot_audio(
+    shot_id: str,
+    body: ShotAudioGenerateRequest,
+    service: AudioService = Depends(get_audio_service),
+) -> dict[str, Any]:
+    """为单个分镜生成配音"""
+    return await service.generate_shot_audio(
+        shot_id,
+        body.dialogue_text,
+        body.voice_id,
+        tts_provider_id=body.tts_provider_id,
+    )
+
+
+@router.get("/shots/{shot_id}/audio")
+def get_shot_audio(
+    shot_id: str,
+    service: AudioService = Depends(get_audio_service),
+) -> dict[str, Any] | None:
+    """获取分镜当前配音"""
+    return service.get_shot_audio(shot_id)
+
+
+@router.get("/shots/{shot_id}/audio/versions")
+def list_shot_audio_versions(
+    shot_id: str,
+    service: AudioService = Depends(get_audio_service),
+) -> list[dict[str, Any]]:
+    """列出分镜所有配音版本"""
+    return service.list_shot_audios(shot_id)
+
+
+@router.get("/projects/{project_id}/bgm")
+def list_bgms(
+    project_id: str,
+    service: AudioService = Depends(get_audio_service),
+) -> list[dict[str, Any]]:
+    """列出项目所有 BGM"""
+    return service.list_project_bgms(project_id)
+
+
+@router.post("/projects/{project_id}/bgm")
+async def upload_bgm(
+    project_id: str,
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    mood_tags: str = Form(default="[]"),
+    service: AudioService = Depends(get_audio_service),
+) -> dict[str, Any]:
+    """上传 BGM 文件"""
+    from app.errors import bad_request
+    from app.services.utils import json_loads
+
+    # 限制文件大小为 50MB
+    MAX_FILE_SIZE = 50 * 1024 * 1024
+    file_data = await file.read()
+
+    if len(file_data) > MAX_FILE_SIZE:
+        raise bad_request(f"文件大小超过限制（最大 50MB）")
+
+    # 验证文件类型
+    if file.content_type and not file.content_type.startswith("audio/"):
+        raise bad_request(f"不支持的文件类型：{file.content_type}")
+
+    mood_tags_list = json_loads(mood_tags, [])
+
+    return service.save_bgm(project_id, name, file_data, mood_tags_list)
+
+
+@router.delete("/bgm/{bgm_id}")
+def delete_bgm(
+    bgm_id: str,
+    service: AudioService = Depends(get_audio_service),
+) -> dict[str, str]:
+    """删除 BGM"""
+    service.delete_bgm(bgm_id)
+    return {"message": "BGM 已删除"}

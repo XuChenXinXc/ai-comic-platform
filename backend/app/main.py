@@ -13,7 +13,9 @@ from starlette.types import Scope
 
 from app.api import (
     assets,
+    audio,
     chapters,
+    composition,
     jobs,
     media,
     projects,
@@ -64,7 +66,11 @@ class ProjectMediaStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope: Scope) -> Response:
         normalized_path = PurePath(path).as_posix().strip("/")
         parts = normalized_path.split("/") if normalized_path else []
+        # 加强路径验证：检查是否包含 ".." 或其他可疑模式
         if len(parts) < 2 or any(part in {"", ".", ".."} for part in parts):
+            raise StarletteHTTPException(status_code=404)
+        # 额外检查：确保原始路径中不包含 ".."（防止编码绕过）
+        if ".." in path:
             raise StarletteHTTPException(status_code=404)
         project_id = parts[0]
         relative_path = Path(*parts[1:])
@@ -98,10 +104,13 @@ class ProjectMediaStaticFiles(StaticFiles):
         else:
             raise StarletteHTTPException(status_code=404)
         project_candidate = storage_root / storage_name
-        if is_reparse_point(project_candidate):
-            raise StarletteHTTPException(status_code=404)
+        # 先 resolve 再检查，避免 TOCTOU 竞态
         project_root = project_candidate.resolve()
-        if not storage_name or project_root.parent != storage_root:
+        # 检查 resolve 后是否仍是符号链接（说明目标本身是符号链接）
+        if is_reparse_point(project_root):
+            raise StarletteHTTPException(status_code=404)
+        # 使用 is_relative_to 检查路径包含关系，防止符号链接穿越
+        if not storage_name or not project_root.is_relative_to(storage_root):
             raise StarletteHTTPException(status_code=404)
         requested_path = (project_root / relative_path).resolve()
         try:
@@ -156,6 +165,8 @@ for api_router in (
     providers.router,
     jobs.router,
     settings_api.router,
+    audio.router,
+    composition.router,
 ):
     app.include_router(api_router, prefix="/api")
 

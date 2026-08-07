@@ -1,6 +1,7 @@
 from app.db import Database, db
 from app.jobs.runner import JobRunner, job_runner
 from app.services.asset_service import AssetService
+from app.services.composition_service import CompositionService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
 from app.services.shot_service import ShotService
@@ -23,6 +24,7 @@ def register_handlers(
     assets = AssetService(current_database, jobs)
     shots = ShotService(current_database, jobs)
     media = MediaService(current_database, jobs)
+    composition = CompositionService(current_database, jobs)
 
     handlers = {
         "analyze_novel": writing.handle_analysis,
@@ -40,6 +42,7 @@ def register_handlers(
         "generate_asset_image": media.handle_asset_image,
         "generate_keyframe": media.handle_keyframe,
         "generate_video": media.handle_video,
+        "compose_chapter": composition.handle_compose,
     }
     for job_type, handler in handlers.items():
         current_runner.register_handler(job_type, handler)

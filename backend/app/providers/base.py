@@ -225,6 +225,19 @@ class VideoProvider(Protocol):
     async def download(self, result: ProviderPollResult, target: Path) -> Path: ...
 
 
+@runtime_checkable
+class TTSProvider(Protocol):
+    async def synthesize(
+        self,
+        *,
+        text: str,
+        voice_id: str,
+        params: dict[str, Any],
+    ) -> bytes: ...
+
+    def supports_voice(self, voice_id: str) -> bool: ...
+
+
 def extract_path(value: Any, path: str, default: Any = None) -> Any:
     if not path:
         return value

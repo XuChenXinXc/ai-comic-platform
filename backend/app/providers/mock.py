@@ -518,3 +518,43 @@ class MockVideoProvider:
         finally:
             temporary.unlink(missing_ok=True)
         return target
+
+
+class MockTTSProvider:
+    """Mock TTS Provider for testing"""
+
+    def __init__(self, config: ProviderConfig) -> None:
+        self.config = config
+
+    async def synthesize(
+        self,
+        *,
+        text: str,
+        voice_id: str,
+        params: dict[str, Any],
+    ) -> bytes:
+        """
+        生成模拟的音频数据（实际是静音的 MP3）
+
+        在真实场景中，这里会调用 TTS API 生成语音。
+        Mock 实现返回一个极小的静音 MP3 文件。
+        """
+        await asyncio.sleep(0.1)  # 模拟网络延迟
+
+        # 生成一个简单的静音 MP3（44 字节的最小 MP3 文件）
+        # 这只是一个占位符，实际使用时应该生成真实的音频
+        silent_mp3 = bytes([
+            0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ])
+
+        return silent_mp3
+
+    def supports_voice(self, voice_id: str) -> bool:
+        """Mock provider 支持任意音色"""
+        return True
+

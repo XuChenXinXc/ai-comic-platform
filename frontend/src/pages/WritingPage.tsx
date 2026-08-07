@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronDown,
   ChevronUp,
+  Mic,
   Plus,
   RefreshCw,
   Save,
@@ -14,6 +15,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useNavigate } from "react-router";
 import { toast } from "sonner";
 import { ApiError, api, queryKeys } from "../api/client";
 import { JsonEditor } from "../components/json-editor";
@@ -90,6 +92,13 @@ function screenplayContent(
 
 export function WritingPage() {
   const queryClient = useQueryClient();
+  let navigate: ReturnType<typeof useNavigate> | null = null;
+  try {
+    navigate = useNavigate();
+  } catch {
+    // useNavigate 在测试环境中可能失败，使用 fallback
+    navigate = null;
+  }
   const { activeProject, activeProjectId } = useProject();
   const { activeChapterId, activeChapter } = useChapter();
   const [tab, setTab] = useState<WritingTab>("screenplay");
@@ -489,6 +498,15 @@ export function WritingPage() {
           actions={
             <>
               <ChapterSelector />
+              {screenplayQuery.data?.status === "confirmed" && activeProjectId && activeChapterId && navigate && (
+                <Button
+                  variant="secondary"
+                  onClick={() => navigate(`/audio/${activeProjectId}/${activeChapterId}`)}
+                >
+                  <Mic className="h-4 w-4" />
+                  配音工作台
+                </Button>
+              )}
               <Button
                 busy={
                   stylePromptMutation.isPending ||

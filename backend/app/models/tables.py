@@ -102,7 +102,7 @@ api_provider = Table(
     Column("last_test_message", Text, nullable=False, server_default=""),
     Column("created_at", Text, nullable=False),
     Column("updated_at", Text, nullable=False),
-    CheckConstraint("kind IN ('text','image','video')", name="kind"),
+    CheckConstraint("kind IN ('text','image','video','tts')", name="kind"),
 )
 Index(
     "ux_provider_default",
@@ -386,6 +386,113 @@ Index("idx_job_project_status", job.c.project_id, job.c.status)
 Index("idx_job_batch", job.c.batch_id)
 
 
+audio_config = Table(
+    "audio_config",
+    metadata,
+    Column("project_id", Text, ForeignKey("project.id", ondelete="CASCADE"), primary_key=True),
+    Column("tts_provider_id", Text, ForeignKey("api_provider.id", ondelete="SET NULL")),
+    Column("bgm_volume", Float, nullable=False, server_default="0.3"),
+    Column("dialogue_volume", Float, nullable=False, server_default="1.0"),
+    Column("sound_effect_volume", Float, nullable=False, server_default="0.5"),
+    Column("updated_at", Text, nullable=False),
+    CheckConstraint("bgm_volume >= 0 AND bgm_volume <= 1", name="bgm_volume"),
+    CheckConstraint("dialogue_volume >= 0 AND dialogue_volume <= 1", name="dialogue_volume"),
+    CheckConstraint("sound_effect_volume >= 0 AND sound_effect_volume <= 1", name="sound_effect_volume"),
+)
+
+
+shot_audio = Table(
+    "shot_audio",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("shot_id", Text, ForeignKey("shot.id", ondelete="CASCADE"), nullable=False),
+    Column("dialogue_text", Text, nullable=False),
+    Column("speaker_name", Text, nullable=False, server_default=""),
+    Column("voice_id", Text, nullable=False, server_default=""),
+    Column("file_path", Text),
+    Column("duration_sec", Float),
+    Column("version_no", Integer, nullable=False),
+    Column("provider_id", Text, ForeignKey("api_provider.id")),
+    Column("model", Text, nullable=False, server_default=""),
+    Column("status", Text, nullable=False, server_default="queued"),
+    Column("is_current", Integer, nullable=False, server_default="0"),
+    Column("source", Text, nullable=False, server_default="generated"),
+    Column("error", Text, nullable=False, server_default=""),
+    Column("created_at", Text, nullable=False),
+    CheckConstraint(
+        "status IN ('queued','running','completed','failed')",
+        name="status",
+    ),
+    CheckConstraint("source IN ('generated','uploaded')", name="source"),
+    UniqueConstraint("shot_id", "version_no", name="uq_shot_audio_shot_version"),
+)
+Index(
+    "ux_shot_audio_current",
+    shot_audio.c.shot_id,
+    unique=True,
+    sqlite_where=shot_audio.c.is_current == 1,
+)
+
+
+shot_subtitle = Table(
+    "shot_subtitle",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("shot_id", Text, ForeignKey("shot.id", ondelete="CASCADE"), nullable=False),
+    Column("text", Text, nullable=False),
+    Column("start_time", Float, nullable=False),
+    Column("end_time", Float, nullable=False),
+    Column("style_preset", Text, nullable=False, server_default="default"),
+    Column("created_at", Text, nullable=False),
+    CheckConstraint("start_time >= 0 AND end_time > start_time", name="time_range"),
+)
+Index("idx_subtitle_shot", shot_subtitle.c.shot_id)
+
+
+project_bgm = Table(
+    "project_bgm",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("project_id", Text, ForeignKey("project.id", ondelete="CASCADE"), nullable=False),
+    Column("name", Text, nullable=False),
+    Column("file_path", Text, nullable=False),
+    Column("duration_sec", Float),
+    Column("mood_tags", Text, nullable=False, server_default="[]"),
+    Column("created_at", Text, nullable=False),
+)
+Index("idx_bgm_project", project_bgm.c.project_id)
+
+
+chapter_composition = Table(
+    "chapter_composition",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("chapter_id", Text, ForeignKey("chapter.id", ondelete="CASCADE"), nullable=False),
+    Column("job_id", Text, ForeignKey("job.id", ondelete="SET NULL")),
+    Column("file_path", Text),
+    Column("duration_sec", Float),
+    Column("resolution", Text, nullable=False, server_default="1080p"),
+    Column("include_audio", Integer, nullable=False, server_default="1"),
+    Column("burn_subtitles", Integer, nullable=False, server_default="1"),
+    Column("bgm_id", Text, ForeignKey("project_bgm.id", ondelete="SET NULL")),
+    Column("status", Text, nullable=False, server_default="pending"),
+    Column("error", Text, nullable=False, server_default=""),
+    Column("created_at", Text, nullable=False),
+    Column("updated_at", Text, nullable=False),
+    CheckConstraint(
+        "status IN ('pending','processing','completed','failed')",
+        name="status",
+    ),
+    CheckConstraint("resolution IN ('720p','1080p','4k')", name="resolution"),
+)
+Index(
+    "ux_composition_chapter",
+    chapter_composition.c.chapter_id,
+    unique=True,
+    sqlite_where=chapter_composition.c.status.in_(["pending", "processing"]),
+)
+
+
 ALL_TABLES = (
     project,
     chapter,
@@ -399,4 +506,9 @@ ALL_TABLES = (
     keyframe_version,
     video_version,
     job,
+    audio_config,
+    shot_audio,
+    shot_subtitle,
+    project_bgm,
+    chapter_composition,
 )

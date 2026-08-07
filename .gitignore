@@ -1,19 +1,108 @@
+# 环境变量
 .env
+.env.local
+.env.*.local
+
+# Python
 .venv/
-.run/
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 测试和覆盖率
 .pytest_cache/
-.ruff_cache/
 .coverage
 htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Ruff
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 运行时
+.run/
+*.log
+*.pid
+.backend.pid
+.frontend.pid
+
+# Node.js
 node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 前端构建
 frontend/dist/
 frontend/playwright-report/
 frontend/test-results/
+
+# 数据库
 workspace/platform.db
 workspace/platform.db-shm
 workspace/platform.db-wal
 workspace/platform.db.bak-*
+*.db
+*.db-journal
+
+# 项目数据
 workspace/projects/*
 !workspace/projects/.gitkeep
+
+# 数据导出
+data_export/
+
+# 临时文件
+*.tmp
+*.temp
+tmp/
+temp/
+
+# 密钥和证书
+*.key
+*.pem
+*.crt
+*.cert
+secrets/
+
+# 备份文件
+*.bak
+*.backup
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Alembic
+# 保留迁移文件，忽略临时文件
+alembic/versions/*.pyc

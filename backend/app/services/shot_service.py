@@ -338,20 +338,68 @@ class ShotService:
         return raw_records
 
     def list_project(self, project_id: str) -> list[dict[str, Any]]:
-        """全书分镜，按章节序 + 镜序排列。供跨章节的审校、精修与质量报告使用。"""
-        self._project(project_id)
+        """全书分镜，按章节序 + 镜序排列。供跨章节的审校、精修与质量报告使用。
+
+        优化：一次查询获取所有分镜，避免 N+1 查询问题。
+        """
+        current_project = self._project(project_id)
         with self.database.engine.connect() as connection:
-            chapter_ids = list(
-                connection.execute(
-                    select(chapter.c.id)
+            # 一次性查询所有章节信息
+            chapter_map = {
+                row.id: {"chapter_no": row.chapter_no, "title": row.title}
+                for row in connection.execute(
+                    select(chapter.c.id, chapter.c.chapter_no, chapter.c.title)
                     .where(chapter.c.project_id == project_id)
                     .order_by(chapter.c.chapter_no)
-                ).scalars()
+                )
+            }
+
+            if not chapter_map:
+                return []
+
+            # 一次性查询所有分镜（按章节序 + 镜序排列）
+            statement = (
+                select(shot, chapter.c.chapter_no)
+                .join(chapter, shot.c.chapter_id == chapter.c.id)
+                .where(chapter.c.project_id == project_id)
+                .order_by(chapter.c.chapter_no, shot.c.shot_order, shot.c.shot_no)
             )
-        records: list[dict[str, Any]] = []
-        for chapter_id in chapter_ids:
-            records.extend(self.list(chapter_id))
-        return records
+
+            raw_records = []
+            for row in connection.execute(statement):
+                record = self._decode(dict(row._mapping))
+                chapter_id = record["chapter_id"]
+                chapter_info = chapter_map[chapter_id]
+
+                # 获取源签名（需要当前章节信息）
+                current_chapter = self._chapter(chapter_id)
+                source_now = self._current_source_signature(
+                    connection, current_chapter, record["source_type"]
+                )
+                record["is_stale"] = bool(
+                    record["source_signature"] and record["source_signature"] != source_now
+                )
+
+                # 获取当前关键帧和视频
+                record["current_keyframe"] = self._media_record(
+                    connection, keyframe_version, record["id"], project_id
+                )
+                record["current_video"] = self._media_record(
+                    connection, video_version, record["id"], project_id
+                )
+
+                # 添加章节信息
+                record["chapter_no"] = chapter_info["chapter_no"]
+                record["chapter_title"] = chapter_info["title"]
+                raw_records.append(record)
+
+            # 计算编译后的提示词（需要前一镜信息）
+            for i, record in enumerate(raw_records):
+                prev = raw_records[i - 1] if i > 0 else None
+                self._add_compiled_prompts(connection, current_project, record, prev)
+
+        return raw_records
+
 
     def get(self, shot_id: str) -> dict[str, Any]:
         with self.database.engine.connect() as connection:
@@ -1434,6 +1482,7 @@ class ShotService:
             scene_no = item.pop("scene_no", None)
             source_ref = item.pop("source_ref", "")
             if scene_no:
+                source_ref = re.sub(r"^scene:\d+\|?", "", source_ref)
                 source_ref = f"scene:{scene_no}|{source_ref}"
             scene_name = item.pop("scene_name", "")
             scene_asset_id = self._resolve_asset_id(

@@ -50,6 +50,9 @@ function errorMessage(payload: unknown, fallback: string) {
   return typeof message === "string" ? message : fallback;
 }
 
+// 用于标记 204 No Content 响应的类型
+export type NoContent = void;
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body && !(init.body instanceof FormData)) {
@@ -417,22 +420,6 @@ export const api = {
       request<Job>(`/shots/${id}/image-prompt/generate`, json("POST", body)),
     generateVideoPrompt: (id: string, body: Record<string, unknown> = {}) =>
       request<Job>(`/shots/${id}/video-prompt/generate`, json("POST", body)),
-    optimizeVideoPrompt: (
-      id: string,
-      body: { prompt: string; provider_id?: string | null; params?: Record<string, unknown> },
-    ) =>
-      request<{ shot_id: string; original: string; prompt: string }>(
-        `/shots/${id}/video-prompt/optimize`,
-        json("POST", body),
-      ),
-    optimizeVideoPromptsAll: (
-      projectId: string,
-      body: { ids?: string[]; provider_id?: string | null; params?: Record<string, unknown> } = {},
-    ) =>
-      request<BatchResponse>(
-        `/projects/${projectId}/video-prompts/optimize-all`,
-        json("POST", body),
-      ),
     batchPrompts: (
       chapterId: string,
       body: { ids?: string[]; prompt_types?: Array<"image" | "video"> } = {},
@@ -584,4 +571,201 @@ export const api = {
     batch: (id: string) =>
       request<{ batch_id: string; jobs: Job[] }>(`/jobs/batches/${id}`),
   },
+
+  audio: {
+    getConfig: (projectId: string) =>
+      request<{
+        project_id: string;
+        tts_provider_id: string | null;
+        bgm_volume: number;
+        dialogue_volume: number;
+        sound_effect_volume: number;
+      }>(`/audio/projects/${projectId}/config`),
+
+    updateConfig: (projectId: string, config: {
+      tts_provider_id?: string;
+      bgm_volume?: number;
+      dialogue_volume?: number;
+      sound_effect_volume?: number;
+    }) =>
+      request<{
+        project_id: string;
+        tts_provider_id: string | null;
+        bgm_volume: number;
+        dialogue_volume: number;
+        sound_effect_volume: number;
+      }>(`/audio/projects/${projectId}/config`, json("PUT", config)),
+
+    extractDialogues: (chapterId: string) =>
+      request<Array<{
+        shot_no: number;
+        speaker: string;
+        text: string;
+      }>>(`/audio/chapters/${chapterId}/dialogues`),
+
+    generateShotAudio: (shotId: string, body: {
+      dialogue_text: string;
+      voice_id: string;
+      tts_provider_id?: string;
+    }) =>
+      request<{
+        id: string;
+        shot_id: string;
+        dialogue_text: string;
+        speaker_name: string;
+        voice_id: string;
+        file_path: string | null;
+        duration_sec: number | null;
+        version_no: number;
+        status: string;
+        is_current: number;
+        created_at: string;
+      }>(`/audio/shots/${shotId}/audio`, json("POST", body)),
+
+    getShotAudio: (shotId: string) =>
+      request<{
+        id: string;
+        shot_id: string;
+        dialogue_text: string;
+        voice_id: string;
+        file_path: string | null;
+        duration_sec: number | null;
+        version_no: number;
+        status: string;
+        is_current: number;
+      } | null>(`/audio/shots/${shotId}/audio`),
+
+    listShotAudioVersions: (shotId: string) =>
+      request<Array<{
+        id: string;
+        shot_id: string;
+        dialogue_text: string;
+        version_no: number;
+        status: string;
+        is_current: number;
+      }>>(`/audio/shots/${shotId}/audio/versions`),
+
+    listBGMs: (projectId: string) =>
+      request<Array<{
+        id: string;
+        project_id: string;
+        name: string;
+        file_path: string;
+        duration_sec: number | null;
+        mood_tags: string;
+        created_at: string;
+      }>>(`/audio/projects/${projectId}/bgm`),
+
+    uploadBGM: async (projectId: string, file: File, name: string, moodTags: string[]) => {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("name", name);
+      formData.append("mood_tags", JSON.stringify(moodTags));
+
+      return request<{
+        id: string;
+        project_id: string;
+        name: string;
+        file_path: string;
+        duration_sec: number | null;
+        mood_tags: string;
+        created_at: string;
+      }>(`/audio/projects/${projectId}/bgm`, {
+        method: "POST",
+        body: formData,
+      });
+    },
+
+    deleteBGM: (bgmId: string) =>
+      request<{ message: string }>(`/audio/bgm/${bgmId}`, json("DELETE")),
+  },
+
+  composition: {
+    generateSubtitle: (shotId: string) =>
+      request<Array<{
+        text: string;
+        start_time: number;
+        end_time: number;
+        style_preset: string;
+      }>>(`/composition/shots/${shotId}/subtitles/generate`, json("POST")),
+
+    saveSubtitles: (shotId: string, subtitles: Array<{
+      text: string;
+      start_time: number;
+      end_time: number;
+      style_preset: string;
+    }>) =>
+      request<Array<{
+        id: string;
+        shot_id: string;
+        text: string;
+        start_time: number;
+        end_time: number;
+        style_preset: string;
+        created_at: string;
+      }>>(`/composition/shots/${shotId}/subtitles`, json("POST", { subtitles })),
+
+    getSubtitles: (shotId: string) =>
+      request<Array<{
+        id: string;
+        shot_id: string;
+        text: string;
+        start_time: number;
+        end_time: number;
+        style_preset: string;
+        created_at: string;
+      }>>(`/composition/shots/${shotId}/subtitles`),
+
+    getSubtitleStyles: () =>
+      request<Record<string, {
+        name: string;
+        position: string;
+        font: string;
+        font_size: string;
+        color: string;
+        outline: string;
+        outline_color: string;
+      }>>(`/composition/subtitle-styles`),
+
+    exportChapterSRT: (chapterId: string) =>
+      fetch(`${API_BASE}/composition/chapters/${chapterId}/subtitles/srt`)
+        .then(r => r.blob()),
+
+    composeChapter: (chapterId: string, config: {
+      resolution?: "720p" | "1080p" | "4k";
+      include_audio?: boolean;
+      burn_subtitles?: boolean;
+      bgm_id?: string;
+      bgm_volume?: number;
+    }) =>
+      request<{
+        id: string;
+        chapter_id: string;
+        job_id: string | null;
+        file_path: string | null;
+        duration_sec: number | null;
+        resolution: string;
+        include_audio: number;
+        burn_subtitles: number;
+        bgm_id: string | null;
+        status: string;
+        error: string;
+        created_at: string;
+        updated_at: string;
+      }>(`/composition/chapters/${chapterId}/compose`, json("POST", config)),
+
+    getChapterComposition: (chapterId: string) =>
+      request<{
+        id: string;
+        chapter_id: string;
+        job_id: string | null;
+        file_path: string | null;
+        duration_sec: number | null;
+        resolution: string;
+        status: string;
+        error: string;
+        created_at: string;
+      } | null>(`/composition/chapters/${chapterId}/composition`),
+  },
 };
+

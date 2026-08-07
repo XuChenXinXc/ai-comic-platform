@@ -259,3 +259,78 @@ class JobService:
                     updated_at=utc_now(),
                 )
             )
+
+    def cleanup_old_jobs(
+        self,
+        project_id: str,
+        days: int = 7,
+        keep_failed: bool = True,
+    ) -> int:
+        """
+        清理旧的已完成任务记录，防止内存泄漏。
+
+        Args:
+            project_id: 项目 ID
+            days: 保留最近 N 天的记录（默认 7 天）
+            keep_failed: 是否保留失败的任务（默认 True）
+
+        Returns:
+            删除的任务数量
+        """
+        from datetime import datetime, timedelta
+
+        cutoff_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+        with self.database.engine.connect() as connection:
+            # 构建删除条件
+            conditions = [
+                job.c.project_id == project_id,
+                job.c.finished_at.isnot(None),
+                job.c.finished_at < cutoff_date,
+            ]
+
+            if keep_failed:
+                # 只删除成功的任务，保留失败的供调试
+                conditions.append(job.c.status == "completed")
+            else:
+                # 删除所有已完成的任务（成功 + 失败）
+                conditions.append(job.c.status.in_(["completed", "failed", "cancelled"]))
+
+            # 先查询要删除的任务数量
+            count_query = select(job.c.id).where(*conditions)
+            delete_count = len(list(connection.execute(count_query)))
+
+            if delete_count > 0:
+                # 执行删除
+                from sqlalchemy import delete as sql_delete
+
+                connection.execute(sql_delete(job).where(*conditions))
+                connection.commit()
+
+        return delete_count
+
+    def cleanup_all_projects(self, days: int = 7, keep_failed: bool = True) -> dict[str, int]:
+        """
+        清理所有项目的旧任务记录。
+
+        Args:
+            days: 保留最近 N 天的记录（默认 7 天）
+            keep_failed: 是否保留失败的任务（默认 True）
+
+        Returns:
+            每个项目删除的任务数量
+        """
+        from app.models.tables import project as project_table
+
+        results = {}
+        with self.database.engine.connect() as connection:
+            project_ids = [
+                row.id for row in connection.execute(select(project_table.c.id))
+            ]
+
+        for project_id in project_ids:
+            deleted = self.cleanup_old_jobs(project_id, days, keep_failed)
+            if deleted > 0:
+                results[project_id] = deleted
+
+        return results

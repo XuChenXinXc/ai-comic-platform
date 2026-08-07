@@ -7,7 +7,7 @@ from app.schemas import ScreenplayDialogue, ShotTransitionFromPrev
 
 AssetType = Literal["character", "scene", "prop"]
 ContentStatus = Literal["draft", "ready", "confirmed", "failed"]
-ProviderKind = Literal["text", "image", "video"]
+ProviderKind = Literal["text", "image", "video", "tts"]
 ShotSourceType = Literal["novel", "screenplay"]
 ProjectStorageSource = Literal["database", "environment", "default"]
 
@@ -110,22 +110,6 @@ class ProjectStorageSelectionResult(ProjectStorageSetting):
 
 
 class GenerateRequest(ApiModel):
-    provider_id: str | None = None
-    params: dict[str, Any] = Field(default_factory=dict)
-
-    _validate_params = field_validator("params")(_validate_public_params)
-
-
-class VideoPromptOptimizeRequest(ApiModel):
-    prompt: str = Field(min_length=1, max_length=8000)
-    provider_id: str | None = None
-    params: dict[str, Any] = Field(default_factory=dict)
-
-    _validate_params = field_validator("params")(_validate_public_params)
-
-
-class VideoPromptOptimizeAllRequest(ApiModel):
-    ids: list[str] | None = None
     provider_id: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -521,3 +505,46 @@ class ChapterReorderRequest(ApiModel):
         if len(set(self.ids)) != len(self.ids):
             raise ValueError("ids 不能重复")
         return self
+
+
+# ============ 音频相关 ============
+
+
+class ShotAudioGenerateRequest(ApiModel):
+    """分镜配音生成请求"""
+
+    dialogue_text: str = Field(min_length=1)
+    voice_id: str = Field(min_length=1)
+    tts_provider_id: str | None = None
+
+
+class SubtitleItem(ApiModel):
+    """字幕项"""
+
+    text: str = Field(min_length=1)
+    start_time: float = Field(ge=0)
+    end_time: float = Field(gt=0)
+    style_preset: str = Field(default="default")
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "SubtitleItem":
+        if self.end_time <= self.start_time:
+            raise ValueError("end_time 必须大于 start_time")
+        return self
+
+
+class SubtitleSaveRequest(ApiModel):
+    """保存字幕请求"""
+
+    subtitles: list[SubtitleItem] = Field(min_length=0)
+
+
+class ChapterComposeRequest(ApiModel):
+    """章节合成请求"""
+
+    resolution: Literal["720p", "1080p", "4k"] = "1080p"
+    include_audio: bool = True
+    burn_subtitles: bool = True
+    bgm_id: str | None = None
+    bgm_volume: float = Field(default=0.3, ge=0, le=1)
+

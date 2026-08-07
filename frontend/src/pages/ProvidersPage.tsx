@@ -49,12 +49,23 @@ const adapterOptions: Record<ProviderKind, Array<{ value: string; label: string 
       { value: "mock", label: "Mock（本地验收）" },
       { value: "http_video", label: "通用 HTTP Video" },
     ],
+    tts: [
+      { value: "mock", label: "Mock（本地验收）" },
+      { value: "openai_tts", label: "OpenAI TTS" },
+      { value: "http_tts", label: "通用 HTTP TTS" },
+    ],
   };
 
 function blankProvider(kind: ProviderKind): ProviderInput {
+  let name = "模型";
+  if (kind === "text") name = "文字模型";
+  else if (kind === "image") name = "图片模型";
+  else if (kind === "video") name = "视频模型";
+  else if (kind === "tts") name = "TTS 语音模型";
+
   return {
     kind,
-    name: kind === "text" ? "文字模型" : kind === "image" ? "图片模型" : "视频模型",
+    name,
     adapter: "mock",
     base_url: "",
     api_key_env: "",
@@ -187,6 +198,11 @@ export function ProvidersPage() {
               value: "video",
               label: "视频模型",
               count: query.data?.filter((item) => item.kind === "video").length || 0,
+            },
+            {
+              value: "tts",
+              label: "TTS 语音",
+              count: query.data?.filter((item) => item.kind === "tts").length || 0,
             },
           ]}
         />
@@ -362,6 +378,7 @@ export function ProvidersPage() {
               <option value="text">文字模型</option>
               <option value="image">图片模型</option>
               <option value="video">视频模型</option>
+              <option value="tts">TTS 语音</option>
             </Select>
           </div>
           <div>

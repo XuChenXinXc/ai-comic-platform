@@ -4,13 +4,16 @@ from fastapi import Depends
 
 from app.db import Database, get_database
 from app.services.asset_service import AssetService
+from app.services.audio_service import AudioService
 from app.services.chapter_service import ChapterService
+from app.services.composition_service import CompositionService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
 from app.services.project_service import ProjectService
 from app.services.provider_service import ProviderService
 from app.services.setting_service import SettingService
 from app.services.shot_service import ShotService
+from app.services.subtitle_service import SubtitleService
 from app.services.writing_service import WritingService
 
 
@@ -34,26 +37,30 @@ def get_job_service(
 
 def get_writing_service(
     database: Annotated[Database, Depends(get_database)],
+    job_service: Annotated[JobService, Depends(get_job_service)],
 ) -> WritingService:
-    return WritingService(database, JobService(database))
+    return WritingService(database, job_service)
 
 
 def get_asset_service(
     database: Annotated[Database, Depends(get_database)],
+    job_service: Annotated[JobService, Depends(get_job_service)],
 ) -> AssetService:
-    return AssetService(database, JobService(database))
+    return AssetService(database, job_service)
 
 
 def get_shot_service(
     database: Annotated[Database, Depends(get_database)],
+    job_service: Annotated[JobService, Depends(get_job_service)],
 ) -> ShotService:
-    return ShotService(database, JobService(database))
+    return ShotService(database, job_service)
 
 
 def get_media_service(
     database: Annotated[Database, Depends(get_database)],
+    job_service: Annotated[JobService, Depends(get_job_service)],
 ) -> MediaService:
-    return MediaService(database, JobService(database))
+    return MediaService(database, job_service)
 
 
 def get_provider_service(
@@ -66,3 +73,24 @@ def get_setting_service(
     database: Annotated[Database, Depends(get_database)],
 ) -> SettingService:
     return SettingService(database)
+
+
+def get_audio_service(
+    database: Annotated[Database, Depends(get_database)],
+    job_service: Annotated[JobService, Depends(get_job_service)],
+) -> AudioService:
+    return AudioService(database, job_service)
+
+
+def get_subtitle_service(
+    database: Annotated[Database, Depends(get_database)],
+) -> SubtitleService:
+    return SubtitleService(database)
+
+
+def get_composition_service(
+    database: Annotated[Database, Depends(get_database)],
+    job_service: Annotated[JobService, Depends(get_job_service)],
+) -> CompositionService:
+    return CompositionService(database, job_service)
+
