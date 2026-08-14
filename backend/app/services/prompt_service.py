@@ -111,6 +111,22 @@ def apply_content_safety(prompt: str) -> str:
     return compiled
 
 
+_TRAILING_SENTENCE_PUNCT = "。，；、"
+
+
+def _strip_sentence_end(value: str) -> str:
+    """去掉句子末尾的句读符号，用于字段拼接前清理。"""
+    return value.rstrip(_TRAILING_SENTENCE_PUNCT)
+
+
+def _normalize_sentence_end(value: str) -> str:
+    """确保字段以单个句号结尾；感叹号/问号结尾保持不变。"""
+    stripped = _strip_sentence_end(value)
+    if stripped.endswith(("！", "？")):
+        return stripped
+    return f"{stripped}。"
+
+
 def resolve_keyframe_description(image_prompt: str, frame_description: str) -> str:
     return image_prompt.strip() or frame_description.strip()
 
@@ -199,7 +215,8 @@ def _scene_profile_value(
 def resolve_asset_negative_prompt(asset_type: str, negative_prompt: str) -> str:
     defaults = {
         "character": "多人、身份漂移、脸型变化、发型变化、服装不一致、畸形手指、"
-        "文字、水印、真人摄影、产品摄影、3D建模渲染",
+        "除指定人物资料卡外的其他文字、数字、英文、标识、签名、水印、乱码或无意义符号、"
+        "真人摄影、产品摄影、3D建模渲染",
         "prop": "完整人物、人物脸、多件物品、结构错误、比例错误、材质漂移、"
         "文字、水印、真人摄影、产品摄影、3D建模渲染",
         "scene": f"{_SCENE_REQUIRED_NEGATIVE_PROMPT}、空间结构矛盾、门窗家具漂移、"
@@ -223,6 +240,13 @@ def resolve_asset_negative_prompt(asset_type: str, negative_prompt: str) -> str:
     return "、".join(merged_items)
 
 
+def _expression_items(value: Any) -> list[str]:
+    """把表情组拆成条目，供角色设定板按真实数量写特写。"""
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item or "").strip()]
+    return [part.strip() for part in str(value or "").split("、") if part.strip()]
+
+
 def _character_setting_sheet(
     *,
     name: str,
@@ -238,6 +262,7 @@ def _character_setting_sheet(
     identity = _profile_value(profile, "identity", fallback="核心角色")
     worldview = _profile_value(profile, "worldview", "world", fallback="本项目世界观")
     personality = _profile_value(profile, "personality", fallback="以素材资料为准")
+    core = _profile_value(profile, "core", "concept", fallback=identity)
     appearance = _profile_value(profile, "appearance", "face", fallback="脸部特征以素材资料为准")
     hair = _profile_value(profile, "hair", fallback="发型以素材资料为准")
     eyes = _profile_value(profile, "eyes", "appearance", fallback="眼睛特征以素材资料为准")
@@ -260,7 +285,6 @@ def _character_setting_sheet(
     outer = _profile_value(profile, "outer", "outerwear", fallback=costume)
     shoes = _profile_value(profile, "shoes", "footwear", fallback=costume)
     accessories = _profile_value(profile, "accessories", fallback=immutable)
-    props = _profile_value(profile, "carried_item", "core_prop", fallback=immutable)
     style_tone = _profile_value(profile, "style_tone", fallback=detail)
     expression_group = _profile_value(
         profile,
@@ -268,81 +292,83 @@ def _character_setting_sheet(
         "acting_traits",
         fallback=normal_expression,
     )
-    lighting = _profile_value(profile, "lighting", fallback="标准角色设定柔光")
-    atmosphere = _profile_value(profile, "atmosphere", fallback=style_tone)
+    expression_items = _expression_items(
+        profile.get("expression_group") or profile.get("acting_traits")
+    )
+    expression_count = len(expression_items) or 3
     anchors = "、".join(consistency_keywords)
     detail_clean = detail.rstrip("。") if detail else detail
     has_detail = bool(detail_clean) and detail_clean != "以素材资料保持稳定一致"
     paragraphs = [
         f"《{name}・{concept} 角色基础设定稿》",
-        "核心人物设定：\n"
-        f"{name}，一位{age}的{gender}角色，身份为{identity}，生活在{worldview}中。"
+        "角色身份设定：\n"
+        f"{name}，一位{age}的{gender}角色，身份为{identity}，生活在{worldview}中。\n"
         f"性格关键词为{personality}。\n"
-        f"外貌：{hair}；{appearance}；{eyes}；常态表情{normal_expression}；身形{body}。\n"
-        f"核心视觉识别点包括：{immutable}。",
-        "服饰与造型设定：\n"
+        f"人物核心：{core}。",
+        "外貌锁定：\n"
+        f"发型{hair}；外貌{appearance}；{eyes}；常态表情{normal_expression}；"
+        f"身形{body}。\n"
+        f"不可变视觉锚点：{immutable}。",
+        "服装锁定：\n"
         f"角色穿着{costume}，主色调为{main_color}，辅以{accent_color}少量点缀，"
         f"材质为{material}，清晰表现不同材质之间的纹理、厚度和光泽差异。\n"
         f"上装为{upper}；下装为{lower}；外搭为{outer}；鞋履为{shoes}；"
-        f"配饰{accessories}；核心道具{props}。\n"
+        f"配饰{accessories}。\n"
+        "角色采用标准无道具站姿：双臂自然下垂，双手自然放松，"
+        "不持武器或其他大型道具；如有核心道具，另出独立物品设定图。\n"
         f"整体造型呈现{style_tone}的气质，具有鲜明辨识度，"
         "同时适合后续AI漫剧分镜图和视频生成时保持角色一致性。",
         f"细节补充：{detail_clean}。" if has_detail else "",
-        "版面背景与整体要求：\n"
+        "版式结构：\n"
         "整张角色设定展板使用标准纯白色背景，背景干净、明亮、极简、通透。"
         "不要浅灰背景，不要米白背景，不要渐变背景，不要彩色背景，不要环境场景，"
         "不要室内或室外布景。\n"
+        "所有人物模块均置于纯白设定稿背景中，仅使用柔和冷暖综合色光塑造人物体积，"
+        "不出现任何环境、布景或场景元素。\n"
         "仅使用极细浅灰色分隔线和少量低饱和冷蓝灰色细线建立版面秩序，"
         "不使用厚重边框、大面积色块、复杂花纹或抢眼装饰。\n"
-        "整体呈现高规格动画、漫画或AI漫剧项目的官方角色设定面板质感，"
-        "专业、精致、高级、规整、清晰。",
-        "版面排布结构：\n"
         f"采用3:2横向宽幅、分块拼接式专业角色设定面板排版。画面只展示{name}同一名角色，"
         "不出现其他人物。\n"
         "面板只保留人物介绍、主人物立绘、三视图和核心面部特写四类信息，"
-        "不加入服装拆解、配饰拆解、发型拆解、道具拆解、场景插图或意境参考图。",
-        "左上角人物介绍区：\n"
-        "在画面左上角设置简洁、高级、规整的人物资料卡，与左侧主人物立绘形成一个完整区域。\n"
-        "人物资料卡内容为：\n"
+        "不加入服装拆解、配饰拆解、发型拆解、道具拆解、场景插图或意境参考图。\n"
+        "整体呈现高规格动画、漫画或AI漫剧项目的官方角色设定面板质感，"
+        "专业、精致、高级、规整、清晰。",
+        "各模块内容：\n"
+        "左上角叠放或邻接一个非常简洁的人物信息卡，不遮挡身体，"
+        "与左侧主人物立绘形成一个完整区域。人物资料卡内容为：\n"
         f"角色姓名：{name}\n"
-        f"角色意境或代号：{concept}\n"
         f"身份定位：{identity}\n"
-        f"世界观或背景：{worldview}\n"
-        f"性格关键词：{personality}\n"
-        f"视觉识别点：{immutable}\n"
+        f"人物核心：{core}\n"
         "人物资料卡采用现代官方动画设定稿式排版，标题、姓名和正文具有清晰的字号层级，"
         "文字区域留白舒适、排列整齐。中文文字尽量清晰、准确、可读，"
-        "不要乱码、错字、重复文字或无意义符号。",
-        "左侧主人物立绘：\n"
-        f"左侧主体区域放置一张尺寸最大的{name}全身精致立绘，占整张画面约40%至45%。\n"
-        "完整展示头部、清晰五官、发型、服装、鞋履和随身配饰。"
+        "不要乱码、错字、重复文字或无意义符号。\n"
+        f"主人物立绘位于画面左侧主体区域，并在该区域内部居中完整站立，占整张画面约42%。"
+        "完整展示头部、清晰五官、发型、服装、鞋履和随身配饰；"
         "人物从头顶到脚底全部处于画面内，不裁切头部、手臂、腿部或鞋履，"
-        "不被人物资料卡和其他模块遮挡。",
-        "右上区域三视图：\n"
-        "右上区域规整排列三张标准全身视图，依次为正面全身、标准侧面全身、背面全身。\n"
-        "三张视图采用统一自然站姿、统一身体比例、统一服装、统一发型和统一影棚光照。"
-        "清楚展示人物正面轮廓、侧面结构、背部造型和服装前后结构。"
-        "每张视图均保持完整全身，不裁切、不遮挡、不采用夸张透视。",
-        "右下区域核心面部特写：\n"
-        f"右下区域排列三个高精度面部特写，分别为{expression_group}。\n"
-        "三个面部特写必须保持完全一致的脸型、骨相、五官比例、年龄感、肤色、发型和发色，"
-        "仅通过眼神、眉形、眼睑和嘴角的细微变化表现状态差异，"
+        "不被人物资料卡和其他模块遮挡。\n"
+        "右上约58%×55%区域规整排列三张标准全身视图，依次为正面全身、标准侧面全身、"
+        "背面全身。三张视图人物比例稍小，但必须完整展示鞋子。"
+        "三张视图采用统一自然站姿、统一身体比例、统一服装、统一发型和统一影棚光照，"
+        "清楚展示人物正面轮廓、侧面结构、背部造型和服装前后结构；"
+        "每张视图均保持完整全身，不裁切、不遮挡、不采用夸张透视。\n"
+        f"右下约58%×45%区域排列{expression_count}个高精度面部特写，"
+        f"分别为{expression_group}。"
+        f"{expression_count}个面部特写必须保持完全一致的脸型、骨相、五官比例、年龄感、"
+        "肤色、发型和发色，仅通过眼神、眉形、眼睑和嘴角的细微变化表现状态差异，"
         "表情自然细腻，不夸张、不低幼、不颜艺化。",
         "角色一致性要求：\n"
-        f"主人物立绘、三视图和三个面部特写必须严格表现为同一个{name}。"
+        f"主人物立绘、三视图和{expression_count}个面部特写必须严格表现为同一个{name}。"
         "所有模块保持完全一致的脸型、五官比例、年龄感、肤色、身体比例、发型结构、发色、"
         "服装款式、服装颜色、材质和核心视觉识别点。\n"
         "不得生成不同版本的角色，不得改变年龄、脸型、服装或发型，"
         "不得随机增加或删除配饰。" + (f"一致性锚点：{anchors}。" if anchors else ""),
+        f"【角色身份唯一性】整张设定板不是多个相似人物，而是同一人物{name}的多角度、"
+        "多表情记录。所有模块共享同一角色身份编码。禁止因视角、表情或尺寸变化导致"
+        "脸型重绘、年龄变化、美型程度变化、发量变化、发际线变化或服装重新设计。",
         f"构图补充：{composition.rstrip('。')}。" if composition else "",
-        "画面美术风格：\n"
-        "整体采用半写实二维国漫动画风，精致干净的角色线稿，细腻克制的二维动画上色，"
-        "高质量AI漫剧角色设定图质感。\n"
-        "严格保持插画、动漫和二维动画媒介，不转换为真人摄影、影视剧照、三次元演员、"
-        "真人模特或写实实拍风格。",
         "灯光与色彩氛围：\n"
-        f"{lighting}，角色整体配色以{main_color}和{accent_color}为核心，"
-        f"营造{atmosphere}的氛围。",
+        "采用柔和中性主光，辅以极轻微暖金轮廓光，准确展示肤色、服装颜色和材质，"
+        f"不使用强烈环境染色。角色整体配色以{main_color}和{accent_color}为核心。",
         "画质与成图要求：\n"
         "高精度视觉效果，人物发丝、眼眸、服装纹理和配饰细节清楚可见。"
         "全画面保持高清晰度，无景深模糊，无低清缩略图感，无杂色噪点，无脏污背景。\n"
@@ -804,13 +830,22 @@ def compile_keyframe_prompt(
 ) -> str:
     effective_aspect_ratio = resolve_visual_aspect_ratio("keyframe", aspect_ratio)
     opening_frame = _value(shot_context.get("opening_frame"), image_prompt)
-    ending_frame = _value(shot_context.get("ending_frame"), "与下一镜衔接的稳定状态")
     characters = _value(shot_context.get("characters"), "当前分镜角色")
     props = _value(shot_context.get("props"), "当前分镜物品")
     positions = _value(shot_context.get("positions"), "")
     expressions = _value(shot_context.get("expressions"), "")
     dialogue = _value(shot_context.get("dialogue"), "")
     voice_over = _value(shot_context.get("voice_over"), "")
+    shot_type = _value(shot_context.get("shot_type"), "中景")
+    camera_angle = _value(shot_context.get("camera_angle"), "平视")
+    focus = _value(shot_context.get("focus"), "当前主要动作")
+    environment_details = str(shot_context.get("environment_details") or "").strip()
+    wide_shot_body_rule = (
+        f"\n本镜为{shot_type}，人物仍需保持清晰可辨识的体量，约占画面高度的1/5至1/4，"
+        "可明确识别其发型、服装与手持道具，不得缩成远景小黑点。"
+        if ("全景" in shot_type or "远景" in shot_type) and "大远景" not in shot_type
+        else ""
+    )
     paragraphs = [
         "【参考】\n"
         + style_anchor(style_prompt, effective_aspect_ratio)
@@ -853,15 +888,13 @@ def compile_keyframe_prompt(
         "外观、尺寸、颜色与磨损痕迹沿用绑定参考图，"
         "不放大、不缩小、不变形、不漂浮、不穿模、不遮挡人物关键动作。",
         "【镜头构图】\n"
-        f"景别{_value(shot_context.get('shot_type'), '中景')}，"
-        f"机位{_value(shot_context.get('camera_angle'), '平视')}，"
-        f"运镜{_value(shot_context.get('camera_move'), '稳定机位')}，"
-        f"焦点{_value(shot_context.get('focus'), '当前主要动作')}。\n"
+        f"景别{shot_type}，机位{camera_angle}，焦点{focus}。\n"
         f"首帧关键构图：{opening_frame.rstrip('。')}。\n"
-        "用途：生成当前分镜唯一的分镜图，并作为图生视频严格第0秒起始帧。\n"
-        "画面必须停在动作发生前约0.2-0.5秒或动作刚开始的稳定边界，"
-        "不得提前呈现动作完成结果。\n"
-        f"视频末帧边界：{ending_frame.rstrip('。')}。",
+        "本帧只表现该动作发生前的单一稳定瞬间，不表现动作开始与结束并存的分解状态；"
+        "画面必须停在首帧关键构图对应的动作前约0.2-0.5秒或动作刚开始的稳定边界，"
+        "不得提前呈现动作完成结果。"
+        f"{wide_shot_body_rule}\n"
+        "用途：生成当前分镜唯一的分镜图，并作为图生视频严格第0秒起始帧。",
         "【人物神态与情绪】\n"
         + (
             f"{expressions}。表情自然细腻、克制真实，不使用夸张颜艺，"
@@ -871,19 +904,23 @@ def compile_keyframe_prompt(
         ),
         "【灯光与色彩】\n"
         f"{_value(shot_context.get('lighting'), '符合场景设定的光线')}，"
-        f"{_value(shot_context.get('color_tone'), '统一色调')}，"
-        f"环境细节{_value(shot_context.get('environment_details'), '场景固定环境细节')}。\n"
+        f"{_value(shot_context.get('color_tone'), '统一色调')}"
+        + (f"，环境细节：{environment_details}" if environment_details else "")
+        + "。\n"
         "光线符合场景设定的真实光源逻辑，清晰照亮人物五官、双手与关键物品，"
         "不让暗部吞没剧情信息，不产生无来源的强光或过度戏剧化阴影。",
         "【画面美术质感】\n"
         f"保持{style_prompt.strip() or '项目既定动画风格'}的动画/插画质感，"
         "人物线条干净，面部和手部结构准确，场景空间清晰，材质区分明确，光影自然克制。\n"
+        "人物双手与关键手持道具清晰可见，手指结构完整，不被衣袖、道具或画面边缘裁切。\n"
         "人物、场景与物品的完成精度保持统一，不呈现真人摄影、影视剧照、三次元演员、"
         "写实实拍或过度三维游戏CG质感。",
         f"【连续性要求】\n{continuity_instruction}" if continuity_instruction.strip() else "",
         "【成图限制】\n"
         "画面只表现当前一个剧情瞬间，不制作多格漫画，不制作设定展板，"
         "不制作动作分解图，不在同一画面重复展示同一角色。\n"
+        "不做角色海报、概念插画封面或设定展示页构图。\n"
+        "只出现本镜绑定的角色，不出现背景行人、看客、路人或模糊人影。\n"
         "无人物漂浮，无物品漂浮，无穿模，无物品尺寸异常，无家具移动，无门窗错位，"
         "无场景镜像翻转，无错误透视。\n"
         "画面中不出现字幕、对白、对话框、旁白文字、水印、品牌标志、"
@@ -1036,11 +1073,12 @@ def compile_video_prompt(
     lighting = _value(shot_context.get("lighting"), "符合场景设定的光线")
     color_tone = _value(shot_context.get("color_tone"), "统一色调")
     environment_details = _value(shot_context.get("environment_details"), "场景固定环境细节")
-    has_dialogue = bool(str(shot_context.get("dialogue") or "").strip())
     prev_ending = shot_context.get("prev_end_state", "")
     positions = _value(shot_context.get("positions"), "")
     expressions = _value(shot_context.get("expressions"), "")
-    voice_over = _value(shot_context.get("voice_over"), "")
+    sound_effects = _normalize_sentence_end(
+        _value(shot_context.get("sound_effects"), "符合场景的环境声")
+    )
 
     # 时间分段：检查 video_prompt 是否已包含时间轴
     timeline_matches = list(_TIMELINE_PATTERN.finditer(video_prompt))
@@ -1103,7 +1141,7 @@ def compile_video_prompt(
 
     sections = [
         "【全局风格】",
-        f"{style_prompt}。",
+        _normalize_sentence_end(style_prompt),
         f"画面比例：{effective_aspect_ratio}，总时长：{duration_sec}秒。",
     ]
     sections.append("")
@@ -1114,7 +1152,7 @@ def compile_video_prompt(
         sections.extend(character_anchors)
     sections.extend(
         [
-            f"本镜角色：{characters}。",
+            f"本镜角色：{_normalize_sentence_end(characters)}",
             "严格保持每位角色的身份、面部特征、发型、服装、体型、左右位置关系不变。",
             "人物不得变形、消失、新增或互换位置。",
         ]
@@ -1126,7 +1164,7 @@ def compile_video_prompt(
         sections.append("【物品锁定】")
         if prop_anchors:
             sections.extend(prop_anchors)
-        sections.append(f"本镜道具：{props}。")
+        sections.append(f"本镜道具：{_normalize_sentence_end(props)}")
         sections.append(
             "重点道具的外观、尺寸、颜色和材质保持一致；"
             "若剧情要求道具被拿取、移动或放下，位置随人物动作自然变化，"
@@ -1144,9 +1182,13 @@ def compile_video_prompt(
         sections.extend(scene_anchors)
     sections.extend(
         [
-            f"场景：{scene_name}。",
+            f"场景：{_normalize_sentence_end(scene_name)}",
             "本镜及相邻镜统一使用该场景名称，不得改用其他叫法或另造地点。",
-            f"视觉风格：{lighting}，{color_tone}，{environment_details}。",
+            (
+                f"视觉风格：{_strip_sentence_end(lighting)}，"
+                f"{_strip_sentence_end(color_tone)}，"
+                f"{_normalize_sentence_end(environment_details)}"
+            ),
             "背景建筑、道路布局、光源方向、天气状态全程保持一致；"
             "雨势、灯光、昼夜不得突变，场景结构与主要陈设保持稳定。",
         ]
@@ -1161,7 +1203,7 @@ def compile_video_prompt(
         sections.append(prev_frame_anchor)
     if transition == "continuous":
         sections.append(
-            f"{prev_ending}。本镜动作直接承接该状态，人物位置、姿态与朝向保持连续。"
+            f"{_normalize_sentence_end(prev_ending)}本镜动作直接承接该状态，人物位置、姿态与朝向保持连续。"
             if prev_ending
             else "本镜动作直接承接上一镜结束状态，人物位置、姿态与朝向保持连续。"
         )
@@ -1174,7 +1216,7 @@ def compile_video_prompt(
         )
     elif transition == "elliptical":
         sections.append(
-            f"{prev_ending}。本镜在此之后，中间省略了一段过程："
+            f"{_normalize_sentence_end(prev_ending)}本镜在此之后，中间省略了一段过程："
             "人物衣着与持有物保持一致，但画面不承接上一镜构图。"
             if prev_ending
             else "本镜承接上一镜之后的时间点，中间省略了一段过程，画面不承接上一镜构图。"
@@ -1192,11 +1234,11 @@ def compile_video_prompt(
     sections.append("【本镜唯一开始状态】")
     if current_frame_anchor:
         sections.append(current_frame_anchor)
-    sections.append(f"从{opening_frame}开始。")
+    sections.append(f"从{_strip_sentence_end(opening_frame)}开始。")
     if positions and positions != "当前分镜位置":
-        sections.append(f"人物站位：{positions}。")
+        sections.append(f"人物站位：{_normalize_sentence_end(positions)}")
     if expressions and expressions != "当前分镜表情":
-        sections.append(f"表情状态：{expressions}。")
+        sections.append(f"表情状态：{_normalize_sentence_end(expressions)}")
     sections.append(
         "人物站位必须与起始姿态一致：若起始为蜷缩/躺姿，站位不得写成坐姿；"
         "动作起点从该姿态自然展开。"
@@ -1235,37 +1277,24 @@ def compile_video_prompt(
             f"{_value(shot_context.get('shot_type'), '中景')}，"
             f"{_value(shot_context.get('camera_angle'), '平视')}视角，"
             f"{_camera_line(shot_context.get('camera_move'))}",
-            f"焦点围绕{focus}进行平缓、连续的调度；{composition}，景别和光线方向保持稳定。",
+            (
+                f"焦点围绕{focus}进行平缓、连续的调度；"
+                f"{_strip_sentence_end(composition)}，景别和光线方向保持稳定。"
+            ),
         ]
     )
     sections.append("")
 
     # 声音
     sections.append("【声音】")
-    if voice_over and voice_over != "当前画外音":
-        sections.append(f"画外音（后期配音，画面人物闭口）：{voice_over}。")
-    sections.append(
-        f"画外音与对白文本必须在 {duration_sec:g} 秒内能自然读完；"
-        "超长时应拆分到多镜或压缩文本，不得让后期配音明显超出画面时长。"
-    )
-    sections.extend(
-        [
-            (
-                "说话角色嘴唇轻微开合、表情自然，不生成夸张口型；非说话角色全程闭口，不抢话。"
-                if has_dialogue
-                else "画面内无台词对白：所有人物全程闭口，不产生说话口型。"
-            ),
-            "生成画面时不添加可辨识对白声音，正式对白与画外音由后期配音添加。",
-            f"环境与动作声音：{_value(shot_context.get('sound_effects'), '符合场景的环境声')}。",
-        ]
-    )
+    sections.append(f"环境与动作声音：{sound_effects}")
     sections.append("")
 
     # 结束状态
     sections.extend(
         [
             "【结束状态】",
-            f"{ending_frame}。",
+            _normalize_sentence_end(ending_frame),
             "结束状态必须明确所有已持有道具的最终位置；"
             "若某道具不再持有，必须交代已放下或离开画面，不得凭空消失。",
         ]

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db import Database, db
-from app.models.tables import asset, asset_image, chapter, job, project, shot
+from app.models.tables import asset, asset_image, chapter, job, novel_analysis, project, shot
 from app.prompts import load_prompt
 from app.schemas import AssetExtractionOutput, AssetPromptOutput
 from app.services.errors import bad_request, conflict, not_found
@@ -34,6 +35,33 @@ _EXTRACTION_KEYS = {
 }
 
 _ACTIVE_JOB_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+_NAME_VARIANT_TOKENS = (
+    "已熄灭",
+    "熄灭",
+    "已灭",
+    "蒙尘",
+    "残破",
+    "破损",
+    "陈旧",
+    "黑色",
+    "暗色",
+    "金色",
+    "青色",
+    "银白",
+    "白色",
+    "红色",
+    "夜色",
+    "夜景",
+    "雪夜",
+    "风雪",
+    "清晨",
+    "黄昏",
+    "深夜",
+    "室内",
+    "室外",
+    "外部",
+    "内部",
+)
 _SHOT_JSON_FIELDS = {
     "character_ids": "character_ids_json",
     "prop_ids": "prop_ids_json",
@@ -73,6 +101,86 @@ class AssetService:
         result["consistency_json"] = consistency
         result["consistency_keywords"] = consistency
         return result
+
+    @staticmethod
+    def _normalize_label(value: str) -> str:
+        return re.sub(r"[\W_]+", "", value.casefold())
+
+    @classmethod
+    def _variant_name_core(cls, value: str) -> str:
+        """去掉常见状态/颜色修饰词，得到用于匹配变体素材的名称核心。"""
+        text = str(value or "").strip()
+        text = text.split("的")[-1]
+        for token in sorted(_NAME_VARIANT_TOKENS, key=len, reverse=True):
+            text = text.replace(token, "")
+        return cls._normalize_label(text)
+
+    @classmethod
+    def _asset_name_matches(cls, left: str, right: str) -> bool:
+        """判断两个素材名是否指向同一对象，含别名、归属前缀与状态变体。"""
+        left_text = str(left or "").strip()
+        right_text = str(right or "").strip()
+        if not left_text or not right_text:
+            return False
+        if left_text == right_text:
+            return True
+        if cls._normalize_label(left_text) == cls._normalize_label(right_text):
+            return True
+        # 「顾长渊的青玉命灯」与「青玉命灯」这类归属前缀
+        if left_text.split("的")[-1] == right_text or right_text.split("的")[-1] == left_text:
+            return True
+        # 较长名称以较短名称为后缀，如「万灯阁第七层」与「第七层」
+        shorter, longer = sorted((left_text, right_text), key=len)
+        if len(shorter) >= 2 and longer.endswith(shorter):
+            return True
+        # 「万灯阁命灯」与「万灯阁黑色命灯」这类状态变体
+        return cls._variant_name_core(left_text) == cls._variant_name_core(right_text)
+
+    @classmethod
+    def _find_matching_asset(
+        cls,
+        connection: Any,
+        *,
+        project_id: str,
+        asset_type: str,
+        name: str,
+        aliases: list[str],
+    ) -> tuple[Any, str]:
+        """按名称、别名与状态变体查找同项目同类型已有素材，返回匹配行和提示。"""
+        rows = connection.execute(
+            select(asset).where(
+                asset.c.project_id == project_id,
+                asset.c.asset_type == asset_type,
+            )
+        ).all()
+        exact = next((row for row in rows if row.name == name), None)
+        if exact is not None:
+            return exact, ""
+        raw_aliases = aliases if isinstance(aliases, list) else []
+        provided_aliases = [str(item).strip() for item in raw_aliases if str(item).strip()]
+        scored: list[tuple[int, Any]] = []
+        for row in rows:
+            profile = json_loads(row.profile_json, {})
+            existing_aliases = [
+                str(item).strip()
+                for item in profile.get("aliases", [])
+                if str(item).strip()
+            ]
+            if name in existing_aliases or row.name in provided_aliases:
+                scored.append((3, row))
+                continue
+            if cls._asset_name_matches(name, row.name):
+                scored.append((1, row))
+        if not scored:
+            return None, ""
+        best_score = max(score for score, _ in scored)
+        candidates = [row for score, row in scored if score == best_score]
+        matched = max(candidates, key=lambda row: len(row.name))
+        if len(candidates) > 1:
+            warning = f"素材「{name}」匹配到多个已有素材，已并入「{matched.name}」"
+        else:
+            warning = f"素材「{name}」与已有「{matched.name}」按别名或状态变体合并"
+        return matched, warning
 
     @staticmethod
     def _compiled_prompt(
@@ -510,6 +618,47 @@ class AssetService:
                 )
         return result
 
+    def _missing_key_characters(
+        self,
+        connection: Any,
+        *,
+        chapter_id: str,
+        project_id: str,
+    ) -> list[str]:
+        """用已生成的小说分析里的主角名单核对素材库，返回尚未提取的角色名。"""
+        analysis_raw = connection.execute(
+            select(novel_analysis.c.content_json).where(
+                novel_analysis.c.chapter_id == chapter_id
+            )
+        ).scalar()
+        if not analysis_raw:
+            return []
+        analysis = json_loads(analysis_raw, {})
+        main_characters = analysis.get("main_characters", [])
+        if not isinstance(main_characters, list) or not main_characters:
+            return []
+        rows = connection.execute(
+            select(asset.c.name, asset.c.profile_json).where(
+                asset.c.project_id == project_id,
+                asset.c.asset_type == "character",
+            )
+        ).all()
+        labels = set()
+        for row in rows:
+            labels.add(str(row.name).strip())
+            profile = json_loads(row.profile_json, {})
+            aliases = profile.get("aliases", [])
+            if isinstance(aliases, list):
+                labels.update(str(item).strip() for item in aliases if str(item).strip())
+        missing = []
+        for character in main_characters:
+            name = str(character or "").strip()
+            if not name:
+                continue
+            if not any(self._asset_name_matches(name, label) for label in labels):
+                missing.append(name)
+        return missing
+
     def queue_extract(self, chapter_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current_chapter = self._chapter(chapter_id)
         project_id = current_chapter["project_id"]
@@ -587,18 +736,35 @@ class AssetService:
         )
         payload = output.model_dump(mode="json")
         saved_ids: list[str] = []
+        warnings: list[str] = []
         for asset_type, key in _EXTRACTION_KEYS.items():
             if asset_type not in selected_types:
                 continue
             for extracted in payload[key]:
-                saved_ids.append(self._upsert_extracted(current_project, asset_type, extracted))
-        return {"asset_ids": saved_ids, "count": len(saved_ids)}
+                saved_ids.append(
+                    self._upsert_extracted(
+                        current_project,
+                        asset_type,
+                        extracted,
+                        warnings=warnings,
+                    )
+                )
+        with self.database.engine.connect() as connection:
+            for character in self._missing_key_characters(
+                connection,
+                chapter_id=chapter_id,
+                project_id=current_project["id"],
+            ):
+                warnings.append(f"核心角色「{character}」尚未在素材库中")
+        return {"asset_ids": saved_ids, "count": len(saved_ids), "warnings": warnings}
 
     def _upsert_extracted(
         self,
         current_project: dict[str, Any],
         asset_type: str,
         extracted: dict[str, Any],
+        *,
+        warnings: list[str] | None = None,
     ) -> str:
         name = extracted["name"].strip()
         profile = dict(extracted)
@@ -616,35 +782,28 @@ class AssetService:
         composition = str(profile.pop("composition", "")).strip()
         now = utc_now()
         with self.database.engine.begin() as connection:
-            existing = row_dict(
-                connection.execute(
-                    select(asset).where(
-                        asset.c.project_id == current_project["id"],
-                        asset.c.asset_type == asset_type,
-                        asset.c.name == name,
-                    )
-                ).first()
+            matched, match_warning = self._find_matching_asset(
+                connection,
+                project_id=current_project["id"],
+                asset_type=asset_type,
+                name=name,
+                aliases=profile.get("aliases", []),
             )
+            existing = row_dict(matched) if matched is not None else None
+            if match_warning and warnings is not None:
+                warnings.append(match_warning)
             if existing:
                 # 同名素材字段级合并：保留现有非空字段（用户手动编辑/已审阅内容），
                 # 新提取结果只填充空缺字段，不再整体覆盖。
                 existing_profile = json_loads(existing["profile_json"], {})
-                merged_profile = {
-                    **{
-                        key: value
-                        for key, value in profile.items()
-                        if value not in (None, "", [], {})
-                    },
-                    **{
-                        key: value
-                        for key, value in existing_profile.items()
-                        if value not in (None, "", [], {})
-                    },
-                }
+                merged_profile = self._merge_profile(existing_profile, profile)
                 saved_prompt = existing["prompt"] or prompt
                 saved_negative_prompt = existing["negative_prompt"] or negative_prompt
-                saved_consistency = (
-                    json_loads(existing["consistency_json"], []) or consistency_keywords
+                existing_consistency = json_loads(existing["consistency_json"], [])
+                if not isinstance(existing_consistency, list):
+                    existing_consistency = []
+                saved_consistency = list(
+                    dict.fromkeys([*existing_consistency, *consistency_keywords])
                 )
                 saved_composition = existing["composition"] or composition
                 connection.execute(

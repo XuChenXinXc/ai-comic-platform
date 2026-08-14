@@ -1,15 +1,21 @@
-from fastapi import APIRouter, Depends, File, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from fastapi.responses import FileResponse
 
 from app.api.schemas import AssetBatchRequest, GenerateRequest, MediaBatchRequest
 from app.dependencies import get_media_service
+from app.services.constants import MAX_IMAGE_SIZE, MAX_VIDEO_SIZE
 from app.services.media_service import MediaService
 
 router = APIRouter(tags=["media"])
 
 
-async def _read_upload(file: UploadFile) -> tuple[str, str, bytes]:
-    data = await file.read()
+async def _read_upload(file: UploadFile, max_bytes: int) -> tuple[str, str, bytes]:
+    data = await file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="文件大小超过限制",
+        )
     return file.filename or "upload", file.content_type or "", data
 
 
@@ -48,7 +54,7 @@ async def upload_asset_image(
     file: UploadFile = File(...),
     service: MediaService = Depends(get_media_service),
 ) -> dict:
-    return service.upload_asset_image(asset_id, *(await _read_upload(file)))
+    return service.upload_asset_image(asset_id, *(await _read_upload(file, MAX_IMAGE_SIZE)))
 
 
 @router.put("/asset-images/{image_id}/current")
@@ -123,7 +129,7 @@ async def upload_keyframe(
     file: UploadFile = File(...),
     service: MediaService = Depends(get_media_service),
 ) -> dict:
-    return service.upload_keyframe(shot_id, *(await _read_upload(file)))
+    return service.upload_keyframe(shot_id, *(await _read_upload(file, MAX_IMAGE_SIZE)))
 
 
 @router.put("/keyframes/{keyframe_id}/current")
@@ -198,7 +204,7 @@ async def upload_video(
     file: UploadFile = File(...),
     service: MediaService = Depends(get_media_service),
 ) -> dict:
-    return service.upload_video(shot_id, *(await _read_upload(file)))
+    return service.upload_video(shot_id, *(await _read_upload(file, MAX_VIDEO_SIZE)))
 
 
 @router.put("/videos/{video_id}/current")

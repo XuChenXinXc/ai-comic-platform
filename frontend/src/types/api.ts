@@ -39,6 +39,7 @@ export interface Project {
   default_text_provider_id?: string | null;
   default_image_provider_id?: string | null;
   default_video_provider_id?: string | null;
+  is_free_create: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -59,6 +60,7 @@ export type ProjectInput = Pick<
       | "default_text_provider_id"
       | "default_image_provider_id"
       | "default_video_provider_id"
+      | "is_free_create"
     >
   >;
 

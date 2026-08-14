@@ -76,6 +76,8 @@ workspace/platform.db.bak-*
 # 项目数据
 workspace/projects/*
 !workspace/projects/.gitkeep
+workspace/provider_tasks/
+workspace/real_verification/
 
 # 数据导出
 data_export/

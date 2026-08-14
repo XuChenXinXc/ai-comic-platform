@@ -207,6 +207,8 @@ def download_url_atomic(
             stream=True,
         ) as response:
             response.raise_for_status()
+            # stream 模式复制 response.raw 不会自动解压 gzip，需要显式开启解码
+            response.raw.decode_content = True
             with temporary.open("wb") as output:
                 _copy_response(response.raw, output)
         _validate_non_empty(temporary)

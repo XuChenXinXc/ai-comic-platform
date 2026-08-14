@@ -386,6 +386,12 @@ class PropAssetOutput(AssetVisualPromptFields):
             raise ValueError("物品素材缺少核心视觉信息")
         return self
 
+    @model_validator(mode="after")
+    def validate_prop_importance(self) -> PropAssetOutput:
+        if self.importance != "core":
+            raise ValueError("物品素材 importance 必须为 core")
+        return self
+
 
 class AssetExtractionOutput(OutputModel):
     characters: list[CharacterAssetOutput]

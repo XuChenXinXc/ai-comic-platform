@@ -1,7 +1,7 @@
 """video_version.end_frame_url 改名为 end_frame_path
 
 Revision ID: 20260807_0009
-Revises: 7384338f6bea
+Revises: 20260806_0008a
 Create Date: 2026-08-07
 """
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260807_0009"
-down_revision: str | None = "7384338f6bea"
+down_revision: str | None = "20260806_0008a"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

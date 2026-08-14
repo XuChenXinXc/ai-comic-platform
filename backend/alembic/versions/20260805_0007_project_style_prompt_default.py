@@ -8,8 +8,9 @@ Create Date: 2026-08-05
 这里把默认值写入表默认约束，并回填历史项目中仍为空的画风。
 """
 
-from alembic import op
 from sqlalchemy import inspect
+
+from alembic import op
 
 revision: str = "20260805_0007"
 down_revision: str | None = "20260803_0006"
@@ -17,8 +18,10 @@ branch_labels: str | None = None
 depends_on: str | None = None
 
 DEFAULT_STYLE_PROMPT = (
-    "电影感现实主义二维国漫，稳定自然的半写实人物比例，沉稳细腻线条，"
-    "低饱和冷暖协调色调，真实清晰的微表情，层次分明的电影光影。"
+    "电影感古风仙域二维国漫，稳定自然的半写实人物比例，东方审美骨相，"
+    "克制细腻的古风线条，低饱和青灰、玉白、玄黑与暖金综合色调，"
+    "仙气通透但不过度梦幻，真实清晰的微表情，层次分明的电影光影，"
+    "东方山水空间美学，精致但不浮夸。"
 )
 
 

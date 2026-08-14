@@ -267,14 +267,27 @@ class JobRepository:
     ) -> dict[str, Any]:
         if not provider_task_id:
             raise JobStateError("provider_task_id 不能为空")
-        changes: dict[str, Any] = {
+        values: dict[str, Any] = {
             "provider_task_id": provider_task_id,
             "status": status,
             "message": message,
         }
         if result_data is not None:
-            changes["result_data"] = dict(result_data)
-        return self.update(job_id, **changes)
+            values["result_json"] = _json_dumps(dict(result_data))
+        values["updated_at"] = utc_now()
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(job)
+                .where(
+                    job.c.id == job_id,
+                    job.c.status.in_(NON_TERMINAL_STATUSES),
+                )
+                .values(**values)
+            )
+        # 任务可能刚被取消：不覆盖终态，处理器会在下一次轮询检查到取消并中止。
+        if result.rowcount != 1:
+            return None
+        return self.require(job_id)
 
     def update_progress(
         self,

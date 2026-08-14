@@ -5,6 +5,7 @@ import {
   FolderCog,
   ListChecks,
   Mic,
+  PenLine,
   Settings2,
   Sparkles,
   Video,
@@ -33,6 +34,7 @@ const productionSteps: ProductionStep[] = [
   { to: "/shots", label: "分镜视频", short: "分镜", icon: Film },
   { to: "/audio", label: "配音工作台", short: "配音", icon: Mic, requiresChapter: true },
   { to: "/composition", label: "视频合成", short: "合成", icon: Video, requiresProject: true },
+  { to: "/custom-shots", label: "自由制作", short: "自由", icon: PenLine },
 ];
 
 export function AppShell() {

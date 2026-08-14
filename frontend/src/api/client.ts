@@ -241,7 +241,12 @@ export const api = {
     },
   },
   projects: {
-    list: async () => asList(await request<Project[] | { items: Project[] }>("/projects")),
+    list: async (filters: { kind?: "regular" | "free" } = {}) =>
+      asList(
+        await request<Project[] | { items: Project[] }>(
+          `/projects${params(filters)}`,
+        ),
+      ),
     get: (id: string) => request<Project>(`/projects/${id}`),
     create: (body: ProjectInput) => request<Project>("/projects", json("POST", body)),
     update: (id: string, body: Partial<ProjectInput>) =>
@@ -480,7 +485,12 @@ export const api = {
         request<Job>(`/shots/${shotId}/keyframes/generate`, json("POST", body)),
       batch: (
         chapterId: string,
-        body: { ids?: string[]; scene_no?: number } = {},
+        body: {
+          ids?: string[];
+          scene_no?: number;
+          only_missing?: boolean;
+          provider_id?: string | null;
+        } = {},
       ) =>
         request<BatchResponse>(
           `/chapters/${chapterId}/keyframes/batch`,
@@ -510,7 +520,12 @@ export const api = {
         request<Job>(`/shots/${shotId}/videos/generate`, json("POST", body)),
       batch: (
         chapterId: string,
-        body: { ids?: string[]; scene_no?: number } = {},
+        body: {
+          ids?: string[];
+          scene_no?: number;
+          only_missing?: boolean;
+          provider_id?: string | null;
+        } = {},
       ) =>
         request<BatchResponse>(
           `/chapters/${chapterId}/videos/batch`,
@@ -573,6 +588,14 @@ export const api = {
   },
 
   audio: {
+    getEdgeTTSVoices: () =>
+      request<Array<{
+        name: string;
+        display_name: string;
+        gender: string;
+        description: string;
+      }>>(`/audio/edge-tts/voices`),
+
     getConfig: (projectId: string) =>
       request<{
         project_id: string;
@@ -644,6 +667,23 @@ export const api = {
         status: string;
         is_current: number;
       }>>(`/audio/shots/${shotId}/audio/versions`),
+
+    getChapterAudios: (chapterId: string) =>
+      request<Array<{
+        shot_id: string;
+        shot_no: number;
+        audio: {
+          id: string;
+          dialogue_text: string;
+          voice_id: string;
+          file_path: string | null;
+          duration_sec: number | null;
+          status: string;
+        } | null;
+      }>>(`/audio/chapters/${chapterId}/audios`),
+
+    deleteShotAudio: (audioId: string) =>
+      request<void>(`/audio/shot-audios/${audioId}`, json("DELETE")),
 
     listBGMs: (projectId: string) =>
       request<Array<{
@@ -737,6 +777,8 @@ export const api = {
       burn_subtitles?: boolean;
       bgm_id?: string;
       bgm_volume?: number;
+      crossfade?: boolean;
+      crossfade_seconds?: number;
     }) =>
       request<{
         id: string;

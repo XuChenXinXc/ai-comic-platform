@@ -20,7 +20,6 @@ from app.models.tables import (
     shot,
     shot_audio,
 )
-from app.providers.registry import provider_registry
 from app.providers.tts.openai_tts import OpenAITTSProvider
 from app.services.errors import bad_request, not_found
 from app.services.file_service import FileServiceError, atomic_write_bytes, file_service
@@ -60,13 +59,17 @@ class AudioService:
 
         return row_dict(record)
 
-    def update_project_audio_config(self, project_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    def update_project_audio_config(
+        self, project_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any]:
         """更新项目音频配置"""
         now = utc_now()
 
         with self.database.engine.begin() as connection:
             # 检查项目是否存在
-            proj = connection.execute(select(project.c.id).where(project.c.id == project_id)).first()
+            proj = connection.execute(
+                select(project.c.id).where(project.c.id == project_id)
+            ).first()
             if proj is None:
                 raise not_found(f"项目不存在：{project_id}")
 
@@ -143,7 +146,12 @@ class AudioService:
         *,
         tts_provider_id: str | None = None,
     ) -> dict[str, Any]:
-        """为单个分镜生成配音"""
+        """为单个分镜生成配音
+
+        支持两种模式：
+        1. Edge TTS：voice_id 以 "edge-tts:" 开头，如 "edge-tts:zh-CN-XiaoxiaoNeural"
+        2. Provider TTS：使用配置的 TTS Provider
+        """
         with self.database.engine.begin() as connection:
             # 检查分镜是否存在
             shot_record = connection.execute(
@@ -154,58 +162,77 @@ class AudioService:
 
             project_id = shot_record.project_id
 
-            # 获取 TTS Provider
-            if not tts_provider_id:
-                config = self.get_project_audio_config(project_id)
-                tts_provider_id = config.get("tts_provider_id")
+            # 检查是否使用 Edge TTS
+            use_edge_tts = voice_id.startswith("edge-tts:")
 
-            if not tts_provider_id:
-                raise bad_request("未配置 TTS Provider")
+            if use_edge_tts:
+                # 使用 Edge TTS（免费，无需配置）
+                edge_voice = voice_id.replace("edge-tts:", "")
+                from app.providers.tts.edge_tts import COMMON_VOICES
 
-            provider_record = connection.execute(
-                select(api_provider).where(api_provider.c.id == tts_provider_id)
-            ).first()
-            if provider_record is None:
-                raise not_found("TTS Provider 不存在")
+                if edge_voice not in {voice["name"] for voice in COMMON_VOICES}:
+                    raise bad_request(f"不支持的 Edge TTS 音色：{edge_voice}")
+                audio_data = await self._generate_with_edge_tts(dialogue_text, edge_voice)
+                provider_id_to_save = None  # Edge TTS 不需要 Provider ID
+            else:
+                # 使用配置的 TTS Provider
+                if not tts_provider_id:
+                    config = self.get_project_audio_config(project_id)
+                    tts_provider_id = config.get("tts_provider_id")
 
-            provider_dict = row_dict(provider_record)
+                if not tts_provider_id:
+                    raise bad_request("未配置 TTS Provider")
 
-            # 获取运行时配置（包含解密的 API Key）
-            runtime_config = self.providers._runtime_config(
-                self.providers._decode(provider_dict, redact_base_url=False, include_secret=True)
-            )
-            api_key = runtime_config.get("api_key", "")
-            if not api_key:
-                raise bad_request("TTS Provider 未配置 API Key")
+                provider_record = connection.execute(
+                    select(api_provider).where(api_provider.c.id == tts_provider_id)
+                ).first()
+                if provider_record is None:
+                    raise not_found("TTS Provider 不存在")
 
-            # 创建 Provider 实例
-            from app.schemas import ProviderConfig
+                provider_dict = row_dict(provider_record)
 
-            provider_config = ProviderConfig(
-                kind="tts",
-                adapter=provider_dict["adapter"],
-                base_url=provider_dict["base_url"],
-                model=provider_dict["model"],
-                params=json_loads(provider_dict["params_json"], {}),
-                timeout_sec=provider_dict["timeout_sec"],
-                max_retries=provider_dict["max_retries"],
-            )
-
-            if provider_dict["adapter"] != "openai_tts":
-                raise bad_request(f"不支持的 TTS adapter：{provider_dict['adapter']}")
-
-            tts_provider = OpenAITTSProvider(provider_config, api_key)
-
-            # 调用 TTS API
-            try:
-                audio_data = await tts_provider.synthesize(
-                    text=dialogue_text,
-                    voice_id=voice_id,
-                    params=provider_config.params,
+                # 获取运行时配置（包含解密的 API Key）
+                runtime_config = self.providers._runtime_config(
+                    self.providers._decode(
+                        provider_dict,
+                        redact_base_url=False,
+                        include_secret=True,
+                    )
                 )
-            except Exception as exc:
-                logger.error(f"TTS 生成失败：{exc}")
-                raise bad_request(f"TTS 生成失败：{exc}") from exc
+                api_key = runtime_config.get("api_key", "")
+                if not api_key:
+                    raise bad_request("TTS Provider 未配置 API Key")
+
+                # 创建 Provider 实例
+                from app.schemas import ProviderConfig
+
+                provider_config = ProviderConfig(
+                    kind="tts",
+                    adapter=provider_dict["adapter"],
+                    base_url=provider_dict["base_url"],
+                    model=provider_dict["model"],
+                    params=json_loads(provider_dict["params_json"], {}),
+                    timeout_sec=provider_dict["timeout_sec"],
+                    max_retries=provider_dict["max_retries"],
+                )
+
+                if provider_dict["adapter"] != "openai_tts":
+                    raise bad_request(f"不支持的 TTS adapter：{provider_dict['adapter']}")
+
+                tts_provider = OpenAITTSProvider(provider_config, api_key)
+
+                # 调用 TTS API
+                try:
+                    audio_data = await tts_provider.synthesize(
+                        text=dialogue_text,
+                        voice_id=voice_id,
+                        params=provider_config.params,
+                    )
+                except Exception as exc:
+                    logger.error(f"TTS 生成失败：{exc}")
+                    raise bad_request(f"TTS 生成失败：{exc}") from exc
+
+                provider_id_to_save = tts_provider_id
 
             # 保存音频文件
             project_path = file_service.project_path(project_id)
@@ -234,7 +261,7 @@ class AudioService:
             )
 
             # 插入数据库
-            audio_id = new_id()
+            audio_id = new_id("audio")
             now = utc_now()
             connection.execute(
                 insert(shot_audio).values(
@@ -246,8 +273,8 @@ class AudioService:
                     file_path=str(audio_path.relative_to(project_path)),
                     duration_sec=duration_sec,
                     version_no=version_no,
-                    provider_id=tts_provider_id,
-                    model=provider_dict["model"],
+                    provider_id=provider_id_to_save,  # Edge TTS 时为 None
+                    model=edge_voice if use_edge_tts else provider_dict["model"],
                     status="completed",
                     is_current=1,
                     source="generated",
@@ -256,6 +283,31 @@ class AudioService:
             )
 
         return self.get_shot_audio(shot_id)
+
+    async def _generate_with_edge_tts(self, text: str, voice: str) -> bytes:
+        """使用 Edge TTS 生成音频"""
+        import tempfile
+
+        from app.providers.tts import edge_tts
+
+        if not edge_tts.EDGE_TTS_AVAILABLE:
+            raise bad_request("Edge TTS 未安装，请运行: pip install edge-tts")
+
+        # 使用临时文件
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+
+        try:
+            # 生成音频
+            await edge_tts._generate_tts(text, voice, temp_path)
+
+            # 读取音频数据
+            audio_data = temp_path.read_bytes()
+
+            return audio_data
+        finally:
+            # 清理临时文件
+            temp_path.unlink(missing_ok=True)
 
     def get_shot_audio(self, shot_id: str) -> dict[str, Any] | None:
         """获取分镜的当前配音"""
@@ -282,6 +334,88 @@ class AudioService:
 
         return [row_dict(r) for r in records]
 
+    def list_chapter_audios(self, chapter_id: str) -> list[dict[str, Any]]:
+        """列出章节内所有分镜的当前配音。"""
+        with self.database.engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    shot.c.id.label("shot_id"),
+                    shot.c.shot_no,
+                    shot_audio.c.id.label("audio_id"),
+                    shot_audio.c.dialogue_text,
+                    shot_audio.c.voice_id,
+                    shot_audio.c.file_path,
+                    shot_audio.c.duration_sec,
+                    shot_audio.c.status,
+                )
+                .outerjoin(
+                    shot_audio,
+                    (shot_audio.c.shot_id == shot.c.id)
+                    & (shot_audio.c.is_current == 1),
+                )
+                .where(shot.c.chapter_id == chapter_id)
+                .order_by(shot.c.shot_no)
+            ).fetchall()
+
+        return [
+            {
+                "shot_id": row.shot_id,
+                "shot_no": row.shot_no,
+                "audio": (
+                    {
+                        "id": row.audio_id,
+                        "dialogue_text": row.dialogue_text,
+                        "voice_id": row.voice_id,
+                        "file_path": row.file_path,
+                        "duration_sec": row.duration_sec,
+                        "status": row.status,
+                    }
+                    if row.audio_id
+                    else None
+                ),
+            }
+            for row in rows
+        ]
+
+    def delete_shot_audio(self, audio_id: str) -> None:
+        """删除一个配音版本；删除当前版本后自动提升最新版本为当前。"""
+        project_id = ""
+        with self.database.engine.begin() as connection:
+            record = connection.execute(
+                select(shot_audio).where(shot_audio.c.id == audio_id)
+            ).first()
+            if record is None:
+                raise not_found(f"配音不存在：{audio_id}")
+            shot_id = record.shot_id
+            file_path = record.file_path
+            was_current = record.is_current == 1
+            shot_row = connection.execute(
+                select(shot.c.project_id).where(shot.c.id == shot_id)
+            ).first()
+            if shot_row is not None:
+                project_id = shot_row.project_id
+            connection.execute(delete(shot_audio).where(shot_audio.c.id == audio_id))
+            if was_current:
+                latest = connection.execute(
+                    select(shot_audio.c.id)
+                    .where(shot_audio.c.shot_id == shot_id)
+                    .order_by(shot_audio.c.version_no.desc())
+                    .limit(1)
+                ).first()
+                if latest is not None:
+                    connection.execute(
+                        update(shot_audio)
+                        .where(shot_audio.c.id == latest.id)
+                        .values(is_current=1)
+                    )
+
+        if file_path and project_id:
+            try:
+                target = file_service.resolve_project_path(project_id, file_path)
+                target.unlink(missing_ok=True)
+            except (FileServiceError, OSError):
+                logger.warning("删除配音文件失败：%s", file_path)
+
     def list_project_bgms(self, project_id: str) -> list[dict[str, Any]]:
         """列出项目所有 BGM"""
         with self.database.engine.connect() as connection:
@@ -293,11 +427,19 @@ class AudioService:
 
         return [row_dict(r) for r in records]
 
-    def save_bgm(self, project_id: str, name: str, file_data: bytes, mood_tags: list[str]) -> dict[str, Any]:
+    def save_bgm(
+        self,
+        project_id: str,
+        name: str,
+        file_data: bytes,
+        mood_tags: list[str],
+    ) -> dict[str, Any]:
         """保存 BGM 文件"""
         with self.database.engine.begin() as connection:
             # 检查项目是否存在
-            proj = connection.execute(select(project.c.id).where(project.c.id == project_id)).first()
+            proj = connection.execute(
+                select(project.c.id).where(project.c.id == project_id)
+            ).first()
             if proj is None:
                 raise not_found(f"项目不存在：{project_id}")
 
@@ -306,7 +448,7 @@ class AudioService:
             bgm_dir = project_path / "BGM"
             bgm_dir.mkdir(parents=True, exist_ok=True)
 
-            bgm_id = new_id()
+            bgm_id = new_id("bgm")
             bgm_filename = f"bgm-{bgm_id}.mp3"
             bgm_path = bgm_dir / bgm_filename
 

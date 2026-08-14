@@ -47,6 +47,7 @@ def _valid_prop_asset() -> dict[str, Any]:
         "negative_prompt": "完整人物，多件物品，结构错误，文字，水印",
         "consistency_keywords": ["圆形翻盖", "暗金色", "表盘刻纹"],
         "composition": "纯白背景横向道具设定面板",
+        "importance": "core",
     }
 
 
@@ -330,6 +331,14 @@ def test_prop_asset_nested_description_is_normalized() -> None:
         "surface_texture": "细密拉丝纹理",
         "wear": "翻盖边缘有固定磨损",
     }
+
+
+def test_prop_asset_with_normal_importance_is_rejected() -> None:
+    payload = _valid_prop_asset()
+    payload["importance"] = "normal"
+
+    with pytest.raises(ValidationError):
+        PropAssetOutput.model_validate(payload)
 
 
 def test_shot_dialogue_with_speaker_and_line_is_normalized() -> None:

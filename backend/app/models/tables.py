@@ -40,7 +40,12 @@ project = Table(
         "style_prompt",
         Text,
         nullable=False,
-        server_default="电影感现实主义二维国漫，稳定自然的半写实人物比例，沉稳细腻线条，低饱和冷暖协调色调，真实清晰的微表情，层次分明的电影光影。",
+        server_default=(
+            "电影感古风仙域二维国漫，稳定自然的半写实人物比例，东方审美骨相，"
+            "克制细腻的古风线条，低饱和青灰、玉白、玄黑与暖金综合色调，"
+            "仙气通透但不过度梦幻，真实清晰的微表情，层次分明的电影光影，"
+            "东方山水空间美学，精致但不浮夸。"
+        ),
     ),
     Column("aspect_ratio", Text, nullable=False, server_default="16:9"),
     Column("image_size", Text, nullable=False, server_default="1920x1080"),
@@ -49,6 +54,12 @@ project = Table(
     Column("default_text_provider_id", Text),
     Column("default_image_provider_id", Text),
     Column("default_video_provider_id", Text),
+    Column(
+        "is_free_create",
+        Integer,
+        nullable=False,
+        server_default="0",
+    ),
     Column("created_at", Text, nullable=False),
     Column("updated_at", Text, nullable=False),
 )
@@ -194,6 +205,7 @@ asset_image = Table(
     Column("asset_id", Text, ForeignKey("asset.id", ondelete="CASCADE"), nullable=False),
     Column("version_no", Integer, nullable=False),
     Column("file_path", Text),
+    Column("provider_url", Text),
     Column("prompt_snapshot", Text, nullable=False, server_default=""),
     Column("negative_prompt_snapshot", Text, nullable=False, server_default=""),
     Column("reference_files_json", Text, nullable=False, server_default="[]"),
@@ -281,6 +293,7 @@ keyframe_version = Table(
     Column("shot_id", Text, ForeignKey("shot.id", ondelete="CASCADE"), nullable=False),
     Column("version_no", Integer, nullable=False),
     Column("file_path", Text),
+    Column("provider_url", Text),
     Column("prompt_snapshot", Text, nullable=False, server_default=""),
     Column("negative_prompt_snapshot", Text, nullable=False, server_default=""),
     Column("reference_bindings_json", Text, nullable=False, server_default="[]"),
@@ -397,7 +410,10 @@ audio_config = Table(
     Column("updated_at", Text, nullable=False),
     CheckConstraint("bgm_volume >= 0 AND bgm_volume <= 1", name="bgm_volume"),
     CheckConstraint("dialogue_volume >= 0 AND dialogue_volume <= 1", name="dialogue_volume"),
-    CheckConstraint("sound_effect_volume >= 0 AND sound_effect_volume <= 1", name="sound_effect_volume"),
+    CheckConstraint(
+        "sound_effect_volume >= 0 AND sound_effect_volume <= 1",
+        name="sound_effect_volume",
+    ),
 )
 
 

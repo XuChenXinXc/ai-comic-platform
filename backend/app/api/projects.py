@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, Response, status
+from typing import Literal
+
+from fastapi import APIRouter, Depends, Query, Response, status
 
 from app.api.schemas import ProjectCreate, ProjectUpdate
 from app.dependencies import get_project_service
@@ -16,8 +18,11 @@ def create_project(
 
 
 @router.get("")
-def list_projects(service: ProjectService = Depends(get_project_service)) -> list[dict]:
-    return service.list()
+def list_projects(
+    kind: Literal["regular", "free"] | None = Query(default=None),
+    service: ProjectService = Depends(get_project_service),
+) -> list[dict]:
+    return service.list(kind=kind)
 
 
 @router.get("/{project_id}")

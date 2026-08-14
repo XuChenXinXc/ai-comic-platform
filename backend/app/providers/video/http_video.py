@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import math
-import mimetypes
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 
@@ -14,6 +14,7 @@ from app.schemas import ProviderConfig, ProviderPollResult, ProviderSubmission
 from ..base import (
     HttpProviderBase,
     ProviderError,
+    compress_reference_image,
     extract_path,
     normalize_provider_status,
 )
@@ -26,12 +27,14 @@ class HttpVideoProvider(HttpProviderBase):
     def _options(self) -> dict[str, Any]:
         options = dict(self.config.params)
         model = self.config.model.strip().lower()
+        # 未识别的视频模型也要有通用 OpenAI 兼容提交路径，避免 submit_path
+        # 为空时把请求直接打到 base_url（网关返回 Invalid URL (POST /v1)）。
+        options.setdefault("submit_path", "videos/generations")
         if model in {
             "grok-imagine-1.5-video-apimart",
             "grok-imagine-1.5-video-ext",
         }:
             options.setdefault("retry_unsafe_methods", False)
-            options.setdefault("submit_path", "videos/generations")
             options.setdefault("poll_path", "tasks/{task_id}")
             options.setdefault("task_id_path", "data.0.task_id")
             options.setdefault("submit_status_path", "data.0.status")
@@ -62,7 +65,6 @@ class HttpVideoProvider(HttpProviderBase):
             # doubao-seedance-2.0 系列：分镜填多少秒就传多少秒（4~15 秒整数），
             # 不做向上取整或最低时长抬升；生成音频默认开启。
             options.setdefault("retry_unsafe_methods", False)
-            options.setdefault("submit_path", "videos/generations")
             options.setdefault("poll_path", "tasks/{task_id}")
             options.setdefault("task_id_path", "data.0.task_id")
             options.setdefault("submit_status_path", "data.0.status")
@@ -86,11 +88,85 @@ class HttpVideoProvider(HttpProviderBase):
                 "generate_audio": True,
                 **dict(options.get("default_params", {})),
             }
+        elif self._uses_tianyue_video_protocol(options):
+            # 天悦官方视频接口：POST /v1/videos、GET /v1/videos/{task_id}。
+            # 按次计费模型固定 duration=1，实际生成时长写到 video_duration；
+            # 参考图最多 9 张，使用 image_urls 数组（实测接受 base64 data URL）。
+            options["submit_path"] = "videos"
+            options.setdefault("poll_path", "videos/{task_id}")
+            options.setdefault("mode", "async")
+            options.setdefault("task_id_path", "task_id")
+            options.setdefault("submit_status_path", "status")
+            options.setdefault("status_path", "status")
+            options.setdefault("result_url_path", "url")
+            options.setdefault("error_path", "error.message")
+            options.setdefault("input_image_field", "image_urls")
+            options.setdefault("input_image_list", True)
+            options.setdefault("input_image_mode", "base64")
+            options.setdefault("input_image_data_url", True)
+            options.setdefault("max_reference_files", 9)
+            options.setdefault("min_duration_sec", 15)
+            options.setdefault("max_duration_sec", 15)
+            options.setdefault("duration_integer_only", True)
+            options.setdefault("duration_round_up", True)
+            options.setdefault("force_duration_sec", 15)
+            options.setdefault("duration_field", "video_duration")
+            options.setdefault("billing_duration_field", "duration")
+            options.setdefault("billing_duration_value", 1)
+            options.setdefault(
+                "ignored_payload_fields",
+                [
+                    "protocol",
+                    "submit_path",
+                    "poll_path",
+                    "mode",
+                    "task_id_path",
+                    "submit_status_path",
+                    "status_path",
+                    "result_url_path",
+                    "result_base64_path",
+                    "error_path",
+                    "input_image_field",
+                    "input_image_list",
+                    "input_image_mode",
+                    "input_image_data_url",
+                    "max_reference_files",
+                    "min_duration_sec",
+                    "max_duration_sec",
+                    "duration_integer_only",
+                    "duration_round_up",
+                    "force_duration_sec",
+                    "duration_field",
+                    "billing_duration_field",
+                    "billing_duration_value",
+                    "ignored_payload_fields",
+                    "test_path",
+                    "test_method",
+                    "retry_unsafe_methods",
+                ],
+            )
+            options["default_params"] = {
+                "duration": 1,
+                "aspect_ratio": "16:9",
+                **dict(options.get("default_params", {})),
+            }
         return options
+
+    def _uses_tianyue_video_protocol(self, options: dict[str, Any]) -> bool:
+        protocol = str(options.get("protocol", "")).strip().lower()
+        if protocol:
+            return protocol == "tianyue"
+        hostname = (urlsplit(self.config.base_url).hostname or "").lower()
+        return hostname in {"api.tianyue.xyz", "tianyue.xyz"}
 
     @property
     def supports_multiple_input_images(self) -> bool:
         return bool(self._options().get("input_image_list", False))
+
+    @property
+    def prefers_public_reference_urls(self) -> bool:
+        """天悦 image_urls 优先使用公网 URL，缺失时由调用方回退 base64。"""
+        return self._uses_tianyue_video_protocol(self._options())
 
     async def prepare_input_image(self, local_file: Path) -> dict[str, Any]:
         if not local_file.is_file() or local_file.stat().st_size <= 0:
@@ -98,11 +174,10 @@ class HttpVideoProvider(HttpProviderBase):
         options = self._options()
         mode = str(options.get("input_image_mode", "base64"))
         if mode == "base64":
-            encoded = await asyncio.to_thread(local_file.read_bytes)
-            value = base64.b64encode(encoded).decode("ascii")
+            compressed = await asyncio.to_thread(compress_reference_image, local_file)
+            value = base64.b64encode(compressed).decode("ascii")
             if options.get("input_image_data_url", True):
-                media_type = mimetypes.guess_type(local_file.name)[0] or "image/png"
-                value = f"data:{media_type};base64,{value}"
+                value = f"data:image/jpeg;base64,{value}"
             return {"value": value, "mode": "base64"}
         if mode == "upload":
             return await self._upload_input_image(local_file, options)
@@ -128,23 +203,34 @@ class HttpVideoProvider(HttpProviderBase):
         if duration_sec <= 0:
             raise ProviderError("视频时长必须大于 0")
         options = self._options()
-        effective_duration: float | int = duration_sec
-        round_up = bool(options.get("duration_round_up"))
-        # 显式配置 duration_round_up=False 的模型（如 doubao-seedance）分镜多少秒
-        # 就传多少秒，超范围由 _validate_duration 报错；缺省或 True 时保留旧行为：
-        # 向上取整并把时长抬到供应商下限（grok 等模型）。
-        suppress_floor = options.get("duration_round_up") is False
-        if round_up:
-            effective_duration = math.ceil(duration_sec)
-        minimum_duration = options.get("min_duration_sec")
-        if minimum_duration is not None and not suppress_floor:
-            effective_duration = max(effective_duration, float(minimum_duration))
+        forced_duration = options.get("force_duration_sec")
+        if forced_duration is None:
+            effective_duration: float | int = duration_sec
+            round_up = bool(options.get("duration_round_up"))
+            # 显式配置 duration_round_up=False 的模型（如 doubao-seedance）分镜多少秒
+            # 就传多少秒，超范围由 _validate_duration 报错；缺省或 True 时保留旧行为：
+            # 向上取整并把时长抬到供应商下限（grok 等模型）。
+            suppress_floor = options.get("duration_round_up") is False
+            if round_up:
+                effective_duration = math.ceil(duration_sec)
+            minimum_duration = options.get("min_duration_sec")
+            if minimum_duration is not None and not suppress_floor:
+                effective_duration = max(effective_duration, float(minimum_duration))
+        else:
+            # 固定时长模型（如天悦 mini-15s）：忽略分镜秒数，全部按固定时长提交。
+            effective_duration = float(forced_duration)
         self._validate_duration(effective_duration, options)
         if options.get("duration_integer_only"):
             effective_duration = int(effective_duration)
         payload = dict(options.get("payload", {}))
         payload.update(options.get("default_params", {}))
-        payload.update(params)
+        filtered_params = dict(params)
+        for field in options.get("ignored_payload_fields", []):
+            filtered_params.pop(str(field), None)
+        payload.update(filtered_params)
+        billing_field = options.get("billing_duration_field")
+        if billing_field is not None:
+            payload[str(billing_field)] = options.get("billing_duration_value")
         payload[str(options.get("prompt_field", "prompt"))] = prompt
         input_image_values = input_image.get("values")
         if not isinstance(input_image_values, list) or not input_image_values:
@@ -236,8 +322,9 @@ class HttpVideoProvider(HttpProviderBase):
         def upload() -> dict[str, Any]:
             headers = self._headers(options)
             field = str(options.get("upload_file_field", "file"))
+            # 提交前等比压缩，控制总请求体积；压缩在内存完成，原图不受影响。
             # 内存 bytes 可被 requests 在每次重试时重新读取（文件句柄在重试时会读到 EOF 发空文件）
-            content = local_file.read_bytes()
+            content = compress_reference_image(local_file)
             response = self._request(
                 str(options.get("upload_method", "POST")),
                 self._url(upload_path),
@@ -245,9 +332,9 @@ class HttpVideoProvider(HttpProviderBase):
                 headers=headers,
                 files={
                     field: (
-                        local_file.name,
+                        Path(local_file.name).with_suffix(".jpg").name,
                         content,
-                        mimetypes.guess_type(local_file.name)[0] or "image/png",
+                        "image/jpeg",
                     )
                 },
                 data=dict(options.get("upload_data", {})),

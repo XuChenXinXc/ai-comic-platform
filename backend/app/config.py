@@ -100,7 +100,11 @@ class Settings(BaseSettings):
     def reject_wildcard_cors(cls, value: str) -> str:
         for item in (part.strip() for part in value.split(",")):
             if item == "*":
-                raise ValueError("APP_CORS_ORIGINS 不允许通配符 *，请明确列出允许的来源")
+                raise ValueError(
+                    "APP_CORS_ORIGINS 不允许通配符 *。\n"
+                    "多个来源用逗号分隔，例如：\n"
+                    "  APP_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,https://app.example.com"
+                )
         return value
 
     @model_validator(mode="after")

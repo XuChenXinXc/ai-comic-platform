@@ -920,6 +920,12 @@ function Start-TrackedProcess {
                     Get-DescendantSnapshots -RootSnapshot $LaunchSnapshot |
                         Where-Object {
                             $Child = $_
+                            # 快照可能包含刚退出的进程（Executable/Command 为空），
+                            # 跳过它们，避免 Get-NormalizedPath 因空路径抛错。
+                            if ([string]::IsNullOrWhiteSpace($Child.Executable) -or
+                                [string]::IsNullOrWhiteSpace($Child.Command)) {
+                                return $false
+                            }
                             $Allowed = $false
                             foreach ($AllowedExecutable in $AllowedExecutables) {
                                 if ([string]::Equals(

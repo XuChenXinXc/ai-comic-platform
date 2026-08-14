@@ -5,6 +5,7 @@ import { AssetImagesPage } from "./pages/AssetImagesPage";
 import { AssetsPage } from "./pages/AssetsPage";
 import AudioWorkbenchPage from "./pages/AudioWorkbenchPage";
 import CompositionPage from "./pages/CompositionPage";
+import { CustomShotsPage } from "./pages/CustomShotsPage";
 import { JobsPage } from "./pages/JobsPage";
 import { KeyframesPage } from "./pages/KeyframesPage";
 import { PlatformSettingsPage } from "./pages/PlatformSettingsPage";
@@ -25,6 +26,7 @@ export function App() {
           <Route path="/assets" element={<AssetsPage />} />
           <Route path="/asset-images" element={<AssetImagesPage />} />
           <Route path="/shots" element={<ShotsPage />} />
+          <Route path="/custom-shots" element={<CustomShotsPage />} />
           <Route path="/keyframes" element={<KeyframesPage />} />
           <Route path="/videos" element={<VideosPage />} />
           <Route path="/audio/:projectId/:chapterId" element={<AudioWorkbenchPage />} />

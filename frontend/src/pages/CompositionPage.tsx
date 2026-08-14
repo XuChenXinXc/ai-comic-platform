@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router";
 import { api } from "../api/client";
 import type { Chapter } from "../types/api";
@@ -38,6 +38,13 @@ export default function CompositionPage() {
     job_id: string | null;
   } | null>(null);
   const [uploadingBGM, setUploadingBGM] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (!projectId) return;
@@ -56,6 +63,12 @@ export default function CompositionPage() {
 
   useEffect(() => {
     if (!selectedChapter) return;
+
+    // 切换章节后，上一个章节的轮询任务必须停止，避免状态互相覆盖。
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
 
     // 查询当前章节的合成状态
     api.composition.getChapterComposition(selectedChapter).then(comp => {
@@ -100,24 +113,29 @@ export default function CompositionPage() {
   };
 
   const pollJobStatus = (jobId: string) => {
-    const interval = setInterval(async () => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
       try {
         const job = await api.jobs.get(jobId);
-        if (job.status === "completed" || job.status === "failed") {
-          clearInterval(interval);
+        setCompositionStatus(prev => prev ? { ...prev, status: job.status, job_id: jobId } : prev);
+        if (
+          ["completed", "failed", "cancelled", "interrupted"].includes(
+            job.status,
+          )
+        ) {
+          if (pollRef.current) clearInterval(pollRef.current);
+          pollRef.current = null;
           // 刷新合成状态
           const comp = await api.composition.getChapterComposition(selectedChapter);
           if (comp) {
             setCompositionStatus(comp);
           }
         }
-      } catch (error) {
-        clearInterval(interval);
+      } catch {
+        if (pollRef.current) clearInterval(pollRef.current);
+        pollRef.current = null;
       }
     }, 3000);
-
-    // 10 分钟后停止轮询
-    setTimeout(() => clearInterval(interval), 600000);
   };
 
   const handleUploadBGM = async () => {
@@ -310,11 +328,21 @@ export default function CompositionPage() {
                   ? "bg-green-100 text-green-700"
                   : compositionStatus.status === "failed"
                   ? "bg-red-100 text-red-700"
+                  : compositionStatus.status === "cancelled" || compositionStatus.status === "interrupted"
+                  ? "bg-gray-100 text-gray-600"
                   : "bg-yellow-100 text-yellow-700"
               }`}>
                 {compositionStatus.status === "completed" ? "已完成" :
                  compositionStatus.status === "failed" ? "失败" :
-                 compositionStatus.status === "processing" ? "合成中" : "等待中"}
+                 compositionStatus.status === "cancelled" ? "已取消" :
+                 compositionStatus.status === "interrupted" ? "已中断" :
+                 compositionStatus.status === "queued" ? "等待中" :
+                 compositionStatus.status === "running" ||
+                 compositionStatus.status === "waiting_provider" ||
+                 compositionStatus.status === "downloading" ||
+                 compositionStatus.status === "processing"
+                   ? "合成中"
+                   : "等待中"}
               </span>
             </div>
 
@@ -326,6 +354,11 @@ export default function CompositionPage() {
 
             {compositionStatus.file_path && compositionStatus.status === "completed" && (
               <div className="mt-4">
+                <video
+                  controls
+                  src={`/media/${projectId}/${compositionStatus.file_path}`}
+                  className="w-full max-w-2xl rounded border"
+                />
                 <a
                   href={`/media/${projectId}/${compositionStatus.file_path}`}
                   download

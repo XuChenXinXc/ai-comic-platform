@@ -151,7 +151,7 @@ class MockTextProvider:
                         "negative_prompt": "完整人物，多件物品，结构错误，文字，水印",
                         "consistency_keywords": ["圆形轮廓", "暗金色", "固定刻纹"],
                         "composition": "纯白背景横向道具设定面板",
-                        "importance": "normal",
+                        "importance": "core",
                     }
                 ],
             }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import shutil
 import subprocess
@@ -14,7 +15,11 @@ import requests
 from PIL import Image
 
 from app.config import load_project_environment
-from app.providers.base import ProviderConfigurationError, ProviderError
+from app.providers.base import (
+    ProviderConfigurationError,
+    ProviderError,
+    compress_reference_image,
+)
 from app.providers.image import HttpImageProvider
 from app.providers.mock import MockImageProvider, MockVideoProvider
 from app.providers.registry import provider_registry
@@ -42,6 +47,11 @@ OUTPUT_SCHEMAS = (
     ShotImagePromptOutput,
     ShotVideoPromptOutput,
 )
+
+
+def _write_reference_png(path: Path) -> Path:
+    Image.new("RGB", (320, 180), (200, 30, 30)).save(path)
+    return path
 
 
 def _config(kind: str, adapter: str, **params: Any) -> ProviderConfig:
@@ -610,6 +620,73 @@ def test_openai_compatible_plain_text_schema_keeps_prompts_plain_and_parses_sent
     ]
 
 
+def test_openai_compatible_retries_empty_content_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTP 200 但 content 为空属于瞬时异常，应重试而不是直接失败。"""
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            max_retries=2,
+        )
+    )
+    calls = 0
+
+    async def fake_request(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return {"choices": [{"message": {"content": "   "}}], "finish_reason": "stop"}
+        return {"choices": [{"message": {"content": '{"ok": true}'}}], "finish_reason": "stop"}
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    result = asyncio.run(
+        provider._complete(
+            [{"role": "user", "content": "测试"}],
+            object,
+            {},
+        )
+    )
+
+    assert result == '{"ok": true}'
+    assert calls == 3
+
+
+def test_openai_compatible_empty_content_fails_after_retries_with_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            max_retries=1,
+        )
+    )
+
+    async def fake_request(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+        }
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+
+    with pytest.raises(ProviderError, match=r"返回空内容.*已重试 2 次.*finish_reason=length"):
+        asyncio.run(
+            provider._complete(
+                [{"role": "user", "content": "测试"}],
+                object,
+                {},
+            )
+        )
+
+
 def test_http_image_with_custom_paths_maps_async_submission_and_poll(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -661,6 +738,40 @@ def test_http_image_with_custom_paths_maps_async_submission_and_poll(
     assert result.result_url == "https://example.invalid/result.png"
 
 
+def test_http_image_does_not_send_connection_test_control_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-test-params",
+            kind="image",
+            adapter="http_image",
+            base_url="https://api.tianyue.xyz/v1",
+            model="gpt-image-2",
+            params={"test_path": "models", "test_method": "GET"},
+        )
+    )
+    calls: list[dict[str, Any]] = []
+
+    async def fake_request(_method: str, _path: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {"data": [{"url": "https://cdn.example/generated.png"}]}
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    asyncio.run(
+        provider.submit(
+            prompt="测试图",
+            negative_prompt="",
+            reference_files=[],
+            params={"test_path": "models", "test_method": "GET"},
+        )
+    )
+
+    payload = calls[0]["json"]
+    assert "test_path" not in payload
+    assert "test_method" not in payload
+
+
 def test_gpt_image_2_uses_apib_submission_and_poll_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -700,8 +811,7 @@ def test_gpt_image_2_uses_apib_submission_and_poll_contract(
         calls.append({"method": method, "path": path, **kwargs})
         return responses.pop(0)
 
-    reference = tmp_path / "character.png"
-    reference.write_bytes(b"character-reference")
+    reference = _write_reference_png(tmp_path / "character.png")
     monkeypatch.setattr(provider, "_request_json", fake_request)
     submission = asyncio.run(
         provider.submit(
@@ -715,23 +825,35 @@ def test_gpt_image_2_uses_apib_submission_and_poll_contract(
 
     assert calls[0]["method"] == "POST"
     assert calls[0]["path"] == "images/generations"
-    assert calls[0]["json"] == {
-        "resolution": "4k",
-        "quality": "high",
-        "n": 1,
-        "size": "3840x2560",
-        "prompt": "角色基础设定图",
-        "image_urls": [
-            "data:image/png;base64," + base64.b64encode(b"character-reference").decode("ascii")
-        ],
-        "model": "gpt-image-2",
-    }
+    payload = calls[0]["json"]
+    assert payload["resolution"] == "2k"
+    assert payload["n"] == 1
+    assert payload["size"] == "3:2"
+    assert payload["prompt"] == "角色基础设定图"
+    assert payload["model"] == "gpt-image-2"
+    image_url = payload["image_urls"][0]
+    assert image_url.startswith("data:image/jpeg;base64,")
+    assert base64.b64decode(image_url.split(",", 1)[1])[:2] == b"\xff\xd8"
     assert calls[1]["method"] == "GET"
     assert calls[1]["path"] == "tasks/task-1"
     assert submission.task_id == "task-1"
     assert submission.status == "waiting_provider"
     assert result.status == "completed"
     assert result.result_url == "https://cdn.example/result.png"
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        ("1280x853", "3:2"),
+        ("1280x720", "16:9"),
+        ("1024x1536", "2:3"),
+        ("1024x1024", "1:1"),
+        ("16:9", "16:9"),
+    ],
+)
+def test_apib_size_ratio_converts_pixel_sizes(size: str, expected: str) -> None:
+    assert HttpImageProvider._apib_size_ratio(size) == expected
 
 
 def test_gpt_image_2_x5_without_references_uses_generation_json(
@@ -765,9 +887,9 @@ def test_gpt_image_2_x5_without_references_uses_generation_json(
     assert calls[0]["method"] == "POST"
     assert calls[0]["path"] == "images/generations"
     assert calls[0]["json"] == {
-        "quality": "high",
         "response_format": "url",
-        "size": "3840x2560",
+        "output_format": "png",
+        "size": "3:2",
         "prompt": "角色基础设定图",
         "model": "gpt-image-2",
     }
@@ -775,7 +897,113 @@ def test_gpt_image_2_x5_without_references_uses_generation_json(
     assert submission.result["result_url"] == "https://cdn.example/generated.png"
 
 
-def test_gpt_image_2_x5_with_references_uses_multipart_image_edits(
+def test_gpt_image_2_x5_retries_202_upstream_error_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """202 + error JSON 视为瞬时错误：重试后成功。"""
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-gpt-x5",
+            kind="image",
+            adapter="http_image",
+            base_url="https://api.x5m5x.com/v1",
+            model="gpt-image-2",
+            max_retries=2,
+        )
+    )
+    calls = 0
+
+    def fake_request(_method: str, _url: str, **kwargs: Any) -> requests.Response:
+        nonlocal calls
+        calls += 1
+        response = requests.Response()
+        if calls < 3:
+            response.status_code = 202
+            response._content = json.dumps(
+                {"error": {"message": "上游服务暂时不可用"}}
+            ).encode("utf-8")
+        else:
+            response.status_code = 200
+            response._content = b'{"data":[{"url":"https://cdn.example/generated.png"}]}'
+        return response
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="角色基础设定图",
+            negative_prompt="",
+            reference_files=[],
+            params={"size": "1536x1024"},
+        )
+    )
+
+    assert calls == 3
+    assert submission.status == "completed"
+    assert submission.result["result_url"] == "https://cdn.example/generated.png"
+
+
+def test_gpt_image_2_x5_202_upstream_error_preserves_final_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """202 错误重试耗尽后，最终错误保留上游原始消息。"""
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-gpt-x5",
+            kind="image",
+            adapter="http_image",
+            base_url="https://api.x5m5x.com/v1",
+            model="gpt-image-2",
+            max_retries=1,
+        )
+    )
+
+    def fake_request(_method: str, _url: str, **kwargs: Any) -> requests.Response:
+        response = requests.Response()
+        response.status_code = 202
+        response._content = json.dumps(
+            {"error": {"message": "上游服务暂时不可用"}}
+        ).encode("utf-8")
+        return response
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    with pytest.raises(ProviderError, match=r"HTTP 202.*上游服务暂时不可用"):
+        asyncio.run(
+            provider.submit(
+                prompt="角色基础设定图",
+                negative_prompt="",
+                reference_files=[],
+                params={"size": "1536x1024"},
+            )
+        )
+
+
+def test_compress_reference_image_caps_long_side_and_preserves_aspect(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.png"
+    Image.new("RGB", (3840, 2160), (30, 60, 90)).save(source)
+
+    data = compress_reference_image(source)
+
+    assert data[:2] == b"\xff\xd8"
+    assert len(data) <= 1024 * 1024
+    with Image.open(io.BytesIO(data)) as compressed:
+        assert compressed.size == (2048, 1152)
+    with Image.open(source) as original:
+        assert original.size == (3840, 2160)
+
+
+def test_edge_tts_sync_wrapper_rejects_running_loop() -> None:
+    async def call() -> None:
+        from app.providers.tts.edge_tts import list_voices_sync
+
+        with pytest.raises(RuntimeError, match="事件循环"):
+            list_voices_sync()
+
+    asyncio.run(call())
+
+
+def test_gpt_image_2_x5_with_references_uses_multipart_edits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -788,63 +1016,41 @@ def test_gpt_image_2_x5_with_references_uses_multipart_image_edits(
             model="gpt-image-2",
         )
     )
-    first_reference = tmp_path / "character.png"
-    second_reference = tmp_path / "scene.webp"
-    first_reference.write_bytes(b"character-reference")
-    second_reference.write_bytes(b"scene-reference")
-    captured: dict[str, Any] = {}
+    first_reference = _write_reference_png(tmp_path / "character.png")
+    second_reference = _write_reference_png(tmp_path / "scene.webp")
+    calls: list[dict[str, Any]] = []
 
     def fake_request(method: str, url: str, **kwargs: Any) -> requests.Response:
-        captured["method"] = method
-        captured["url"] = url
-        captured["headers"] = kwargs["headers"]
-        captured["data"] = kwargs["data"]
-        captured["file_fields"] = [field for field, _ in kwargs["files"]]
-        captured["file_names"] = [value[0] for _, value in kwargs["files"]]
-        captured["file_contents"] = [
-            value[1].read() if hasattr(value[1], "read") else value[1]
-            for _, value in kwargs["files"]
-        ]
+        calls.append({"method": method, "url": url, **kwargs})
         response = requests.Response()
         response.status_code = 200
-        response._content = json.dumps(
-            {
-                "data": [
-                    {
-                        "b64_json": base64.b64encode(b"generated-image").decode("ascii"),
-                    }
-                ]
-            }
-        ).encode("utf-8")
+        response._content = b'{"data":[{"url":"https://cdn.example/generated.png"}]}'
         return response
 
-    monkeypatch.setattr(requests, "request", fake_request)
+    monkeypatch.setattr(provider, "_request", fake_request)
     submission = asyncio.run(
         provider.submit(
-            prompt="林风站在山门石阶上",
+            prompt="林风站在山门石阶上\n\n@Image1：场景。\n@Image2：角色。",
             negative_prompt="模糊",
             reference_files=[first_reference, second_reference],
             params={"size": "3840x2160"},
         )
     )
 
-    assert captured["method"] == "POST"
-    assert captured["url"] == "https://api.x5m5x.com/v1/images/edits"
-    assert "Content-Type" not in captured["headers"]
-    assert captured["data"] == {
-        "quality": "high",
-        "n": "1",
-        "size": "3840x2160",
-        "prompt": "林风站在山门石阶上",
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "https://api.x5m5x.com/v1/images/edits"
+    assert calls[0]["data"] == {
         "model": "gpt-image-2",
+        "prompt": "林风站在山门石阶上\n\n图片1：场景。\n图片2：角色。",
+        "size": "16:9",
+        "response_format": "url",
+        "output_format": "png",
     }
-    assert captured["file_fields"] == ["image[]", "image[]"]
-    assert captured["file_names"] == ["character.png", "scene.webp"]
-    assert captured["file_contents"] == [b"character-reference", b"scene-reference"]
+    files = calls[0]["files"]
+    assert [item[0] for item in files] == ["image", "image"]
+    assert all(item[1][1][:2] == b"\xff\xd8" for item in files)
     assert submission.status == "completed"
-    assert submission.result["content_base64"] == base64.b64encode(b"generated-image").decode(
-        "ascii"
-    )
+    assert submission.result["result_url"] == "https://cdn.example/generated.png"
 
 
 def test_gpt_image_2_x5_multipart_retry_resends_complete_reference(
@@ -861,18 +1067,17 @@ def test_gpt_image_2_x5_multipart_retry_resends_complete_reference(
             max_retries=1,
         )
     )
-    reference = tmp_path / "character.png"
-    reference.write_bytes(b"complete-reference")
+    reference = _write_reference_png(tmp_path / "character.png")
     sent_contents: list[bytes] = []
 
     def fake_request(_method: str, _url: str, **kwargs: Any) -> requests.Response:
         value = kwargs["files"][0][1][1]
-        sent_contents.append(value.read() if hasattr(value, "read") else value)
+        sent_contents.append(value if isinstance(value, bytes) else value.read())
         if len(sent_contents) == 1:
             raise requests.ConnectionError("connection reset")
         response = requests.Response()
         response.status_code = 200
-        response._content = b'{"data":[{"b64_json":"ZmFrZQ=="}]}'
+        response._content = b'{"data":[{"url":"https://cdn.example/generated.png"}]}'
         return response
 
     monkeypatch.setattr(requests, "request", fake_request)
@@ -886,8 +1091,10 @@ def test_gpt_image_2_x5_multipart_retry_resends_complete_reference(
     )
 
     # POST 允许重试：第一次连接被重置后自动重试，第二次成功；
-    # 重试时 multipart 参考文件重新读取，两次发送内容完整一致。
-    assert sent_contents == [b"complete-reference", b"complete-reference"]
+    # 重试时 multipart 参考图重新压缩，两次发送内容完整一致。
+    assert len(sent_contents) == 2
+    assert sent_contents[0] == sent_contents[1]
+    assert sent_contents[0][:2] == b"\xff\xd8"
     assert submission.status == "completed"
 
 
@@ -904,11 +1111,10 @@ def test_gpt_image_2_x5_multipart_retry_can_be_disabled_by_params(
             base_url="https://api.x5m5x.com/v1",
             model="gpt-image-2",
             max_retries=1,
-            params={"retry_unsafe_methods": False},
+            params={"retry_unsafe_methods": False, "reference_mode": "multipart"},
         )
     )
-    reference = tmp_path / "character.png"
-    reference.write_bytes(b"complete-reference")
+    reference = _write_reference_png(tmp_path / "character.png")
     sent_contents: list[bytes] = []
     failures = 0
 
@@ -931,7 +1137,8 @@ def test_gpt_image_2_x5_multipart_retry_can_be_disabled_by_params(
         )
 
     assert failures == 1
-    assert sent_contents == [b"complete-reference"]
+    assert len(sent_contents) == 1
+    assert sent_contents[0][:2] == b"\xff\xd8"
 
 
 @pytest.mark.parametrize(
@@ -955,8 +1162,7 @@ def test_grok_video_models_upload_local_input_image_to_apib(
             model=model,
         )
     )
-    reference = tmp_path / "keyframe.png"
-    reference.write_bytes(b"keyframe")
+    reference = _write_reference_png(tmp_path / "keyframe.png")
     captured: dict[str, Any] = {}
 
     def fake_request(method: str, url: str, **kwargs: Any) -> requests.Response:
@@ -1061,6 +1267,154 @@ def test_grok_video_models_use_apib_submission_and_poll_contract(
     assert submission.status == "waiting_provider"
     assert result.status == "completed"
     assert result.result_url == "https://cdn.example/result.mp4"
+
+
+def test_unknown_video_model_keeps_default_generations_submit_path() -> None:
+    """未识别的视频模型不能把 submit_path 留空，否则请求会打到 base_url 本身。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-jbb",
+            kind="video",
+            adapter="http_video",
+            base_url="https://cn.jbbt.cc/v1",
+            model="video-ds-2.0",
+        )
+    )
+
+    assert provider._options()["submit_path"] == "videos/generations"
+
+
+@pytest.mark.parametrize("duration_sec", [1.0, 4.0, 8.0, 15.0, 20.0])
+def test_tianyue_video_uses_per_call_duration_and_official_video_contract(
+    duration_sec: float,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """天悦固定 15 秒：任意分镜秒数都提交 duration=1、video_duration=15。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-tianyue",
+            kind="video",
+            adapter="http_video",
+            base_url="https://api.tianyue.xyz/v1",
+            model="C-sd2-video-mini-15s",
+            params={"test_path": "models", "test_method": "GET"},
+        )
+    )
+    calls: list[dict[str, Any]] = []
+    responses = [
+        {
+            "id": "task-1",
+            "task_id": "task-1",
+            "object": "video",
+            "status": "queued",
+            "progress": 0,
+        },
+        {
+            "id": "task-1",
+            "task_id": "task-1",
+            "object": "video",
+            "status": "completed",
+            "progress": 100,
+            "url": "https://cdn.example/result.mp4",
+            "metadata": {"url": "https://cdn.example/result.mp4"},
+        },
+    ]
+
+    async def fake_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"method": method, "path": path, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="让画面动起来",
+            input_image={
+                "values": [
+                    "data:image/png;base64,AAAA",
+                    "data:image/png;base64,BBBB",
+                ]
+            },
+            duration_sec=duration_sec,
+            params={"duration": 99, "test_path": "models"},
+        )
+    )
+    result = asyncio.run(provider.poll(submission.task_id))
+
+    options = provider._options()
+    assert provider.supports_multiple_input_images is True
+    assert options["max_reference_files"] == 9
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["path"] == "videos"
+    assert calls[0]["json"] == {
+        "duration": 1,
+        "aspect_ratio": "16:9",
+        "video_duration": 15,
+        "prompt": "让画面动起来",
+        "image_urls": [
+            "data:image/png;base64,AAAA",
+            "data:image/png;base64,BBBB",
+        ],
+        "model": "C-sd2-video-mini-15s",
+    }
+    assert type(calls[0]["json"]["video_duration"]) is int
+    assert "test_path" not in calls[0]["json"]
+    assert "test_method" not in calls[0]["json"]
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["path"] == "videos/task-1"
+    assert submission.task_id == "task-1"
+    assert submission.status == "waiting_provider"
+    assert result.status == "completed"
+    assert result.result_url == "https://cdn.example/result.mp4"
+
+
+def test_tianyue_video_protocol_can_be_forced_by_provider_params() -> None:
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-tianyue-protocol",
+            kind="video",
+            adapter="http_video",
+            base_url="https://gateway.example.com/v1",
+            model="C-sd2-video-mini-15s",
+            params={"protocol": "tianyue"},
+        )
+    )
+
+    options = provider._options()
+
+    assert provider._uses_tianyue_video_protocol(options) is True
+    assert options["submit_path"] == "videos"
+    assert options["poll_path"] == "videos/{task_id}"
+    assert options["default_params"]["duration"] == 1
+    assert options["default_params"]["aspect_ratio"] == "16:9"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.x5m5x.com/v1",
+        "https://us-api.x5m5x.com/v1",
+        "https://cn.jbbt.cc/v1",
+    ],
+)
+def test_x5m5x_jbb_image_protocol_uses_multipart_reference_defaults(base_url: str) -> None:
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-gateway",
+            kind="image",
+            adapter="http_image",
+            base_url=base_url,
+            model="gpt-image-2",
+        )
+    )
+    options = provider._options()
+
+    assert provider._uses_x5m5x_image_protocol({}) is True
+    assert options["reference_mode"] == "multipart"
+    assert options["reference_file_field"] == "image"
+    assert options["default_params"] == {
+        "response_format": "url",
+        "output_format": "png",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1339,8 +1693,7 @@ def test_grok_video_upload_retries_transient_status_with_complete_content(
             max_retries=1,
         )
     )
-    reference = tmp_path / "keyframe.png"
-    reference.write_bytes(b"complete-keyframe-content")
+    reference = _write_reference_png(tmp_path / "keyframe.png")
     sent_contents: list[bytes] = []
 
     def fake_request(_method: str, _url: str, **kwargs: Any) -> requests.Response:
@@ -1360,5 +1713,6 @@ def test_grok_video_upload_retries_transient_status_with_complete_content(
     prepared = asyncio.run(provider.prepare_input_image(reference))
 
     assert len(sent_contents) == 2
-    assert sent_contents == [b"complete-keyframe-content", b"complete-keyframe-content"]
+    assert sent_contents[0] == sent_contents[1]
+    assert sent_contents[0][:2] == b"\xff\xd8"
     assert prepared["value"] == "https://getapib.org/image/keyframe.png"

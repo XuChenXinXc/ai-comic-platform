@@ -42,7 +42,8 @@ class SubtitleService:
                 raise bad_request("配音时长无效，无法生成字幕")
 
             # 简单策略：整句字幕，从 0 到 duration_sec
-            # TODO: 更精细的策略可以调用语音识别 API 获取时间戳
+            # TODO(#1): 更精细的策略可以调用语音识别 API 获取时间戳
+            # 详见 FEATURE_TRACKING.md - Issue #1
             subtitle_data = [
                 {
                     "text": dialogue_text,

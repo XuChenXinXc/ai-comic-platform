@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -95,20 +96,41 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
         for internal_key in ("headers", "verify_ssl"):
             options.pop(internal_key, None)
         payload: dict[str, Any] = {"model": model, "messages": messages, **options}
-        if json_response:
+        if json_response and response_format:
             payload["response_format"] = response_format
         payload["reasoning_effort"] = "high"
-        response = await self._request_json(
-            "POST",
-            chat_path,
-            options=self.config.params,
-            headers=headers,
-            json=payload,
-        )
-        content = self._extract_content(response)
-        if not content.strip():
-            raise ProviderError("文字 Provider 返回空内容")
-        return content
+        attempts = self.config.max_retries + 1
+        last_reason = ""
+        for attempt in range(attempts):
+            response = await self._request_json(
+                "POST",
+                chat_path,
+                options=self.config.params,
+                headers=headers,
+                json=payload,
+            )
+            try:
+                content = self._extract_content(response)
+            except ProviderError as exc:
+                last_reason = str(exc)
+                content = ""
+            if content.strip():
+                return content
+            if not last_reason:
+                finish_reason = (
+                    str((response.get("choices") or [{}])[0].get("finish_reason", ""))
+                    if isinstance(response.get("choices"), list)
+                    else ""
+                )
+                last_reason = f"返回空内容（finish_reason={finish_reason or '未知'}）"
+            # 部分推理模型在长 prompt + json_object 组合下会返回空 content；
+            # 后续尝试去掉 response_format（提示词本身已要求 JSON 输出）
+            if json_response and payload.get("response_format"):
+                payload.pop("response_format", None)
+                last_reason += "；已尝试去掉 response_format"
+            if attempt < attempts - 1:
+                await asyncio.sleep(min(2**attempt * 0.5, 2))
+        raise ProviderError(f"文字 Provider 返回空内容（已重试 {attempts} 次）：{last_reason}")
 
     @classmethod
     def _validate_output(

@@ -30,8 +30,9 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from alembic import op
 import sqlalchemy as sa
+
+from alembic import op
 
 revision: str = "20260806_0008"
 down_revision: str | None = "20260805_0007"
@@ -42,7 +43,9 @@ depends_on: str | None = None
 def export_data_before_deletion() -> None:
     """在删除数据前导出备份"""
     bind = op.get_bind()
-    export_dir = Path("data_export") / f"migration_{revision}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    export_dir = Path("data_export") / (
+        f"migration_{revision}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
     export_dir.mkdir(parents=True, exist_ok=True)
 
     tables_to_export = ["shot", "novel_analysis", "screenplay", "job"]
@@ -97,6 +100,8 @@ def upgrade() -> None:
         import time
         time.sleep(3)
 
+    existing_tables = set(sa.inspect(op.get_bind()).get_table_names())
+
     op.create_table(
         "chapter",
         sa.Column("id", sa.Text(), primary_key=True),
@@ -124,7 +129,6 @@ def upgrade() -> None:
 
     # 删除数据（如果未跳过）
     if not skip_deletion:
-        existing_tables = set(sa.inspect(op.get_bind()).get_table_names())
         for table_name in (
             "keyframe_version",
             "video_version",

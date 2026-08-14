@@ -9,15 +9,16 @@ description = "AI 漫剧本地平台后端"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "alembic>=1.14,<2",
+    "edge-tts>=7,<8",
     "fastapi>=0.115,<1",
-    "pillow>=11,<13",
+    "pillow>=11,<12",
     "pydantic>=2.10,<3",
     "pydantic-settings>=2.7,<3",
     "python-dotenv>=1.0,<2",
     "python-multipart>=0.0.20,<1",
     "requests>=2.32,<3",
     "sqlalchemy>=2.0,<3",
-    "uvicorn[standard]>=0.34,<1",
+    "uvicorn[standard]>=0.34,<0.35",
 ]
 
 [project.optional-dependencies]
@@ -48,4 +49,3 @@ ignore = ["B008"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
-

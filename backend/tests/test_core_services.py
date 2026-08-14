@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 import requests
 
 from app.db import Database
+from app.services.composition_service import _ffconcat_escape, _ffmpeg_filter_quote
 from app.services.errors import ServiceError
 from app.services.file_service import (
     FileService,
@@ -25,6 +27,14 @@ from app.services.signature_service import (
     source_signature,
     video_signature,
 )
+
+
+def test_ffconcat_escape_handles_single_quote() -> None:
+    assert _ffconcat_escape("C:/proj/林'风.png") == "C:/proj/林'\\''风.png"
+
+
+def test_ffmpeg_filter_quote_escapes_quote_and_backslash() -> None:
+    assert _ffmpeg_filter_quote(r"FontName=A'B\C") == r"'FontName=A'\''B\\C'"
 
 
 def test_source_signature_with_mixed_line_endings_returns_normalized_hash() -> None:
@@ -296,6 +306,22 @@ def test_project_service_create_initializes_storage_and_returns_path(
     database.dispose()
 
 
+def test_project_service_list_filters_regular_and_free_create_projects(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite:///{(tmp_path / 'platform.db').as_posix()}")
+    database.create_all()
+    service = ProjectService(database, FileService(tmp_path / "files"))
+    regular = service.create({"name": "常规项目"})
+    free = service.create({"name": "自由制作", "is_free_create": True})
+
+    assert {item["id"] for item in service.list(kind="regular")} == {regular["id"]}
+    assert {item["id"] for item in service.list(kind="free")} == {free["id"]}
+    assert {item["id"] for item in service.list()} == {regular["id"], free["id"]}
+    assert service.get(free["id"])["is_free_create"] is True
+    database.dispose()
+
+
 def test_project_service_create_with_too_deep_storage_returns_400(
     tmp_path: Path,
 ) -> None:
@@ -389,3 +415,46 @@ def test_download_url_atomic_with_signed_http_error_hides_credentials(
 
     assert "secret-token" not in str(exc_info.value)
     assert "https://cdn.invalid" not in str(exc_info.value)
+
+
+def test_download_url_atomic_decodes_gzip_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"decoded-image-bytes"
+
+    class Raw:
+        def __init__(self) -> None:
+            self.decode_content = False
+            self._compressed = gzip.compress(payload)
+            self._done = False
+
+        def read(self, size: int = -1) -> bytes:
+            if self._done:
+                return b""
+            self._done = True
+            return payload if self.decode_content else self._compressed
+
+    class GzipResponse:
+        raw = Raw()
+
+        def __enter__(self) -> GzipResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.services.file_service.requests.get",
+        lambda *_args, **_kwargs: GzipResponse(),
+    )
+
+    target = tmp_path / "image.png"
+    download_url_atomic("https://cdn.invalid/image.png", target)
+
+    assert GzipResponse.raw.decode_content is True
+    assert target.read_bytes() == payload

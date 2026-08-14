@@ -186,13 +186,33 @@ describe("分镜视频统一页面", () => {
       screen.getByRole("button", { name: "生成全部视频" }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /生成.*提示词|补齐.*提示词/ }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: /重新生成.*提示词/ }),
+    ).toBeInTheDocument();
     expect(screen.queryByText("最终视频执行提示词")).not.toBeInTheDocument();
     expect(
       await screen.findByLabelText("分镜 1 关键帧区块"),
     ).toBeInTheDocument();
     expect(screen.getByLabelText("分镜 1 视频区块")).toBeInTheDocument();
+  });
+
+  test("test_shot_page_regenerate_prompts_uses_chapter_batch", async () => {
+    const user = userEvent.setup();
+    const batchSpy = vi
+      .spyOn(api.shots, "batchPrompts")
+      .mockResolvedValue({ batch_id: "batch-1", jobs: [] } as never);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderShotsPage();
+
+    await screen.findByRole("heading", { name: "分镜视频" });
+    await user.click(
+      screen.getByRole("button", { name: /重新生成.*提示词/ }),
+    );
+
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(batchSpy).toHaveBeenCalledWith("chapter-1", {
+      ids: undefined,
+      prompt_types: ["image", "video"],
+    });
   });
 
   test("test_shot_extraction_has_single_screenplay_source_without_selector", async () => {

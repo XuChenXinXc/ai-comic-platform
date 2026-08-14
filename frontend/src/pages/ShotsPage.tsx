@@ -13,6 +13,7 @@ import {
   Merge,
   Pencil,
   Plus,
+  RefreshCw,
   Scissors,
   Trash2,
   TriangleAlert,
@@ -272,6 +273,18 @@ export function ShotsPage() {
     onError: (error) => toast.error(formatError(error)),
   });
 
+  const handleContinuityCheck = () => {
+    if (
+      localStorage.getItem(`continuity-check-run-${activeProjectId}`) &&
+      !window.confirm(
+        "再次执行剧情连贯审校会重新生成并覆盖修正内容，确定继续吗？",
+      )
+    ) {
+      return;
+    }
+    continuityFixMutation.mutate();
+  };
+
   const mediaBatchMutation = useMutation({
     mutationFn: (kind: "keyframe" | "video") =>
       kind === "keyframe"
@@ -296,6 +309,7 @@ export function ShotsPage() {
         insert_transitions: false,
       }),
     onSuccess: async () => {
+      localStorage.setItem(`continuity-check-run-${activeProjectId}`, "1");
       await queryClient.invalidateQueries({
         queryKey: queryKeys.jobs(activeProjectId),
       });
@@ -305,6 +319,36 @@ export function ShotsPage() {
     },
     onError: (error) => toast.error(formatError(error)),
   });
+
+  // 重新生成提示词：把当前源字段重新编译为图片/视频提示词。
+  // 审校修正写回源字段后必须执行这一步，否则旧提示词仍会被使用。
+  const promptBatchMutation = useMutation({
+    mutationFn: () =>
+      api.shots.batchPrompts(activeChapterId, {
+        ids: batchIds,
+        prompt_types: ["image", "video"],
+      }),
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      toast.success(`已入队 ${result.jobs.length} 个提示词任务`, {
+        description: "完成后请重新生成关键帧与视频，修正才会进入画面",
+      });
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
+  const handlePromptBatch = () => {
+    if (
+      !window.confirm(
+        "将重新生成提示词并覆盖现有提示词（含手工覆盖的版本），确定继续吗？",
+      )
+    ) {
+      return;
+    }
+    promptBatchMutation.mutate();
+  };
 
   // 分镜质量报告：提取阶段的警告不阻断保存，这里主动扫描存量分镜。
   const qualityQuery = useQuery({
@@ -488,10 +532,24 @@ export function ShotsPage() {
                 busy={continuityFixMutation.isPending}
                 disabled={!shots.length}
                 title="把相邻分镜的起止状态与旁白交给文字模型逐对审校并自动修正源字段；完成后需重新生成提示词才会生效"
-                onClick={() => continuityFixMutation.mutate()}
+                onClick={handleContinuityCheck}
               >
                 <Link2 className="h-4 w-4" />
                 剧情连贯审校
+              </Button>
+              <Button
+                variant="secondary"
+                busy={promptBatchMutation.isPending}
+                disabled={!shots.length}
+                title="把所选（或全部）分镜的最新字段重新编译为图片与视频提示词；会覆盖现有提示词与手工覆盖"
+                onClick={handlePromptBatch}
+              >
+                <RefreshCw className="h-4 w-4" />
+                {selected.size
+                  ? `重新生成所选提示词（${selected.size}）`
+                  : scope === "scene"
+                    ? "重新生成当前场次提示词"
+                    : "重新生成全部提示词"}
               </Button>
               <Button
                 variant="secondary"

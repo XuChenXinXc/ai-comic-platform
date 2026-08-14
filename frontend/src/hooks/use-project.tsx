@@ -30,7 +30,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   );
   const projectsQuery = useQuery({
     queryKey: queryKeys.projects,
-    queryFn: api.projects.list,
+    queryFn: () => api.projects.list({ kind: "regular" }),
   });
   const projects = useMemo(
     () => projectsQuery.data || [],

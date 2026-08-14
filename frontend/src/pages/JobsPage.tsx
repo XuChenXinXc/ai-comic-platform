@@ -26,15 +26,21 @@ import {
   Tabs,
 } from "../components/ui";
 import { isJobActive } from "../hooks/use-job-polling";
-import { useProject } from "../hooks/use-project";
 import { JOB_TYPE_LABELS } from "../lib/job-labels";
 import { formatDate, formatError, prettyJson } from "../lib/utils";
 import type { Job } from "../types/api";
 
 export function JobsPage() {
   const queryClient = useQueryClient();
-  const { projects, activeProjectId } = useProject();
-  const [projectFilter, setProjectFilter] = useState(activeProjectId || "all");
+  const projectsQuery = useQuery({
+    queryKey: ["projects", "all-kinds"],
+    queryFn: async () => [
+      ...(await api.projects.list({ kind: "regular" })),
+      ...(await api.projects.list({ kind: "free" })),
+    ],
+  });
+  const projects = projectsQuery.data ?? [];
+  const [projectFilter, setProjectFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
   const [detail, setDetail] = useState<Job | null>(null);
@@ -137,6 +143,7 @@ export function JobsPage() {
             {projects.map((project) => (
               <option key={project.id} value={project.id}>
                 {project.name}
+                {project.is_free_create ? "（自由制作）" : ""}
               </option>
             ))}
           </Select>

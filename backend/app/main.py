@@ -95,6 +95,9 @@ class ProjectMediaStaticFiles(StaticFiles):
         storage_root = Path(stored_root) if stored_root else Path(self.directory)
         if not storage_root.is_absolute():
             raise StarletteHTTPException(status_code=404)
+        # 存储根目录本身不能是符号链接/目录联接（resolve 后再查会查不到）
+        if is_reparse_point(Path(stored_root)):
+            raise StarletteHTTPException(status_code=404)
         storage_root = storage_root.resolve()
         layout = str(record["storage_layout"] or "prefixed")
         if layout == "categorized":
@@ -104,11 +107,10 @@ class ProjectMediaStaticFiles(StaticFiles):
         else:
             raise StarletteHTTPException(status_code=404)
         project_candidate = storage_root / storage_name
-        # 先 resolve 再检查，避免 TOCTOU 竞态
-        project_root = project_candidate.resolve()
-        # 检查 resolve 后是否仍是符号链接（说明目标本身是符号链接）
-        if is_reparse_point(project_root):
+        # 项目目录本身不能是符号链接/目录联接
+        if is_reparse_point(project_candidate):
             raise StarletteHTTPException(status_code=404)
+        project_root = project_candidate.resolve()
         # 使用 is_relative_to 检查路径包含关系，防止符号链接穿越
         if not storage_name or not project_root.is_relative_to(storage_root):
             raise StarletteHTTPException(status_code=404)

@@ -13,6 +13,8 @@ Create Date: 2026-08-08
 - asset 表：status 索引（用于查询状态）
 """
 
+import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "20260808_0012"
@@ -22,34 +24,44 @@ depends_on: str | None = None
 
 
 def upgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    tables = set(inspector.get_table_names())
+
     # shot 表：按章节查询的索引
-    op.create_index("idx_shot_chapter", "shot", ["chapter_id"])
+    if "shot" in tables:
+        op.create_index("idx_shot_chapter", "shot", ["chapter_id"])
 
     # keyframe_version 表：查询特定分镜的完成版本
-    op.create_index(
-        "idx_keyframe_shot_status",
-        "keyframe_version",
-        ["shot_id", "status"],
-    )
+    if "keyframe_version" in tables:
+        op.create_index(
+            "idx_keyframe_shot_status",
+            "keyframe_version",
+            ["shot_id", "status"],
+        )
 
     # video_version 表：查询特定分镜的完成版本
-    op.create_index(
-        "idx_video_shot_status",
-        "video_version",
-        ["shot_id", "status"],
-    )
+    if "video_version" in tables:
+        op.create_index(
+            "idx_video_shot_status",
+            "video_version",
+            ["shot_id", "status"],
+        )
 
     # novel_analysis 表：按状态查询
-    op.create_index("idx_novel_analysis_status", "novel_analysis", ["status"])
+    if "novel_analysis" in tables:
+        op.create_index("idx_novel_analysis_status", "novel_analysis", ["status"])
 
     # screenplay 表：按状态查询
-    op.create_index("idx_screenplay_status", "screenplay", ["status"])
+    if "screenplay" in tables:
+        op.create_index("idx_screenplay_status", "screenplay", ["status"])
 
     # asset 表：按状态查询（project_id + status 复合索引）
-    op.create_index("idx_asset_status", "asset", ["project_id", "status"])
+    if "asset" in tables:
+        op.create_index("idx_asset_status", "asset", ["project_id", "status"])
 
     # job 表：按 chapter_id 查询（如果已存在则跳过）
-    op.create_index("idx_job_chapter", "job", ["chapter_id"])
+    if "job" in tables:
+        op.create_index("idx_job_chapter", "job", ["chapter_id"])
 
 
 def downgrade() -> None:

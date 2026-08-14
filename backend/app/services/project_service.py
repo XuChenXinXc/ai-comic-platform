@@ -27,6 +27,7 @@ class ProjectService:
         result = dict(record)
         result.pop("storage_name", None)
         result["storage_path"] = str(self.storage.project_path(record["id"]))
+        result["is_free_create"] = bool(record.get("is_free_create", 0))
         return result
 
     @staticmethod
@@ -78,6 +79,7 @@ class ProjectService:
             "storage_layout": "categorized",
             "source_signature": source_signature(source_text),
             "source_revision": 1,
+            "is_free_create": int(bool(values.get("is_free_create", False))),
             "created_at": now,
             "updated_at": now,
         }
@@ -89,8 +91,12 @@ class ProjectService:
             raise
         return self.get(record["id"])
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self, kind: str | None = None) -> list[dict[str, Any]]:
         statement = select(project).order_by(project.c.updated_at.desc())
+        if kind == "free":
+            statement = statement.where(project.c.is_free_create == 1)
+        elif kind == "regular":
+            statement = statement.where(project.c.is_free_create == 0)
         with self.database.engine.connect() as connection:
             return [
                 self._public_record(dict(row._mapping)) for row in connection.execute(statement)

@@ -24,10 +24,11 @@ from app.models.tables import (
 from app.schemas import ProviderSubmission
 from app.services.asset_service import AssetService
 from app.services.chapter_service import ChapterService
+from app.services.constants import MAX_IMAGE_SIZE, MAX_VIDEO_SIZE
 from app.services.errors import ServiceError
 from app.services.file_service import FileService, FileServiceError, file_service
 from app.services.job_service import JobService
-from app.services.media_service import MediaService
+from app.services.media_service import JobCancelledError, MediaService
 from app.services.project_service import ProjectService
 from app.services.shot_service import ShotService
 from app.services.utils import utc_now
@@ -134,13 +135,13 @@ def _fail_second_provider_resolve(
 @pytest.mark.parametrize(
     ("target_type", "expected_size"),
     [
-        ("character", "2560x1707"),
-        ("scene", "2560x1440"),
-        ("prop", "2560x1707"),
-        ("keyframe", "2560x1440"),
+        ("character", "1536x1024"),
+        ("scene", "1536x1024"),
+        ("prop", "1536x1024"),
+        ("keyframe", "2048x1152"),
     ],
 )
-def test_gpt_image_2_generation_params_use_target_size(
+def test_gpt_image_2_generation_params_use_stable_size_for_generic_provider(
     target_type: str,
     expected_size: str,
     media_job_services: dict[str, Any],
@@ -190,6 +191,122 @@ def test_gpt_image_2_generation_params_use_target_size(
             current["id"],
             {"params": {"size": "1024x1024"}},
         )
+
+    assert queued["input_data"]["params"]["size"] == expected_size
+
+
+@pytest.mark.parametrize(
+    ("target_type", "expected_size"),
+    [
+        ("character", "2048x1360"),
+        ("scene", "2048x1152"),
+        ("prop", "2048x1360"),
+        ("keyframe", "2048x1152"),
+    ],
+)
+def test_gpt_image_2_generation_params_use_2k_size_for_apib(
+    target_type: str,
+    expected_size: str,
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            object(),
+            {
+                "id": "mock-image",
+                "model": "gpt-image-2",
+                "base_url": "https://api.apib.ai/v1",
+                "params": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    if target_type == "keyframe":
+        current = ShotService(database, jobs).create(
+            media_job_services["chapter"]["id"],
+            _shot_create(
+                scene_asset_id=media_job_services["scene"]["id"],
+                action="主角走入画面",
+                image_prompt="主角站在画面中央",
+            ).model_dump(),
+        )
+        queued = media.queue_keyframe(current["id"], {})
+    else:
+        current = AssetService(database, jobs).create(
+            project["id"],
+            {
+                "asset_type": target_type,
+                "name": f"{target_type}测试素材",
+                "prompt": "设定图",
+            },
+        )
+        queued = media.queue_asset_image(current["id"], {})
+
+    assert queued["input_data"]["params"]["size"] == expected_size
+
+
+@pytest.mark.parametrize(
+    ("target_type", "expected_size"),
+    [
+        ("character", "2048x1360"),
+        ("scene", "2048x1152"),
+        ("prop", "2048x1360"),
+        ("keyframe", "2048x1152"),
+    ],
+)
+def test_gpt_image_2_generation_params_use_2k_size_for_tianyue(
+    target_type: str,
+    expected_size: str,
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            object(),
+            {
+                "id": "mock-image",
+                "model": "gpt-image-2",
+                "base_url": "https://api.tianyue.xyz/v1",
+                "params": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    if target_type == "keyframe":
+        current = ShotService(database, jobs).create(
+            media_job_services["chapter"]["id"],
+            _shot_create(
+                scene_asset_id=media_job_services["scene"]["id"],
+                action="主角走入画面",
+                image_prompt="主角站在画面中央",
+            ).model_dump(),
+        )
+        queued = media.queue_keyframe(current["id"], {})
+    else:
+        current = AssetService(database, jobs).create(
+            project["id"],
+            {
+                "asset_type": target_type,
+                "name": f"{target_type}测试素材",
+                "prompt": "设定图",
+            },
+        )
+        queued = media.queue_asset_image(current["id"], {})
 
     assert queued["input_data"]["params"]["size"] == expected_size
 
@@ -319,6 +436,29 @@ def test_shot_prompt_batch_with_image_and_video_updates_both_prompts(
     assert updated["video_prompt"]
 
 
+def test_manual_shot_create_persists_prompt_overrides(
+    media_job_services: dict[str, Any],
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    shots = ShotService(database, jobs)
+
+    current = shots.create(
+        media_job_services["chapter"]["id"],
+        {
+            "source_ref": "manual",
+            "duration_sec": 6,
+            "image_prompt_override": "自定义分镜图提示词",
+            "video_prompt_override": "自定义视频提示词",
+        },
+    )
+
+    assert current["source_ref"] == "manual"
+    assert current["image_prompt_override"] == "自定义分镜图提示词"
+    assert current["video_prompt_override"] == "自定义视频提示词"
+    assert current["duration_sec"] == 6
+
+
 def test_keyframe_queue_uses_saved_final_prompt_override_verbatim(
     media_job_services: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -407,6 +547,99 @@ def test_video_queue_uses_saved_final_prompt_override_verbatim(
     assert ShotService(database, jobs).get(current["id"])["final_video_prompt"] == override
 
 
+def test_manual_shot_keyframe_override_keeps_user_prompt_without_auto_anchors(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    override = "主角站在山门前，晨光斜照。"
+    character = AssetService(database, jobs).create(
+        project["id"],
+        {
+            "asset_type": "character",
+            "name": "林雪",
+            "prompt": "黑发女符师",
+        },
+    )
+    media.upload_asset_image(character["id"], "character.png", "image/png", _PNG)
+    current = ShotService(database, jobs).create(
+        media_job_services["chapter"]["id"],
+        {
+            "source_ref": "manual",
+            "duration_sec": 6,
+            "scene_asset_id": media_job_services["scene"]["id"],
+            "character_ids": [character["id"]],
+            "image_prompt_override": override,
+        },
+    )
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    media.queue_keyframe(current["id"], {})
+
+    snapshot = media.list_keyframes(current["id"])[0]["prompt_snapshot"]
+    assert snapshot == override
+    assert "@Image" not in snapshot
+
+
+def test_manual_shot_video_override_keeps_user_prompt_without_auto_anchors(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    override = "镜头从山门缓缓推进到主角近景。"
+    character = AssetService(database, jobs).create(
+        project["id"],
+        {
+            "asset_type": "character",
+            "name": "林雪",
+            "prompt": "黑发女符师",
+        },
+    )
+    media.upload_asset_image(character["id"], "character.png", "image/png", _PNG)
+    current = ShotService(database, jobs).create(
+        media_job_services["chapter"]["id"],
+        {
+            "source_ref": "manual",
+            "duration_sec": 6,
+            "scene_asset_id": media_job_services["scene"]["id"],
+            "character_ids": [character["id"]],
+            "video_prompt_override": override,
+        },
+    )
+    media.upload_keyframe(current["id"], "frame.png", "image/png", _PNG)
+
+    class FakeVideoProvider:
+        supports_multiple_input_images = True
+
+        async def prepare_input_images(self, _paths: list[Path]) -> dict[str, Any]:
+            return {"values": ["keyframe", "scene", "character"]}
+
+        async def submit(self, **_kwargs: Any) -> ProviderSubmission:
+            return ProviderSubmission(status="completed")
+
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            FakeVideoProvider(),
+            {"id": "mock-video", "model": "multi", "params": {}, "timeout_sec": 60},
+        ),
+    )
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    media.queue_video(current["id"], {})
+
+    snapshot = media.list_videos(current["id"])[0]["prompt_snapshot"]
+    assert snapshot == override
+    assert "@Image" not in snapshot
+
+
 def test_uploaded_keyframe_uses_saved_final_prompt_override(
     media_job_services: dict[str, Any],
 ) -> None:
@@ -463,6 +696,83 @@ def test_asset_image_versions_use_readable_current_and_flat_history_paths(
     assert switched[2]["file_path"] == "角色/角色-林舟-v002.jpg"
     assert switched[2]["is_current"] is False
     assert second["id"] == switched[2]["id"]
+
+
+def test_upload_asset_image_over_size_limit_rejects(
+    media_job_services: dict[str, Any],
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    current = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "character", "name": "超大图", "prompt": "测试"},
+    )
+
+    with pytest.raises(ServiceError) as exc_info:
+        media.upload_asset_image(
+            current["id"],
+            "big.png",
+            "image/png",
+            b"\x00" * (MAX_IMAGE_SIZE + 1),
+        )
+
+    assert exc_info.value.status_code == 400
+
+
+def test_media_stores_only_usable_provider_url(
+    media_job_services: dict[str, Any],
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    current = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "character", "name": "URL素材", "prompt": "测试"},
+    )
+    image = media.upload_asset_image(
+        current["id"],
+        "url.png",
+        "image/png",
+        _PNG,
+    )
+    good_url = f"https://cdn.example/good.png?Expires={int(time.time()) + 3600}"
+
+    media._store_provider_url(asset_image, image["id"], good_url)
+    media._store_provider_url(
+        asset_image,
+        image["id"],
+        f"https://cdn.example/expired.png?Expires={int(time.time()) - 1}",
+    )
+
+    assert media._get_version("asset_image", image["id"])["provider_url"] == good_url
+
+
+def test_upload_video_over_size_limit_rejects(
+    media_job_services: dict[str, Any],
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    current_shot = ShotService(database, jobs).create(
+        media_job_services["chapter"]["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            action="测试动作",
+        ).model_dump(),
+    )
+
+    with pytest.raises(ServiceError) as exc_info:
+        media.upload_video(
+            current_shot["id"],
+            "big.mp4",
+            "video/mp4",
+            b"\x00" * (MAX_VIDEO_SIZE + 1),
+        )
+
+    assert exc_info.value.status_code == 400
 
 
 def test_asset_image_sanitized_name_collision_keeps_each_asset_file(
@@ -554,10 +864,17 @@ def test_keyframe_queue_without_scene_binding_returns_conflict_before_provider_r
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    media_job_services["project"]
+    project = media_job_services["project"]
+    character = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "character", "name": "测试角色", "prompt": "设定图"},
+    )
     current = ShotService(database, jobs).create(
         media_job_services["chapter"]["id"],
-        _shot_create(image_prompt="主角站在画面中央").model_dump(),
+        {
+            **_shot_create(image_prompt="主角站在画面中央").model_dump(),
+            "character_ids": [character["id"]],
+        },
     )
     monkeypatch.setattr(
         media.providers,
@@ -580,10 +897,17 @@ def test_video_queue_without_scene_binding_returns_conflict_before_provider_reso
     database = media_job_services["database"]
     jobs = media_job_services["jobs"]
     media = media_job_services["media"]
-    media_job_services["project"]
+    project = media_job_services["project"]
+    character = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "character", "name": "测试角色", "prompt": "设定图"},
+    )
     current = ShotService(database, jobs).create(
         media_job_services["chapter"]["id"],
-        _shot_create(video_prompt="主角缓慢转身并停稳").model_dump(),
+        {
+            **_shot_create(video_prompt="主角缓慢转身并停稳").model_dump(),
+            "character_ids": [character["id"]],
+        },
     )
     media.upload_keyframe(current["id"], "frame.png", "image/png", _PNG)
     monkeypatch.setattr(
@@ -598,6 +922,49 @@ def test_video_queue_without_scene_binding_returns_conflict_before_provider_reso
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == "分镜尚未绑定场景素材，请先在分镜编辑中绑定场景素材"
     assert media.list_videos(current["id"]) == []
+
+
+def test_manual_keyframe_queue_without_asset_bindings_succeeds(
+    media_job_services: dict[str, Any],
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    current = ShotService(database, jobs).create(
+        media_job_services["chapter"]["id"],
+        {
+            "source_ref": "manual",
+            "duration_sec": 6,
+            "image_prompt_override": "自定义分镜图提示词",
+        },
+    )
+
+    media.queue_keyframe(current["id"], {})
+
+    versions = media.list_keyframes(current["id"])
+    assert len(versions) == 1
+    assert versions[0]["prompt_snapshot"] == "自定义分镜图提示词"
+
+
+def test_manual_video_queue_without_asset_bindings_succeeds(
+    media_job_services: dict[str, Any],
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    current = ShotService(database, jobs).create(
+        media_job_services["chapter"]["id"],
+        {
+            "source_ref": "manual",
+            "duration_sec": 6,
+            "video_prompt_override": "自定义视频提示词",
+        },
+    )
+    media.upload_keyframe(current["id"], "frame.png", "image/png", _PNG)
+
+    media.queue_video(current["id"], {})
+
+    assert len(media.list_videos(current["id"])) == 1
 
 
 def test_grok_video_queue_rounds_fractional_duration_up_consistently(
@@ -1545,6 +1912,271 @@ def test_video_job_with_previous_end_frame_keeps_keyframe_first_and_anchor_order
     assert "@Image2：上一镜结束帧" in snapshot
 
 
+def test_video_job_manual_continuous_puts_previous_end_frame_first(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """自由制作分镜从第二镜起默认连续：上一镜末帧作为第 0 秒起始帧。"""
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    scene_id = media_job_services["scene"]["id"]
+    chapter_id = media_job_services["chapter"]["id"]
+    shots = ShotService(database, jobs)
+
+    previous_shot = shots.create(
+        chapter_id,
+        _shot_create(scene_asset_id=scene_id, action="林雪走到门前").model_dump(),
+    )
+    current_shot = shots.create(
+        chapter_id,
+        _shot_create(
+            scene_asset_id=scene_id,
+            action="林雪推开木门",
+            video_prompt="林雪缓慢推开木门。",
+            transition_from_prev="continuous",
+            source_ref="manual",
+        ).model_dump(),
+    )
+
+    end_frame_relative = "分镜视频/prev-manual-end.jpg"
+    file_service.write_bytes_atomic(
+        media_job_services["project"]["id"],
+        end_frame_relative,
+        _PNG,
+    )
+    now = utc_now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(video_version).values(
+                id="video-prev-manual-end",
+                shot_id=previous_shot["id"],
+                version_no=1,
+                file_path="分镜视频/prev-manual.mp4",
+                end_frame_path=end_frame_relative,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                requested_duration_sec=6,
+                model="multi",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="",
+                source="generated",
+                error="",
+                created_at=now,
+            )
+        )
+
+    media.upload_keyframe(current_shot["id"], "frame.png", "image/png", _PNG)
+    captured: dict[str, Any] = {}
+
+    class FakeVideoProvider:
+        supports_multiple_input_images = True
+
+        async def prepare_input_images(self, paths: list[Path]) -> dict[str, Any]:
+            captured["paths"] = list(paths)
+            return {"values": [f"image-{index}" for index in range(len(paths))]}
+
+        async def submit(self, **_kwargs: Any) -> ProviderSubmission:
+            return ProviderSubmission(status="completed")
+
+    async def fake_download(_provider: Any, _result: Any, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"video-data")
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            FakeVideoProvider(),
+            {"id": "mock-video", "model": "multi", "params": {}, "timeout_sec": 60},
+        ),
+    )
+    monkeypatch.setattr(media, "_download_provider_result", fake_download)
+    monkeypatch.setattr(media, "_verify_video", lambda _path: 6.0)
+    monkeypatch.setattr(media, "_extract_last_frame", lambda _src, _dst: None)
+
+    queued = media.queue_video(current_shot["id"], {})
+    job = repository.require(queued["id"])
+    asyncio.run(media.handle_video(job))
+
+    keyframe_path = file_service.resolve_project_path(
+        media_job_services["project"]["id"],
+        media.list_keyframes(current_shot["id"])[0]["file_path"],
+    )
+    prev_frame_path = file_service.resolve_project_path(
+        media_job_services["project"]["id"],
+        end_frame_relative,
+    )
+
+    assert captured["paths"][0] == prev_frame_path
+    assert captured["paths"][1] == keyframe_path
+    snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
+    assert "@Image1：上一镜结束帧" in snapshot
+    assert "@Image2：当前分镜关键帧" in snapshot
+
+
+def test_tianyue_video_execution_prefers_provider_urls_and_falls_back_for_end_frame(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    runner = media_job_services["runner"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    chapter_id = media_job_services["chapter"]["id"]
+    scene_id = media_job_services["scene"]["id"]
+    shots = ShotService(database, jobs)
+
+    character = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "character", "name": "测试角色", "prompt": "角色设定"},
+    )
+    prop = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "prop", "name": "测试物品", "prompt": "物品设定"},
+    )
+    scene_image = media_job_services["scene_image"]
+    character_image = media.upload_asset_image(
+        character["id"],
+        "character.png",
+        "image/png",
+        _PNG,
+    )
+    prop_image = media.upload_asset_image(prop["id"], "prop.png", "image/png", _PNG)
+    urls = {
+        scene_image["id"]: "https://cdn.example/scene.png",
+        character_image["id"]: "https://cdn.example/character.png",
+        prop_image["id"]: "https://cdn.example/prop.png",
+    }
+    with database.engine.begin() as connection:
+        for version_id, url in urls.items():
+            connection.execute(
+                update(asset_image)
+                .where(asset_image.c.id == version_id)
+                .values(provider_url=url)
+            )
+
+    previous_shot = shots.create(
+        chapter_id,
+        _shot_create(scene_asset_id=scene_id, action="上一镜动作").model_dump(),
+    )
+    current_shot = shots.create(
+        chapter_id,
+        {
+            **_shot_create(
+                scene_asset_id=scene_id,
+                action="本镜动作",
+                video_prompt="保持画面稳定。",
+                transition_from_prev="continuous",
+            ).model_dump(),
+            "source_ref": "manual",
+            "duration_sec": 15,
+            "character_ids": [character["id"]],
+            "prop_ids": [prop["id"]],
+        },
+    )
+
+    end_frame_relative = "分镜视频/tianyue-prev-end.jpg"
+    file_service.write_bytes_atomic(project["id"], end_frame_relative, _PNG)
+    now = utc_now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(video_version).values(
+                id="video-tianyue-prev",
+                shot_id=previous_shot["id"],
+                version_no=1,
+                file_path="分镜视频/tianyue-prev.mp4",
+                end_frame_path=end_frame_relative,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                requested_duration_sec=6,
+                model="multi",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="",
+                source="generated",
+                error="",
+                created_at=now,
+            )
+        )
+
+    keyframe = media.upload_keyframe(
+        current_shot["id"],
+        "frame.png",
+        "image/png",
+        _PNG,
+    )
+    keyframe_url = "https://cdn.example/keyframe.png"
+    with database.engine.begin() as connection:
+        connection.execute(
+            update(keyframe_version)
+            .where(keyframe_version.c.id == keyframe["id"])
+            .values(provider_url=keyframe_url)
+        )
+
+    captured: dict[str, Any] = {"fallbacks": []}
+
+    class FakeTianyueVideoProvider:
+        supports_multiple_input_images = True
+        prefers_public_reference_urls = True
+
+        async def prepare_input_image(self, path: Path) -> dict[str, Any]:
+            captured["fallbacks"].append(path.name)
+            return {"value": f"b64:{path.name}", "mode": "base64"}
+
+        async def prepare_input_images(
+            self,
+            paths: list[Path],
+        ) -> dict[str, Any]:
+            return {
+                "values": [f"b64:{path.name}" for path in paths],
+                "mode": "base64",
+            }
+
+        async def submit(self, **kwargs: Any) -> ProviderSubmission:
+            captured["submit"] = kwargs
+            return ProviderSubmission(status="completed")
+
+    async def fake_download(_provider: Any, _result: Any, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"video-data")
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            FakeTianyueVideoProvider(),
+            {"id": "mock-video", "model": "multi", "params": {}, "timeout_sec": 60},
+        ),
+    )
+    monkeypatch.setattr(media, "_download_provider_result", fake_download)
+    monkeypatch.setattr(media, "_verify_video", lambda _path: 15.0)
+    monkeypatch.setattr(media, "_extract_last_frame", lambda _src, _dst: None)
+
+    queued = media.queue_video(current_shot["id"], {})
+    job = repository.require(queued["id"])
+    asyncio.run(media.handle_video(job))
+
+    values = captured["submit"]["input_image"]["values"]
+    prev_frame_name = Path(end_frame_relative).name
+    assert values[0] == f"b64:{prev_frame_name}"
+    assert values[1] == keyframe_url
+    assert values[2] == urls[scene_image["id"]]
+    assert values[3] == urls[character_image["id"]]
+    assert values[4] == urls[prop_image["id"]]
+    assert captured["fallbacks"] == [prev_frame_name]
+    assert captured["submit"]["duration_sec"] == 15.0
+
+
 def test_video_queue_across_scene_change_omits_previous_end_frame(
     media_job_services: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -2364,3 +2996,19 @@ def test_video_execution_with_reference_files_deleted_reports_error(
         asyncio.run(media.handle_video(repository.require(queued["id"])))
     assert excinfo.value.status_code == 409
     assert "视频参考图文件缺失" in str(excinfo.value)
+
+
+def test_media_poll_aborts_when_job_is_cancelled(
+    media_job_services: dict[str, Any],
+) -> None:
+    repository = media_job_services["repository"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    record = repository.create_job(
+        project_id=project["id"],
+        job_type="generate_keyframe",
+    )
+    repository.cancel(record["id"])
+
+    with pytest.raises(JobCancelledError, match="任务已取消"):
+        media._raise_if_job_cancelled(record["id"])

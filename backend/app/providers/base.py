@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import os
 import re
 import time
@@ -11,9 +12,15 @@ from typing import Any, Protocol, runtime_checkable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel
 
 from app.schemas import ProviderConfig, ProviderPollResult, ProviderSubmission
+from app.services.constants import (
+    PROVIDER_REFERENCE_JPEG_QUALITY,
+    PROVIDER_REFERENCE_MAX_BYTES,
+    PROVIDER_REFERENCE_MAX_SIDE,
+)
 from app.services.file_service import atomic_write_bytes, download_url_atomic
 from app.services.utils import sanitize_error_message
 
@@ -24,6 +31,37 @@ class ProviderError(RuntimeError):
 
 class ProviderConfigurationError(ProviderError):
     pass
+
+
+def compress_reference_image(
+    local_file: Path,
+    *,
+    max_side: int = PROVIDER_REFERENCE_MAX_SIDE,
+    quality: int = PROVIDER_REFERENCE_JPEG_QUALITY,
+    max_bytes: int = PROVIDER_REFERENCE_MAX_BYTES,
+) -> bytes:
+    """等比压缩 Provider 输入图：保持宽高比，只缩小超过最长边的图，转 JPEG。"""
+    try:
+        with Image.open(local_file) as image:
+            image = ImageOps.exif_transpose(image)
+            width, height = image.size
+            scale = min(1.0, max_side / max(width, height))
+            if scale < 1.0:
+                image = image.resize(
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            rgb = image.convert("RGB")
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ProviderError(f"参考图无法解码：{local_file}") from exc
+    data = b""
+    for current_quality in range(max(quality, 50), 49, -10):
+        buffer = io.BytesIO()
+        rgb.save(buffer, format="JPEG", quality=current_quality)
+        data = buffer.getvalue()
+        if len(data) <= max_bytes:
+            return data
+    return data
 
 
 _SENSITIVE_QUERY_PARTS = {
@@ -328,6 +366,10 @@ class HttpProviderBase:
                     **kwargs,
                 )
                 response.raise_for_status()
+                # 中转渠道偶发 202 + error JSON（如“上游服务暂时不可用”），
+                # 按瞬时错误处理，允许重试而不是当成成功响应。
+                if response.status_code == 202 and self._http_failure_message(response):
+                    raise requests.HTTPError(response=response)
                 return response
             except requests.HTTPError as exc:
                 last_error = exc

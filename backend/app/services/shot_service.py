@@ -613,6 +613,24 @@ class ShotService:
         semantic["duration_sec"] = values["duration_sec"]
         semantic.setdefault("image_prompt_override", "")
         semantic.setdefault("video_prompt_override", "")
+        # 这些列 NOT NULL 且无 server_default，未传入时补空串，
+        # 允许只提供时长和提示词的手动分镜直接创建。
+        for key in (
+            "source_ref",
+            "start_state",
+            "action",
+            "narration",
+            "shot_type",
+            "camera_angle",
+            "camera_move",
+            "end_state",
+            "next_hook",
+            "frame_description",
+            "image_prompt",
+            "video_prompt",
+            "negative_prompt",
+        ):
+            semantic.setdefault(key, "")
         # 该列 NOT NULL；调用方未指定时取安全侧默认（不引用上一镜末帧）
         if not semantic.get("transition_from_prev"):
             semantic["transition_from_prev"] = "scene_change"
@@ -819,6 +837,34 @@ class ShotService:
         return keyframe_ids, video_ids
 
     @classmethod
+    def _cancel_active_jobs(
+        cls,
+        connection: Any,
+        shot_ids: set[str],
+    ) -> tuple[set[str], set[str]]:
+        """删除分镜时取消其进行中的任务，避免用户被“进行中”拦截。"""
+        keyframe_ids, video_ids = cls._related_media_ids(connection, shot_ids)
+        now = utc_now()
+        connection.execute(
+            update(job)
+            .where(
+                job.c.status.in_(_ACTIVE_JOB_STATUSES),
+                (
+                    (job.c.target_type == "shot") & job.c.target_id.in_(shot_ids)
+                    | (job.c.target_type == "keyframe") & job.c.target_id.in_(keyframe_ids)
+                    | (job.c.target_type == "video") & job.c.target_id.in_(video_ids)
+                ),
+            )
+            .values(
+                status="cancelled",
+                message="关联分镜已删除，任务已取消",
+                finished_at=now,
+                updated_at=now,
+            )
+        )
+        return keyframe_ids, video_ids
+
+    @classmethod
     def _remove_previous_keyframe_bindings(
         cls,
         connection: Any,
@@ -863,7 +909,7 @@ class ShotService:
     def delete(self, shot_id: str) -> None:
         current = self.get(shot_id)
         with self.database.engine.begin() as connection:
-            keyframe_ids, _ = self._ensure_no_active_jobs(connection, {shot_id})
+            keyframe_ids, _ = self._cancel_active_jobs(connection, {shot_id})
             media_paths = self._media_paths(connection, [shot_id])
             self._remove_previous_keyframe_bindings(
                 connection,

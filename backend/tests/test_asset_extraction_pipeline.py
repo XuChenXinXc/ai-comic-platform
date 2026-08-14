@@ -104,6 +104,25 @@ def _extract_job(chapter_id: str, project_id: str = "") -> dict[str, object]:
     }
 
 
+def _analysis_content() -> dict[str, object]:
+    return {
+        "summary": "主角发现线索。",
+        "genre": "悬疑",
+        "time_period": "现代",
+        "locations": ["办公室"],
+        "worldview": "当代现实世界",
+        "main_characters": ["小明", "李四"],
+        "character_relations": [],
+        "core_conflict": "寻找真相",
+        "plot_structure": {},
+        "emotion_curve": [],
+        "foreshadowing": [],
+        "visualizable_content": [],
+        "hard_to_visualize": [],
+        "production_risks": [],
+    }
+
+
 def test_reextract_ready_asset_keeps_existing_fields_and_fills_missing(
     asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
 ) -> None:
@@ -210,3 +229,127 @@ def test_extract_assets_with_minor_screenplay_characters_saves_only_key_roles_on
     )
     assert {item["name"] for item in characters} == {"小明"}
     assert result["count"] == 1
+
+
+def test_upsert_matches_existing_asset_by_alias(
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
+) -> None:
+    _database, service, project, _chapter = asset_extraction_services
+    existing = service.create(
+        str(project["id"]),
+        {
+            "asset_type": "character",
+            "name": "小明",
+            "profile": {"aliases": ["阿明"]},
+            "prompt": "已有提示词",
+            "negative_prompt": "已有负向提示词",
+        },
+    )
+
+    saved_id = service._upsert_extracted(
+        project,
+        "character",
+        {**_fresh_character(), "name": "阿明"},
+    )
+
+    assert saved_id == existing["id"]
+    assert [item["name"] for item in service.list(str(project["id"]), "character")] == ["小明"]
+
+
+def test_upsert_matches_existing_asset_by_state_variant_name(
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
+) -> None:
+    _database, service, project, _chapter = asset_extraction_services
+    existing = service.create(
+        str(project["id"]),
+        {
+            "asset_type": "prop",
+            "name": "万灯阁命灯",
+            "profile": {"concept": "命灯"},
+            "prompt": "铜制命灯",
+            "negative_prompt": "人物",
+        },
+    )
+    extracted = {
+        "name": "万灯阁黑色命灯",
+        "description": "熄灭后的命灯",
+        "prompt": "黑色命灯",
+        "negative_prompt": "人物",
+        "consistency_keywords": ["铜灯"],
+        "composition": "居中",
+        "importance": "core",
+    }
+
+    saved_id = service._upsert_extracted(project, "prop", extracted)
+
+    assert saved_id == existing["id"]
+    assert [item["name"] for item in service.list(str(project["id"]), "prop")] == ["万灯阁命灯"]
+
+
+def test_upsert_merges_list_profile_fields_instead_of_discarding_new_values(
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
+) -> None:
+    _database, service, project, _chapter = asset_extraction_services
+    existing = service.create(
+        str(project["id"]),
+        {
+            "asset_type": "character",
+            "name": "小明",
+            "profile": {"aliases": ["阿明"], "costume_variants": ["旧袍"]},
+            "prompt": "已有提示词",
+            "negative_prompt": "已有负向提示词",
+        },
+    )
+
+    service._upsert_extracted(
+        project,
+        "character",
+        {
+            **_fresh_character(),
+            "aliases": ["小名"],
+            "costume_variants": ["战损袍"],
+        },
+    )
+
+    updated = service.get(existing["id"])
+    assert updated["profile"]["aliases"] == ["阿明", "小名"]
+    assert updated["profile"]["costume_variants"] == ["旧袍", "战损袍"]
+
+
+def test_extract_warns_when_analysis_main_character_has_no_asset(
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, service, project, chapter = asset_extraction_services
+    WritingService(database).update_analysis(
+        str(chapter["id"]),
+        {"content": _analysis_content()},
+    )
+    service.create(
+        str(project["id"]),
+        {
+            "asset_type": "character",
+            "name": "小明",
+            "profile": {"appearance": "黑色短发"},
+            "prompt": "黑色短发",
+            "negative_prompt": "身份漂移",
+        },
+    )
+
+    class EmptyAssetProvider:
+        async def generate_json(self, **_values: Any) -> AssetExtractionOutput:
+            return AssetExtractionOutput.model_validate(
+                {"characters": [], "scenes": [], "props": []}
+            )
+
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_values: (EmptyAssetProvider(), {"params": {}}),
+    )
+
+    result = asyncio.run(
+        service.handle_extract(_extract_job(str(chapter["id"]), str(project["id"])))
+    )
+
+    assert result["warnings"] == ["核心角色「李四」尚未在素材库中"]

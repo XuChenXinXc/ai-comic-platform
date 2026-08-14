@@ -67,7 +67,11 @@ class ProviderService:
 
     @staticmethod
     def _is_sensitive_name(name: Any) -> bool:
-        normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name))
+        name_str = str(name)
+        # 防止极长输入导致 ReDoS
+        if len(name_str) > 200:
+            return False
+        normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name_str)
         parts = {part for part in re.split(r"[^a-z0-9]+", normalized.lower()) if part}
         collapsed = re.sub(r"[^a-z0-9]", "", normalized.lower())
         return bool(

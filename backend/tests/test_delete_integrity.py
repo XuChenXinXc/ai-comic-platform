@@ -7,7 +7,7 @@ from sqlalchemy import insert, select
 from app.api.schemas import ShotCreate
 from app.db import Database
 from app.jobs.repository import JobRepository
-from app.models.tables import asset_image, keyframe_version, shot, video_version
+from app.models.tables import asset_image, job, keyframe_version, shot, video_version
 from app.services.asset_service import AssetService
 from app.services.chapter_service import ChapterService
 from app.services.errors import ServiceError
@@ -386,7 +386,7 @@ def test_merge_assets_with_related_active_job_returns_conflict(
 
 @pytest.mark.parametrize("operation", ["delete", "split", "merge"])
 @pytest.mark.parametrize("target_type", ["shot", "keyframe", "video"])
-def test_destructive_shot_operation_with_related_active_job_returns_conflict(
+def test_destructive_shot_operation_with_related_active_job(
     database: Database,
     project_record: dict[str, Any],
     chapter_record: dict[str, Any],
@@ -407,10 +407,20 @@ def test_destructive_shot_operation_with_related_active_job_returns_conflict(
     }[target_type]
     _create_active_job(database, project_record["id"], target_type, target_id)
 
+    if operation == "delete":
+        # 删除允许取消进行中的任务后直接删除，不再报 409。
+        service.delete(current["id"])
+        with database.engine.connect() as connection:
+            assert connection.execute(
+                select(shot.c.id).where(shot.c.id == current["id"])
+            ).first() is None
+            assert connection.execute(
+                select(job.c.status).where(job.c.target_id == target_id)
+            ).scalar_one() == "cancelled"
+        return
+
     with pytest.raises(ServiceError) as exc_info:
-        if operation == "delete":
-            service.delete(current["id"])
-        elif operation == "split":
+        if operation == "split":
             service.split(current["id"], [])
         else:
             service.merge(current["id"], [source["id"]])
@@ -495,6 +505,53 @@ def test_delete_shot_cleans_previous_keyframe_binding(
             select(shot.c.reference_bindings_json).where(shot.c.id == referencing["id"])
         ).scalar_one()
     assert json_loads(raw, None) == []
+
+
+def test_delete_shot_cancels_active_jobs_and_removes_shot(
+    database: Database,
+    project_record: dict[str, Any],
+    chapter_record: dict[str, Any],
+) -> None:
+    service = ShotService(database)
+    current = _create_shot(service, chapter_record["id"], action="生成中待删除")
+    keyframe_id = "keyframe-active-job"
+    _insert_keyframe(database, current["id"], keyframe_id)
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(job).values(
+                id="job-active-keyframe",
+                project_id=project_record["id"],
+                chapter_id=chapter_record["id"],
+                job_type="generate_keyframe",
+                target_type="keyframe",
+                target_id=keyframe_id,
+                provider_kind="image",
+                provider_id=None,
+                provider_task_id="",
+                status="waiting_provider",
+                progress_current=0,
+                progress_total=1,
+                message="",
+                input_json="{}",
+                result_json="{}",
+                error="",
+                retry_count=0,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+        )
+
+    service.delete(current["id"])
+
+    with database.engine.connect() as connection:
+        deleted = connection.execute(
+            select(shot.c.id).where(shot.c.id == current["id"])
+        ).first()
+        job_status = connection.execute(
+            select(job.c.status).where(job.c.id == "job-active-keyframe")
+        ).scalar_one()
+    assert deleted is None
+    assert job_status == "cancelled"
 
 
 def test_delete_keyframe_referenced_by_non_terminal_video_returns_conflict(

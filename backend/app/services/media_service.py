@@ -4,10 +4,12 @@ import io
 import logging
 import math
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
+from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy import delete, func, insert, select, update
@@ -26,6 +28,7 @@ from app.models.tables import (
     video_version,
 )
 from app.schemas import ProviderPollResult
+from app.services.constants import MAX_IMAGE_SIZE, MAX_VIDEO_SIZE
 from app.services.errors import ServiceError, bad_request, conflict, not_found
 from app.services.file_service import (
     FileServiceError,
@@ -66,6 +69,11 @@ logger = logging.getLogger(__name__)
 
 MediaKind = Literal["asset_image", "keyframe", "video"]
 
+
+class JobCancelledError(RuntimeError):
+    """任务被用户取消，媒体处理器应尽快中止轮询。"""
+
+
 _MEDIA_TABLES = {
     "asset_image": (asset_image, "asset_id"),
     "keyframe": (keyframe_version, "shot_id"),
@@ -75,12 +83,15 @@ _DELETED_MEDIA_ERROR = "__deleted_by_user__"
 _ACTIVE_MEDIA_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
 _MEDIA_VERSION_FILE_LOCK = RLock()
 _GPT_IMAGE_2_SIZES = {
-    # 2K 分辨率，长宽比与 4K 版本保持一致（角色/物品 3:2，场景/关键帧 16:9）。
-    # 4K 出图在多参考图场景下一致性明显更差，且请求体积大易触发中转限制。
-    "character": "2560x1707",
-    "scene": "2560x1440",
-    "prop": "2560x1707",
-    "keyframe": "2560x1440",
+    # apib 按分辨率档位出图：这些像素尺寸只作为比例提示，
+    # resolution=2k 时实际输出 2048 宽（3:2 / 16:9 保持）。
+    # 实测 ai.rjk66.cn（OpenAI 兼容 relay）：请求 2560x1707 实际返回
+    # 1536x1024、请求 2560x1440 实际返回 1672x941，即大尺寸会被静默缩图；
+    # 只有 2048x1360 / 2048x1152 会按原尺寸输出真 2K，因此统一用这两个值。
+    "character": "2048x1360",
+    "scene": "2048x1152",
+    "prop": "2048x1360",
+    "keyframe": "2048x1152",
 }
 _INTEGER_DURATION_VIDEO_MODELS = {
     "grok-imagine-1.5-video-apimart",
@@ -129,13 +140,45 @@ class MediaService:
         model: str,
         target_type: str,
         params: dict[str, Any],
+        *,
+        provider_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         result = dict(params)
         if model.strip().lower() == "gpt-image-2":
             size = _GPT_IMAGE_2_SIZES.get(target_type)
             if size:
-                result["size"] = size
+                result["size"] = (
+                    size
+                    if (
+                        MediaService._provider_supports_gpt_image_2_2k(provider_config)
+                        or target_type == "keyframe"
+                    )
+                    else "1536x1024"
+                )
         return result
+
+    @staticmethod
+    def _provider_uses_apib(provider_config: dict[str, Any] | None) -> bool:
+        if not provider_config:
+            return False
+        base_url = str(provider_config.get("base_url") or "").lower()
+        protocol = str((provider_config.get("params") or {}).get("protocol") or "").lower()
+        return protocol in {"apib", "apimart"} or "apib.ai" in base_url or "apimart.ai" in base_url
+
+    @staticmethod
+    def _provider_supports_gpt_image_2_2k(provider_config: dict[str, Any] | None) -> bool:
+        """天悦 gpt-image-2 与 apib 一样支持 2K 档，按域名/协议识别。"""
+        if not provider_config:
+            return False
+        if MediaService._provider_uses_apib(provider_config):
+            return True
+        base_url = str(provider_config.get("base_url") or "").lower()
+        protocol = str((provider_config.get("params") or {}).get("protocol") or "").lower()
+        return (
+            protocol == "tianyue"
+            or "api.tianyue.xyz" in base_url
+            or "tianyue.xyz" in base_url
+        )
 
     @staticmethod
     def _supports_multiple_video_inputs(provider: Any) -> bool:
@@ -263,13 +306,27 @@ class MediaService:
         project_id: str,
         bindings: list[dict[str, Any]],
     ) -> list[tuple[Path, str]]:
-        items: list[tuple[Path, str]] = []
+        return [
+            (Path(item["path"]), item["label"])
+            for item in self._binding_reference_sources(project_id, bindings)
+        ]
+
+    def _binding_reference_sources(
+        self,
+        project_id: str,
+        bindings: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
         with self.database.engine.connect() as connection:
             for binding in bindings:
                 role = str(binding.get("role", ""))
                 if binding.get("asset_image_id"):
                     record = connection.execute(
-                        select(asset_image.c.file_path, asset.c.name)
+                        select(
+                            asset_image.c.file_path,
+                            asset_image.c.provider_url,
+                            asset.c.name,
+                        )
                         .join(asset, asset.c.id == asset_image.c.asset_id)
                         .where(
                             asset_image.c.id == binding["asset_image_id"],
@@ -278,9 +335,14 @@ class MediaService:
                     ).first()
                     relative = record.file_path if record else ""
                     name = str(record.name) if record else ""
+                    url = str(record.provider_url or "") if record else ""
                 elif binding.get("keyframe_id"):
                     record = connection.execute(
-                        select(keyframe_version.c.file_path, shot.c.shot_no)
+                        select(
+                            keyframe_version.c.file_path,
+                            keyframe_version.c.provider_url,
+                            shot.c.shot_no,
+                        )
                         .join(shot, shot.c.id == keyframe_version.c.shot_id)
                         .where(
                             keyframe_version.c.id == binding["keyframe_id"],
@@ -289,24 +351,63 @@ class MediaService:
                     ).first()
                     relative = record.file_path if record else ""
                     name = f"上一镜分镜 {record.shot_no}" if record else ""
+                    url = str(record.provider_url or "") if record else ""
                 else:
                     relative = ""
                     name = ""
+                    url = ""
                 if not relative:
                     continue
                 path = file_service.resolve_project_path(project_id, relative)
                 if path.is_file() and path.stat().st_size > 0:
-                    items.append((path, self._reference_role_label(role, name)))
+                    items.append(
+                        {
+                            "path": path,
+                            "label": self._reference_role_label(role, name),
+                            "url": url,
+                        }
+                    )
         return items
+
+    @staticmethod
+    def _provider_url_usable(url: str) -> bool:
+        if not str(url or "").startswith(("http://", "https://")):
+            return False
+        try:
+            query = parse_qs(urlsplit(url).query)
+            expires = query.get("Expires", [])
+            if expires and int(expires[0]) <= int(time.time()):
+                return False
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _store_provider_url(self, table: Any, version_id: str, url: str) -> None:
+        if not self._provider_url_usable(url):
+            return
+        with self.database.engine.begin() as connection:
+            connection.execute(
+                update(table)
+                .where(table.c.id == version_id)
+                .values(provider_url=str(url))
+            )
 
     def _resolve_shot_reference_bindings(
         self,
         current: dict[str, Any],
     ) -> list[dict[str, Any]]:
         if not current.get("scene_asset_id"):
-            raise conflict("分镜尚未绑定场景素材，请先在分镜编辑中绑定场景素材")
-        requested = [
-            (current.get("scene_asset_id"), "scene_layout"),
+            # 手动分镜可以不绑定任何素材直接生成；
+            # 只要存在角色/物品/参考绑定，仍必须提供场景素材。
+            if (
+                current.get("character_ids")
+                or current.get("prop_ids")
+                or current.get("reference_bindings")
+            ):
+                raise conflict("分镜尚未绑定场景素材，请先在分镜编辑中绑定场景素材")
+            return []
+        requested: list[tuple[str, str]] = [
+            (current["scene_asset_id"], "scene_layout"),
             *((item, "character_identity") for item in current["character_ids"]),
             *((item, "prop_identity") for item in current["prop_ids"]),
         ]
@@ -795,6 +896,7 @@ class MediaService:
             config["model"],
             current["asset_type"],
             options.get("params", {}),
+            provider_config=config,
         )
         params = {**config["params"], **request_params}
         references: list[str] = []
@@ -921,27 +1023,30 @@ class MediaService:
             config["model"],
             "keyframe",
             options.get("params", {}),
+            provider_config=config,
         )
         params = {**config["params"], **request_params}
         reference_items = self._binding_reference_items(current["project_id"], bindings)
         reference_anchors = [
             f"@Image{index}：{label}。" for index, (_, label) in enumerate(reference_items, start=1)
         ]
+        prompt_snapshot = image_prompt_override
+        if not prompt_snapshot:
+            prompt_snapshot = compile_keyframe_prompt(
+                style_prompt=current_project["style_prompt"],
+                aspect_ratio=current_project["aspect_ratio"],
+                image_prompt=image_prompt,
+                anchors=reference_anchors,
+                shot_context=self._shot_template_context(current),
+                negative_prompt=current["negative_prompt"],
+            )
         version = self._insert_version(
             table=keyframe_version,
             parent_column="shot_id",
             parent_id=shot_id,
             values={
                 "file_path": None,
-                "prompt_snapshot": image_prompt_override
-                or compile_keyframe_prompt(
-                    style_prompt=current_project["style_prompt"],
-                    aspect_ratio=current_project["aspect_ratio"],
-                    image_prompt=image_prompt,
-                    anchors=reference_anchors,
-                    shot_context=self._shot_template_context(current),
-                    negative_prompt=current["negative_prompt"],
-                ),
+                "prompt_snapshot": prompt_snapshot,
                 "negative_prompt_snapshot": current["negative_prompt"],
                 "reference_bindings_json": json_dumps(bindings),
                 "provider_id": config["id"],
@@ -1085,12 +1190,26 @@ class MediaService:
             reference_bindings,
         )
 
-        # @Image 编号顺序必须与 handle_video 组装的图片列表严格一致。
-        # 当前关键帧固定第一：单图 Provider 只取首图（http_video 在 input_image_list
-        # 为假时仅发送 values[0]），而首图必须是本镜起始画面。
-        reference_anchors = ["@Image1：当前分镜关键帧，锁定构图、人物左右关系和起始站位。"]
-        if prev_end_frame_relative:
-            reference_anchors.append("@Image2：上一镜结束帧，仅用于衔接连贯，不是本镜起始画面。")
+        # 自由制作分镜从第二镜起默认「连续承接」：上一镜末帧作为本镜第 0 秒起始帧，
+        # 当前关键帧作为结束目标帧。其余分镜保持关键帧为首图的旧语义。
+        prev_end_frame_first = (
+            current.get("source_ref") == "manual"
+            and bool(prev_end_frame_relative)
+        )
+        reference_anchors = (
+            [
+                "@Image1：上一镜结束帧，作为本镜第0秒起始帧（严格从该画面开始）。",
+                "@Image2：当前分镜关键帧，作为本镜动作结束的目标帧。",
+            ]
+            if prev_end_frame_first
+            else [
+                "@Image1：当前分镜关键帧，锁定构图、人物左右关系和起始站位。",
+            ]
+        )
+        if prev_end_frame_relative and not prev_end_frame_first:
+            reference_anchors.append(
+                "@Image2：上一镜结束帧，仅用于衔接连贯，不是本镜起始画面。"
+            )
         # 先算基准编号：extend 的生成器里取 len() 会随列表增长而漂移
         base_index = len(reference_anchors) + 1
         reference_anchors.extend(
@@ -1098,18 +1217,20 @@ class MediaService:
             for index, (_, label) in enumerate(reference_items)
         )
 
-        prompt = video_prompt_override or compile_video_prompt(
-            style_prompt=current_project["style_prompt"],
-            aspect_ratio=current_project["aspect_ratio"],
-            video_prompt=video_prompt,
-            duration_sec=effective_duration,
-            anchors=reference_anchors,
-            shot_context=self._shot_template_context(
-                generation_current,
-                prev_end_state=prev_end_state,
-            ),
-            negative_prompt=current["negative_prompt"],
-        )
+        prompt = video_prompt_override
+        if not prompt:
+            prompt = compile_video_prompt(
+                style_prompt=current_project["style_prompt"],
+                aspect_ratio=current_project["aspect_ratio"],
+                video_prompt=video_prompt,
+                duration_sec=effective_duration,
+                anchors=reference_anchors,
+                shot_context=self._shot_template_context(
+                    generation_current,
+                    prev_end_state=prev_end_state,
+                ),
+                negative_prompt=current["negative_prompt"],
+            )
         version = self._insert_version(
             table=video_version,
             parent_column="shot_id",
@@ -1160,6 +1281,7 @@ class MediaService:
                 "reference_bindings": reference_bindings,
                 # 项目内相对路径；为空表示本镜不引用上一镜结束帧
                 "prev_end_frame_path": prev_end_frame_relative,
+                "prev_end_frame_first": prev_end_frame_first,
                 "supports_multiple_input_images": supports_multiple_input_images,
                 "provider_updated_at": str(config.get("updated_at") or ""),
                 "params": options.get("params", {}),
@@ -1332,6 +1454,8 @@ class MediaService:
         data: bytes,
     ) -> dict[str, Any]:
         del content_type
+        if len(data) > MAX_IMAGE_SIZE:
+            raise bad_request("图片大小超过限制（最大 10MB）")
         self._verify_image(data)
         current = self._asset(asset_id)
         suffix = self._image_suffix(filename)
@@ -1385,6 +1509,8 @@ class MediaService:
         data: bytes,
     ) -> dict[str, Any]:
         del content_type
+        if len(data) > MAX_IMAGE_SIZE:
+            raise bad_request("图片大小超过限制（最大 10MB）")
         self._verify_image(data)
         current = self._shot(shot_id)
         suffix = self._image_suffix(filename)
@@ -1444,6 +1570,8 @@ class MediaService:
         del content_type
         if not data:
             raise bad_request("上传视频不能为空")
+        if len(data) > MAX_VIDEO_SIZE:
+            raise bad_request("视频大小超过限制（最大 100MB）")
         current = self._shot(shot_id)
         suffix = self._video_suffix(filename)
         with self.database.engine.connect() as connection:
@@ -2005,6 +2133,7 @@ class MediaService:
                 config["model"],
                 target_type,
                 input_data.get("params", {}),
+                provider_config=config,
             )
             params = {**config["params"], **request_params}
             self._set_media_status(table, version_id, "running")
@@ -2040,6 +2169,7 @@ class MediaService:
             target_created = True
             relative = file_service.relative_project_path(project_id, target)
             completed = self._complete_media(table, version_id, relative)
+            self._store_provider_url(table, version_id, result.result_url)
             self._delete_staged_provider_result(project_id, result)
             return {"version_id": version_id, "file_path": completed["file_path"]}
         except Exception as exc:
@@ -2104,11 +2234,15 @@ class MediaService:
                 if supports_multiple_input_images and not runtime_supports_multiple:
                     raise RuntimeError("视频 Provider 当前不支持任务所需的多参考图输入")
                 prepare_multiple = getattr(provider, "prepare_input_images", None)
+                prefer_public_urls = bool(
+                    getattr(provider, "prefers_public_reference_urls", False)
+                )
                 if supports_multiple_input_images:
                     bindings = input_data.get("reference_bindings")
                     if not isinstance(bindings, list):
                         bindings = current["reference_bindings"]
-                    reference_paths = self._resolve_binding_files(project_id, bindings)
+                    reference_sources = self._binding_reference_sources(project_id, bindings)
+                    reference_paths = [Path(item["path"]) for item in reference_sources]
                     if bindings and len(reference_paths) < len(bindings):
                         # 参考图绑定存在但文件缺失/记录失效：不允许静默降级（含部分缺失）
                         raise conflict(
@@ -2117,10 +2251,10 @@ class MediaService:
                         )
 
                     # 图片顺序必须与 queue_video 写进 prompt 的 @Image 编号一一对应：
-                    # 关键帧 → 上一镜结束帧（可选）→ 各素材绑定。
-                    # 关键帧必须排首位：单图 Provider 只取 values[0]，那必须是本镜起始画面。
-                    all_input_paths = [keyframe_path]
+                    # 自由制作连续承接时为「上一镜结束帧 → 关键帧 → 各素材绑定」，
+                    # 其他分镜保持「关键帧 → 上一镜结束帧（可选）→ 各素材绑定」。
                     prev_end_frame_path = input_data.get("prev_end_frame_path")
+                    resolved_prev: Path | None = None
                     if prev_end_frame_path:
                         resolved_prev = self._readable_project_file(
                             project_id,
@@ -2133,9 +2267,38 @@ class MediaService:
                                 "上一镜结束帧文件缺失或失效，提示词中的参考图编号将无法对应。"
                                 "请重新生成上一镜视频，或重新生成本镜视频提示词后重试"
                             )
+                    all_input_paths: list[Path] = []
+                    all_input_urls: list[str] = []
+                    if resolved_prev is not None and input_data.get(
+                        "prev_end_frame_first"
+                    ):
                         all_input_paths.append(resolved_prev)
+                        all_input_urls.append("")
+                    all_input_paths.append(keyframe_path)
+                    all_input_urls.append(str(keyframe.get("provider_url") or ""))
+                    if resolved_prev is not None and not input_data.get(
+                        "prev_end_frame_first"
+                    ):
+                        all_input_paths.append(resolved_prev)
+                        all_input_urls.append("")
                     all_input_paths.extend(reference_paths)
-                    prepared = await prepare_multiple(all_input_paths)
+                    all_input_urls.extend(str(item.get("url") or "") for item in reference_sources)
+                    if prefer_public_urls:
+                        values: list[str] = []
+                        for path, url in zip(
+                            all_input_paths,
+                            all_input_urls,
+                            strict=True,
+                        ):
+                            if self._provider_url_usable(url):
+                                values.append(url)
+                            else:
+                                values.append(
+                                    (await provider.prepare_input_image(path))["value"]
+                                )
+                        prepared = {"values": values, "mode": "url"}
+                    else:
+                        prepared = await prepare_multiple(all_input_paths)
                 else:
                     prepared = await provider.prepare_input_image(keyframe_path)
                 submission = await provider.submit(
@@ -2224,6 +2387,7 @@ class MediaService:
         submission: Any,
         timeout_sec: int,
     ) -> ProviderPollResult:
+        self._raise_if_job_cancelled(job_record["id"])
         task_id = submission.task_id
         if task_id:
             self._set_media_status(table, version_id, "waiting_provider", provider_task_id=task_id)
@@ -2257,11 +2421,13 @@ class MediaService:
         task_id: str,
         timeout_sec: int,
     ) -> ProviderPollResult:
+        self._raise_if_job_cancelled(job_record["id"])
         self._set_media_status(table, version_id, "waiting_provider", provider_task_id=task_id)
         self.jobs.repository.set_provider_task(job_record["id"], task_id, status="waiting_provider")
         try:
             async with asyncio.timeout(timeout_sec):
                 while True:
+                    self._raise_if_job_cancelled(job_record["id"])
                     result = await provider.poll(task_id)
                     if result.status == "completed":
                         return self._save_provider_result(job_record["id"], result)
@@ -2270,6 +2436,11 @@ class MediaService:
                     await asyncio.sleep(0.25)
         except TimeoutError as exc:
             raise RuntimeError("Provider 轮询超时，可稍后重试原任务") from exc
+
+    def _raise_if_job_cancelled(self, job_id: str) -> None:
+        record = self.jobs.repository.get(job_id)
+        if record is None or record["status"] == "cancelled":
+            raise JobCancelledError("任务已取消")
 
     def _save_provider_result(
         self,

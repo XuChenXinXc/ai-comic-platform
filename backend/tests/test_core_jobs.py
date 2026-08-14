@@ -306,6 +306,22 @@ def test_job_cancel_after_started_rejects_transition(tmp_path: Path) -> None:
     database.dispose()
 
 
+def test_set_provider_task_does_not_overwrite_cancelled_job(tmp_path: Path) -> None:
+    database, repository = _repository(tmp_path)
+    record = _create(repository, "generate_video")
+    repository.cancel(record["id"])
+
+    updated = repository.set_provider_task(
+        record["id"],
+        "provider-task-1",
+        status="waiting_provider",
+    )
+
+    assert updated is None
+    assert repository.require(record["id"])["status"] == "cancelled"
+    database.dispose()
+
+
 def test_job_service_get_with_provider_secret_result_hides_sensitive_diagnostics(
     tmp_path: Path,
 ) -> None:

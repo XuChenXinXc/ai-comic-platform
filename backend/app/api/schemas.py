@@ -13,8 +13,10 @@ ProjectStorageSource = Literal["database", "environment", "default"]
 
 # 项目默认画风：仅作为新建项目的初始值，之后只允许用户手动修改
 DEFAULT_STYLE_PROMPT = (
-    "电影感现实主义二维国漫，稳定自然的半写实人物比例，沉稳细腻线条，"
-    "低饱和冷暖协调色调，真实清晰的微表情，层次分明的电影光影。"
+    "电影感古风仙域二维国漫，稳定自然的半写实人物比例，东方审美骨相，"
+    "克制细腻的古风线条，低饱和青灰、玉白、玄黑与暖金综合色调，"
+    "仙气通透但不过度梦幻，真实清晰的微表情，层次分明的电影光影，"
+    "东方山水空间美学，精致但不浮夸。"
 )
 
 
@@ -85,6 +87,7 @@ class ProjectCreate(ApiModel):
     default_text_provider_id: str | None = None
     default_image_provider_id: str | None = None
     default_video_provider_id: str | None = None
+    is_free_create: bool = False
 
 
 class ProjectUpdate(ApiModel):
@@ -98,6 +101,7 @@ class ProjectUpdate(ApiModel):
     default_text_provider_id: str | None = None
     default_image_provider_id: str | None = None
     default_video_provider_id: str | None = None
+    is_free_create: bool | None = None
 
 
 class ProjectStorageSetting(ApiModel):
@@ -547,4 +551,6 @@ class ChapterComposeRequest(ApiModel):
     burn_subtitles: bool = True
     bgm_id: str | None = None
     bgm_volume: float = Field(default=0.3, ge=0, le=1)
+    crossfade: bool = False
+    crossfade_seconds: float = Field(default=0.5, ge=0.1, le=5)
 

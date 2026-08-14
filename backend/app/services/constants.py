@@ -69,6 +69,11 @@ IMAGE_DEFAULT_HEIGHT = 1024
 IMAGE_MIN_SIZE = 256  # 最小尺寸
 IMAGE_MAX_SIZE = 2048  # 最大尺寸
 
+# Provider 输入参考图压缩（仅提交前使用，本地原图不压缩）
+PROVIDER_REFERENCE_MAX_SIDE = 2048  # 最长边像素
+PROVIDER_REFERENCE_JPEG_QUALITY = 92  # JPEG 初始质量（提高以降低参考图重压缩损失）
+PROVIDER_REFERENCE_MAX_BYTES = 1024 * 1024  # 单张最大字节数（1 MB）
+
 # ==================== 音频生成 ====================
 
 # 音频参数

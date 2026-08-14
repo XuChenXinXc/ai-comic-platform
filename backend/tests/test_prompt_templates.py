@@ -4,12 +4,66 @@ import pytest
 
 from app.prompts import load_prompt
 from app.services.prompt_service import (
+    _normalize_sentence_end,
+    _strip_sentence_end,
     compile_asset_prompt,
     compile_keyframe_prompt,
     compile_video_prompt,
     resolve_asset_negative_prompt,
     shot_template_context,
 )
+
+
+def test_normalize_sentence_end_collapses_double_periods() -> None:
+    assert (
+        _normalize_sentence_end("低饱和冷暖协调色调，层次分明的电影光影。。")
+        == "低饱和冷暖协调色调，层次分明的电影光影。"
+    )
+    assert _normalize_sentence_end("只用了不到一小时。") == "只用了不到一小时。"
+    assert _normalize_sentence_end("真的吗？") == "真的吗？"
+
+
+def test_strip_sentence_end_removes_trailing_punctuation_for_joins() -> None:
+    assert _strip_sentence_end("画面不出现任何文字。") == "画面不出现任何文字"
+    assert _strip_sentence_end("准备打开面前的玻璃罐。") == "准备打开面前的玻璃罐"
+
+
+def test_compile_video_prompt_normalizes_field_punctuation_joins() -> None:
+    prompt = compile_video_prompt(
+        style_prompt="电影感现实主义二维国漫，层次分明的电影光影。",
+        aspect_ratio="16:9",
+        video_prompt="0-2秒：拧开罐盖；2-4秒：取胡萝卜。",
+        duration_sec=6,
+        anchors=[],
+        shot_context={
+            "transition_from_prev": "continuous",
+            "prev_end_state": "已走到厨房操作台前停下。",
+            "opening_frame": "站在厨房操作台前，准备打开面前的玻璃罐。",
+            "ending_frame": "站在操作台前，低头等待泡发。",
+            "characters": ["陈鑫"],
+            "scene_name": "陈鑫的一楼公寓。",
+            "shot_type": "近景",
+            "camera_angle": "俯视",
+            "camera_move": "缓慢下移",
+            "focus": "陈鑫",
+            "composition": "画面不出现任何文字。",
+            "lighting": "符合场景设定的光线",
+            "color_tone": "低饱和冷暖协调",
+            "environment_details": "场景固定环境细节。",
+            "dialogue": "",
+            "voice_over": "只用了不到一小时。",
+            "sound_effects": "罐盖拧开的轻响和温水声。",
+        },
+    )
+
+    assert "。。" not in prompt
+    assert "。，" not in prompt
+    assert "。开始。" not in prompt
+    assert "从站在厨房操作台前，准备打开面前的玻璃罐开始。" in prompt
+    assert "已走到厨房操作台前停下。本镜动作直接承接该状态" in prompt
+    assert "画外音" not in prompt
+    assert "画面不出现任何文字，景别和光线方向保持稳定。" in prompt
+    assert "场景：陈鑫的一楼公寓。" in prompt
 
 
 def test_asset_extraction_prompt_requires_independent_key_props() -> None:
@@ -171,7 +225,9 @@ def test_compile_asset_prompt_uses_type_specific_setting_sheet_template(
     assert "补充的视觉细节" in prompt
     # 自定义负向与默认负向合并：自定义项保留，默认约束自动追加
     assert "negative prompt: 文字水印、真人摄影" in prompt
-    assert "文字、水印" in prompt
+    assert "文字水印" in prompt
+    if asset_type == "character":
+        assert "除指定人物资料卡外的其他文字" in prompt
     assert f"画面比例：{expected_aspect_ratio}。" in prompt
     assert "画面比例：9:16。" not in prompt
     assert "{" not in prompt
@@ -191,6 +247,47 @@ def test_compile_asset_prompt_uses_type_specific_default_negative_prompt() -> No
     )
 
     assert "negative prompt: 完整人物、人物脸、多件物品" in prompt
+
+
+def test_character_sheet_counts_expression_group_and_strips_scene_staging() -> None:
+    """表情组四个就写四个特写；角色灯光、场景与手持道具不进入设定板。"""
+    prompt = compile_asset_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="3:2",
+        asset_type="character",
+        asset_name="徐尘心",
+        profile={
+            "age": "二十岁上下",
+            "gender": "男",
+            "identity": "万灯阁守灯弟子，无灵根・守灯人",
+            "expression_group": ["平静倾听", "惊讶屏息", "执拗追问", "沉默悲伤"],
+            "lighting": "命灯金暖光与夜色冷光，面部偏侧光",
+            "carried_item": "常提一只旧铜油壶",
+            "immutable_features": ["黑色低马尾", "青灰交领布袍"],
+        },
+        prompt="清瘦青年，黑色低马尾，青灰交领粗布内袍",
+        negative_prompt="",
+        consistency_keywords=["黑色低马尾"],
+        composition="主人物立绘位于画面左侧主体区域，并在该区域内部居中完整站立。",
+    )
+
+    assert "排列4个高精度面部特写" in prompt
+    assert "4个面部特写必须保持完全一致" in prompt
+    assert "命灯金暖光与夜色冷光" not in prompt
+    assert "旧铜油壶" not in prompt
+    assert "柔和中性主光，辅以极轻微暖金轮廓光" in prompt
+    assert "双臂自然下垂，双手自然放松" in prompt
+    assert "不出现任何环境、布景或场景元素" in prompt
+    assert "【角色身份唯一性】" in prompt
+    assert "主人物立绘位于画面左侧主体区域，并在该区域内部居中完整站立" in prompt
+
+
+def test_character_negative_prompt_allows_only_designated_info_card_text() -> None:
+    merged = resolve_asset_negative_prompt("character", "不要其他人物")
+
+    assert "多人" in merged
+    assert "除指定人物资料卡外的其他文字" in merged
+    assert "水印" in merged
 
 
 def test_scene_negative_prompt_merge_is_idempotent() -> None:
@@ -341,11 +438,74 @@ def test_compile_keyframe_prompt_uses_v3_template_and_reference_order() -> None:
     assert "@Image1：林雪" in prompt
     assert "用途：生成当前分镜唯一的分镜图" in prompt
     assert "不得提前呈现动作完成结果" in prompt
-    assert "视频末帧边界：木门刚被推开一条缝。" in prompt
+    assert "视频末帧边界" not in prompt
+    assert "木门刚被推开一条缝" not in prompt
+    assert "运镜" not in prompt
+    assert "缓慢推进" not in prompt
+    assert "环境细节：旧木门与浮尘" in prompt
+    assert "不做角色海报、概念插画封面或设定展示页构图。" in prompt
+    assert "只出现本镜绑定的角色，不出现背景行人、看客、路人或模糊人影。" in prompt
     assert "negative prompt: 身份漂移、服装变化、文字水印" in prompt
     assert "画面比例：16:9。" in prompt
     assert "画面比例：9:16。" not in prompt
     assert "导演画面补充" not in prompt
+
+
+def test_compile_keyframe_prompt_wide_shot_requires_readable_character_size() -> None:
+    """全景/远景必须写明人物体量，避免人物被缩成小黑点。"""
+    prompt = compile_keyframe_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        image_prompt="万灯阁第七层夜巡开场全景。",
+        anchors=[],
+        shot_context={
+            "opening_frame": "徐尘心左手提旧铜油壶，右手微抬但尚未触及命灯。",
+            "characters": ["徐尘心"],
+            "scene_name": "万灯阁第七层",
+            "shot_type": "全景",
+            "camera_angle": "略高于人物视线，轻微下压",
+            "focus": "徐尘心缓步前行并准备扶正命灯",
+        },
+    )
+
+    assert "约占画面高度的1/5至1/4" in prompt
+    assert "不得缩成远景小黑点" in prompt
+
+
+def test_compile_keyframe_prompt_close_shot_omits_wide_body_rule() -> None:
+    """特写等近距离景别不追加全景人物体量约束。"""
+    prompt = compile_keyframe_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        image_prompt="特写：指尖触向灯身。",
+        anchors=[],
+        shot_context={
+            "opening_frame": "指尖尚未贴到灯身。",
+            "characters": ["徐尘心"],
+            "shot_type": "特写",
+        },
+    )
+
+    assert "1/5至1/4" not in prompt
+
+
+def test_compile_keyframe_prompt_empty_environment_details_has_no_redundant_suffix() -> None:
+    """environment_details 为空时不得拼出「环境细节场景固定环境细节」。"""
+    prompt = compile_keyframe_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        image_prompt="徐尘心行走于灯架甬道。",
+        anchors=[],
+        shot_context={
+            "opening_frame": "右手微抬但尚未触及灯盏。",
+            "characters": ["徐尘心"],
+            "environment_details": "",
+        },
+    )
+
+    assert "环境细节场景固定环境细节" not in prompt
+    assert "环境细节" not in prompt
+    assert "统一色调。" in prompt
 
 
 def test_compile_keyframe_prompt_includes_positions_and_expressions() -> None:
@@ -597,7 +757,8 @@ def test_compile_keyframe_prompt_marks_voice_over_as_closed_lips() -> None:
     assert "画面中所有人物全程闭口" in prompt
 
 
-def test_compile_video_prompt_voice_over_keeps_mouths_closed() -> None:
+def test_compile_video_prompt_does_not_add_dubbing_restrictions() -> None:
+    """视频提示词按正常生成处理，不追加后期配音/闭口/无台词限制。"""
     context = shot_template_context(
         {
             "dialogue": [
@@ -619,12 +780,15 @@ def test_compile_video_prompt_voice_over_keeps_mouths_closed() -> None:
         shot_context=context,
     )
 
-    assert "画面内无台词对白：所有人物全程闭口" in prompt
-    assert "画外音（后期配音，画面人物闭口）：父亲（录音）：怀表留给你。" in prompt
+    assert "画外音" not in prompt
+    assert "闭口" not in prompt
+    assert "无台词对白" not in prompt
+    assert "后期配音" not in prompt
+    assert "环境与动作声音" in prompt
 
 
-def test_compile_video_prompt_mixes_dialogue_and_voice_over() -> None:
-    """画面内对白与画外音并存时：两者都输出，口型指令按画面内对白处理。"""
+def test_compile_video_prompt_ignores_dialogue_for_dubbing_restrictions() -> None:
+    """即使存在对白/画外音，视频提示词也不再追加配音相关限制。"""
     context = shot_template_context(
         {
             "dialogue": [
@@ -650,9 +814,10 @@ def test_compile_video_prompt_mixes_dialogue_and_voice_over() -> None:
         shot_context=context,
     )
 
-    assert "说话角色嘴唇轻微开合、表情自然" in prompt
-    assert "画面内无台词对白" not in prompt
-    assert "画外音（后期配音，画面人物闭口）：父亲（录音）：小舟" in prompt
+    assert "说话角色嘴唇轻微开合" not in prompt
+    assert "画外音" not in prompt
+    assert "闭口" not in prompt
+    assert "后期配音" not in prompt
 
 
 def test_compile_asset_prompt_clean_reference_mode_has_no_setting_sheet_text() -> None:
