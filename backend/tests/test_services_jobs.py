@@ -18,6 +18,7 @@ from app.models.tables import (
     asset_image,
     keyframe_version,
     novel_analysis,
+    project,
     screenplay,
     video_version,
 )
@@ -193,6 +194,48 @@ def test_gpt_image_2_generation_params_use_stable_size_for_generic_provider(
         )
 
     assert queued["input_data"]["params"]["size"] == expected_size
+
+
+def test_free_create_asset_image_uses_raw_user_prompt(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project_record = media_job_services["project"]
+    with database.engine.begin() as connection:
+        connection.execute(
+            update(project)
+            .where(project.c.id == project_record["id"])
+            .values(is_free_create=1)
+        )
+    current = AssetService(database, jobs).create(
+        project_record["id"],
+        {
+            "asset_type": "character",
+            "name": "自由制作角色",
+            "prompt": "黑发少女，白色短裙",
+        },
+    )
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            object(),
+            {
+                "id": "mock-image",
+                "model": "gpt-image-2",
+                "params": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    media.queue_asset_image(current["id"], {})
+
+    snapshot = media.list_asset_images(current["id"])[0]["prompt_snapshot"]
+    assert snapshot == "黑发少女，白色短裙"
 
 
 @pytest.mark.parametrize(

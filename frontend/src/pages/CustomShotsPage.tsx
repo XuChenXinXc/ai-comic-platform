@@ -671,6 +671,41 @@ function CustomShotsInner() {
     onError: (error) => toast.error(formatError(error)),
   });
 
+  const assetBatchMutation = useMutation({
+    mutationFn: () =>
+      api.assets.images.batch(manualProjectId, {
+        only_missing: true,
+        provider_id: imageProviderId || undefined,
+      }),
+    onSuccess: async (result) => {
+      for (const job of result.jobs) {
+        assetJobsRef.current.add(job.id);
+      }
+      setGeneratingAssetIds((current) => {
+        const next = new Set(current);
+        for (const asset of assets) {
+          if (asset.current_image?.status !== "completed") next.add(asset.id);
+        }
+        return next;
+      });
+      await invalidateAssets();
+      startAssetPolling();
+      const failures = result.preflight_failures ?? [];
+      if (!result.jobs.length && !failures.length) {
+        toast.info("所有素材都已生成参考图");
+        return;
+      }
+      if (failures.length) {
+        toast.warning(
+          `已入队 ${result.jobs.length} 个素材图任务，跳过 ${failures.length} 项`,
+        );
+        return;
+      }
+      toast.success(`已入队 ${result.jobs.length} 个素材图任务`);
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
   const removeAssetMutation = useMutation({
     mutationFn: (id: string) => api.assets.remove(id),
     onSuccess: async (_data, id) => {
@@ -1000,19 +1035,31 @@ function CustomShotsInner() {
               为素材填写名称和生图提示词，可直接生成参考图，并在分镜中选择使用。
             </p>
           </div>
-          <Tabs
-            value={assetType}
-            onChange={(value) => {
-              setAssetType(value as AssetType);
-              setAssetName("");
-              setAssetPrompt("");
-            }}
-            items={assetTypes.map((type) => ({
-              value: type,
-              label: assetLabels[type],
-              count: assets.filter((asset) => asset.asset_type === type).length,
-            }))}
-          />
+          <div className="flex flex-wrap items-center gap-3">
+            <Button
+              variant="primary"
+              busy={assetBatchMutation.isPending}
+              onClick={() => assetBatchMutation.mutate()}
+            >
+              <WandSparkles className="h-4 w-4" />
+              一键生成素材图
+            </Button>
+            <Tabs
+              value={assetType}
+              onChange={(value) => {
+                setAssetType(value as AssetType);
+                setAssetName("");
+                setAssetPrompt("");
+              }}
+              items={assetTypes.map((type) => ({
+                value: type,
+                label: assetLabels[type],
+                count: assets.filter(
+                  (asset) => asset.asset_type === type,
+                ).length,
+              }))}
+            />
+          </div>
         </div>
 
         <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_auto]">

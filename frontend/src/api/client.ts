@@ -361,7 +361,12 @@ export const api = {
         request<Job>(`/assets/${assetId}/images/generate`, json("POST", body)),
       batch: (
         projectId: string,
-        body: { ids?: string[]; asset_type?: AssetType } = {},
+        body: {
+          ids?: string[];
+          asset_type?: AssetType;
+          only_missing?: boolean;
+          provider_id?: string | null;
+        } = {},
       ) =>
         request<BatchResponse>(
           `/projects/${projectId}/assets/images/batch`,

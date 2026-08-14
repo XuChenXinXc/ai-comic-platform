@@ -42,11 +42,11 @@ export function ImagePreview({
         </span>
       </button>
       <Modal open={open} onClose={() => setOpen(false)} title={alt} wide>
-        <div className="flex min-h-[55vh] items-center justify-center bg-[#202420]">
+        <div className="flex items-center justify-center bg-[#202420]">
           <img
             src={src}
             alt={`${alt}大图`}
-            className="max-h-[76vh] max-w-full object-contain"
+            className="max-h-[calc(92vh-170px)] max-w-full object-contain"
           />
         </div>
       </Modal>

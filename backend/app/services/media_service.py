@@ -904,18 +904,22 @@ class MediaService:
             current["asset_type"],
             current["negative_prompt"],
         )
-        prompt = compile_asset_prompt(
-            style_prompt=current_project["style_prompt"],
-            aspect_ratio=current_project["aspect_ratio"],
-            asset_type=current["asset_type"],
-            asset_name=current["name"],
-            profile=current["profile"],
-            prompt=current["prompt"],
-            negative_prompt=negative_prompt,
-            consistency_keywords=current["consistency_keywords"],
-            composition=current["composition"],
-            reference_mode=bool(options.get("reference_mode")),
-        )
+        if current_project.get("is_free_create"):
+            # 自由制作直接使用用户填写的素材提示词生图，不套模板、不追加风格设定
+            prompt = str(current.get("prompt") or "").strip()
+        else:
+            prompt = compile_asset_prompt(
+                style_prompt=current_project["style_prompt"],
+                aspect_ratio=current_project["aspect_ratio"],
+                asset_type=current["asset_type"],
+                asset_name=current["name"],
+                profile=current["profile"],
+                prompt=current["prompt"],
+                negative_prompt=negative_prompt,
+                consistency_keywords=current["consistency_keywords"],
+                composition=current["composition"],
+                reference_mode=bool(options.get("reference_mode")),
+            )
         prompt_override = str(current.get("prompt_override") or "").strip()
         if prompt_override:
             # 用户编辑过的最终提示词优先，不再按模板重新编译
