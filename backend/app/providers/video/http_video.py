@@ -9,10 +9,12 @@ from urllib.parse import urlsplit
 
 import requests
 
+from app.config import settings
 from app.schemas import ProviderConfig, ProviderPollResult, ProviderSubmission
 
 from ..base import (
     HttpProviderBase,
+    ProviderConfigurationError,
     ProviderError,
     compress_reference_image,
     extract_path,
@@ -91,7 +93,8 @@ class HttpVideoProvider(HttpProviderBase):
         elif self._uses_tianyue_video_protocol(options):
             # 天悦官方视频接口：POST /v1/videos、GET /v1/videos/{task_id}。
             # 按次计费模型固定 duration=1，实际生成时长写到 video_duration；
-            # 参考图最多 9 张，使用 image_urls 数组（实测接受 base64 data URL）。
+            # 参考图最多 9 张，使用 images 数组；火山上游只认公网 URL，
+            # 本地图先上传 ImgBB 换成 HTTPS URL。
             options["submit_path"] = "videos"
             options.setdefault("poll_path", "videos/{task_id}")
             options.setdefault("mode", "async")
@@ -100,10 +103,9 @@ class HttpVideoProvider(HttpProviderBase):
             options.setdefault("status_path", "status")
             options.setdefault("result_url_path", "url")
             options.setdefault("error_path", "error.message")
-            options.setdefault("input_image_field", "image_urls")
+            options.setdefault("input_image_field", "images")
             options.setdefault("input_image_list", True)
-            options.setdefault("input_image_mode", "base64")
-            options.setdefault("input_image_data_url", True)
+            options.setdefault("input_image_mode", "public_url")
             options.setdefault("max_reference_files", 9)
             options.setdefault("min_duration_sec", 15)
             options.setdefault("max_duration_sec", 15)
@@ -181,6 +183,8 @@ class HttpVideoProvider(HttpProviderBase):
             return {"value": value, "mode": "base64"}
         if mode == "upload":
             return await self._upload_input_image(local_file, options)
+        if mode == "public_url":
+            return await self._upload_input_image_public(local_file)
         raise ProviderError(f"不支持的视频关键帧输入模式：{mode}")
 
     async def prepare_input_images(self, local_files: list[Path]) -> dict[str, Any]:
@@ -350,6 +354,39 @@ class HttpVideoProvider(HttpProviderBase):
             if not value:
                 raise ProviderError("关键帧上传响应缺少结果标识")
             return {"value": value, "mode": "upload", "raw": payload}
+
+        return await asyncio.to_thread(upload)
+
+    async def _upload_input_image_public(self, local_file: Path) -> dict[str, Any]:
+        """把本地参考图上传到 ImgBB，返回公网 HTTPS URL（天悦火山接口需要）。"""
+        if not settings.imgbb_api_key:
+            raise ProviderConfigurationError(
+                "未配置 ImgBB API Key（APP_IMGBB_API_KEY），无法生成公网参考图 URL"
+            )
+
+        def upload() -> dict[str, Any]:
+            content = compress_reference_image(local_file)
+            encoded = base64.b64encode(content).decode("ascii")
+            response = requests.post(
+                "https://api.imgbb.com/1/upload",
+                params={"key": settings.imgbb_api_key, "expiration": 600},
+                files={"image": (None, encoded)},
+                timeout=60,
+            )
+            response.raise_for_status()
+            try:
+                payload = response.json()
+            except requests.JSONDecodeError as exc:
+                raise ProviderError("ImgBB 返回的不是 JSON") from exc
+            url = extract_path(payload, "data.url")
+            if not payload.get("success") or not url:
+                detail = str(
+                    extract_path(payload, "error.message", "")
+                    or payload.get("error")
+                    or payload
+                )[:200]
+                raise ProviderError(f"ImgBB 上传失败：{detail}")
+            return {"value": str(url), "mode": "url"}
 
         return await asyncio.to_thread(upload)
 

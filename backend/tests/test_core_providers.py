@@ -14,7 +14,7 @@ import pytest
 import requests
 from PIL import Image
 
-from app.config import load_project_environment
+from app.config import load_project_environment, settings
 from app.providers.base import (
     ProviderConfigurationError,
     ProviderError,
@@ -1350,7 +1350,7 @@ def test_tianyue_video_uses_per_call_duration_and_official_video_contract(
         "aspect_ratio": "16:9",
         "video_duration": 15,
         "prompt": "让画面动起来",
-        "image_urls": [
+        "images": [
             "data:image/png;base64,AAAA",
             "data:image/png;base64,BBBB",
         ],
@@ -1388,12 +1388,54 @@ def test_tianyue_video_protocol_can_be_forced_by_provider_params() -> None:
     assert options["default_params"]["aspect_ratio"] == "16:9"
 
 
+def test_tianyue_video_prepare_input_image_uploads_to_imgbb(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "imgbb_api_key", "test-imgbb-key")
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-tianyue",
+            kind="video",
+            adapter="http_video",
+            base_url="https://api.tianyue.xyz/v1",
+            model="C-sd2-video-mini-15s",
+        )
+    )
+    source = _write_reference_png(tmp_path / "keyframe.png")
+    captured: dict[str, Any] = {}
+
+    def fake_post(url: str, **kwargs: Any) -> requests.Response:
+        captured["url"] = url
+        captured["params"] = kwargs.get("params")
+        captured["files"] = kwargs.get("files")
+        response = requests.Response()
+        response.status_code = 200
+        response._content = (
+            b'{"success":true,"status":200,'
+            b'"data":{"url":"https://i.ibb.co/abc/ref.jpg"}}'
+        )
+        return response
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    prepared = asyncio.run(provider.prepare_input_image(source))
+
+    assert prepared == {
+        "value": "https://i.ibb.co/abc/ref.jpg",
+        "mode": "url",
+    }
+    assert captured["url"] == "https://api.imgbb.com/1/upload"
+    assert captured["params"] == {"key": "test-imgbb-key", "expiration": 600}
+    assert captured["files"]["image"][0] is None
+
+
 @pytest.mark.parametrize(
     "base_url",
     [
         "https://api.x5m5x.com/v1",
         "https://us-api.x5m5x.com/v1",
         "https://cn.jbbt.cc/v1",
+        "https://api.tianyue.xyz/v1",
     ],
 )
 def test_x5m5x_jbb_image_protocol_uses_multipart_reference_defaults(base_url: str) -> None:

@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     provider_poll_interval_sec: float = Field(default=0.25, gt=0)
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
+    imgbb_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("APP_IMGBB_API_KEY", "IMGBB_API_KEY"),
+    )
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

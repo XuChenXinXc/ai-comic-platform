@@ -51,7 +51,7 @@ class HttpImageProvider(HttpProviderBase):
                     **dict(options.get("default_params", {})),
                 }
             elif self._uses_x5m5x_image_protocol(options):
-                # x5m5x / JBB 同源网关：文生图走 images/generations JSON，
+                # x5m5x / JBB / 天悦：文生图走 images/generations JSON，
                 # 图生图必须走 multipart images/edits（重复 image 字段），
                 # 不支持 reference_images(data URL) JSON 字段和 quality=high；
                 # size 只接受比例写法（如 16:9），像素尺寸会被 400 拒绝。
@@ -113,6 +113,7 @@ class HttpImageProvider(HttpProviderBase):
             "api.x5m5x.com",
             "us-api.x5m5x.com",
             "cn.jbbt.cc",
+            "api.tianyue.xyz",
         }
 
     async def submit(
