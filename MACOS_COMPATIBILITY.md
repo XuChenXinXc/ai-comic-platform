@@ -1,7 +1,7 @@
 # macOS 兼容性分析与适配方案
 
-**当前状态:** ❌ 不支持 macOS  
-**阻塞原因:** Windows DPAPI 依赖  
+**当前状态:** ✅ 支持 macOS（直接 API Key 使用 Keychain）
+**原阻塞原因:** Windows DPAPI 依赖（已于 2026-08-15 通过 keyring 解决）
 **影响范围:** API Key 加密存储功能  
 
 ---
@@ -27,6 +27,10 @@ def _windows_api() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
 - ❌ 在 Web UI 的"接口配置"页填写 API Key 会失败
 - ❌ 已有包含加密 API Key 的数据库无法在 macOS 上使用
 - ✅ 使用环境变量配置 API Key 不受影响（`api_key_env` 方式）
+
+**已于 2026-08-15 修复:** `secret_service.py` 已抽象为平台后端，
+macOS 使用 Keychain 保存直接 API Key，Windows 保持 DPAPI。
+旧的 Windows DPAPI 密文无法在 macOS 上解密，需在 Web UI 重新填写。
 
 ### 其他 Windows 特定代码
 
@@ -115,7 +119,7 @@ nano .env
 ```
 
 ```env
-# 使用环境变量配置 API Key（绕过 DPAPI）
+# 使用环境变量配置 API Key（旧兼容方式）
 TEXT_API_KEY=sk-...
 IMAGE_API_KEY=sk-...
 VIDEO_API_KEY=sk-...
@@ -130,9 +134,9 @@ APP_CORS_ORIGINS=http://127.0.0.1:3000,http://localhost:3000
 3. **创建 Provider 使用环境变量**
 
 在 Web UI 的"接口配置"页：
-- **不要填写** "API Key" 字段（会触发 DPAPI 错误）
 - 在 "API Key 环境变量" 字段填写 `TEXT_API_KEY` / `IMAGE_API_KEY` / `VIDEO_API_KEY`
-- 重启平台后生效
+- 也可以直接填写 "API Key" 字段（使用 Keychain 保存）
+- 修改环境变量后需重启平台生效
 
 4. **启动平台**
 
@@ -147,26 +151,25 @@ cd ~/Projects/ai-comic-platform/frontend
 npm run dev
 ```
 
-**限制:**
-- ❌ 无法在 Web UI 直接填写 API Key
+**限制（仅环境变量方式）:**
 - ❌ API Key 明文存储在 `.env` 文件中（安全性较低）
-- ❌ 修改 API Key 需要重启平台
+- ❌ 修改环境变量后需要重启平台
 
 **优点:**
 - ✅ 立即可用，无需修改代码
-- ✅ 完整功能可用（除了 Web UI 配置 API Key）
+- ✅ 完整功能可用（Web UI 直接填写 API Key 也已支持）
 
 ---
 
-### 方案 B: 跨平台加密适配（推荐）
+### 方案 B: 跨平台加密适配（✅ 已实现）
 
 **适用场景:** 生产环境、多用户、团队协作
 
-**设计目标:**
+**实现内容:**
 - macOS 使用 Keychain
-- Linux 使用 Secret Service API
+- Linux Secret Service API（未实现，仍走环境变量）
 - Windows 保持 DPAPI
-- 统一接口，零代码改动
+- 统一接口，业务调用方零改动
 
 **实现方案:**
 
@@ -375,12 +378,12 @@ with db.engine.begin() as conn:
 **优点:**
 - ✅ 完整功能，Web UI 可直接配置 API Key
 - ✅ 安全性高（使用系统级密钥链）
-- ✅ 跨平台统一体验
+- ✅ macOS / Windows 统一体验
 
-**工作量:**
-- 🔧 重构 `secret_service.py`（约 2-3 小时）
-- 🔧 编写迁移脚本（约 1 小时）
-- 🧪 跨平台测试（约 2 小时）
+**进度:**
+- ✅ 已重构 `secret_service.py`，macOS 使用 Keychain
+- ✅ 已补充单元测试
+- ⏳ Windows → macOS 旧密文不自动迁移，需重新填写
 
 ---
 
@@ -429,37 +432,18 @@ def decrypt_secret(ciphertext: str) -> str:
 
 ## 推荐方案总结
 
-### 立即使用（今天）
+### 当前使用（已实现）
 
-**选择方案 A: 环境变量方式**
+**直接填写 API Key（推荐）**
 
-```bash
-# 1. 安装依赖
-brew install python@3.11 ffmpeg node
+1. 在 Web UI 的"接口配置"页创建或编辑 Provider；
+2. 在 "API Key" 字段直接填写密钥；
+3. 平台使用 macOS Keychain 加密保存，重启后仍可用。
 
-# 2. 配置项目
-cd ai-comic-platform
-cp .env.example .env
-# 编辑 .env，添加 TEXT_API_KEY 等
+环境变量方式仍然兼容旧配置；修改 `.env` 中的环境变量后需要重启平台。
 
-# 3. 启动
-cd backend && source .venv/bin/activate && uvicorn app.main:app &
-cd frontend && npm run dev
-```
-
-**限制:** 
-- API Key 配置需要手动编辑 `.env` 并重启
-- 无法使用 Web UI 的"接口配置"功能
-
-### 长期使用（本周内）
-
-**选择方案 B: 跨平台加密适配**
-
-1. 安装 `keyring` 依赖
-2. 重构 `secret_service.py` 支持 macOS Keychain
-3. 编写数据库迁移脚本（如果有已存在的 Windows 数据库）
-
-**优点:** 功能完整，体验一致
+**Windows → macOS 数据库迁移：** 旧 DPAPI 密文无法在 macOS 解密，
+需要在 Web UI 重新填写 API Key。
 
 ---
 
@@ -529,15 +513,15 @@ chmod +x start-mac.sh
 
 | 功能 | 方案 A (环境变量) | 方案 B (Keychain) | 方案 C (文件加密) |
 |------|------------------|------------------|------------------|
-| 立即可用 | ✅ 是 | ❌ 需要开发 | ❌ 需要开发 |
+| 立即可用 | ✅ 是 | ✅ 已实现 | ❌ 需要开发 |
 | Web UI 配置 | ❌ 否 | ✅ 是 | ✅ 是 |
 | 安全性 | ⚠️ 明文存储 | ✅ 系统级加密 | ⚠️ 用户管理密钥 |
 | 跨平台 | ✅ 是 | ✅ 是 | ✅ 是 |
 | 迁移成本 | 低 | 中 | 低 |
 
 **建议:**
-- **快速测试/开发:** 使用方案 A
-- **生产环境/团队协作:** 投入时间实现方案 B
+- **快速测试/开发:** 使用方案 B（已实现，Web UI 直接填写）
+- **生产环境/团队协作:** 使用方案 B（已实现，Keychain 加密保存）
 - **无系统密钥链访问权限:** 考虑方案 C
 
 ---
@@ -554,5 +538,5 @@ chmod +x start-mac.sh stop-mac.sh
 
 ---
 
-**更新日期:** 2026-08-14  
-**维护者:** 请在实现方案 B 后更新此文档
+**更新日期:** 2026-08-15
+**维护者:** 方案 B 已实现（macOS Keychain）

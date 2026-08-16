@@ -919,9 +919,9 @@ def test_gpt_image_2_x5_retries_202_upstream_error_then_succeeds(
         response = requests.Response()
         if calls < 3:
             response.status_code = 202
-            response._content = json.dumps(
-                {"error": {"message": "上游服务暂时不可用"}}
-            ).encode("utf-8")
+            response._content = json.dumps({"error": {"message": "上游服务暂时不可用"}}).encode(
+                "utf-8"
+            )
         else:
             response.status_code = 200
             response._content = b'{"data":[{"url":"https://cdn.example/generated.png"}]}'
@@ -960,9 +960,7 @@ def test_gpt_image_2_x5_202_upstream_error_preserves_final_message(
     def fake_request(_method: str, _url: str, **kwargs: Any) -> requests.Response:
         response = requests.Response()
         response.status_code = 202
-        response._content = json.dumps(
-            {"error": {"message": "上游服务暂时不可用"}}
-        ).encode("utf-8")
+        response._content = json.dumps({"error": {"message": "上游服务暂时不可用"}}).encode("utf-8")
         return response
 
     monkeypatch.setattr(requests, "request", fake_request)
@@ -1412,8 +1410,7 @@ def test_tianyue_video_prepare_input_image_uploads_to_imgbb(
         response = requests.Response()
         response.status_code = 200
         response._content = (
-            b'{"success":true,"status":200,'
-            b'"data":{"url":"https://i.ibb.co/abc/ref.jpg"}}'
+            b'{"success":true,"status":200,"data":{"url":"https://i.ibb.co/abc/ref.jpg"}}'
         )
         return response
 
@@ -1465,13 +1462,16 @@ def test_x5m5x_jbb_image_protocol_uses_multipart_reference_defaults(base_url: st
         "doubao-seedance-2.0",
         "doubao-seedance-2.0-fast",
         "doubao-seedance-2.0-mini",
+        "seedance-2.0",
+        "seedance-2.0-fast",
+        "seedance-2.0-mini",
     ],
 )
-def test_doubao_video_models_pass_storyboard_duration_verbatim(
+def test_seedance_video_models_pass_storyboard_duration_verbatim(
     model: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """doubao 系列：LLM 分镜填多少秒就传多少秒（4~15 秒整数），不取整不抬升。"""
+    """seedance / doubao-seedance 系列：分镜填多少秒就传多少秒（4~15 秒整数）。"""
     provider = HttpVideoProvider(
         ProviderConfig(
             id="video-doubao",

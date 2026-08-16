@@ -63,8 +63,11 @@ class HttpVideoProvider(HttpProviderBase):
             "doubao-seedance-2.0",
             "doubao-seedance-2.0-fast",
             "doubao-seedance-2.0-mini",
+            "seedance-2.0",
+            "seedance-2.0-fast",
+            "seedance-2.0-mini",
         }:
-            # doubao-seedance-2.0 系列：分镜填多少秒就传多少秒（4~15 秒整数），
+            # seedance / doubao-seedance 系列：分镜填多少秒就传多少秒（4~15 秒整数），
             # 不做向上取整或最低时长抬升；生成音频默认开启。
             options.setdefault("retry_unsafe_methods", False)
             options.setdefault("poll_path", "tasks/{task_id}")
@@ -381,9 +384,7 @@ class HttpVideoProvider(HttpProviderBase):
             url = extract_path(payload, "data.url")
             if not payload.get("success") or not url:
                 detail = str(
-                    extract_path(payload, "error.message", "")
-                    or payload.get("error")
-                    or payload
+                    extract_path(payload, "error.message", "") or payload.get("error") or payload
                 )[:200]
                 raise ProviderError(f"ImgBB 上传失败：{detail}")
             return {"value": str(url), "mode": "url"}

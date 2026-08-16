@@ -428,7 +428,7 @@ class ProviderService:
                 runtime["api_key"] = decrypt_secret(str(ciphertext))
             except SecretServiceError as exc:
                 raise bad_request(
-                    "Provider API Key 解密失败，请使用保存该配置的 Windows 用户运行平台"
+                    "Provider API Key 解密失败，请在当前平台重新填写 API Key"
                 ) from exc
         else:
             runtime["api_key"] = ""
