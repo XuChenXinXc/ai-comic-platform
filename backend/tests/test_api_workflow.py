@@ -393,11 +393,11 @@ def test_shot_split_copy_merge_and_reorder_preserve_contiguous_numbers(
     chapter = _create_chapter(api_client, project["id"])
     first = api_client.post(
         f"/api/chapters/{chapter['id']}/shots",
-        json={"action": "主角走入房间，然后停下观察。", "duration_sec": 4},
+        json={"action": "主角走入房间，然后停下观察。", "duration_sec": 5},
     ).json()
     second = api_client.post(
         f"/api/chapters/{chapter['id']}/shots",
-        json={"action": "主角拿起戒指。", "duration_sec": 3},
+        json={"action": "主角拿起戒指。", "duration_sec": 10},
     ).json()
     reordered = api_client.post(
         f"/api/chapters/{chapter['id']}/shots/reorder",
@@ -428,7 +428,7 @@ def test_shot_split_clears_prompt_overrides(api_client: TestClient) -> None:
         f"/api/chapters/{chapter['id']}/shots",
         json={
             "action": "主角走入房间，然后停下观察。",
-            "duration_sec": 4,
+            "duration_sec": 10,
             "image_prompt_override": "旧的最终关键帧提示词",
             "video_prompt_override": "旧的最终视频提示词",
         },
@@ -448,14 +448,14 @@ def test_shot_merge_clears_prompt_overrides(api_client: TestClient) -> None:
         f"/api/chapters/{chapter['id']}/shots",
         json={
             "action": "主角走入房间。",
-            "duration_sec": 2,
+            "duration_sec": 5,
             "image_prompt_override": "旧的最终关键帧提示词",
             "video_prompt_override": "旧的最终视频提示词",
         },
     ).json()
     source = api_client.post(
         f"/api/chapters/{chapter['id']}/shots",
-        json={"action": "主角停下观察。", "duration_sec": 2},
+        json={"action": "主角停下观察。", "duration_sec": 5},
     ).json()
 
     response = api_client.post(
@@ -483,14 +483,19 @@ def test_shot_create_requires_duration_and_forces_screenplay_source(
         json={
             "source_type": "novel",
             "action": "主角进入房间。",
-            "duration_sec": 3,
+            "duration_sec": 5,
         },
+    )
+    too_short = api_client.post(
+        f"/api/chapters/{chapter['id']}/shots",
+        json={"action": "主角停在门口。", "duration_sec": 4},
     )
 
     assert missing_duration.status_code == 422
+    assert too_short.status_code == 422
     assert created.status_code == 201
     assert created.json()["source_type"] == "screenplay"
-    assert created.json()["duration_sec"] == 3
+    assert created.json()["duration_sec"] == 5
 
 
 def test_shot_create_with_legacy_nested_fields_normalizes_aliases(
@@ -502,7 +507,7 @@ def test_shot_create_with_legacy_nested_fields_normalizes_aliases(
     created = api_client.post(
         f"/api/chapters/{chapter['id']}/shots",
         json={
-            "duration_sec": 3,
+            "duration_sec": 5,
             "positions": [
                 {
                     "character_id": "char-1",
@@ -548,7 +553,7 @@ def test_shot_update_with_legacy_nested_fields_updates_duration(
     chapter = _create_chapter(api_client, project["id"])
     created = api_client.post(
         f"/api/chapters/{chapter['id']}/shots",
-        json={"duration_sec": 3},
+        json={"duration_sec": 5},
     )
     assert created.status_code == 201
 
@@ -564,6 +569,45 @@ def test_shot_update_with_legacy_nested_fields_updates_duration(
 
     assert updated.status_code == 200
     assert updated.json()["duration_sec"] == 5
+
+
+def test_shot_update_rejects_duration_below_five(api_client: TestClient) -> None:
+    project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
+    created = api_client.post(
+        f"/api/chapters/{chapter['id']}/shots",
+        json={"action": "主角进入房间。", "duration_sec": 5},
+    )
+    assert created.status_code == 201
+
+    response = api_client.put(
+        f"/api/shots/{created.json()['id']}",
+        json={"duration_sec": 4},
+    )
+
+    assert response.status_code == 422
+
+
+def test_shot_split_rejects_duration_below_five(api_client: TestClient) -> None:
+    project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
+    created = api_client.post(
+        f"/api/chapters/{chapter['id']}/shots",
+        json={"action": "主角进入房间。", "duration_sec": 10},
+    )
+    assert created.status_code == 201
+
+    response = api_client.post(
+        f"/api/shots/{created.json()['id']}/split",
+        json={
+            "parts": [
+                {"action": "主角迈步。", "duration_sec": 4},
+                {"action": "主角停下。", "duration_sec": 6},
+            ]
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_video_batch_keeps_valid_item_when_another_shot_lacks_keyframe(
@@ -616,7 +660,7 @@ def test_keyframe_without_image_prompt_returns_400_even_with_frame_description(
         json={
             "action": "主角推开房门。",
             "frame_description": "主角站在旧屋门口，右手按住木门。",
-            "duration_sec": 3,
+            "duration_sec": 5,
         },
     )
     assert created.status_code == 201
@@ -638,7 +682,7 @@ def test_keyframe_without_visual_description_returns_400(
     chapter = _create_chapter(api_client, project["id"])
     created = api_client.post(
         f"/api/chapters/{chapter['id']}/shots",
-        json={"action": "主角推开房门。", "duration_sec": 3},
+        json={"action": "主角推开房门。", "duration_sec": 5},
     )
     assert created.status_code == 201
 
@@ -663,7 +707,7 @@ def test_video_without_video_prompt_returns_400_even_with_shot_action(
             "action": "主角推开房门并向屋内迈出一步。",
             "end_state": "主角进入旧屋。",
             "camera_move": "缓慢跟随",
-            "duration_sec": 4,
+            "duration_sec": 5,
         },
     )
     assert created.status_code == 201
@@ -690,7 +734,7 @@ def test_video_without_action_description_returns_400(
     chapter = _create_chapter(api_client, project["id"])
     created = api_client.post(
         f"/api/chapters/{chapter['id']}/shots",
-        json={"frame_description": "主角站在旧屋门口。", "duration_sec": 3},
+        json={"frame_description": "主角站在旧屋门口。", "duration_sec": 5},
     )
     assert created.status_code == 201
     current_shot = created.json()

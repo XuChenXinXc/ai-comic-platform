@@ -107,6 +107,14 @@ def test_shot_extraction_prompt_keeps_generic_items_out_of_asset_bindings() -> N
     assert "不得写入 `prop_names` 或 `prop_asset_ids`" in prompt
 
 
+def test_shot_extraction_prompt_requires_verbatim_screenplay_facts_and_dialogue() -> None:
+    prompt = load_prompt("shot_extract")
+
+    assert "逐字复制" in prompt
+    assert "不得改写、删减、补写" in prompt
+    assert "不得新增或改变剧情事实" in prompt
+
+
 def _shot_context_with_positions_and_expressions() -> dict[str, object]:
     return shot_template_context(
         {

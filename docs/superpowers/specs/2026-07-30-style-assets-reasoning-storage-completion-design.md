@@ -6,7 +6,7 @@
 
 1. 使用用户提供的完整系统提示词和用户提示词，将自动画风压缩到 18 至 32 个字符。
 2. 素材提取只保留影响剧情或多次出场的关键角色；律师、前台、助理等临时角色不创建素材，也不阻塞分镜提取。
-3. 所有 OpenAI-compatible 文字模型请求统一使用 `reasoning_effort: high`。
+3. 所有 OpenAI-compatible 文字模型请求统一使用 `reasoning_effort: xhigh`。
 4. 完成平台项目存储目录设置，使设置可加载、可选择，并立即影响之后新建的项目；已有项目路径保持不变。
 
 ## 已确认根因
@@ -56,12 +56,12 @@ OpenAI-compatible 文字 Provider 直接合并配置参数与调用参数，没�
 
 场景和重要物品仍保持现有绑定校验。角色请求提供未知素材 ID，或提供的角色 ID 与名称不一致时仍返回错误，避免把关键角色错误绑定到其他素材。
 
-### 3. 文字模型统一使用 high 推理强度
+### 3. 文字模型统一使用 xhigh 推理强度
 
 在 `OpenAICompatibleTextProvider._complete()` 的请求载荷层统一设置：
 
 ```json
-{"reasoning_effort": "high"}
+{"reasoning_effort": "xhigh"}
 ```
 
 该值在 Provider 配置和单次调用参数合并后写入，因此调用方不能降级覆盖。首次结构化输出和校验失败后的修复调用都会经过同一入口。Mock Provider 不发送 HTTP 请求，无需模拟该参数；图片和视频 Provider 不受影响。
@@ -114,7 +114,7 @@ OpenAI-compatible 文字 Provider 直接合并配置参数与调用参数，没�
 - 断言剧本包含律师、前台和助理等临时角色时，素材提取仍只调用一次并只保存模型识别出的关键角色。
 - 断言同一分镜包含关键角色和临时角色时成功保存，只将已有关键角色写入 `character_ids`。
 - 断言场景、重要物品、未知角色素材 ID 及角色 ID/名称不一致仍会阻止错误绑定。
-- 断言所有 OpenAI-compatible 文字请求及修复请求载荷都包含 `reasoning_effort: high`，调用参数不能覆盖。
+- 断言所有 OpenAI-compatible 文字请求及修复请求载荷都包含 `reasoning_effort: xhigh`，调用参数不能覆盖。
 - 断言主应用平台设置 GET/POST 路由可访问。
 - 运行并通过现有 `test_project_storage_settings.py`、`test_project_storage_paths.py` 以及动态媒体路由相关测试。
 

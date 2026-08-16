@@ -200,7 +200,7 @@ class JobService:
                 update(media_table)
                 .where(
                     media_table.c.id == target_id,
-                    media_table.c.status == "queued",
+                    media_table.c.status.in_(NON_TERMINAL_STATUSES),
                 )
                 .values(status="failed", error=_CANCELLED_TARGET_ERROR)
             )

@@ -925,6 +925,12 @@ function CustomShotsInner() {
       Boolean(draft.videoPrompt.trim()) &&
       slotShot(index)?.current_keyframe?.status === "completed",
   ).length;
+  const hasInvalidFilledDuration = slotDrafts.some(
+    (draft) =>
+      (draft.imagePrompt.trim() || draft.videoPrompt.trim()) &&
+      !tianyueFixedVideo &&
+      draft.duration < 5,
+  );
 
   if (workspaceError) {
     return (
@@ -1197,7 +1203,7 @@ function CustomShotsInner() {
                 mediaBatchMutation.isPending &&
                 mediaBatchMutation.variables === "keyframe"
               }
-              disabled={filledImageSlots === 0}
+              disabled={filledImageSlots === 0 || hasInvalidFilledDuration}
               onClick={() => mediaBatchMutation.mutate("keyframe")}
             >
               一键生成分镜图
@@ -1207,7 +1213,7 @@ function CustomShotsInner() {
                 mediaBatchMutation.isPending &&
                 mediaBatchMutation.variables === "video"
               }
-              disabled={filledVideoSlots === 0}
+              disabled={filledVideoSlots === 0 || hasInvalidFilledDuration}
               onClick={() => mediaBatchMutation.mutate("video")}
             >
               一键生成分镜视频
@@ -1223,6 +1229,7 @@ function CustomShotsInner() {
             const keyframeRunning = RUNNING.has(keyframe?.status ?? "");
             const videoRunning = RUNNING.has(video?.status ?? "");
             const keyframeReady = keyframe?.status === "completed";
+            const durationValid = tianyueFixedVideo || draft.duration >= 5;
             const slotBoundAssets = assets.filter((asset) =>
               [draft.sceneAssetId, ...draft.characterIds, ...draft.propIds].includes(
                 asset.id,
@@ -1255,6 +1262,7 @@ function CustomShotsInner() {
                     <Button
                       size="sm"
                       busy={savingSlotIndex === index}
+                      disabled={!durationValid}
                       onClick={() => void saveSlot(index)}
                     >
                       保存
@@ -1262,7 +1270,9 @@ function CustomShotsInner() {
                     <Button
                       variant="primary"
                       size="sm"
-                      disabled={!draft.imagePrompt.trim() || keyframeRunning}
+                      disabled={
+                        !durationValid || !draft.imagePrompt.trim() || keyframeRunning
+                      }
                       onClick={() => void generateSlotMedia(index, "keyframe")}
                     >
                       生成分镜图
@@ -1270,6 +1280,7 @@ function CustomShotsInner() {
                     <Button
                       size="sm"
                       disabled={
+                        !durationValid ||
                         !draft.videoPrompt.trim() ||
                         !keyframeReady ||
                         videoRunning
@@ -1345,7 +1356,7 @@ function CustomShotsInner() {
                           <Input
                             id={`slot-${index}-duration`}
                             type="number"
-                            min={1}
+                            min={5}
                             step={1}
                             value={draft.duration}
                             onChange={(event) =>

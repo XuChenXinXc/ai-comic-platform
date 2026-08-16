@@ -358,7 +358,7 @@ export function JobsPage() {
                       重试
                     </Button>
                   ) : null}
-                  {job.status === "queued" ? (
+                  {isJobActive(job.status) ? (
                     <Button
                       size="sm"
                       variant="ghost"

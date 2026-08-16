@@ -358,6 +358,29 @@ def test_mock_shot_extraction_with_catalog_aliases_uses_alias_matches() -> None:
     assert output.shots[0].character_asset_ids == ["character-main"]
 
 
+def test_mock_shot_extraction_copies_screenplay_dialogue_verbatim() -> None:
+    provider = provider_registry.get(_config("text", "mock"))
+    dialogue = [{"speaker": "小明", "text": "我已经决定下山。"}]
+    source = {
+        "title": "测试剧本",
+        "logline": "主角做出决定。",
+        "scene": {"dialogue": dialogue},
+    }
+
+    output = asyncio.run(
+        provider.generate_json(
+            system_prompt="提取分镜",
+            user_prompt=(
+                f"当前项目可用素材目录：\n[]\n来源内容：\n{json.dumps(source, ensure_ascii=False)}"
+            ),
+            schema=ShotExtractionOutput,
+            params={},
+        )
+    )
+
+    assert [item.model_dump(mode="json") for item in output.shots[0].dialogue] == dialogue
+
+
 def test_mock_image_submit_and_download_returns_decodable_png(tmp_path: Path) -> None:
     provider = MockImageProvider(_config("image", "mock"))
     submission = asyncio.run(
@@ -481,7 +504,7 @@ def test_openai_compatible_with_invalid_first_response_repairs_once(
     assert responses == []
 
 
-def test_openai_compatible_text_request_forces_high_reasoning_after_param_merge(
+def test_openai_compatible_text_request_forces_xhigh_reasoning_after_param_merge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = OpenAICompatibleTextProvider(
@@ -525,10 +548,10 @@ def test_openai_compatible_text_request_forces_high_reasoning_after_param_merge(
         )
     )
 
-    assert [payload["reasoning_effort"] for payload in payloads] == ["high"]
+    assert [payload["reasoning_effort"] for payload in payloads] == ["xhigh"]
 
 
-def test_openai_compatible_text_repair_request_keeps_high_reasoning(
+def test_openai_compatible_text_repair_request_keeps_xhigh_reasoning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = OpenAICompatibleTextProvider(
@@ -575,7 +598,7 @@ def test_openai_compatible_text_repair_request_keeps_high_reasoning(
         )
     )
 
-    assert [payload["reasoning_effort"] for payload in payloads] == ["high", "high"]
+    assert [payload["reasoning_effort"] for payload in payloads] == ["xhigh", "xhigh"]
 
 
 def test_openai_compatible_plain_text_schema_keeps_prompts_plain_and_parses_sentence(
@@ -615,7 +638,7 @@ def test_openai_compatible_plain_text_schema_keeps_prompts_plain_and_parses_sent
                 {"role": "system", "content": "完整系统提示词"},
                 {"role": "user", "content": "完整用户提示词\n\n小说正文"},
             ],
-            "reasoning_effort": "high",
+            "reasoning_effort": "xhigh",
         }
     ]
 

@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import update
 
 from app.db import Database
+from app.models.tables import screenplay
 from app.services.asset_service import AssetService
 from app.services.chapter_service import ChapterService
 from app.services.errors import ServiceError
@@ -75,7 +77,7 @@ def _extracted_shot(scene_asset_id: str) -> dict[str, Any]:
         "shot_type": "中景",
         "camera_angle": "平视",
         "camera_move": "固定",
-        "duration_sec": 3,
+        "duration_sec": 5,
         "end_state": "少年面向下山方向。",
         "next_hook": "准备迈步。",
         "frame_description": "少年站在山巅。",
@@ -187,7 +189,7 @@ def test_extract_shots_with_catalog_asset_id_binds_scene(
     assert "青云山巅" in captured["user_prompt"]
     assert shots[0]["scene_asset_id"] == scene["id"]
     assert shots[0]["source_type"] == "screenplay"
-    assert shots[0]["duration_sec"] == 3
+    assert shots[0]["duration_sec"] == 5
 
 
 def test_extract_shots_chunks_by_scene_when_screenplay_has_multiple_scenes(
@@ -247,6 +249,124 @@ def test_extract_shots_chunks_by_scene_when_screenplay_has_multiple_scenes(
     assert len(shots) == 2
     assert {item["scene_no"] for item in shots} == {1, 2}
     assert result["count"] == 2
+
+
+def test_extract_shots_preserves_screenplay_dialogue_verbatim_and_in_order(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, service, _jobs, chapter = storyboard_services
+    scene = AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "scene", "name": "青云山巅"},
+    )
+    content = _screenplay_content()
+    content["scenes"][0]["dialogue"] = [
+        {"speaker": "少年", "text": "我已经决定下山。"},
+        {"speaker": "师父", "text": "你想清楚了吗？"},
+        {"speaker": "少年", "text": "我已经想清楚了。"},
+    ]
+    WritingService(database).update_screenplay(chapter["id"], {"content": content})
+    first = _extracted_shot(scene["id"])
+    first["dialogue"] = [{"speaker": "少年", "text": "我决定下山。"}]
+    second = _extracted_shot(scene["id"])
+    second["shot_no"] = 2
+    second["dialogue"] = [{"speaker": "师父", "text": "想清楚了吗？"}]
+
+    class IncompleteDialogueProvider:
+        async def generate_json(self, **_values: Any) -> ExtractionOutput:
+            return ExtractionOutput([first, second])
+
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_kwargs: (
+            IncompleteDialogueProvider(),
+            {"id": "mock-text", "params": {}},
+        ),
+    )
+    job = {
+        "project_id": chapter["project_id"],
+        "chapter_id": chapter["id"],
+        "provider_id": "mock-text",
+        "input_json": json_dumps(
+            {
+                "source_type": "screenplay",
+                "scope": "all",
+                "scene_no": None,
+                "params": {},
+            }
+        ),
+    }
+
+    asyncio.run(service.handle_extract(job))
+
+    saved = service.list(chapter["id"])
+    assert [line for item in saved for line in item["dialogue"]] == content["scenes"][0]["dialogue"]
+
+
+def test_extract_shots_rejects_when_model_drops_all_screenplay_dialogue() -> None:
+    source_scene = {"dialogue": [{"speaker": "少年", "text": "我已经决定下山。"}]}
+
+    with pytest.raises(ServiceError, match="未返回本场对白"):
+        ShotService._synchronize_dialogue_with_source(
+            source_scene,
+            [_extracted_shot("scene-1")],
+        )
+
+
+def test_extract_shots_legacy_screenplay_restores_structured_dialogue(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, service, _jobs, chapter = storyboard_services
+    scene = AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "scene", "name": "青云山巅"},
+    )
+    legacy_content = {
+        "title": "旧格式",
+        "action": "少年转身。",
+        "dialogue": [{"speaker": "少年", "text": "我已经决定下山。"}],
+    }
+    with database.engine.begin() as connection:
+        connection.execute(
+            update(screenplay)
+            .where(screenplay.c.chapter_id == chapter["id"])
+            .values(content_json=json_dumps(legacy_content))
+        )
+    extracted = _extracted_shot(scene["id"])
+    extracted["dialogue"] = [{"speaker": "少年", "text": "我决定下山。"}]
+
+    class LegacyProvider:
+        async def generate_json(self, **_values: Any) -> ExtractionOutput:
+            return ExtractionOutput([extracted])
+
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_kwargs: (
+            LegacyProvider(),
+            {"id": "mock-text", "params": {}},
+        ),
+    )
+    job = {
+        "project_id": chapter["project_id"],
+        "chapter_id": chapter["id"],
+        "provider_id": "mock-text",
+        "input_json": json_dumps(
+            {
+                "source_type": "screenplay",
+                "scope": "all",
+                "scene_no": None,
+                "params": {},
+            }
+        ),
+    }
+
+    asyncio.run(service.handle_extract(job))
+
+    assert service.list(chapter["id"])[0]["dialogue"] == legacy_content["dialogue"]
 
 
 def test_extract_shots_with_names_and_aliases_bind_assets(

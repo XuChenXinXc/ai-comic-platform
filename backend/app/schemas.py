@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+MIN_SHOT_DURATION_SEC = 5
 
 
 def _has_content(value: Any) -> bool:
@@ -479,7 +480,7 @@ class ShotOutput(OutputModel):
     shot_type: str
     camera_angle: str
     camera_move: str
-    duration_sec: int = Field(gt=0)
+    duration_sec: int = Field(ge=MIN_SHOT_DURATION_SEC)
     end_state: str
     next_hook: str
     frame_description: str
@@ -827,7 +828,7 @@ class ShotContinuityTransition(OutputModel):
     action: NonEmptyText
     start_state: NonEmptyText
     end_state: NonEmptyText
-    duration_sec: int = Field(default=3, gt=0, le=4)
+    duration_sec: int = Field(default=MIN_SHOT_DURATION_SEC, ge=MIN_SHOT_DURATION_SEC)
 
 
 class ShotContinuityPairOutput(OutputModel):
@@ -864,7 +865,7 @@ class BatchRefinedPromptsOutput(OutputModel):
 class ShotQualityFixOutput(OutputModel):
     """单镜质量修复结果：只返回被修改的字段，未修改的字段应缺省。"""
 
-    duration_sec: int | None = Field(default=None, gt=0, le=12)
+    duration_sec: int | None = Field(default=None, ge=MIN_SHOT_DURATION_SEC, le=12)
     end_state: str | None = None
     video_prompt: str | None = None
     dialogue: list[ScreenplayDialogue] | None = None
