@@ -13,7 +13,7 @@ from sqlalchemy import insert
 
 from app.db import Database, utc_now
 from app.jobs.recovery import recover_jobs
-from app.jobs.repository import JobRepository, JobStateError
+from app.jobs.repository import JobRepository
 from app.jobs.runner import JobRunner
 from app.models.tables import project
 from app.schemas import JobCreate, ProviderPollResult
@@ -296,13 +296,15 @@ def test_two_runners_with_same_waiting_job_executes_handler_once(tmp_path: Path)
     assert call_count == 1
 
 
-def test_job_cancel_after_started_rejects_transition(tmp_path: Path) -> None:
+@pytest.mark.parametrize("status", ["queued", "running", "waiting_provider", "downloading"])
+def test_cancel_non_terminal_job_returns_cancelled(tmp_path: Path, status: str) -> None:
     database, repository = _repository(tmp_path)
     record = _create(repository)
-    repository.update(record["id"], status="running")
+    repository.update(record["id"], status=status)
 
-    with pytest.raises(JobStateError):
-        repository.cancel(record["id"])
+    cancelled = repository.cancel(record["id"])
+
+    assert cancelled["status"] == "cancelled"
     database.dispose()
 
 

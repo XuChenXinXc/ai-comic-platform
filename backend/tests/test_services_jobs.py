@@ -22,7 +22,7 @@ from app.models.tables import (
     screenplay,
     video_version,
 )
-from app.schemas import ProviderSubmission
+from app.schemas import ProviderSubmission, ShotQualityFixOutput
 from app.services.asset_service import AssetService
 from app.services.chapter_service import ChapterService
 from app.services.constants import MAX_IMAGE_SIZE, MAX_VIDEO_SIZE
@@ -1102,7 +1102,7 @@ def test_grok_video_queue_rounds_fractional_duration_up_consistently(
             scene_asset_id=media_job_services["scene"]["id"],
             action="主角转身",
             video_prompt="主角缓慢转身并停稳。",
-            duration_sec=2.5,
+            duration_sec=5.5,
         ).model_dump(),
     )
     media.upload_keyframe(
@@ -3133,3 +3133,69 @@ def test_media_poll_aborts_when_job_is_cancelled(
 
     with pytest.raises(JobCancelledError, match="任务已取消"):
         media._raise_if_job_cancelled(record["id"])
+
+
+def test_quality_fix_does_not_write_after_job_is_cancelled(
+    job_service: JobService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shot_service = ShotService.__new__(ShotService)
+    shot_service.jobs = job_service
+    current = {
+        "id": "shot-1",
+        "revision": 1,
+        "shot_no": 1,
+        "duration_sec": 6,
+        "action": "主角站起",
+        "start_state": "主角坐着",
+        "end_state": "主角站起",
+        "video_prompt": "主角保持坐姿",
+        "video_prompt_override": "",
+        "dialogue": [],
+    }
+    updates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    class CancellingProvider:
+        async def generate_json(self, **_kwargs: Any) -> ShotQualityFixOutput:
+            job_service.repository.update(
+                record["id"],
+                status="cancelled",
+                message="任务已取消",
+                finished_at=utc_now(),
+            )
+            return ShotQualityFixOutput(
+                video_prompt="修复后的提示词",
+                changed_fields=["video_prompt"],
+                reason="测试结果",
+            )
+
+    class FakeProviders:
+        def resolve(self, **_kwargs: Any) -> tuple[CancellingProvider, dict[str, Any]]:
+            return CancellingProvider(), {"params": {}}
+
+    monkeypatch.setattr(
+        shot_service,
+        "_project",
+        lambda _project_id: {"default_text_provider_id": "mock-text"},
+    )
+    monkeypatch.setattr(shot_service, "get", lambda _shot_id: current)
+    monkeypatch.setattr(shot_service, "_shot_quality_warnings", lambda _current: ["需要修复"])
+    monkeypatch.setattr(
+        shot_service,
+        "update",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+    shot_service.providers = FakeProviders()
+    record = job_service.repository.create_job(
+        project_id=job_service.project_id,  # type: ignore[attr-defined]
+        job_type="fix_shot_quality",
+        target_type="project",
+        target_id=job_service.project_id,  # type: ignore[attr-defined]
+        provider_kind="text",
+        input_data={"ids": ["shot-1"], "params": {}},
+    )
+    job_service.repository.update(record["id"], status="running")
+
+    asyncio.run(shot_service.handle_quality_fix(record))
+
+    assert updates == []

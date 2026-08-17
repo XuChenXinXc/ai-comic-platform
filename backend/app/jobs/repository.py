@@ -480,7 +480,7 @@ class JobRepository:
         now = utc_now()
         result = connection.execute(
             update(job)
-            .where(job.c.id == job_id, job.c.status == "queued")
+            .where(job.c.id == job_id, job.c.status.in_(NON_TERMINAL_STATUSES))
             .values(
                 status="cancelled",
                 message="任务已取消",
@@ -492,7 +492,7 @@ class JobRepository:
         if result.rowcount != 1:
             if current is None:
                 raise JobNotFoundError(f"任务不存在：{job_id}")
-            raise JobStateError("只有排队中的任务可以取消")
+            raise JobStateError("只有未完成的任务可以取消")
         if current is None:
             raise JobNotFoundError(f"任务不存在：{job_id}")
         return current

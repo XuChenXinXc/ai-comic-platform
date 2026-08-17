@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -33,6 +33,24 @@ StageStatus = WorkflowStatus
 SourceKind = Literal["full_text", "synopsis"]
 DeliverySubstage = Literal["image", "keyframe", "video", "audio", "subtitle", "composition"]
 DiagnosticLevel = Literal["warning", "blocking"]
+
+# Phase 2 阶段产物使用的稳定枚举和数值类型。
+Importance = Literal["core", "supporting", "ensemble"]
+ShootabilityStatus = Literal["shootable", "needs_adaptation", "unshootable"]
+ConflictTurnKind = Literal["conflict", "turn", "payoff"]
+RhythmBeatType = Literal[
+    "hook",
+    "setup",
+    "escalation",
+    "conflict",
+    "turn",
+    "payoff",
+    "breath",
+    "foreshadowing",
+    "transition",
+    "cliffhanger",
+]
+DynamicLevel = Annotated[float, Field(ge=0, le=1)]
 
 
 class PipelineModel(BaseModel):
@@ -217,3 +235,208 @@ class StageActionRequest(PipelineModel):
 class WorkflowRunActionRead(PipelineModel):
     run: WorkflowRunRead
     stages: list[WorkflowStageRead] = Field(default_factory=list)
+
+
+class ArtifactMeta(PipelineModel):
+    schema_version: str = Field(min_length=1)
+    normalizer_version: str = Field(min_length=1)
+    input_signature: str = Field(min_length=1)
+    content_signature: str = Field(min_length=1)
+    source_attempt: int = Field(default=1, ge=1)
+    provider_id: str | None = Field(default=None, min_length=1)
+    provider_model: str | None = Field(default=None, min_length=1)
+    generated_at: str | None = Field(default=None, min_length=1)
+    edited_at: str | None = Field(default=None, min_length=1)
+
+
+class SourceMetadata(PipelineModel):
+    source_kind: SourceKind
+    title: str = Field(min_length=1)
+    chapter_title: str = Field(min_length=1)
+    source_signature: str = Field(min_length=1)
+    target_duration_sec: float = Field(gt=0)
+    aspect_ratio: str = Field(min_length=1)
+
+
+class SourceCharacterRef(PipelineModel):
+    character_key: str = Field(min_length=1)
+    canonical_name: str = Field(min_length=1)
+    aliases: list[str] = Field(default_factory=list)
+    importance: Importance
+    story_function: str = Field(min_length=1)
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class SourceSceneShootability(PipelineModel):
+    status: ShootabilityStatus
+    visible_action: str = Field(min_length=1)
+    required_asset_keys: list[str] = Field(default_factory=list)
+    production_risks: list[str] = Field(default_factory=list)
+    adaptation_note: str | None = Field(default=None, min_length=1)
+
+
+class SourceScene(PipelineModel):
+    scene_id: str = Field(min_length=1)
+    ordinal: int = Field(ge=1)
+    location: str = Field(min_length=1)
+    time_weather: str = Field(min_length=1)
+    characters: list[SourceCharacterRef] = Field(default_factory=list)
+    narrative_task: str = Field(min_length=1)
+    plot_event: str = Field(min_length=1)
+    conflict_or_turn: str = Field(min_length=1)
+    visual_focus: str = Field(min_length=1)
+    estimated_duration_sec: float = Field(ge=0)
+    shootability: SourceSceneShootability
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class ConflictTurn(PipelineModel):
+    kind: ConflictTurnKind
+    summary: str = Field(min_length=1)
+    scene_id: str | None = Field(default=None, min_length=1)
+    participants: list[str] = Field(default_factory=list)
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class SourceAnalysisOutput(PipelineModel):
+    artifact_meta: ArtifactMeta
+    metadata: SourceMetadata
+    episode_logline: str = Field(min_length=1)
+    scenes: list[SourceScene] = Field(default_factory=list)
+    character_roster: list[SourceCharacterRef] = Field(default_factory=list)
+    conflict_turns: list[ConflictTurn] = Field(default_factory=list)
+    visualizable_content: list[str] = Field(default_factory=list)
+    hard_to_visualize: list[str] = Field(default_factory=list)
+    rewrite_requirements: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    continuation_outline: list[str] = Field(default_factory=list)
+
+
+class CharacterBasicInfo(PipelineModel):
+    character_key: str = Field(min_length=1)
+    canonical_name: str = Field(min_length=1)
+    aliases: list[str] = Field(default_factory=list)
+    importance: Importance
+    identity: str = ""
+    age: str = ""
+    gender: str = ""
+
+
+class CharacterVisualAnchor(PipelineModel):
+    visual_facts: list[str] = Field(default_factory=list)
+    face: str = Field(min_length=1)
+    hair: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+    costume: str = Field(min_length=1)
+    accessories: list[str] = Field(default_factory=list)
+    immutable_features: list[str] = Field(default_factory=list)
+    forbidden_changes: list[str] = Field(default_factory=list)
+    makeup_keyword_string: str = Field(min_length=1)
+    variants: list[str] = Field(default_factory=list)
+    current_variant: str | None = Field(default=None, min_length=1)
+    approved_reference_ids: list[str] = Field(default_factory=list)
+
+
+class CharacterBio(PipelineModel):
+    basic_info: CharacterBasicInfo
+    background: str = Field(min_length=1)
+    personality_behavior_logic: str = Field(min_length=1)
+    dynamic_comic_setting: str = Field(min_length=1)
+    plot_relation: str = Field(min_length=1)
+    visual_anchor: CharacterVisualAnchor
+
+
+class EnsembleAnchor(PipelineModel):
+    ensemble_key: str = Field(min_length=1)
+    canonical_name: str = Field(min_length=1)
+    visual_facts: list[str] = Field(default_factory=list)
+    usage_notes: str = ""
+
+
+class CharacterBiosOutput(PipelineModel):
+    artifact_meta: ArtifactMeta
+    characters: list[CharacterBio] = Field(default_factory=list)
+    ensemble_anchors: list[EnsembleAnchor] = Field(default_factory=list)
+    unresolved_character_refs: list[str] = Field(default_factory=list)
+
+
+class RhythmSegment(PipelineModel):
+    segment_id: str = Field(min_length=1)
+    ordinal: int = Field(ge=1)
+    start_sec: float = Field(ge=0)
+    end_sec: float = Field(gt=0)
+    beat_type: RhythmBeatType
+    narrative_task: str = Field(min_length=1)
+    event_summary: str = Field(min_length=1)
+    visual_action: str = Field(min_length=1)
+    focus_characters: list[str] = Field(default_factory=list)
+    dynamic_level: DynamicLevel
+    strong_dynamic_event_id: str | None = Field(default=None, min_length=1)
+    source_refs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> RhythmSegment:
+        if self.end_sec <= self.start_sec:
+            raise ValueError("end_sec 必须大于 start_sec")
+        return self
+
+
+class StrongDynamicEvent(PipelineModel):
+    event_id: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    segment_id: str | None = Field(default=None, min_length=1)
+    dynamic_level: DynamicLevel = 1.0
+    visual_action: str = ""
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class StrongDynamicBudget(PipelineModel):
+    max_events: int = Field(default=0, ge=0)
+    event_ids: list[str] = Field(default_factory=list)
+    events: list[StrongDynamicEvent] = Field(default_factory=list)
+
+
+class DialogueSuggestion(PipelineModel):
+    segment_id: str | None = Field(default=None, min_length=1)
+    speaker: str = ""
+    text: str = Field(min_length=1)
+    purpose: str = ""
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class SoundSuggestion(PipelineModel):
+    segment_id: str | None = Field(default=None, min_length=1)
+    kind: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    intensity: DynamicLevel | None = None
+    source_refs: list[str] = Field(default_factory=list)
+
+
+RhythmBeat = StrongDynamicEvent | Annotated[str, Field(min_length=1)]
+
+
+class RhythmOutput(PipelineModel):
+    target_duration_sec: float = Field(gt=0)
+    artifact_meta: ArtifactMeta
+    timeline: list[RhythmSegment] = Field(default_factory=list)
+    core_payoff: RhythmBeat
+    small_beats: list[RhythmBeat] = Field(default_factory=list)
+    strong_dynamic_budget: StrongDynamicBudget
+    foreshadowing: list[str] = Field(default_factory=list)
+    open_space: list[str] = Field(default_factory=list)
+    dialogue_suggestions: list[DialogueSuggestion] = Field(default_factory=list)
+    sound_suggestions: list[SoundSuggestion] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+
+
+StageArtifactContent = SourceAnalysisOutput | CharacterBiosOutput | RhythmOutput | dict[str, Any]
+
+
+class StageArtifactEnvelope(PipelineModel):
+    meta: ArtifactMeta
+    content: StageArtifactContent
+
+
+class StageArtifactDraft(StageArtifactEnvelope):
+    stage_key: StageKey | None = None

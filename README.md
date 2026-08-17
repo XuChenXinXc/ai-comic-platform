@@ -21,7 +21,7 @@ V1 不包含配音、字幕、BGM 和最终视频合成。
 | 平台 | 状态 | 说明 |
 |------|------|------|
 | Windows 10/11 | ✅ 完全支持 | 推荐平台，所有功能可用 |
-| macOS | ⚠️ 部分支持 | 需使用环境变量配置 API Key，详见 [macOS 兼容性指南](MACOS_COMPATIBILITY.md) |
+| macOS | ✅ 支持 | API Key 使用系统 Keychain 加密保存，详见 [macOS 兼容性指南](MACOS_COMPATIBILITY.md) |
 | Linux | ⚠️ 未测试 | 理论上可用（与 macOS 类似限制） |
 
 ## 运行前提
@@ -107,24 +107,10 @@ chmod +x start-mac.sh
 ./stop-mac.sh
 ```
 
-**⚠️ macOS 重要提示:**
+**macOS 提示:**
 
-macOS 不支持 Windows DPAPI 加密，必须使用环境变量配置 API Key：
-
-1. 在 `.env` 文件中配置：
-   ```env
-   TEXT_API_KEY=sk-...
-   IMAGE_API_KEY=sk-...
-   VIDEO_API_KEY=sk-...
-   ```
-
-2. 在 Web UI 创建 Provider 时：
-   - **不要填写** “API Key” 字段
-   - 在 “API Key 环境变量” 字段填写 `TEXT_API_KEY` 等变量名
-
-3. 修改 API Key 后需要重启平台
-
-详细说明请参考 [MACOS_COMPATIBILITY.md](MACOS_COMPATIBILITY.md)
+macOS 支持在 Web UI 直接填写 API Key，密钥使用系统 Keychain 加密保存，重启后仍可用；
+不需要手动维护环境变量。详细说明请参考 [MACOS_COMPATIBILITY.md](MACOS_COMPATIBILITY.md)
 
 ## 开发运行
 
@@ -191,9 +177,14 @@ npm run test:e2e
 - API Key 推荐在”接口配置”页直接填写，平台使用 Windows DPAPI 加密保存，重启后仍可用
 - 数据库只保存 API Key 密文，不保存明文；接口列表和详情不会返回明文
 
-### macOS / Linux
+### macOS
 
-- API Key 必须通过环境变量配置（`.env` 文件）
+- API Key 推荐在”接口配置”页直接填写，平台使用 macOS Keychain 加密保存，重启后仍可用
+- 数据库只保存 Keychain 引用，不保存明文；接口列表和详情不会返回明文
+
+### Linux
+
+- 直接填写 API Key 暂不支持，需通过环境变量配置（`.env` 文件）
 - 在 Web UI 创建 Provider 时，”API Key 环境变量” 字段填写变量名
 - 修改 API Key 需要重启平台
 

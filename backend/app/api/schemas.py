@@ -3,7 +3,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.schemas import ScreenplayDialogue, ShotTransitionFromPrev
+from app.schemas import MIN_SHOT_DURATION_SEC, ScreenplayDialogue, ShotTransitionFromPrev
 
 AssetType = Literal["character", "scene", "prop"]
 ContentStatus = Literal["draft", "ready", "confirmed", "failed"]
@@ -308,7 +308,7 @@ class ShotFields(ApiModel):
     shot_type: str = ""
     camera_angle: str = ""
     camera_move: str = ""
-    duration_sec: float = Field(gt=0)
+    duration_sec: float = Field(ge=MIN_SHOT_DURATION_SEC)
     end_state: str = ""
     next_hook: str = ""
     transition_from_prev: ShotTransitionFromPrev = "scene_change"
@@ -341,7 +341,7 @@ class ShotUpdate(ApiModel):
     shot_type: str | None = None
     camera_angle: str | None = None
     camera_move: str | None = None
-    duration_sec: float | None = Field(default=None, gt=0)
+    duration_sec: float | None = Field(default=None, ge=MIN_SHOT_DURATION_SEC)
     end_state: str | None = None
     next_hook: str | None = None
     transition_from_prev: ShotTransitionFromPrev | None = None
@@ -377,7 +377,7 @@ class ShotSplitPart(ApiModel):
     frame_description: str = ""
     dialogue: list[ScreenplayDialogue] | None = None
     narration: str | None = None
-    duration_sec: float | None = Field(default=None, gt=0)
+    duration_sec: float | None = Field(default=None, ge=MIN_SHOT_DURATION_SEC)
 
 
 class ShotSplitRequest(ApiModel):
@@ -553,4 +553,3 @@ class ChapterComposeRequest(ApiModel):
     bgm_volume: float = Field(default=0.3, ge=0, le=1)
     crossfade: bool = False
     crossfade_seconds: float = Field(default=0.5, ge=0.1, le=5)
-

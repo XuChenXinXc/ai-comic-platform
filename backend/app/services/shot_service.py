@@ -21,7 +21,9 @@ from app.models.tables import (
 )
 from app.prompts import load_prompt
 from app.schemas import (
+    MIN_SHOT_DURATION_SEC,
     BatchRefinedPromptsOutput,
+    ScreenplayDialogue,
     ShotContinuityPairOutput,
     ShotExtractionOutput,
     ShotImagePromptOutput,
@@ -128,6 +130,15 @@ class ShotService:
         if record is None:
             raise not_found("章节")
         return record
+
+    @staticmethod
+    def _validate_duration(value: Any) -> None:
+        try:
+            duration = float(value)
+        except (TypeError, ValueError) as exc:
+            raise bad_request("分镜时长必须是数字") from exc
+        if not math.isfinite(duration) or duration < MIN_SHOT_DURATION_SEC:
+            raise bad_request(f"分镜时长不能小于{MIN_SHOT_DURATION_SEC}秒")
 
     @staticmethod
     def _scene_no(source_ref: str) -> int | None:
@@ -593,6 +604,7 @@ class ShotService:
         project_id = current_chapter["project_id"]
         if values.get("duration_sec") is None:
             raise bad_request("必须提供分镜时长")
+        self._validate_duration(values["duration_sec"])
         source_type = "screenplay"
         with self.database.engine.connect() as connection:
             source_signature = self._current_source_signature(
@@ -740,6 +752,8 @@ class ShotService:
         current = self.get(shot_id)
         if expected_revision is not None and current["revision"] != expected_revision:
             raise conflict("分镜已被其他请求更新，请重试")
+        if "duration_sec" in values:
+            self._validate_duration(values["duration_sec"])
         self._validate_asset_ids(
             current["project_id"],
             scene_asset_id=values.get("scene_asset_id", current["scene_asset_id"]),
@@ -979,8 +993,12 @@ class ShotService:
         with self.database.engine.begin() as connection:
             self._ensure_no_active_jobs(connection, {shot_id})
         if not parts:
+            current_duration = float(current["duration_sec"])
+            self._validate_duration(current_duration)
+            if current_duration < MIN_SHOT_DURATION_SEC * 2:
+                raise bad_request("分镜时长不足以拆分为两个不低于5秒的分镜")
             first_action, second_action = self._split_action(current["action"])
-            first_duration = max(current["duration_sec"] / 2, 0.1)
+            first_duration = current_duration / 2
             parts = [
                 {
                     "action": first_action,
@@ -992,10 +1010,18 @@ class ShotService:
                     "action": second_action,
                     "start_state": "承接上一镜结束状态",
                     "end_state": current["end_state"],
-                    "duration_sec": max(current["duration_sec"] - first_duration, 0.1),
+                    "duration_sec": current_duration - first_duration,
                     "transition_from_prev": "continuous",
                 },
             ]
+        normalized_parts: list[dict[str, Any]] = []
+        for part in parts:
+            duration = part.get("duration_sec")
+            if duration is None:
+                duration = current["duration_sec"]
+            self._validate_duration(duration)
+            normalized_parts.append({**part, "duration_sec": duration})
+        parts = normalized_parts
         parts = [
             {
                 **part,
@@ -1033,6 +1059,11 @@ class ShotService:
     ) -> dict[str, Any]:
         project_id = current["project_id"]
         chapter_id = current["chapter_id"]
+        duration = overrides.get("duration_sec")
+        if duration is None:
+            duration = current.get("duration_sec")
+        self._validate_duration(duration)
+        overrides = {**overrides, "duration_sec": duration}
         with self.database.engine.begin() as connection:
             ordered = list(
                 connection.execute(
@@ -1310,6 +1341,12 @@ class ShotService:
                         f"范围：{input_data.get('scope', 'all')}\n"
                         f"目标场次：{scene_no}\n"
                         f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
+                        "本场剧本事实原文（权威，只能拆镜，不能新增、改写或删减）：\n"
+                        f"动作：{scene.get('action', '')}\n"
+                        f"叙事目的：{scene.get('objective', '')}\n"
+                        f"场间衔接：{scene.get('transition_to_next', '')}\n"
+                        f"对白原文（必须逐字复制）：{json_dumps(scene.get('dialogue', []))}\n"
+                        f"旁白原文（只能从这里取）：{json_dumps(scene.get('narration', []))}\n"
                         f"来源内容：\n{scene_payload}"
                         f"{continuity_context}"
                     ),
@@ -1317,6 +1354,7 @@ class ShotService:
                     params={**config["params"], **input_data.get("params", {})},
                 )
                 shots, warnings = self._collect_extraction_result(output)
+                self._synchronize_dialogue_with_source(scene, shots)
                 if not shots:
                     raise conflict(
                         f"场次 {scene_no} 未提取到分镜，已中止整批提取，避免覆盖旧分镜"
@@ -1351,6 +1389,10 @@ class ShotService:
                 params={**config["params"], **input_data.get("params", {})},
             )
             all_shots, all_warnings = self._collect_extraction_result(output)
+            if isinstance(screenplay_content, dict) and isinstance(
+                screenplay_content.get("dialogue"), list
+            ):
+                self._synchronize_dialogue_with_source(screenplay_content, all_shots)
         return self._save_extracted(
             current_chapter,
             source_type,
@@ -1358,6 +1400,69 @@ class ShotService:
             all_shots,
             all_warnings,
         )
+
+    @staticmethod
+    def _synchronize_dialogue_with_source(
+        source_scene: dict[str, Any],
+        shots: list[dict[str, Any]],
+    ) -> None:
+        """对白由剧本定稿，模型只负责决定对白落在哪个镜头。"""
+        source_dialogue: list[dict[str, str]] = []
+        raw_dialogue = source_scene.get("dialogue", [])
+        if not isinstance(raw_dialogue, list):
+            raw_dialogue = []
+        for item in raw_dialogue:
+            try:
+                source_dialogue.append(
+                    ScreenplayDialogue.model_validate(item).model_dump(mode="json")
+                )
+            except Exception:
+                continue
+        if not shots:
+            return
+        if not source_dialogue:
+            for shot in shots:
+                shot["dialogue"] = []
+            return
+
+        synchronized: list[list[dict[str, str]]] = [[] for _ in shots]
+        source_index = 0
+        matched_candidate = False
+        for shot_index, shot in enumerate(shots):
+            candidates = shot.get("dialogue")
+            if not isinstance(candidates, list):
+                continue
+            for candidate in candidates:
+                try:
+                    normalized = ScreenplayDialogue.model_validate(candidate).model_dump(
+                        mode="json"
+                    )
+                except Exception:
+                    continue
+                matched_candidate = True
+                match_index = next(
+                    (
+                        index
+                        for index in range(source_index, len(source_dialogue))
+                        if source_dialogue[index] == normalized
+                        or source_dialogue[index]["text"] == normalized["text"]
+                    ),
+                    None,
+                )
+                if match_index is None:
+                    if source_index >= len(source_dialogue):
+                        continue
+                    match_index = source_index
+                synchronized[shot_index].extend(source_dialogue[source_index : match_index + 1])
+                source_index = match_index + 1
+
+        if not matched_candidate:
+            raise conflict("模型未返回本场对白，已中止提取，避免对白与剧情镜头错位")
+
+        if source_index < len(source_dialogue):
+            synchronized[-1].extend(source_dialogue[source_index:])
+        for shot, dialogue in zip(shots, synchronized, strict=True):
+            shot["dialogue"] = dialogue
 
     @staticmethod
     def _collect_extraction_result(
@@ -1555,6 +1660,7 @@ class ShotService:
                 names=prop_names,
             )
             shot_label = item.get("shot_no", len(normalized) + 1)
+            self._validate_duration(item.get("duration_sec"))
             if not scene_asset_id:
                 binding_errors.append(
                     f"分镜 {shot_label} 未匹配到场景素材：{scene_name or '未提供场景名称'}"
@@ -2745,6 +2851,10 @@ class ShotService:
                 )
         return {"total": len(items), "items": items}
 
+    def _job_cancelled(self, job_id: str) -> bool:
+        record = self.jobs.repository.get(job_id)
+        return record is None or record["status"] == "cancelled"
+
     def queue_quality_fix(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
         """入队质量修复任务：只处理存在警告的分镜。"""
         current_project = self._project(project_id)
@@ -2786,6 +2896,8 @@ class ShotService:
         changes: list[dict[str, Any]] = []
         total = len(requested)
         for index, shot_id in enumerate(requested, start=1):
+            if self._job_cancelled(job["id"]):
+                break
             try:
                 current = self.get(shot_id)
             except ServiceError:
@@ -2818,6 +2930,8 @@ class ShotService:
                     schema=ShotQualityFixOutput,
                     params={**config["params"], **params},
                 )
+                if self._job_cancelled(job["id"]):
+                    break
                 result = output.model_dump(mode="json", exclude_none=True)
                 updates = {
                     name: result[name]

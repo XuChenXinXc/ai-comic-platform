@@ -1221,7 +1221,7 @@ export function ShotsPage() {
                 disabled={
                   !form.action?.trim() ||
                   !form.duration_sec ||
-                  form.duration_sec <= 0 ||
+                  form.duration_sec < 5 ||
                   !jsonValid
                 }
                 onClick={() => saveMutation.mutate()}
@@ -1462,7 +1462,7 @@ export function ShotsPage() {
                 <Label>时长（秒）</Label>
                 <Input
                   type="number"
-                  min={1}
+                  min={5}
                   step={1}
                   value={form.duration_sec || ""}
                   onChange={(event) =>

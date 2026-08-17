@@ -99,7 +99,7 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
         payload: dict[str, Any] = {"model": model, "messages": messages, **options}
         if json_response and response_format:
             payload["response_format"] = response_format
-        payload["reasoning_effort"] = "high"
+        payload["reasoning_effort"] = "xhigh"
         attempts = self.config.max_retries + 1
         last_reason = ""
         for attempt in range(attempts):

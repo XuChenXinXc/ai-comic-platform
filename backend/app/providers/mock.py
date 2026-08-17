@@ -164,15 +164,35 @@ class MockTextProvider:
             }
         if schema is ShotExtractionOutput:
             catalog: list[dict[str, Any]] = []
+            source_dialogue: list[dict[str, Any]] = []
             marker = "当前项目可用素材目录：\n"
             if marker in user_prompt:
-                catalog_text = user_prompt.split(marker, 1)[1].split("\n来源内容：", 1)[0]
+                catalog_text = (
+                    user_prompt.split(marker, 1)[1]
+                    .split("\n本场剧本事实原文", 1)[0]
+                    .split("\n来源内容：", 1)[0]
+                )
                 try:
                     parsed_catalog = json.loads(catalog_text)
                     if isinstance(parsed_catalog, list):
                         catalog = [item for item in parsed_catalog if isinstance(item, dict)]
                 except json.JSONDecodeError:
                     catalog = []
+            source_marker = "来源内容：\n"
+            if source_marker in user_prompt:
+                source_text = user_prompt.rsplit(source_marker, 1)[1]
+                source_text = source_text.split("\n上一场衔接信息", 1)[0]
+                try:
+                    source_payload = json.loads(source_text)
+                    source_scene = (
+                        source_payload.get("scene") if isinstance(source_payload, dict) else None
+                    )
+                    if isinstance(source_scene, dict) and isinstance(
+                        source_scene.get("dialogue"), list
+                    ):
+                        source_dialogue = source_scene["dialogue"]
+                except json.JSONDecodeError:
+                    source_dialogue = []
 
             def catalog_id(asset_type: str, name: str, fallback: str) -> str:
                 candidate = next(
@@ -212,7 +232,7 @@ class MockTextProvider:
                         "start_state": "主角站在入口",
                         "action": "主角向前走两步并停下观察。",
                         "expressions": [{"character": "主角", "expression": "谨慎"}],
-                        "dialogue": [],
+                        "dialogue": source_dialogue,
                         "narration": "",
                         "shot_type": "中景",
                         "camera_angle": "平视",
@@ -557,4 +577,3 @@ class MockTTSProvider:
     def supports_voice(self, voice_id: str) -> bool:
         """Mock provider 支持任意音色"""
         return True
-
