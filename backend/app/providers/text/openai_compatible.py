@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from types import UnionType
+from typing import Annotated, Any, Union, get_args, get_origin
 
 from pydantic import BaseModel, ValidationError
 
@@ -105,24 +106,24 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
             response = await self._request_json(
                 "POST",
                 chat_path,
-                options=self.config.params,
+                options=options,
                 headers=headers,
                 json=payload,
             )
+            extraction_error = ""
             try:
                 content = self._extract_content(response)
             except ProviderError as exc:
-                last_reason = str(exc)
+                extraction_error = str(exc)
                 content = ""
             if content.strip():
                 return content
-            if not last_reason:
-                finish_reason = (
-                    str((response.get("choices") or [{}])[0].get("finish_reason", ""))
-                    if isinstance(response.get("choices"), list)
-                    else ""
-                )
-                last_reason = f"返回空内容（finish_reason={finish_reason or '未知'}）"
+            finish_reason = self._finish_reason(response)
+            last_reason = extraction_error or (
+                f"返回空内容（finish_reason={finish_reason or '未知'}）"
+            )
+            if extraction_error and finish_reason:
+                last_reason += f"（finish_reason={finish_reason}）"
             # 部分推理模型在长 prompt + json_object 组合下会返回空 content；
             # 后续尝试去掉 response_format（提示词本身已要求 JSON 输出）
             if json_response and payload.get("response_format"):
@@ -143,7 +144,86 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
             value = {plain_text_field: cls._parse_plain_text(raw, plain_text_field)}
         else:
             value = cls._parse_json(raw)
+            value = cls._normalize_value(value, schema)
         return schema.model_validate(value)
+
+    @classmethod
+    def _normalize_value(cls, value: Any, annotation: Any) -> Any:
+        if value is None:
+            return None
+        item_annotation = cls._list_item_annotation(annotation)
+        if item_annotation is not None:
+            values = value if isinstance(value, list) else [value]
+            return [cls._normalize_value(item, item_annotation) for item in values]
+        model = cls._model_annotation(annotation)
+        if model is not None and isinstance(value, dict):
+            normalized = dict(value)
+            for field_name, field in model.model_fields.items():
+                if field_name in normalized:
+                    normalized[field_name] = cls._normalize_value(
+                        normalized[field_name], field.annotation
+                    )
+            return normalized
+        if cls._is_text_annotation(annotation) and not isinstance(value, str):
+            return cls._readable_text(value)
+        return value
+
+    @classmethod
+    def _list_item_annotation(cls, annotation: Any) -> Any | None:
+        origin = get_origin(annotation)
+        if origin is list:
+            args = get_args(annotation)
+            return args[0] if args else Any
+        if origin in (Union, UnionType):
+            for item in get_args(annotation):
+                item_annotation = cls._list_item_annotation(item)
+                if item_annotation is not None:
+                    return item_annotation
+        return None
+
+    @classmethod
+    def _model_annotation(cls, annotation: Any) -> type[BaseModel] | None:
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            return annotation
+        origin = get_origin(annotation)
+        if origin is Annotated:
+            args = get_args(annotation)
+            return cls._model_annotation(args[0]) if args else None
+        if origin in (Union, UnionType):
+            for item in get_args(annotation):
+                model = cls._model_annotation(item)
+                if model is not None:
+                    return model
+        return None
+
+    @classmethod
+    def _is_text_annotation(cls, annotation: Any) -> bool:
+        if annotation is str:
+            return True
+        origin = get_origin(annotation)
+        if origin is Annotated:
+            args = get_args(annotation)
+            return bool(args) and cls._is_text_annotation(args[0])
+        if origin in (Union, UnionType):
+            return any(cls._is_text_annotation(item) for item in get_args(annotation))
+        return False
+
+    @classmethod
+    def _readable_text(cls, value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            return "、".join(filter(None, (cls._readable_text(item) for item in value)))
+        if isinstance(value, dict):
+            for key in ("summary", "description", "text", "value", "content", "line"):
+                if key in value and (text := cls._readable_text(value[key])):
+                    return text
+            return "；".join(
+                f"{key}：{text}"
+                for key, item in value.items()
+                if (text := cls._readable_text(item))
+            )
+        return str(value or "").strip()
 
     @staticmethod
     def _parse_plain_text(raw: str, field_name: str) -> str:
@@ -167,15 +247,35 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
 
     @staticmethod
     def _extract_content(response: dict[str, Any]) -> str:
-        try:
-            content = response["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise ProviderError("OpenAI-compatible 响应缺少 choices[0].message.content") from exc
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ProviderError("OpenAI-compatible 响应缺少 choices[0].message.content")
+        message = choices[0].get("message")
+        if not isinstance(message, dict) or "content" not in message:
+            raise ProviderError("OpenAI-compatible 响应缺少 choices[0].message.content")
+        content = message["content"]
         if isinstance(content, str):
             return content
         if isinstance(content, list):
-            return "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            return "".join(parts)
+        if isinstance(content, dict):
+            for key in ("text", "content"):
+                if isinstance(content.get(key), str):
+                    return content[key]
         raise ProviderError("OpenAI-compatible content 类型无效")
+
+    @staticmethod
+    def _finish_reason(response: dict[str, Any]) -> str:
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            return ""
+        return str(choices[0].get("finish_reason") or "")
 
     @staticmethod
     def _parse_json(raw: str) -> Any:

@@ -61,7 +61,7 @@ def test_compile_video_prompt_normalizes_field_punctuation_joins() -> None:
     assert "。开始。" not in prompt
     assert "从站在厨房操作台前，准备打开面前的玻璃罐开始。" in prompt
     assert "已走到厨房操作台前停下。本镜动作直接承接该状态" in prompt
-    assert "画外音" not in prompt
+    assert "只用了不到一小时" not in prompt
     assert "画面不出现任何文字，景别和光线方向保持稳定。" in prompt
     assert "场景：陈鑫的一楼公寓。" in prompt
 
@@ -757,8 +757,8 @@ def test_compile_keyframe_prompt_marks_voice_over_as_closed_lips() -> None:
     assert "画面中所有人物全程闭口" in prompt
 
 
-def test_compile_video_prompt_does_not_add_dubbing_restrictions() -> None:
-    """视频提示词按正常生成处理，不追加后期配音/闭口/无台词限制。"""
+def test_compile_video_prompt_keeps_voice_over_out_of_spoken_video_prompt() -> None:
+    """录音/旁白不进入视频模型的画内对白指令。"""
     context = shot_template_context(
         {
             "dialogue": [
@@ -780,20 +780,19 @@ def test_compile_video_prompt_does_not_add_dubbing_restrictions() -> None:
         shot_context=context,
     )
 
-    assert "画外音" not in prompt
-    assert "闭口" not in prompt
-    assert "无台词对白" not in prompt
-    assert "后期配音" not in prompt
+    assert "本镜没有画内对白" in prompt
+    assert "所有人物全程闭口" in prompt
+    assert "怀表留给你" not in prompt
     assert "环境与动作声音" in prompt
 
 
-def test_compile_video_prompt_ignores_dialogue_for_dubbing_restrictions() -> None:
-    """即使存在对白/画外音，视频提示词也不再追加配音相关限制。"""
+def test_compile_video_prompt_binds_each_dialogue_to_structured_speaker() -> None:
+    """视频时间轴中的自由文本不能覆盖结构化对白的角色绑定。"""
     context = shot_template_context(
         {
             "dialogue": [
-                {"speaker": "林舟", "text": "你是谁？"},
-                {"speaker": "父亲（录音）", "text": "小舟，别学我逃跑。"},
+                {"speaker": "苏瑶", "text": "你只是送外卖的，也配进这里？"},
+                {"speaker": "顾沉舟", "text": "我是来送餐的。"},
             ],
             "character_ids": [],
             "scene_asset_id": "",
@@ -802,22 +801,52 @@ def test_compile_video_prompt_ignores_dialogue_for_dubbing_restrictions() -> Non
         {},
     )
 
-    assert "林舟自然开口说：你是谁？" in context["dialogue"]
-    assert "父亲（录音）：小舟" in context["voice_over"]
-
     prompt = compile_video_prompt(
         style_prompt="东方奇幻二维动画",
         aspect_ratio="16:9",
-        video_prompt="林舟质问苏晴。",
-        duration_sec=4,
+        video_prompt=(
+            "0-2秒：苏瑶站在门口；2-7秒：她开口说出台词“我是来送餐的。”；"
+            "7-10秒：顾沉舟平静地回答“你只是送外卖的，也配进这里？”。"
+        ),
+        duration_sec=10,
         anchors=["@Image1：当前分镜关键帧。"],
         shot_context=context,
     )
 
-    assert "说话角色嘴唇轻微开合" not in prompt
-    assert "画外音" not in prompt
-    assert "闭口" not in prompt
-    assert "后期配音" not in prompt
+    assert "第1句：苏瑶说：“你只是送外卖的，也配进这里？”" in prompt
+    assert "第2句：顾沉舟说：“我是来送餐的。”" in prompt
+    assert "按第1句对白执行对应口型" in prompt
+    assert "按第2句对白执行对应口型" in prompt
+    assert "2-7秒：她开口说出台词" not in prompt
+    assert "7-10秒：顾沉舟平静地回答" not in prompt
+
+
+def test_compile_video_prompt_removes_narration_from_action_timeline() -> None:
+    """动作描述旁白不得作为视频模型的可朗读内容。"""
+    context = shot_template_context(
+        {
+            "narration": "他未发一言，打开了外卖箱。",
+            "dialogue": [],
+        },
+        {},
+    )
+
+    prompt = compile_video_prompt(
+        style_prompt="都市二维国漫",
+        aspect_ratio="16:9",
+        video_prompt=(
+            "0-2秒：顾沉舟弯腰取下身侧的外卖箱；2-4秒：他拨开箱盖锁扣；"
+            "旁白：“他未发一言，打开了外卖箱。”"
+        ),
+        duration_sec=4,
+        anchors=[],
+        shot_context=context,
+    )
+
+    assert "顾沉舟弯腰取下身侧的外卖箱" in prompt
+    assert "旁白：“他未发一言，打开了外卖箱。”" not in prompt
+    assert "他未发一言，打开了外卖箱" not in prompt
+    assert "本镜没有画内对白" in prompt
 
 
 def test_compile_asset_prompt_clean_reference_mode_has_no_setting_sheet_text() -> None:

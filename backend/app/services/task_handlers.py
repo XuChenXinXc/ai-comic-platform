@@ -1,4 +1,5 @@
 from app.db import Database, db
+from app.jobs.dynamic_handlers import make_dynamic_stage_generate_handler
 from app.jobs.runner import JobRunner, job_runner
 from app.services.asset_service import AssetService
 from app.services.composition_service import CompositionService
@@ -43,6 +44,10 @@ def register_handlers(
         "generate_keyframe": media.handle_keyframe,
         "generate_video": media.handle_video,
         "compose_chapter": composition.handle_compose,
+        "dynamic_stage_generate": make_dynamic_stage_generate_handler(
+            current_database,
+            repository=current_runner.repository,
+        ),
     }
     for job_type, handler in handlers.items():
         current_runner.register_handler(job_type, handler)

@@ -16,6 +16,7 @@ from app.api import (
     audio,
     chapters,
     composition,
+    dynamic_runs,
     jobs,
     media,
     projects,
@@ -26,6 +27,8 @@ from app.api import (
 from app.api import settings as settings_api
 from app.config import get_settings
 from app.db import Database, db, init_db
+from app.jobs.dynamic_recovery import enqueue_recovered_dynamic_jobs
+from app.jobs.repository import JobRepository
 from app.jobs.runner import job_runner
 from app.models.tables import project
 from app.services.errors import ServiceError
@@ -129,6 +132,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     file_service.migrate_categorized_media_layouts(strict=False)
     register_handlers()
     job_runner.start(recover=True)
+    enqueue_recovered_dynamic_jobs(JobRepository(db), job_runner.enqueue)
     try:
         yield
     finally:
@@ -169,6 +173,7 @@ for api_router in (
     settings_api.router,
     audio.router,
     composition.router,
+    dynamic_runs.router,
 ):
     app.include_router(api_router, prefix="/api")
 

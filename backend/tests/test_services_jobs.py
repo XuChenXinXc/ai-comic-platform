@@ -354,6 +354,84 @@ def test_gpt_image_2_generation_params_use_2k_size_for_tianyue(
     assert queued["input_data"]["params"]["size"] == expected_size
 
 
+def test_asset_image_only_missing_skips_queued_media_version(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    runner = media_job_services["runner"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    asset = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "character", "name": "排队角色", "prompt": "黑发少年"},
+    )
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    media.queue_asset_image(asset["id"], {})
+
+    batch = media.queue_asset_image_batch(project["id"], {"only_missing": True})
+
+    assert batch["jobs"] == []
+    assert batch["preflight_failures"] == []
+
+
+def test_keyframe_only_missing_skips_queued_media_version(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    runner = media_job_services["runner"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    shot = ShotService(database, jobs).create(
+        media_job_services["chapter"]["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            action="主角抬头",
+            image_prompt="主角站在旧屋门口抬头。",
+        ).model_dump(),
+    )
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    media.queue_keyframe(shot["id"], {})
+
+    batch = media.queue_keyframe_batch(project["id"], {"only_missing": True})
+
+    assert batch["jobs"] == []
+    assert batch["preflight_failures"] == []
+
+
+def test_video_only_missing_skips_queued_media_version(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    runner = media_job_services["runner"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    shot = ShotService(database, jobs).create(
+        media_job_services["chapter"]["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            action="主角向前走",
+            image_prompt="主角站在旧屋门口。",
+            video_prompt="0-6秒：主角向前走到门边。",
+        ).model_dump(),
+    )
+    media.upload_keyframe(shot["id"], "keyframe.png", "image/png", _PNG)
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    media.queue_video(shot["id"], {})
+
+    batch = media.queue_video_batch(project["id"], {"only_missing": True})
+
+    assert batch["jobs"] == []
+    assert batch["preflight_failures"] == []
+
 def test_asset_image_queue_without_prompt_or_visual_profile_returns_bad_request(
     media_job_services: dict[str, Any],
 ) -> None:

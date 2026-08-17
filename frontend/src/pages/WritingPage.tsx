@@ -92,13 +92,7 @@ function screenplayContent(
 
 export function WritingPage() {
   const queryClient = useQueryClient();
-  let navigate: ReturnType<typeof useNavigate> | null = null;
-  try {
-    navigate = useNavigate();
-  } catch {
-    // useNavigate 在测试环境中可能失败，使用 fallback
-    navigate = null;
-  }
+  const navigate = useNavigate();
   const { activeProject, activeProjectId } = useProject();
   const { activeChapterId, activeChapter } = useChapter();
   const [tab, setTab] = useState<WritingTab>("screenplay");

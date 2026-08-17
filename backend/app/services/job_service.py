@@ -98,11 +98,19 @@ class JobService:
         input_data: dict[str, Any] | None = None,
         batch_id: str | None = None,
         progress_total: int = 1,
+        workflow_run_id: str | None = None,
+        workflow_stage_id: str | None = None,
+        idempotency_key: str | None = None,
+        input_signature: str | None = None,
+        depends_on: list[str] | None = None,
     ) -> dict[str, Any]:
         record = self.repository.create_job(
             JobCreate(
                 project_id=project_id,
                 chapter_id=chapter_id,
+                workflow_run_id=workflow_run_id,
+                workflow_stage_id=workflow_stage_id,
+                idempotency_key=idempotency_key,
                 job_type=job_type,
                 target_type=target_type,
                 target_id=target_id,
@@ -110,10 +118,13 @@ class JobService:
                 provider_id=provider_id,
                 input_data=input_data or {},
                 batch_id=batch_id,
+                input_signature=input_signature,
+                depends_on=depends_on or [],
                 progress_total=progress_total,
             )
         )
-        self.runner.enqueue(record["id"])
+        if record["status"] in NON_TERMINAL_STATUSES:
+            self.runner.enqueue(record["id"])
         return self._public_record(record)
 
     def create_batch(self, items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -324,9 +335,7 @@ class JobService:
 
         results = {}
         with self.database.engine.connect() as connection:
-            project_ids = [
-                row.id for row in connection.execute(select(project_table.c.id))
-            ]
+            project_ids = [row.id for row in connection.execute(select(project_table.c.id))]
 
         for project_id in project_ids:
             deleted = self.cleanup_old_jobs(project_id, days, keep_failed)

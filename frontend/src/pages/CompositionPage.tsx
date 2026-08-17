@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router";
 import { api } from "../api/client";
+import { formatError } from "../lib/utils";
 import type { Chapter } from "../types/api";
 
 interface BGM {
@@ -39,6 +40,7 @@ export default function CompositionPage() {
   } | null>(null);
   const [uploadingBGM, setUploadingBGM] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -48,6 +50,7 @@ export default function CompositionPage() {
 
   useEffect(() => {
     if (!projectId) return;
+    setLoadError(null);
 
     Promise.all([
       api.chapters.list(projectId),
@@ -58,11 +61,15 @@ export default function CompositionPage() {
       if (chaptersData.length > 0) {
         setSelectedChapter(chaptersData[0].id);
       }
+    }).catch((error) => {
+      console.error(error);
+      setLoadError(formatError(error));
     });
   }, [projectId]);
 
   useEffect(() => {
     if (!selectedChapter) return;
+    setLoadError(null);
 
     // 切换章节后，上一个章节的轮询任务必须停止，避免状态互相覆盖。
     if (pollRef.current) {
@@ -77,6 +84,9 @@ export default function CompositionPage() {
       } else {
         setCompositionStatus(null);
       }
+    }).catch((error) => {
+      console.error(error);
+      setLoadError(formatError(error));
     });
   }, [selectedChapter]);
 
@@ -187,6 +197,14 @@ export default function CompositionPage() {
         <p className="text-gray-600">生成完整的章节视频（包含配音、BGM、字幕）</p>
       </div>
 
+      {loadError ? (
+        <div
+          role="alert"
+          className="mb-6 rounded border border-red-200 bg-red-50 p-4 text-sm text-red-700"
+        >
+          视频合成初始化失败：{loadError}
+        </div>
+      ) : null}
       {/* 章节选择 */}
       <div className="bg-white rounded-lg shadow p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择章节</h2>

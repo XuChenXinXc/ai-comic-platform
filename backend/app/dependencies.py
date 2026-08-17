@@ -3,10 +3,14 @@ from typing import Annotated
 from fastapi import Depends
 
 from app.db import Database, get_database
+from app.jobs.dynamic_bridge import DynamicJobBridge
+from app.jobs.repository import JobRepository
+from app.jobs.runner import job_runner
 from app.services.asset_service import AssetService
 from app.services.audio_service import AudioService
 from app.services.chapter_service import ChapterService
 from app.services.composition_service import CompositionService
+from app.services.dynamic_workflow_service import DynamicWorkflowService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
 from app.services.project_service import ProjectService
@@ -94,3 +98,9 @@ def get_composition_service(
 ) -> CompositionService:
     return CompositionService(database, job_service)
 
+
+def get_dynamic_workflow_service(
+    database: Annotated[Database, Depends(get_database)],
+) -> DynamicWorkflowService:
+    job_bridge = DynamicJobBridge(JobRepository(database), enqueue=job_runner.enqueue)
+    return DynamicWorkflowService(database, job_bridge=job_bridge)

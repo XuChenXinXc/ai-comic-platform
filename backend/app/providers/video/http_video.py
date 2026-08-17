@@ -63,8 +63,11 @@ class HttpVideoProvider(HttpProviderBase):
             "doubao-seedance-2.0",
             "doubao-seedance-2.0-fast",
             "doubao-seedance-2.0-mini",
+            "seedance-2.0",
+            "seedance-2.0-fast",
+            "seedance-2.0-mini",
         }:
-            # doubao-seedance-2.0 系列：分镜填多少秒就传多少秒（4~15 秒整数），
+            # APIB Seedance 2.0 系列：分镜填多少秒就传多少秒（4~15 秒整数），
             # 不做向上取整或最低时长抬升；生成音频默认开启。
             options.setdefault("retry_unsafe_methods", False)
             options.setdefault("poll_path", "tasks/{task_id}")
@@ -224,7 +227,9 @@ class HttpVideoProvider(HttpProviderBase):
             # 固定时长模型（如天悦 mini-15s）：忽略分镜秒数，全部按固定时长提交。
             effective_duration = float(forced_duration)
         self._validate_duration(effective_duration, options)
-        if options.get("duration_integer_only"):
+        # 上游部分接口的 duration 字段是 Go int；数据库取出的整数秒可能仍是 6.0，
+        # JSON 序列化后会被上游区分为浮点数，因此整数值统一按 int 发送。
+        if options.get("duration_integer_only") or float(effective_duration).is_integer():
             effective_duration = int(effective_duration)
         payload = dict(options.get("payload", {}))
         payload.update(options.get("default_params", {}))

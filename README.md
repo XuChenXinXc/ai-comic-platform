@@ -30,14 +30,16 @@ V1 不包含配音、字幕、BGM 和最终视频合成。
 
 - Windows PowerShell 5.1 或 PowerShell 7
 - Python 3.11
-- Node.js 20.0 或更高版本
+- **Node.js 20.x LTS（推荐）或 22.x**
+  - 验证版本：`node --version`（应显示 v20.x.x 或 v22.x.x）
+  - 下载地址：https://nodejs.org/
 - FFmpeg 与 ffprobe 已加入 `PATH`（Mock 视频生成与可播放性校验需要）
 
 ### macOS
 
 - macOS 10.15 (Catalina) 或更高版本
 - Python 3.11（通过 Homebrew 安装）
-- Node.js 20.0 或更高版本
+- **Node.js 20.x LTS（推荐）或 22.x**
 - FFmpeg 与 ffprobe（通过 Homebrew 安装）
 
 **安装依赖:**

@@ -12,7 +12,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 
 from app.config import settings
 from app.db import Database, db
@@ -979,7 +979,10 @@ class MediaService:
                 ~select(asset_image.c.id)
                 .where(
                     asset_image.c.asset_id == asset.c.id,
-                    asset_image.c.is_current.is_(True),
+                    or_(
+                        asset_image.c.is_current.is_(True),
+                        asset_image.c.status.in_(_ACTIVE_MEDIA_STATUSES),
+                    ),
                 )
                 .exists()
             )
@@ -1332,7 +1335,10 @@ class MediaService:
                 ~select(table.c.id)
                 .where(
                     table.c.shot_id == shot.c.id,
-                    table.c.is_current.is_(True),
+                    or_(
+                        table.c.is_current.is_(True),
+                        table.c.status.in_(_ACTIVE_MEDIA_STATUSES),
+                    ),
                 )
                 .exists()
             )

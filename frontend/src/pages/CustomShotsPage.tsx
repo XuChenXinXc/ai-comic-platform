@@ -40,6 +40,7 @@ const RUNNING = new Set([
 
 const FREE_PROJECT_IDS_KEY = "free-create-project-ids";
 const FREE_PROJECT_ID_KEY = "free-create-project-id";
+const FREE_SCENE_DEFAULTED_SHOT_IDS_KEY = "free-create-scene-defaulted-shot-ids";
 const legacyFreeNames = new Set(["手动分镜", "手动"]);
 
 const assetLabels: Record<AssetType, string> = {
@@ -61,6 +62,28 @@ function readFreeProjectIds(): string[] {
   } catch {
     return [];
   }
+}
+
+function readFreeSceneDefaultedShotIds(): Set<string> {
+  try {
+    const value = JSON.parse(
+      localStorage.getItem(FREE_SCENE_DEFAULTED_SHOT_IDS_KEY) ?? "[]",
+    );
+    return new Set(
+      Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === "string")
+        : [],
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function writeFreeSceneDefaultedShotIds(ids: Set<string>) {
+  localStorage.setItem(
+    FREE_SCENE_DEFAULTED_SHOT_IDS_KEY,
+    JSON.stringify([...ids]),
+  );
 }
 
 export function nextFreeProjectName(existingNames: string[]): string {
@@ -121,6 +144,10 @@ export function selectedAssetContext(
         `${label}「${asset.name}」设定：${asset.prompt.trim() || "以名称为准"}`,
     )
     .join("\n");
+}
+
+export function firstSceneAssetId(assets: Asset[]): string {
+  return assets.find((asset) => asset.asset_type === "scene")?.id ?? "";
 }
 
 function mergeAssetContext(context: string, prompt: string): string {
@@ -186,6 +213,23 @@ export const emptyFreeShotDraft = (): FreeShotSlotDraft => ({
   videoPrompt: "",
   duration: 6,
 });
+
+export function applyFreeSceneDefault(
+  draft: FreeShotSlotDraft,
+  defaultSceneAssetId: string,
+  alreadyDefaulted: boolean,
+): FreeShotSlotDraft {
+  if (
+    alreadyDefaulted ||
+    draft.sceneAssetId ||
+    !defaultSceneAssetId ||
+    draft.imagePrompt.trim() ||
+    draft.videoPrompt.trim()
+  ) {
+    return draft;
+  }
+  return { ...draft, sceneAssetId: defaultSceneAssetId };
+}
 
 function stripMergedContext(text: string, context: string): string {
   const trimmedContext = context.trim();
@@ -374,16 +418,31 @@ function CustomShotsInner() {
         if (cancelled) return;
         const assetList = await api.assets.list(manualProjectId);
         if (cancelled) return;
+        const defaultSceneAssetId = firstSceneAssetId(assetList);
+        const defaultedShotIds = readFreeSceneDefaultedShotIds();
+        let defaultsApplied = false;
         setSlotDrafts(
           Array.from({ length: FREE_SHOT_SLOT_COUNT }, (_, index) => {
             const shot = list.find(
               (item) => item.source_ref === "manual" && item.shot_no === index + 1,
             );
-            return shot
-              ? draftFromFreeShot(shot, assetList)
-              : emptyFreeShotDraft();
+            if (!shot) return emptyFreeShotDraft();
+            const draft = draftFromFreeShot(shot, assetList);
+            const nextDraft = applyFreeSceneDefault(
+              draft,
+              defaultSceneAssetId,
+              defaultedShotIds.has(shot.id),
+            );
+            if (nextDraft !== draft) {
+              defaultedShotIds.add(shot.id);
+              defaultsApplied = true;
+            }
+            return nextDraft;
           }),
         );
+        if (defaultsApplied) {
+          writeFreeSceneDefaultedShotIds(defaultedShotIds);
+        }
         await queryClient.invalidateQueries({
           queryKey: queryKeys.shots(manualChapterId),
         });

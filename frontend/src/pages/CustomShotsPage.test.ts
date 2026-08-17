@@ -3,7 +3,10 @@ import type { ApiProvider, Asset, Shot } from "../types/api";
 import {
   customShotPayload,
   draftFromFreeShot,
+  applyFreeSceneDefault,
+  emptyFreeShotDraft,
   isTianyueVideoProvider,
+  firstSceneAssetId,
   nextFreeProjectName,
   nextShotTransition,
   selectedAssetContext,
@@ -93,6 +96,43 @@ test("test_free_create_context_ignores_unselected_assets", () => {
   const result = selectedAssetContext([scene, character], "", [], []);
 
   expect(result).toBe("");
+});
+
+test("test_free_create_default_scene_is_empty_without_scene_assets", () => {
+  expect(firstSceneAssetId([])).toBe("");
+  expect(applyFreeSceneDefault(emptyFreeShotDraft(), "", false).sceneAssetId).toBe(
+    "",
+  );
+});
+
+test("test_free_create_default_scene_uses_the_only_scene_asset", () => {
+  const scene = makeAsset("scene-1", "scene", "山道", "晨雾笼罩");
+
+  expect(firstSceneAssetId([scene])).toBe("scene-1");
+  expect(applyFreeSceneDefault(emptyFreeShotDraft(), "scene-1", false).sceneAssetId).toBe(
+    "scene-1",
+  );
+});
+
+test("test_free_create_default_scene_uses_the_first_scene_asset", () => {
+  const firstScene = makeAsset("scene-1", "scene", "山道", "晨雾笼罩");
+  const secondScene = makeAsset("scene-2", "scene", "庭院", "落日余晖");
+
+  expect(firstSceneAssetId([firstScene, secondScene])).toBe("scene-1");
+  expect(
+    applyFreeSceneDefault(emptyFreeShotDraft(), "scene-1", false).sceneAssetId,
+  ).toBe("scene-1");
+});
+
+test("test_free_create_default_scene_preserves_existing_or_explicit_state", () => {
+  const selected = { ...emptyFreeShotDraft(), sceneAssetId: "scene-2" };
+  const filled = { ...emptyFreeShotDraft(), imagePrompt: "主角走向大门" };
+
+  expect(applyFreeSceneDefault(selected, "scene-1", false)).toBe(selected);
+  expect(applyFreeSceneDefault(emptyFreeShotDraft(), "scene-1", true)).toEqual(
+    emptyFreeShotDraft(),
+  );
+  expect(applyFreeSceneDefault(filled, "scene-1", false)).toBe(filled);
 });
 
 test("test_free_create_shot_payload_binds_selected_asset_ids", () => {

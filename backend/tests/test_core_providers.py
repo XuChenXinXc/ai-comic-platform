@@ -1146,9 +1146,12 @@ def test_gpt_image_2_x5_multipart_retry_can_be_disabled_by_params(
     [
         "grok-imagine-1.5-video-apimart",
         "grok-imagine-1.5-video-ext",
+        "seedance-2.0",
+        "seedance-2.0-fast",
+        "seedance-2.0-mini",
     ],
 )
-def test_grok_video_models_upload_local_input_image_to_apib(
+def test_apib_video_models_upload_local_input_image_to_apib(
     model: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1465,13 +1468,16 @@ def test_x5m5x_jbb_image_protocol_uses_multipart_reference_defaults(base_url: st
         "doubao-seedance-2.0",
         "doubao-seedance-2.0-fast",
         "doubao-seedance-2.0-mini",
+        "seedance-2.0",
+        "seedance-2.0-fast",
+        "seedance-2.0-mini",
     ],
 )
-def test_doubao_video_models_pass_storyboard_duration_verbatim(
+def test_apib_seedance_video_models_pass_storyboard_duration_verbatim(
     model: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """doubao 系列：LLM 分镜填多少秒就传多少秒（4~15 秒整数），不取整不抬升。"""
+    """APIB Seedance 别名：分镜填多少秒就传多少秒（4~15 秒整数）。"""
     provider = HttpVideoProvider(
         ProviderConfig(
             id="video-doubao",
@@ -1692,6 +1698,38 @@ def test_generic_http_video_provider_defaults_to_single_input_image() -> None:
     )
 
     assert provider.supports_multiple_input_images is False
+
+
+def test_generic_http_video_serializes_whole_duration_as_integer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-generic",
+            kind="video",
+            adapter="http_video",
+            base_url="https://provider.example/v1",
+            model="generic-video-model",
+        )
+    )
+    calls: list[dict[str, Any]] = []
+
+    async def fake_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"method": method, "path": path, **kwargs})
+        return {"task_id": "task-1", "status": "queued"}
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    asyncio.run(
+        provider.submit(
+            prompt="让画面动起来",
+            input_image={"value": "data:image/png;base64,AAAA"},
+            duration_sec=6.0,
+            params={},
+        )
+    )
+
+    assert calls[0]["json"]["duration"] == 6
+    assert type(calls[0]["json"]["duration"]) is int
 
 
 def test_http_image_with_too_many_references_rejects_before_submission(

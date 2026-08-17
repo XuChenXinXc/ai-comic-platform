@@ -80,7 +80,7 @@ class OpenAITTSProvider:
                     error_msg = error_data.get("error", {}).get("message", str(error_data))
                     raise ProviderError(f"TTS 生成失败：{error_msg}")
                 except (ValueError, KeyError):
-                    raise ProviderError(f"TTS 返回非音频数据：{content_type}")
+                    raise ProviderError(f"TTS 返回非音频数据：{content_type}") from None
 
             return response.content
 

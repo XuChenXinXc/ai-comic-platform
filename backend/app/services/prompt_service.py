@@ -3,7 +3,7 @@ from collections.abc import Iterable
 from typing import Any
 
 STYLE_ANCHOR = "[STYLE_ANCHOR]"
-VISUAL_PROMPT_TEMPLATE_VERSION = "visual-prompt-v3.0"
+VISUAL_PROMPT_TEMPLATE_VERSION = "visual-prompt-v3.1"
 _FIXED_VISUAL_ASPECT_RATIOS = {
     "character": "3:2",
     "prop": "3:2",
@@ -15,6 +15,19 @@ _TIMELINE_PATTERN = re.compile(
     # 前置分隔符需包含。，否则「0-1秒：…。1-2秒：…」只能匹配首段，
     # 导致末段补尾用错 last_end 生成与已有分段重叠的时间轴
     r"(?:^|[。；;，,\n])\s*(\d+(?:\.\d+)?)\s*[-–—~－至]\s*(\d+(?:\.\d+)?)\s*秒"
+)
+_NARRATION_CUE_PATTERN = re.compile(
+    r"(?:画外旁白|画外音|旁白|内心独白|OS)"
+    r"(?:低声)?(?:声音?|声)?(?:开始|起|响起|声中|中|收尾|同期收尾)?"
+)
+_SPEECH_CUE_PATTERN = re.compile(
+    r"(?:开口(?:说(?:出)?(?:台词)?)?|说出(?:台词)?|说道|回答|回应|反问|问道|"
+    r"质问|喊道|喊|低声(?:说)?|高声(?:说)?|轻声(?:说)?|自语|低语|说话)"
+)
+_QUOTED_TEXT_PATTERN = re.compile(r"[“「\"](?P<text>.*?)[”」\"]")
+_TIMELINE_CLAUSE_PATTERN = re.compile(
+    r"^\s*(?P<time>\d+(?:\.\d+)?\s*[-–—~－至]\s*\d+(?:\.\d+)?\s*秒\s*[:：，,])"
+    r"(?P<body>.*)$"
 )
 _SCENE_CLAUSE_PATTERN = re.compile(r"[^。！？；;\n]+[。！？；;]?\s*")
 _SCENE_PERSON_MARKERS = (
@@ -938,6 +951,7 @@ def shot_template_context(
     prev_end_state: str = "",
 ) -> dict[str, Any]:
     dialogue_parts: list[str] = []
+    dialogue_entries: list[dict[str, str]] = []
     voice_over_parts: list[str] = []
     for item in current.get("dialogue", []):
         if not isinstance(item, dict):
@@ -957,6 +971,7 @@ def shot_template_context(
                     deduped = deduped[len(prefix) :].lstrip()
             voice_over_parts.append(f"{speaker}：{deduped}" if deduped else f"{speaker}：{text}")
         else:
+            dialogue_entries.append({"speaker": speaker, "text": text})
             dialogue_parts.append(f"{speaker}自然开口说：{text}")
     if current.get("narration"):
         narration = str(current.get("narration") or "").strip()
@@ -1024,6 +1039,7 @@ def shot_template_context(
         "positions": "；".join(position_parts),
         "expressions": "；".join(expression_parts),
         "dialogue": "；".join(dialogue_parts),
+        "dialogue_entries": dialogue_entries,
         "voice_over": "；".join(voice_over_parts),
         "sound_effects": str(current.get("sound_effects") or ""),
     }
@@ -1049,6 +1065,126 @@ def _camera_line(camera_move: Any) -> str:
     if is_fixed:
         return "固定机位，画面变化由人物动作推动，摄影机不移动。"
     return f"{raw or '缓慢跟随'}；缓慢跟随人物运动，不切换机位。"
+
+
+def _clean_speech_prefix(prefix: str, dialogue_speakers: set[str]) -> str:
+    """保留说话片段中的可视动作，去掉会把代词误当说话人的前缀。"""
+    cleaned = prefix.strip(" ，,；;")
+    timeline_match = _TIMELINE_CLAUSE_PATTERN.match(cleaned)
+    if timeline_match:
+        body = timeline_match.group("body").strip(" ，,；;")
+        if body in dialogue_speakers or body in {"他", "她", "其", "人物", "角色"}:
+            body = ""
+        body = re.sub(
+            r"(?:平静|自然|低声|轻声|高声|压低声音|一字一句|缓慢)地$",
+            "",
+            body,
+        ).rstrip(" ，,")
+        return f"{timeline_match.group('time')}{body}"
+    return cleaned
+
+
+def _join_prompt_clauses(*parts: str) -> str:
+    cleaned = [part.strip(" ，,；;") for part in parts if part.strip(" ，,；;")]
+    if len(cleaned) == 2 and cleaned[0].endswith(("：", ":")):
+        return f"{cleaned[0]}{cleaned[1]}"
+    return "；".join(cleaned)
+
+
+def _strip_narration_clause(text: str) -> str:
+    """从动作时间轴中移除旁白文本，同时保留旁白前后的可视动作。"""
+    match = _NARRATION_CUE_PATTERN.search(text)
+    if not match:
+        return text.strip()
+
+    before = text[: match.start()].strip(" ，,")
+    after = text[match.end() :].lstrip()
+    if after.startswith(("：", ":")):
+        after = after[1:].lstrip()
+        quoted = _QUOTED_TEXT_PATTERN.match(after)
+        if quoted:
+            after = after[quoted.end() :].lstrip(" ，,。；;")
+        else:
+            after = ""
+    elif after.startswith(("“", "「", '"')):
+        quoted = _QUOTED_TEXT_PATTERN.match(after)
+        after = after[quoted.end() :].lstrip(" ，,。；;") if quoted else ""
+    elif after.startswith(("（", "(")):
+        closing = "）" if after.startswith("（") else ")"
+        closing_index = after.find(closing, 1)
+        after = after[closing_index + 1 :].lstrip(" ，,。；;") if closing_index >= 0 else ""
+    elif after.startswith(("，", ",")):
+        after = after[1:].lstrip()
+
+    if before in {"与此同时", "同时", "同期", "此时"}:
+        before = ""
+    return _join_prompt_clauses(before, after)
+
+
+def _replace_speech_clause(
+    text: str,
+    dialogue_entries: list[dict[str, str]],
+    dialogue_index: int,
+) -> tuple[str, int]:
+    """用结构化对白序号替换自由文本中的说话人/引号，避免角色串台。"""
+    speech_match = _SPEECH_CUE_PATTERN.search(text)
+    quoted = _QUOTED_TEXT_PATTERN.search(text)
+    if not speech_match and not quoted:
+        return text.strip(), dialogue_index
+
+    if (
+        not dialogue_entries
+        and speech_match
+        and any(marker in text[: speech_match.start()] for marker in ("背景音", "环境声", "声音"))
+    ):
+        return (
+            f"{text[:speech_match.start()]}环境声{text[speech_match.end() :]}",
+            dialogue_index,
+        )
+
+    boundary = speech_match.start() if speech_match else quoted.start()
+    prefix = _clean_speech_prefix(text[:boundary], {item["speaker"] for item in dialogue_entries})
+    suffix_start = quoted.end() if quoted and quoted.start() >= boundary else (
+        speech_match.end() if speech_match else boundary
+    )
+    suffix = text[suffix_start:].strip(" ，,；;")
+
+    if dialogue_entries and dialogue_index < len(dialogue_entries):
+        dialogue_index += 1
+        replacement = f"按第{dialogue_index}句对白执行对应口型"
+    else:
+        replacement = "人物保持闭口，不生成台词"
+    if prefix.endswith(("：", ":")):
+        result = f"{prefix}{replacement}"
+    elif prefix:
+        result = f"{prefix}；{replacement}"
+    else:
+        result = replacement
+    if suffix:
+        result = f"{result}；{suffix}"
+    return result, dialogue_index
+
+
+def _sanitize_video_prompt_speech(
+    video_prompt: str,
+    dialogue_entries: list[dict[str, str]],
+) -> str:
+    """只保留视觉动作时间轴，实际对白统一由结构化对白段落提供。"""
+    clauses = re.split(r"[；;]", str(video_prompt or "").strip())
+    cleaned_clauses: list[str] = []
+    dialogue_index = 0
+    for clause in clauses:
+        current = _strip_narration_clause(clause.strip())
+        if not current:
+            continue
+        current, dialogue_index = _replace_speech_clause(
+            current,
+            dialogue_entries,
+            dialogue_index,
+        )
+        if current:
+            cleaned_clauses.append(current)
+    return "；".join(cleaned_clauses)
 
 
 def compile_video_prompt(
@@ -1079,9 +1215,17 @@ def compile_video_prompt(
     sound_effects = _normalize_sentence_end(
         _value(shot_context.get("sound_effects"), "符合场景的环境声")
     )
+    dialogue_entries = [
+        item
+        for item in shot_context.get("dialogue_entries", [])
+        if isinstance(item, dict) and item.get("speaker") and item.get("text")
+    ]
+    sanitized_video_prompt = _sanitize_video_prompt_speech(video_prompt, dialogue_entries)
+    if not sanitized_video_prompt:
+        sanitized_video_prompt = focus
 
     # 时间分段：检查 video_prompt 是否已包含时间轴
-    timeline_matches = list(_TIMELINE_PATTERN.finditer(video_prompt))
+    timeline_matches = list(_TIMELINE_PATTERN.finditer(sanitized_video_prompt))
     if timeline_matches:
         # 已有时间轴，检查是否需要补充稳定段
         last_match = timeline_matches[-1]
@@ -1096,23 +1240,23 @@ def compile_video_prompt(
                 else f"{duration_sec:.1f}"
             )
             action_timeline = (
-                f"{video_prompt.rstrip('；')}；{last_end_str}-{duration_str}秒："
+                f"{sanitized_video_prompt.rstrip('；')}；{last_end_str}-{duration_str}秒："
                 "保持上一段结束状态稳定"
             )
         else:
-            action_timeline = video_prompt
+            action_timeline = sanitized_video_prompt
     else:
         # 没有时间轴，根据时长决定是否分段
         if duration_sec <= 2:
             # 短视频（≤2秒）：单段式
-            action_timeline = f"0-{duration_sec}秒：{video_prompt}"
+            action_timeline = f"0-{duration_sec}秒：{sanitized_video_prompt}"
         else:
             # 长视频：三段式
             t1 = duration_sec / 3
             t2 = duration_sec * 2 / 3
             action_timeline = (
                 f"0-{t1:.1f}秒：{focus}的起始状态明确展开；"
-                f"{t1:.1f}-{t2:.1f}秒：{video_prompt}；"
+                f"{t1:.1f}-{t2:.1f}秒：{sanitized_video_prompt}；"
                 f"{t2:.1f}-{duration_sec}秒：动作收尾，为下一镜衔接保留清楚状态"
             )
 
@@ -1254,6 +1398,28 @@ def compile_video_prompt(
         static_objects_rule += f"除本镜剧情明确由人物拿取/移动的{props}外，"
     static_objects_rule += "其余静止物体不得在动画中移动、旋转或重新生成。"
     sections.append(static_objects_rule)
+    sections.append("")
+
+    # 对白只从结构化 dialogue_json 进入视频提示词，避免动作/旁白文本被模型当成台词。
+    sections.append("【对白与口型】")
+    if dialogue_entries:
+        sections.append(
+            "本镜只允许以下画内对白，角色名与台词严格一一对应，禁止交换、代说或新增："
+        )
+        for index, item in enumerate(dialogue_entries, start=1):
+            sections.append(f"第{index}句：{item['speaker']}说：“{item['text']}”")
+        sections.append(
+            "对白按时间轴中出现的对白时段依次执行；只有对应说话人开口，"
+            "其他角色在该时段保持闭口，不抢话、不代说。"
+        )
+    else:
+        sections.append(
+            "本镜没有画内对白。所有人物全程闭口，不生成角色台词、旁白、画外音或可辨识语音。"
+        )
+    sections.append(
+        "时间轴中的动作、表情、旁白、画外音、内心独白和环境声只用于画面或声音效果，"
+        "不得被人物念出；不得用“他/她”替代明确说话人。"
+    )
     sections.append("")
 
     # 核心动作

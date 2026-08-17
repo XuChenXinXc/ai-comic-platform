@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router";
 import { api } from "../api/client";
+import { formatError } from "../lib/utils";
 import type { Chapter, ApiProvider } from "../types/api";
 
 interface Dialogue {
@@ -48,10 +49,11 @@ export default function AudioWorkbenchPage() {
   const [generating, setGenerating] = useState<Set<number>>(new Set());
   const [audioStatus, setAudioStatus] = useState<Record<number, ShotAudio>>({});
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!projectId || !chapterId) return;
-
+    setLoadError(null);
     Promise.all([
       api.chapters.get(chapterId),
       api.audio.extractDialogues(chapterId),
@@ -114,6 +116,9 @@ export default function AudioWorkbenchPage() {
         }
       }
       setVoiceMapping(defaultMapping);
+    }).catch((error) => {
+      console.error(error);
+      setLoadError(formatError(error));
     });
   }, [projectId, chapterId]);
 
@@ -296,6 +301,14 @@ export default function AudioWorkbenchPage() {
         </p>
       </div>
 
+      {loadError ? (
+        <div
+          role="alert"
+          className="mb-6 rounded border border-red-200 bg-red-50 p-4 text-sm text-red-700"
+        >
+          配音工作台加载失败：{loadError}
+        </div>
+      ) : null}
       {/* 配置面板 */}
       <div className="bg-white rounded-lg shadow p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">配置</h2>

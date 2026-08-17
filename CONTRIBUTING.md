@@ -112,11 +112,18 @@ git checkout -b fix/your-bug-fix
 ```
 
 **分支命名规范**：
-- `feature/xxx` - 新功能
-- `fix/xxx` - Bug 修复
-- `docs/xxx` - 文档更新
-- `refactor/xxx` - 代码重构
-- `test/xxx` - 测试相关
+- `feature/xxx` - 新功能（如 `feature/add-batch-export`）
+- `fix/xxx` - Bug 修复（如 `fix/video-generation-timeout`）
+- `docs/xxx` - 文档更新（如 `docs/update-api-guide`）
+- `refactor/xxx` - 代码重构（如 `refactor/simplify-auth-flow`）
+- `test/xxx` - 测试相关（如 `test/add-e2e-coverage`）
+- `chore/xxx` - 构建/工具/依赖更新（如 `chore/upgrade-react-19`）
+
+**分支策略**：
+- **main 分支**：生产就绪代码，受保护，仅通过 PR 合并
+- **功能分支**：从 main 分出，开发完成后通过 PR 合并回 main
+- **临时分支**：合并后应删除
+- **长期分支**：仅保留 main，避免 develop 分支造成混淆
 
 #### 3. 开发
 
@@ -143,11 +150,34 @@ git checkout -b fix/your-bug-fix
 - `feat`: 新功能
 - `fix`: Bug 修复
 - `docs`: 文档更新
-- `style`: 代码格式（不影响功能）
-- `refactor`: 重构
+- `style`: 代码格式（不影响功能，如空格、分号）
+- `refactor`: 重构（不改变功能的代码结构调整）
 - `perf`: 性能优化
 - `test`: 测试相关
-- `chore`: 构建/工具/依赖更新
+- `chore`: 构建/工具/依赖更新（如升级依赖版本）
+- `ci`: CI/CD 配置变更
+
+**作用域（scope）**：可选，表示影响范围
+- `api`: 后端 API
+- `ui`: 前端界面
+- `db`: 数据库
+- `workflow`: 工作流
+- `deps`: 依赖更新
+
+**主题（subject）**：
+- 使用祈使句（如 "add" 而非 "added" 或 "adds"）
+- 不要大写首字母
+- 不要以句号结尾
+- 限制在 50 字符以内
+
+**正文（body）**：可选
+- 详细说明变更的原因和内容
+- 每行不超过 72 字符
+- 与主题之间空一行
+
+**页脚（footer）**：可选
+- 关联 Issue：`Closes #123` 或 `Fixes #456`
+- 破坏性变更：以 `BREAKING CHANGE:` 开头
 
 **示例**：
 
@@ -159,6 +189,22 @@ feat(api): add project export endpoint
 - Include all project assets and metadata
 
 Closes #123
+```
+
+```
+fix(ui): resolve video player crash on mobile
+
+The video player would crash when switching to fullscreen
+on iOS devices. This fix ensures proper cleanup of event
+listeners before mode transition.
+
+Fixes #456
+```
+
+```
+chore(deps): upgrade react to 19.2
+
+BREAKING CHANGE: React 19 requires Node.js >= 20.0.0
 ```
 
 #### 4. 测试

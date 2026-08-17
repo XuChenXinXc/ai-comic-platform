@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
+import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { ApiError, api, queryKeys } from "../api/client";
 import type {
@@ -75,6 +76,16 @@ function screenplayRecord(
   };
 }
 
+function renderWritingPage(queryClient: QueryClient) {
+  return render(
+    <MemoryRouter>
+      <QueryClientProvider client={queryClient}>
+        <WritingPage />
+      </QueryClientProvider>
+    </MemoryRouter>,
+  );
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((complete) => {
@@ -113,11 +124,7 @@ describe("文字工作台服务端版本冲突", () => {
         mutations: { retry: false },
       },
     });
-    render(
-      <QueryClientProvider client={queryClient}>
-        <WritingPage />
-      </QueryClientProvider>,
-    );
+    renderWritingPage(queryClient);
 
     expect(await screen.findByLabelText("剧本标题")).toHaveValue("唯一剧本");
     expect(screen.queryByRole("tab", { name: "小说分析" })).not.toBeInTheDocument();
@@ -135,11 +142,7 @@ describe("文字工作台服务端版本冲突", () => {
         mutations: { retry: false },
       },
     });
-    render(
-      <QueryClientProvider client={queryClient}>
-        <WritingPage />
-      </QueryClientProvider>,
-    );
+    renderWritingPage(queryClient);
 
     const stylePrompt = await screen.findByLabelText("统一画风 STYLE_ANCHOR");
     const titleInput = await screen.findByLabelText("剧本标题");
@@ -170,11 +173,7 @@ describe("文字工作台服务端版本冲突", () => {
         mutations: { retry: false },
       },
     });
-    render(
-      <QueryClientProvider client={queryClient}>
-        <WritingPage />
-      </QueryClientProvider>,
-    );
+    renderWritingPage(queryClient);
 
     const stylePrompt = await screen.findByLabelText("统一画风 STYLE_ANCHOR");
     await userEvent.clear(stylePrompt);
@@ -211,11 +210,7 @@ describe("文字工作台服务端版本冲突", () => {
         mutations: { retry: false },
       },
     });
-    render(
-      <QueryClientProvider client={queryClient}>
-        <WritingPage />
-      </QueryClientProvider>,
-    );
+    renderWritingPage(queryClient);
 
     expect(
       await screen.findByDisplayValue("小明：你终于来了。"),
@@ -231,11 +226,7 @@ describe("文字工作台服务端版本冲突", () => {
         mutations: { retry: false },
       },
     });
-    render(
-      <QueryClientProvider client={queryClient}>
-        <WritingPage />
-      </QueryClientProvider>,
-    );
+    renderWritingPage(queryClient);
 
     await userEvent.click(
       await screen.findByRole("tab", { name: /剧本生成/ }),
@@ -293,11 +284,7 @@ describe("文字工作台延迟保存", () => {
         mutations: { retry: false },
       },
     });
-    render(
-      <QueryClientProvider client={queryClient}>
-        <WritingPage />
-      </QueryClientProvider>,
-    );
+    renderWritingPage(queryClient);
     const titleInput = await screen.findByLabelText("剧本标题");
     fireEvent.change(titleInput, {
       target: { value: "提交版本" },
@@ -345,11 +332,7 @@ describe("文字工作台延迟保存", () => {
         mutations: { retry: false },
       },
     });
-    const view = render(
-      <QueryClientProvider client={queryClient}>
-        <WritingPage />
-      </QueryClientProvider>,
-    );
+    const view = renderWritingPage(queryClient);
     const titleInput = await screen.findByLabelText("剧本标题");
     fireEvent.change(titleInput, {
       target: { value: "项目 A 提交剧本" },
@@ -366,9 +349,11 @@ describe("文字工作台延迟保存", () => {
     };
     projectContext.activeProjectId = "project-2";
     view.rerender(
-      <QueryClientProvider client={queryClient}>
-        <WritingPage />
-      </QueryClientProvider>,
+      <MemoryRouter>
+        <QueryClientProvider client={queryClient}>
+          <WritingPage />
+        </QueryClientProvider>
+      </MemoryRouter>,
     );
     const projectBTitle = await screen.findByLabelText("剧本标题");
     await waitFor(() => {

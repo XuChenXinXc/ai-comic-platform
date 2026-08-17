@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlalchemy as sa
 from sqlalchemy import (
     CheckConstraint,
     Column,
@@ -82,6 +83,89 @@ chapter = Table(
     UniqueConstraint("project_id", "chapter_no", name="uq_chapter_project_no"),
 )
 Index("idx_chapter_project_no", chapter.c.project_id, chapter.c.chapter_no)
+
+
+workflow_run = Table(
+    "workflow_run",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("project_id", Text, ForeignKey("project.id", ondelete="CASCADE"), nullable=False),
+    Column("chapter_id", Text, ForeignKey("chapter.id", ondelete="CASCADE"), nullable=False),
+    Column("kind", Text, nullable=False, server_default="dynamic_comic_0_6"),
+    Column("schema_version", Text, nullable=False, server_default="1"),
+    Column("status", Text, nullable=False, server_default="pending"),
+    Column("current_stage", Text, nullable=False, server_default=""),
+    Column("source_kind", Text, nullable=False),
+    Column("source_snapshot_json", Text, nullable=False, server_default="{}"),
+    Column("config_snapshot_json", Text, nullable=False, server_default="{}"),
+    Column("asset_mapping_json", Text, nullable=False, server_default="{}"),
+    Column("input_signature", Text, nullable=False, server_default=""),
+    Column("revision", Integer, nullable=False, server_default="1"),
+    Column("error", Text, nullable=False, server_default=""),
+    Column("created_at", Text, nullable=False),
+    Column("started_at", Text),
+    Column("updated_at", Text, nullable=False),
+    Column("finished_at", Text),
+    CheckConstraint("kind IN ('dynamic_comic_0_6')", name="kind"),
+    CheckConstraint(
+        "status IN ('pending','queued','running','blocked','ready','confirmed','stale',"
+        "'partial_failed','failed','interrupted','cancelled')",
+        name="status",
+    ),
+    CheckConstraint(
+        "source_kind IN ('full_text','synopsis')",
+        name="source_kind",
+    ),
+)
+Index("idx_workflow_run_project_status", workflow_run.c.project_id, workflow_run.c.status)
+Index("idx_workflow_run_chapter_status", workflow_run.c.chapter_id, workflow_run.c.status)
+Index("idx_workflow_run_current_stage", workflow_run.c.current_stage)
+
+
+workflow_stage = Table(
+    "workflow_stage",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column(
+        "workflow_run_id",
+        Text,
+        ForeignKey("workflow_run.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("stage_key", Text, nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("status", Text, nullable=False, server_default="pending"),
+    Column("input_signature", Text, nullable=False, server_default=""),
+    Column("raw_output_json", Text, nullable=False, server_default="{}"),
+    Column("normalized_output_json", Text, nullable=False, server_default="{}"),
+    Column("draft_output_json", Text, nullable=False, server_default="{}"),
+    Column("output_refs_json", Text, nullable=False, server_default="[]"),
+    Column("gate_result_json", Text, nullable=False, server_default="{}"),
+    Column("attempt", Integer, nullable=False, server_default="1"),
+    Column("error", Text, nullable=False, server_default=""),
+    Column("created_at", Text, nullable=False),
+    Column("started_at", Text),
+    Column("updated_at", Text, nullable=False),
+    Column("finished_at", Text),
+    Column("confirmed_at", Text),
+    Column("confirmed_revision", Integer),
+    CheckConstraint(
+        "status IN ('pending','queued','running','blocked','ready','confirmed','stale',"
+        "'partial_failed','failed','interrupted','cancelled')",
+        name="status",
+    ),
+    UniqueConstraint(
+        "workflow_run_id",
+        "stage_key",
+        "attempt",
+        name="uq_workflow_stage_run_key_attempt",
+    ),
+)
+Index("idx_workflow_stage_run_status", workflow_stage.c.workflow_run_id, workflow_stage.c.status)
+Index("idx_workflow_stage_run_key", workflow_stage.c.workflow_run_id, workflow_stage.c.stage_key)
+Index("idx_workflow_stage_workflow_run_id", workflow_stage.c.workflow_run_id)
+Index("idx_workflow_stage_status", workflow_stage.c.status)
+Index("idx_workflow_stage_stage_key", workflow_stage.c.stage_key)
 
 
 platform_setting = Table(
@@ -178,6 +262,7 @@ asset = Table(
     Column("asset_type", Text, nullable=False),
     Column("name", Text, nullable=False),
     Column("profile_json", Text, nullable=False, server_default="{}"),
+    Column("visual_anchor_json", Text, nullable=False, server_default="{}"),
     Column("prompt", Text, nullable=False, server_default=""),
     Column("negative_prompt", Text, nullable=False, server_default=""),
     Column("prompt_override", Text, nullable=False, server_default=""),
@@ -209,6 +294,10 @@ asset_image = Table(
     Column("prompt_snapshot", Text, nullable=False, server_default=""),
     Column("negative_prompt_snapshot", Text, nullable=False, server_default=""),
     Column("reference_files_json", Text, nullable=False, server_default="[]"),
+    Column("prompt_ir_json", Text),
+    Column("provenance_json", Text),
+    Column("reference_purpose", Text, nullable=False, server_default=""),
+    Column("approved", Integer, nullable=False, server_default="0"),
     Column("provider_id", Text, ForeignKey("api_provider.id")),
     Column("model", Text, nullable=False, server_default=""),
     Column("provider_task_id", Text, nullable=False, server_default=""),
@@ -244,14 +333,18 @@ shot = Table(
     Column("source_type", Text, nullable=False),
     Column("source_ref", Text, nullable=False, server_default=""),
     Column("source_signature", Text, nullable=False, server_default=""),
+    Column("external_key", Text),
     Column("scene_asset_id", Text, ForeignKey("asset.id", ondelete="SET NULL")),
     Column("character_ids_json", Text, nullable=False, server_default="[]"),
     Column("prop_ids_json", Text, nullable=False, server_default="[]"),
     Column("positions_json", Text, nullable=False, server_default="[]"),
     Column("start_state", Text, nullable=False, server_default=""),
     Column("action", Text, nullable=False, server_default=""),
+    Column("action_events_json", Text, nullable=False, server_default="[]"),
     Column("expressions_json", Text, nullable=False, server_default="[]"),
     Column("dialogue_json", Text, nullable=False, server_default="[]"),
+    Column("dialogue_cues_json", Text, nullable=False, server_default="[]"),
+    Column("sound_cues_json", Text, nullable=False, server_default="[]"),
     Column("narration", Text, nullable=False, server_default=""),
     Column("shot_type", Text, nullable=False, server_default=""),
     Column("camera_angle", Text, nullable=False, server_default=""),
@@ -267,6 +360,8 @@ shot = Table(
         nullable=False,
         server_default="scene_change",
     ),
+    Column("continuity_json", Text, nullable=False, server_default="{}"),
+    Column("pipeline_metadata_json", Text, nullable=False, server_default="{}"),
     Column("frame_description", Text, nullable=False, server_default=""),
     Column("image_prompt", Text, nullable=False, server_default=""),
     Column("image_prompt_override", Text, nullable=False, server_default=""),
@@ -297,6 +392,8 @@ keyframe_version = Table(
     Column("prompt_snapshot", Text, nullable=False, server_default=""),
     Column("negative_prompt_snapshot", Text, nullable=False, server_default=""),
     Column("reference_bindings_json", Text, nullable=False, server_default="[]"),
+    Column("prompt_ir_json", Text),
+    Column("provenance_json", Text),
     Column("provider_id", Text, ForeignKey("api_provider.id")),
     Column("model", Text, nullable=False, server_default=""),
     Column("provider_task_id", Text, nullable=False, server_default=""),
@@ -336,6 +433,8 @@ video_version = Table(
     Column("end_frame_path", Text),
     Column("prompt_snapshot", Text, nullable=False, server_default=""),
     Column("negative_prompt_snapshot", Text, nullable=False, server_default=""),
+    Column("prompt_ir_json", Text),
+    Column("provenance_json", Text),
     Column("requested_duration_sec", Float, nullable=False, server_default="0"),
     Column("actual_duration_sec", Float),
     Column("provider_id", Text, ForeignKey("api_provider.id")),
@@ -369,10 +468,13 @@ job = Table(
     Column("id", Text, primary_key=True),
     Column("project_id", Text, ForeignKey("project.id", ondelete="CASCADE"), nullable=False),
     Column("chapter_id", Text, ForeignKey("chapter.id", ondelete="CASCADE")),
+    Column("workflow_run_id", Text, ForeignKey("workflow_run.id", ondelete="CASCADE")),
+    Column("workflow_stage_id", Text, ForeignKey("workflow_stage.id", ondelete="CASCADE")),
     Column("job_type", Text, nullable=False),
     Column("target_type", Text, nullable=False, server_default=""),
     Column("target_id", Text),
     Column("batch_id", Text),
+    Column("idempotency_key", Text),
     Column("provider_kind", Text, nullable=False, server_default=""),
     Column("provider_id", Text, ForeignKey("api_provider.id")),
     Column("provider_task_id", Text, nullable=False, server_default=""),
@@ -381,6 +483,8 @@ job = Table(
     Column("progress_total", Integer, nullable=False, server_default="1"),
     Column("message", Text, nullable=False, server_default=""),
     Column("input_json", Text, nullable=False, server_default="{}"),
+    Column("input_signature", Text),
+    Column("depends_on_json", Text),
     Column("result_json", Text, nullable=False, server_default="{}"),
     Column("error", Text, nullable=False, server_default=""),
     Column("retry_count", Integer, nullable=False, server_default="0"),
@@ -397,6 +501,14 @@ job = Table(
 )
 Index("idx_job_project_status", job.c.project_id, job.c.status)
 Index("idx_job_batch", job.c.batch_id)
+Index("idx_job_workflow_run_status", job.c.workflow_run_id, job.c.status)
+Index("idx_job_workflow_stage_status", job.c.workflow_stage_id, job.c.status)
+Index(
+    "ux_job_idempotency_key",
+    job.c.idempotency_key,
+    unique=True,
+    sqlite_where=sa.text("idempotency_key IS NOT NULL AND idempotency_key <> ''"),
+)
 
 
 audio_config = Table(
@@ -422,7 +534,10 @@ shot_audio = Table(
     metadata,
     Column("id", Text, primary_key=True),
     Column("shot_id", Text, ForeignKey("shot.id", ondelete="CASCADE"), nullable=False),
+    Column("dialogue_line_id", Text),
+    Column("line_order", Integer, nullable=False, server_default="0"),
     Column("dialogue_text", Text, nullable=False),
+    Column("source_text_snapshot", Text, nullable=False, server_default=""),
     Column("speaker_name", Text, nullable=False, server_default=""),
     Column("voice_id", Text, nullable=False, server_default=""),
     Column("file_path", Text),
@@ -433,6 +548,8 @@ shot_audio = Table(
     Column("status", Text, nullable=False, server_default="queued"),
     Column("is_current", Integer, nullable=False, server_default="0"),
     Column("source", Text, nullable=False, server_default="generated"),
+    Column("input_signature", Text, nullable=False, server_default=""),
+    Column("provenance_json", Text, nullable=False, server_default="{}"),
     Column("error", Text, nullable=False, server_default=""),
     Column("created_at", Text, nullable=False),
     CheckConstraint(
@@ -455,10 +572,13 @@ shot_subtitle = Table(
     metadata,
     Column("id", Text, primary_key=True),
     Column("shot_id", Text, ForeignKey("shot.id", ondelete="CASCADE"), nullable=False),
+    Column("dialogue_line_id", Text),
+    Column("audio_id", Text),
     Column("text", Text, nullable=False),
     Column("start_time", Float, nullable=False),
     Column("end_time", Float, nullable=False),
     Column("style_preset", Text, nullable=False, server_default="default"),
+    Column("provenance_json", Text, nullable=False, server_default="{}"),
     Column("created_at", Text, nullable=False),
     CheckConstraint("start_time >= 0 AND end_time > start_time", name="time_range"),
 )
@@ -485,6 +605,10 @@ chapter_composition = Table(
     Column("id", Text, primary_key=True),
     Column("chapter_id", Text, ForeignKey("chapter.id", ondelete="CASCADE"), nullable=False),
     Column("job_id", Text, ForeignKey("job.id", ondelete="SET NULL")),
+    Column("workflow_run_id", Text, ForeignKey("workflow_run.id", ondelete="CASCADE")),
+    Column("input_signature", Text, nullable=False, server_default=""),
+    Column("preflight_json", Text, nullable=False, server_default="{}"),
+    Column("provenance_json", Text, nullable=False, server_default="{}"),
     Column("file_path", Text),
     Column("duration_sec", Float),
     Column("resolution", Text, nullable=False, server_default="1080p"),
@@ -512,6 +636,8 @@ Index(
 ALL_TABLES = (
     project,
     chapter,
+    workflow_run,
+    workflow_stage,
     platform_setting,
     api_provider,
     novel_analysis,

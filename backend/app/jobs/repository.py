@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import Engine, insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.db import Database, db, utc_now
 from app.models.tables import job
@@ -44,6 +45,38 @@ def _json_loads(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _json_loads_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        parsed = value
+    elif not value:
+        return []
+    else:
+        try:
+            parsed = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return []
+    return (
+        parsed if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed) else []
+    )
+
+
+def _is_idempotency_integrity_error(error: IntegrityError) -> bool:
+    original = getattr(error, "orig", None)
+    text = str(original if original is not None else error).lower()
+    diagnostic = getattr(original, "diag", None)
+    constraint_name = str(getattr(diagnostic, "constraint_name", "") or "").lower()
+    if constraint_name == "ux_job_idempotency_key":
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "ux_job_idempotency_key",
+            "unique constraint failed: job.idempotency_key",
+            "unique constraint failed: idempotency_key",
+        )
+    )
+
+
 def has_download_source(record: Mapping[str, Any]) -> bool:
     candidates = (record.get("result_data") or {}, record.get("input_data") or {})
     for value in candidates:
@@ -74,6 +107,7 @@ class JobRepository:
             return None
         record = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
         record["input_data"] = _json_loads(record.get("input_json"))
+        record["depends_on"] = _json_loads_list(record.get("depends_on_json"))
         record["result_data"] = _json_loads(record.get("result_json"))
         return record
 
@@ -91,15 +125,19 @@ class JobRepository:
         if "input_data" not in source and "input_json" in source:
             source["input_data"] = _json_loads(source.pop("input_json"))
         parsed = JobCreate.model_validate(source)
+        idempotency_key = parsed.idempotency_key or None
         now = utc_now()
         values = {
             "id": parsed.id or f"job-{uuid4().hex}",
             "project_id": parsed.project_id,
             "chapter_id": parsed.chapter_id,
+            "workflow_run_id": parsed.workflow_run_id,
+            "workflow_stage_id": parsed.workflow_stage_id,
             "job_type": parsed.job_type,
             "target_type": parsed.target_type,
             "target_id": parsed.target_id,
             "batch_id": parsed.batch_id,
+            "idempotency_key": idempotency_key,
             "provider_kind": parsed.provider_kind,
             "provider_id": parsed.provider_id,
             "provider_task_id": "",
@@ -108,6 +146,8 @@ class JobRepository:
             "progress_total": parsed.progress_total,
             "message": "",
             "input_json": _json_dumps(parsed.input_data),
+            "input_signature": parsed.input_signature,
+            "depends_on_json": _json_dumps(parsed.depends_on),
             "result_json": "{}",
             "error": "",
             "retry_count": 0,
@@ -116,9 +156,27 @@ class JobRepository:
             "started_at": None,
             "finished_at": None,
         }
-        with self.engine.begin() as connection:
-            connection.execute(insert(job).values(**values))
-        created = self.get(values["id"])
+        try:
+            with self.engine.begin() as connection:
+                if idempotency_key is not None:
+                    existing = connection.execute(
+                        select(job).where(job.c.idempotency_key == idempotency_key)
+                    ).first()
+                    if existing is not None:
+                        existing_record = self._decode(existing)
+                        if existing_record is None:
+                            raise JobRepositoryError("幂等任务读取失败")
+                        return existing_record
+                connection.execute(insert(job).values(**values))
+                created = self._decode(
+                    connection.execute(select(job).where(job.c.id == values["id"])).first()
+                )
+        except IntegrityError as error:
+            if idempotency_key is None or not _is_idempotency_integrity_error(error):
+                raise
+            created = self.find_by_idempotency_key(idempotency_key)
+            if created is None:
+                raise
         if created is None:
             raise JobRepositoryError("任务创建后无法读取")
         return created
@@ -141,6 +199,9 @@ class JobRepository:
         status: str | Sequence[str] | None = None,
         job_type: str | None = None,
         batch_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_stage_id: str | None = None,
+        idempotency_key: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
@@ -155,10 +216,36 @@ class JobRepository:
             statement = statement.where(job.c.job_type == job_type)
         if batch_id is not None:
             statement = statement.where(job.c.batch_id == batch_id)
+        if workflow_run_id is not None:
+            statement = statement.where(job.c.workflow_run_id == workflow_run_id)
+        if workflow_stage_id is not None:
+            statement = statement.where(job.c.workflow_stage_id == workflow_stage_id)
+        if idempotency_key is not None:
+            statement = statement.where(job.c.idempotency_key == idempotency_key)
         statement = statement.order_by(job.c.created_at.desc()).limit(limit).offset(offset)
         with self.engine.connect() as connection:
             rows = connection.execute(statement).all()
         return [record for row in rows if (record := self._decode(row)) is not None]
+
+    def find_by_idempotency_key(self, key: str) -> dict[str, Any] | None:
+        if not key:
+            return None
+        with self.engine.connect() as connection:
+            row = connection.execute(select(job).where(job.c.idempotency_key == key)).first()
+        return self._decode(row)
+
+    def list_by_workflow(
+        self,
+        workflow_run_id: str,
+        stage_id: str | None = None,
+        status: str | Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.list(
+            workflow_run_id=workflow_run_id,
+            workflow_stage_id=stage_id,
+            status=status,
+            limit=100_000,
+        )
 
     def list_batch(self, batch_id: str) -> list[dict[str, Any]]:
         statement = (
@@ -410,8 +497,21 @@ class JobRepository:
             raise JobNotFoundError(f"任务不存在：{job_id}")
         return current
 
-    def list_non_terminal(self) -> list[dict[str, Any]]:
-        return self.list(status=sorted(NON_TERMINAL_STATUSES), limit=100_000)
+    def list_non_terminal(
+        self,
+        *,
+        include_dynamic: bool = False,
+        workflow_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        statement = select(job).where(job.c.status.in_(sorted(NON_TERMINAL_STATUSES)))
+        if workflow_run_id is not None:
+            statement = statement.where(job.c.workflow_run_id == workflow_run_id)
+        elif not include_dynamic:
+            statement = statement.where(job.c.workflow_run_id.is_(None))
+        statement = statement.order_by(job.c.created_at.desc()).limit(100_000)
+        with self.engine.connect() as connection:
+            rows = connection.execute(statement).all()
+        return [record for row in rows if (record := self._decode(row)) is not None]
 
 
 job_repository = JobRepository()

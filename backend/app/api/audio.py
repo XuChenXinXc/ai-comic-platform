@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, File, Form, Response, UploadFile, status
 from app.api.schemas import ShotAudioGenerateRequest
 from app.dependencies import get_audio_service
 from app.services.audio_service import AudioService
+from app.services.errors import bad_request
 
 router = APIRouter(prefix="/audio", tags=["audio"])
 
@@ -119,7 +120,6 @@ async def upload_bgm(
     service: AudioService = Depends(get_audio_service),
 ) -> dict[str, Any]:
     """上传 BGM 文件"""
-    from app.errors import bad_request
     from app.services.utils import json_loads
 
     # 限制文件大小为 50MB

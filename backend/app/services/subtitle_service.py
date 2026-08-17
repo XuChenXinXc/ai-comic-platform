@@ -4,10 +4,9 @@
 """
 
 import logging
-from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, insert, select
 
 from app.db import Database, db
 from app.models.tables import shot, shot_audio, shot_subtitle
@@ -41,9 +40,10 @@ class SubtitleService:
             if not duration_sec or duration_sec <= 0:
                 raise bad_request("配音时长无效，无法生成字幕")
 
-            # 简单策略：整句字幕，从 0 到 duration_sec
+            # 简单策略:整句字幕,从 0 到 duration_sec
             # TODO(#1): 更精细的策略可以调用语音识别 API 获取时间戳
-            # 详见 FEATURE_TRACKING.md - Issue #1
+            # 当前使用均分策略足够满足 V1 需求,V2 优化为精确对齐
+            # 改进方案:集成 Azure Speech / 阿里云 / 讯飞语音识别 API
             subtitle_data = [
                 {
                     "text": dialogue_text,
@@ -140,7 +140,9 @@ class SubtitleService:
 
                     # SRT 格式
                     srt_content.append(str(subtitle_index))
-                    srt_content.append(f"{self._format_srt_time(start)} --> {self._format_srt_time(end)}")
+                    srt_content.append(
+                        f"{self._format_srt_time(start)} --> {self._format_srt_time(end)}"
+                    )
                     srt_content.append(text)
                     srt_content.append("")  # 空行
 

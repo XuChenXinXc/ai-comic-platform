@@ -579,9 +579,7 @@ class ShotOutput(OutputModel):
         action_text = str(action or "").strip()
         if not action_text:
             return True
-        return not any(
-            marker in action_text for marker in cls._NON_SPEECH_ACTION_MARKERS
-        )
+        return not any(marker in action_text for marker in cls._NON_SPEECH_ACTION_MARKERS)
 
     @classmethod
     def timeline_conflict_warning(cls, video_prompt: str) -> str:
@@ -599,10 +597,7 @@ class ShotOutput(OutputModel):
             segments.append((start, end))
         for index in range(1, len(segments)):
             if segments[index][0] < segments[index - 1][1] - 0.01:
-                return (
-                    "video_prompt 出现多套时间轴或时间分段重叠，"
-                    "请统一为单套覆盖全程的连续时间轴"
-                )
+                return "video_prompt 出现多套时间轴或时间分段重叠，请统一为单套覆盖全程的连续时间轴"
         return ""
 
     def end_state_warning(self) -> str:
@@ -752,6 +747,9 @@ class JobCreate(BaseModel):
     id: str | None = None
     project_id: str
     chapter_id: str | None = None
+    workflow_run_id: str | None = None
+    workflow_stage_id: str | None = None
+    idempotency_key: str | None = None
     job_type: str
     target_type: str = ""
     target_id: str | None = None
@@ -759,6 +757,8 @@ class JobCreate(BaseModel):
     provider_kind: str = ""
     provider_id: str | None = None
     input_data: dict[str, Any] = Field(default_factory=dict)
+    input_signature: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
     progress_total: int = Field(default=1, ge=1)
 
 
@@ -766,6 +766,9 @@ class JobRead(BaseModel):
     id: str
     project_id: str
     chapter_id: str | None = None
+    workflow_run_id: str | None = None
+    workflow_stage_id: str | None = None
+    idempotency_key: str | None = None
     job_type: str
     target_type: str
     target_id: str | None
@@ -778,6 +781,8 @@ class JobRead(BaseModel):
     progress_total: int
     message: str
     input_data: dict[str, Any]
+    input_signature: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
     result_data: dict[str, Any]
     error: str
     retry_count: int
