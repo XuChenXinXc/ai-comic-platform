@@ -7,8 +7,9 @@ import pytest
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from app.dynamic_pipeline.schemas import (
-    AssetMapping,
     ArtifactMeta,
+    AssetMapping,
+    CharacterBehaviorEvidence,
     CharacterBiosOutput,
     CharacterVisualAnchor,
     ConflictTurnKind,
@@ -21,16 +22,17 @@ from app.dynamic_pipeline.schemas import (
     RhythmBeatType,
     RhythmOutput,
     RhythmSegment,
+    ScriptSoundCue,
+    ShootabilityStatus,
     SoundCue,
     SourceAnalysisOutput,
     SourceKind,
     SourceScene,
     SourceSceneShootability,
-    StageGateResult,
     StageArtifactDraft,
     StageArtifactEnvelope,
+    StageGateResult,
     StageKey,
-    ShootabilityStatus,
     StrongDynamicBudget,
     StrongDynamicEvent,
     WorkflowRunCreate,
@@ -126,6 +128,7 @@ def test_workflow_run_create_uses_expected_default_values() -> None:
     result = WorkflowRunCreate.model_validate(_workflow_run_payload())
 
     assert result.target_duration_sec == 30
+    assert result.strong_dynamic_max_events == 3
     assert result.aspect_ratio == "9:16"
     assert result.generate_audio is True
     assert result.generate_subtitle is True
@@ -185,6 +188,27 @@ def test_workflow_run_create_with_out_of_range_duration_is_rejected(
     with pytest.raises(ValidationError):
         WorkflowRunCreate.model_validate(
             _workflow_run_payload(target_duration_sec=target_duration_sec)
+        )
+
+
+@pytest.mark.parametrize("strong_dynamic_max_events", [0, 1, 12])
+def test_workflow_run_create_accepts_controlled_strong_dynamic_budget(
+    strong_dynamic_max_events: int,
+) -> None:
+    result = WorkflowRunCreate.model_validate(
+        _workflow_run_payload(strong_dynamic_max_events=strong_dynamic_max_events)
+    )
+
+    assert result.strong_dynamic_max_events == strong_dynamic_max_events
+
+
+@pytest.mark.parametrize("strong_dynamic_max_events", [-1, 13])
+def test_workflow_run_create_rejects_uncontrolled_strong_dynamic_budget(
+    strong_dynamic_max_events: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        WorkflowRunCreate.model_validate(
+            _workflow_run_payload(strong_dynamic_max_events=strong_dynamic_max_events)
         )
 
 
@@ -510,6 +534,13 @@ def _character_bios_payload(**overrides: object) -> dict[str, object]:
                 "dynamic_comic_setting": "受伤时仍保持左手护心的习惯。",
                 "plot_relation": "本集冲突的承受者与反击者。",
                 "visual_anchor": _character_visual_anchor_payload(),
+                "behavior_evidence": {
+                    "trigger": "听到刀锋破空声",
+                    "action": "抬手格挡",
+                    "expression": "目光收紧",
+                    "voice": "低声回应",
+                    "source_refs": ["p1-l3"],
+                },
             }
         ],
         "ensemble_anchors": [
@@ -640,6 +671,18 @@ def test_character_visual_anchor_allows_empty_approved_references() -> None:
     assert result.approved_reference_ids == []
 
 
+def test_character_behavior_evidence_defaults_to_empty_for_legacy_payloads() -> None:
+    result = CharacterBehaviorEvidence.model_validate({})
+
+    assert result.model_dump() == {
+        "trigger": "",
+        "action": "",
+        "expression": "",
+        "voice": "",
+        "source_refs": [],
+    }
+
+
 @pytest.mark.parametrize(
     "schema", [Importance, ShootabilityStatus, ConflictTurnKind, RhythmBeatType]
 )
@@ -743,6 +786,30 @@ def test_rhythm_output_accepts_thirty_second_segment_without_five_second_minimum
 
     assert result.target_duration_sec == 30
     assert result.timeline[0].end_sec == 30
+
+
+def test_strong_dynamic_budget_accepts_strong_dynamic_events() -> None:
+    event = StrongDynamicEvent(
+        event_id="dynamic-1",
+        summary="主角完成第一次格挡",
+        dynamic_level=1.0,
+    )
+    result = StrongDynamicBudget(max_events=1, event_ids=[event.event_id], events=[event])
+
+    assert result.max_events == 1
+    assert result.events[0].event_id == "dynamic-1"
+
+
+def test_script_sound_cue_requires_structured_time_contract() -> None:
+    result = ScriptSoundCue(
+        kind="environment",
+        description="雷声",
+        start_sec=0,
+        end_sec=1,
+        source_refs=["scene-1"],
+    )
+
+    assert result.end_sec > result.start_sec
 
 
 def test_stage_artifact_envelope_and_draft_are_constructible() -> None:

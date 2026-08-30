@@ -46,7 +46,6 @@ def export_data_before_deletion() -> None:
     export_dir = Path("data_export") / (
         f"migration_{revision}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
-    export_dir.mkdir(parents=True, exist_ok=True)
 
     tables_to_export = ["shot", "novel_analysis", "screenplay", "job"]
     existing_tables = set(sa.inspect(bind).get_table_names())
@@ -66,12 +65,17 @@ def export_data_before_deletion() -> None:
                 continue
 
             rows = bind.execute(sa.text(f"SELECT * FROM {table_name}")).mappings().fetchall()
+            # 目录延迟到确实有数据要写时才建，否则空库/测试反复跑迁移会堆积空目录。
+            export_dir.mkdir(parents=True, exist_ok=True)
             export_file = export_dir / f"{table_name}.json"
             with open(export_file, "w", encoding="utf-8") as f:
                 json.dump([dict(row) for row in rows], f, ensure_ascii=False, indent=2)
             print(f"  ✓ {table_name}: {len(rows)} 条记录已导出")
         except Exception as e:
             print(f"  ✗ {table_name}: 导出失败 - {e}")
+
+    if not export_dir.exists():
+        print("  （无数据需要导出，未创建导出目录）")
 
     print(f"\n{'='*60}\n")
 

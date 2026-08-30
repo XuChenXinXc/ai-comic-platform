@@ -19,7 +19,7 @@ from .tts import HttpTTSProvider, OpenAITTSProvider
 from .video import HttpVideoProvider
 
 Provider = TextProvider | ImageProvider | VideoProvider | TTSProvider
-ProviderFactory = Callable[[ProviderConfig], Provider]
+ProviderFactory = Callable[..., Provider]
 
 
 class ProviderRegistry:
@@ -48,6 +48,8 @@ class ProviderRegistry:
             raise ProviderConfigurationError(
                 f"未注册 Provider Adapter：{parsed.kind}/{parsed.adapter}"
             )
+        if parsed.kind == "tts":
+            return factory(parsed, parsed.api_key)
         return factory(parsed)
 
     def get(self, config: ProviderConfig | Mapping[str, Any]) -> Provider:
@@ -70,4 +72,3 @@ provider_registry.register("image", "http_image", HttpImageProvider)
 provider_registry.register("video", "http_video", HttpVideoProvider)
 provider_registry.register("tts", "openai_tts", OpenAITTSProvider)
 provider_registry.register("tts", "http_tts", HttpTTSProvider)
-

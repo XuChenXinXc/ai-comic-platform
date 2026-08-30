@@ -5,7 +5,8 @@
  */
 
 import { useEffect, useRef, useCallback, useState } from "react";
-import { useQuery, UseQueryOptions, UseQueryResult } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
+import type { UseQueryOptions, UseQueryResult } from "@tanstack/react-query";
 
 /**
  * 使用防抖值

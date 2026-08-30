@@ -6,11 +6,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from alembic.config import Config
 from sqlalchemy import Engine, create_engine, event, func, insert, select
 from sqlalchemy.pool import StaticPool
 
 from alembic import command
-from alembic.config import Config
 from app.config import BACKEND_DIR, get_settings
 from app.models.tables import api_provider, metadata
 
@@ -133,9 +133,30 @@ def migrate_schema(database: Database | None = None) -> Database:
     alembic_config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
     alembic_config.set_main_option("prepend_sys_path", str(BACKEND_DIR))
     alembic_config.set_main_option("path_separator", "os")
-    with current.engine.begin() as connection:
-        alembic_config.attributes["connection"] = connection
-        command.upgrade(alembic_config, "head")
+    with current.engine.connect() as connection:
+        is_sqlite = connection.dialect.name == "sqlite"
+        if is_sqlite:
+            # SQLite 的 batch migration 需要重建被外键引用的表；
+            # 约束在迁移事务外暂时关闭，完成后立即恢复。
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.commit()
+        try:
+            alembic_config.attributes["connection"] = connection
+            alembic_config.attributes["sqlite_foreign_keys_disabled"] = is_sqlite
+            command.upgrade(alembic_config, "head")
+        finally:
+            if is_sqlite:
+                # PRAGMA foreign_keys 在 SQLite 真实事务内是 no-op。迁移执行过 DML/DDL
+                # 后失败时连接会停在未提交事务上，此时直接发 PRAGMA 会被静默忽略，
+                # 外键保持关闭并随连接回到连接池被后续请求复用，因此先结束事务，
+                # 然后把连接标为 invalid，避免被回收到连接池。
+                if connection.in_transaction():
+                    connection.rollback()
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                connection.commit()
+            # 标记连接失效，下一次 engine.connect() 会从池里取新连接（或新建）。
+            # 这样不会复用「外键刚被临时关过」的连接。
+            connection.invalidate()
     return current
 
 

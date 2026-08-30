@@ -418,6 +418,14 @@ def test_shot_duration_below_five_is_rejected() -> None:
         ShotOutput.model_validate(payload)
 
 
+def test_shot_duration_above_fifteen_is_rejected() -> None:
+    payload = _valid_shot()
+    payload["duration_sec"] = 16
+
+    with pytest.raises(ValidationError):
+        ShotOutput.model_validate(payload)
+
+
 @pytest.mark.parametrize("scene_asset_id", [None, "", "   "])
 def test_shot_with_empty_scene_asset_id_is_rejected(scene_asset_id: str | None) -> None:
     payload = _valid_shot()

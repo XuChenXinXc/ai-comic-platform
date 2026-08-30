@@ -3,7 +3,7 @@ from typing import Any
 from sqlalchemy import insert, select, update
 
 from app.db import Database, db
-from app.models.tables import chapter, novel_analysis, project, screenplay
+from app.models.tables import asset, chapter, novel_analysis, project, screenplay
 from app.prompts import load_prompt
 from app.schemas import (
     NovelAnalysisOutput,
@@ -53,6 +53,31 @@ class WritingService:
         if record is None:
             raise not_found("章节")
         return record
+
+    def _scene_asset_names(self, project_id: str) -> list[dict[str, Any]]:
+        """项目内已有的场景素材名（含别名），供剧本阶段锚定 scene_name。
+
+        剧本的 scene_name 必须与场景素材同名，否则分镜保存时按名称绑定素材
+        会失败。素材提取读的是章节正文、剧本生成读的是正文+分析，两步各自
+        命名必然对不齐，因此这里把已有场景名显式喂给剧本模型。
+        """
+        names: list[dict[str, Any]] = []
+        with self.database.engine.connect() as connection:
+            for row in connection.execute(
+                select(asset.c.name, asset.c.profile_json).where(
+                    asset.c.project_id == project_id,
+                    asset.c.asset_type == "scene",
+                )
+            ):
+                profile = json_loads(row.profile_json, {})
+                aliases = profile.get("aliases")
+                names.append(
+                    {
+                        "name": row.name,
+                        "aliases": aliases if isinstance(aliases, list) else [],
+                    }
+                )
+        return names
 
     def _content_record(self, table: Any, chapter_id: str) -> dict[str, Any] | None:
         with self.database.engine.connect() as connection:
@@ -440,9 +465,19 @@ class WritingService:
                 if saved_analysis is not None
                 else self.get_analysis(chapter_id)["content"]
             )
+            scene_asset_names = self._scene_asset_names(chapter_record["project_id"])
+            warnings: list[str] = []
+            if not scene_asset_names:
+                warnings.append(
+                    "项目尚无场景素材：剧本生成的场次名无法与素材库锚定，"
+                    "分镜提取时可能因场景绑定失败。建议先提取场景素材，"
+                    "再重新生成剧本（或逐场重写）。"
+                )
             user_prompt = (
                 f"本章正文：\n{chapter_record['source_text']}\n\n"
-                f"本次小说分析：\n{json_dumps(analysis_content)}"
+                f"本次小说分析：\n{json_dumps(analysis_content)}\n\n"
+                f"已有场景素材名称（scene_name 必须优先复用，不得改写）：\n"
+                f"{json_dumps(scene_asset_names)}"
             )
             output = await provider.generate_json(
                 system_prompt=load_prompt("screenplay"),
@@ -468,6 +503,7 @@ class WritingService:
             return {
                 "analysis": analysis_result,
                 "content": result,
+                "warnings": warnings,
             }
         except Exception as exc:
             if expected_analysis_revision is not None:
@@ -502,6 +538,8 @@ class WritingService:
             user_prompt = (
                 f"本章正文：\n{chapter_record['source_text']}\n\n"
                 f"完整剧本：\n{json_dumps(current['content'])}\n\n"
+                f"已有场景素材名称（scene_name 必须优先复用，不得改写）：\n"
+                f"{json_dumps(self._scene_asset_names(chapter_record['project_id']))}\n\n"
                 f"目标场次：{input_data['scene_no']}\n"
                 f"补充要求：{input_data.get('instructions', '')}"
             )

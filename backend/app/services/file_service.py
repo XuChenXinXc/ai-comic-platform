@@ -27,6 +27,7 @@ from app.models.tables import (
     shot,
     video_version,
 )
+from app.services.constants import MAX_DOWNLOAD_SIZE
 from app.services.utils import sanitize_error_message
 
 logger = logging.getLogger(__name__)
@@ -194,6 +195,7 @@ def download_url_atomic(
     headers: Mapping[str, str] | None = None,
     timeout: float = 120,
     temp_dir: str | Path | None = None,
+    max_bytes: int = MAX_DOWNLOAD_SIZE,
 ) -> Path:
     target_path = Path(target)
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,10 +209,12 @@ def download_url_atomic(
             stream=True,
         ) as response:
             response.raise_for_status()
+            headers = getattr(response, "headers", {}) or {}
+            _validate_content_length(headers.get("Content-Length"), max_bytes)
             # stream 模式复制 response.raw 不会自动解压 gzip，需要显式开启解码
             response.raw.decode_content = True
             with temporary.open("wb") as output:
-                _copy_response(response.raw, output)
+                _copy_response(response.raw, output, max_bytes)
         _validate_non_empty(temporary)
         os.replace(temporary, target_path)
     except requests.RequestException as exc:
@@ -220,8 +224,29 @@ def download_url_atomic(
     return target_path
 
 
-def _copy_response(source: BinaryIO, target: BinaryIO) -> None:
-    shutil.copyfileobj(source, target, length=1024 * 1024)
+def _validate_content_length(raw_length: str | None, max_bytes: int) -> None:
+    """有 Content-Length 时先行拒绝超限响应，避免白写一遍磁盘。"""
+    if not raw_length:
+        return
+    try:
+        declared = int(raw_length)
+    except ValueError:
+        return
+    if declared > max_bytes:
+        raise FileServiceError(f"下载文件超过大小上限：{declared} > {max_bytes} 字节")
+
+
+def _copy_response(source: BinaryIO, target: BinaryIO, max_bytes: int) -> None:
+    """流式复制并限制总字节数；Content-Length 可以缺失或说谎，必须边写边计数。"""
+    copied = 0
+    while True:
+        chunk = source.read(1024 * 1024)
+        if not chunk:
+            return
+        copied += len(chunk)
+        if copied > max_bytes:
+            raise FileServiceError(f"下载文件超过大小上限：{max_bytes} 字节")
+        target.write(chunk)
 
 
 class FileService:
@@ -978,6 +1003,11 @@ class FileService:
         return True
 
     def clear_temp(self, project_id: str) -> None:
+        """清空项目 temp 目录。
+
+        注意：temp 同时是原子写入的暂存区，调用方必须确保没有并发的
+        下载/生成任务正在进行，否则可能删除其尚未落盘的临时文件。
+        """
         temporary = self.resolve_project_path(project_id, "temp")
         if temporary.exists():
             shutil.rmtree(temporary)

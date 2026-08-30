@@ -34,6 +34,15 @@ _EXTRACTION_KEYS = {
     "prop": "props",
 }
 
+# 首次素材提取（该章节所属项目素材库为空）时，模型返回空结果所允许的额外重试次数。
+_EXTRACT_EMPTY_RETRIES = 1
+# 首次提取空结果重试时追加到 user_prompt 末尾的强化措辞，不改变原始提示内容结构。
+_EXTRACT_EMPTY_RETRY_PROMPT = (
+    "\n\n注意：这是该章节的首次素材提取，素材库当前为空。请仔细阅读正文，"
+    "至少提取正文中确实出现、需要跨分镜保持一致的素材；"
+    "除非本章正文确实没有任何可提取对象，否则不得返回空数组。"
+)
+
 _ACTIVE_JOB_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
 _NAME_VARIANT_TOKENS = (
     "已熄灭",
@@ -724,31 +733,53 @@ class AssetService:
         selected_types = set(input_data["asset_types"])
         provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
         existing_catalog = self._existing_catalog(current_project["id"])
-        output = await provider.generate_json(
-            system_prompt=load_prompt("asset_extract"),
-            user_prompt=(
-                f"本章正文：\n{current_chapter['source_text']}\n\n"
-                f"已有素材目录（已存在，本章若出现同一对象请勿重复提取）：\n"
-                f"{json_dumps(existing_catalog)}"
-            ),
-            schema=AssetExtractionOutput,
-            params={**config["params"], **input_data.get("params", {})},
+        # 首次提取：该章节所属项目素材库为空；此时若模型返回空结果则判为异常并自动重试。
+        # 增量提取（素材库已有内容）结果为空属合法结果（提示词允许数组为空），不重试。
+        first_extract = not existing_catalog
+        user_prompt = (
+            f"本章正文：\n{current_chapter['source_text']}\n\n"
+            f"已有素材目录（已存在，本章若出现同一对象请勿重复提取）：\n"
+            f"{json_dumps(existing_catalog)}"
         )
-        payload = output.model_dump(mode="json")
-        saved_ids: list[str] = []
-        warnings: list[str] = []
-        for asset_type, key in _EXTRACTION_KEYS.items():
-            if asset_type not in selected_types:
-                continue
-            for extracted in payload[key]:
-                saved_ids.append(
-                    self._upsert_extracted(
-                        current_project,
-                        asset_type,
-                        extracted,
-                        warnings=warnings,
+
+        async def _generate(prompt: str) -> dict[str, Any]:
+            output = await provider.generate_json(
+                system_prompt=load_prompt("asset_extract"),
+                user_prompt=prompt,
+                schema=AssetExtractionOutput,
+                params={**config["params"], **input_data.get("params", {})},
+            )
+            return output.model_dump(mode="json")
+
+        def _save(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
+            saved: list[str] = []
+            warns: list[str] = []
+            for asset_type, key in _EXTRACTION_KEYS.items():
+                if asset_type not in selected_types:
+                    continue
+                for extracted in payload[key]:
+                    saved.append(
+                        self._upsert_extracted(
+                            current_project,
+                            asset_type,
+                            extracted,
+                            warnings=warns,
+                        )
                     )
-                )
+            return saved, warns
+
+        payload = await _generate(user_prompt)
+        saved_ids, warnings = _save(payload)
+        # 首次提取却未返回任何素材：判为异常，追加强化措辞重试，
+        # 仍为空则抛出异常交由 runner 标记失败。
+        if first_extract and not saved_ids:
+            for _ in range(_EXTRACT_EMPTY_RETRIES):
+                payload = await _generate(user_prompt + _EXTRACT_EMPTY_RETRY_PROMPT)
+                saved_ids, warnings = _save(payload)
+                if saved_ids:
+                    break
+            if not saved_ids:
+                raise RuntimeError("首次素材提取未返回任何素材，请检查正文或模型输出")
         with self.database.engine.connect() as connection:
             for character in self._missing_key_characters(
                 connection,

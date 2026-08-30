@@ -64,6 +64,7 @@ class WorkflowRunCreate(PipelineModel):
     source_text: str | None = None
     synopsis: str | None = None
     target_duration_sec: float = Field(default=30, gt=0, le=3600)
+    strong_dynamic_max_events: int = Field(default=3, ge=0, le=12)
     aspect_ratio: str = Field(default="9:16", min_length=1)
     style_prompt: str = ""
     auto_run: bool = False
@@ -338,6 +339,16 @@ class CharacterVisualAnchor(PipelineModel):
     approved_reference_ids: list[str] = Field(default_factory=list)
 
 
+class CharacterBehaviorEvidence(PipelineModel):
+    """把人物行为逻辑落成可被剧本和分镜复用的证据。"""
+
+    trigger: str = ""
+    action: str = ""
+    expression: str = ""
+    voice: str = ""
+    source_refs: list[str] = Field(default_factory=list)
+
+
 class CharacterBio(PipelineModel):
     basic_info: CharacterBasicInfo
     background: str = Field(min_length=1)
@@ -345,6 +356,7 @@ class CharacterBio(PipelineModel):
     dynamic_comic_setting: str = Field(min_length=1)
     plot_relation: str = Field(min_length=1)
     visual_anchor: CharacterVisualAnchor
+    behavior_evidence: CharacterBehaviorEvidence = Field(default_factory=CharacterBehaviorEvidence)
 
 
 class EnsembleAnchor(PipelineModel):
@@ -440,3 +452,78 @@ class StageArtifactEnvelope(PipelineModel):
 
 class StageArtifactDraft(StageArtifactEnvelope):
     stage_key: StageKey | None = None
+
+
+# Phase 4.1 阶段 3 的详细剧本合同。该阶段故意不复用 legacy Shot 的最小时长约束。
+LipSyncLevel = Literal["none", "low", "medium", "high"]
+
+
+class ScriptDialogue(PipelineModel):
+    dialogue_line_id: str = Field(min_length=1)
+    speaker: str = ""
+    text: str = Field(min_length=1)
+    start_sec: float | None = Field(default=None, ge=0)
+    end_sec: float | None = Field(default=None, gt=0)
+    lip_sync_level: LipSyncLevel = "none"
+    acting_intent: str = ""
+    source_refs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> ScriptDialogue:
+        if (
+            self.start_sec is not None
+            and self.end_sec is not None
+            and self.end_sec <= self.start_sec
+        ):
+            raise ValueError("end_sec 必须大于 start_sec")
+        return self
+
+
+class ScriptSoundCue(PipelineModel):
+    kind: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    start_sec: float | None = Field(default=None, ge=0)
+    end_sec: float | None = Field(default=None, gt=0)
+    source_refs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> ScriptSoundCue:
+        if (
+            self.start_sec is not None
+            and self.end_sec is not None
+            and self.end_sec <= self.start_sec
+        ):
+            raise ValueError("end_sec 必须大于 start_sec")
+        return self
+
+
+class ScriptScene(PipelineModel):
+    scene_id: str = Field(min_length=1)
+    ordinal: int = Field(ge=1)
+    scene_heading: str = Field(min_length=1)
+    time_weather: str = ""
+    location: str = ""
+    characters: list[str] = Field(default_factory=list)
+    objective: str = ""
+    action: str = ""
+    plot_event_ids: list[str] = Field(default_factory=list)
+    dialogue: list[ScriptDialogue] = Field(default_factory=list)
+    narration: list[str] = Field(default_factory=list)
+    emotion: str = ""
+    dynamic_level: DynamicLevel = 0.0
+    sound_cues: list[ScriptSoundCue | str] = Field(default_factory=list)
+    subtitle_style: str = ""
+    duration_sec: float = Field(gt=0)
+    transition_to_next: str = ""
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class ScriptOutput(PipelineModel):
+    artifact_meta: ArtifactMeta
+    title: str = Field(min_length=1)
+    logline: str = Field(min_length=1)
+    target_duration_sec: float = Field(gt=0)
+    scenes: list[ScriptScene] = Field(default_factory=list)
+    strong_dynamic_event_ids: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)

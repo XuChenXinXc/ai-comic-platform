@@ -3,7 +3,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.schemas import MIN_SHOT_DURATION_SEC, ScreenplayDialogue, ShotTransitionFromPrev
+from app.schemas import (
+    MAX_SHOT_DURATION_SEC,
+    MIN_SHOT_DURATION_SEC,
+    ScreenplayDialogue,
+    ShotTransitionFromPrev,
+)
 
 AssetType = Literal["character", "scene", "prop"]
 ContentStatus = Literal["draft", "ready", "confirmed", "failed"]
@@ -111,6 +116,11 @@ class ProjectStorageSetting(ApiModel):
 
 class ProjectStorageSelectionResult(ProjectStorageSetting):
     selected: bool
+
+
+class ImgbbKeyStatus(ApiModel):
+    configured: bool
+    source: Literal["database", "environment", "default"]
 
 
 class GenerateRequest(ApiModel):
@@ -308,7 +318,7 @@ class ShotFields(ApiModel):
     shot_type: str = ""
     camera_angle: str = ""
     camera_move: str = ""
-    duration_sec: float = Field(ge=MIN_SHOT_DURATION_SEC)
+    duration_sec: float = Field(ge=MIN_SHOT_DURATION_SEC, le=MAX_SHOT_DURATION_SEC)
     end_state: str = ""
     next_hook: str = ""
     transition_from_prev: ShotTransitionFromPrev = "scene_change"
@@ -341,7 +351,11 @@ class ShotUpdate(ApiModel):
     shot_type: str | None = None
     camera_angle: str | None = None
     camera_move: str | None = None
-    duration_sec: float | None = Field(default=None, ge=MIN_SHOT_DURATION_SEC)
+    duration_sec: float | None = Field(
+        default=None,
+        ge=MIN_SHOT_DURATION_SEC,
+        le=MAX_SHOT_DURATION_SEC,
+    )
     end_state: str | None = None
     next_hook: str | None = None
     transition_from_prev: ShotTransitionFromPrev | None = None
@@ -377,7 +391,11 @@ class ShotSplitPart(ApiModel):
     frame_description: str = ""
     dialogue: list[ScreenplayDialogue] | None = None
     narration: str | None = None
-    duration_sec: float | None = Field(default=None, ge=MIN_SHOT_DURATION_SEC)
+    duration_sec: float | None = Field(
+        default=None,
+        ge=MIN_SHOT_DURATION_SEC,
+        le=MAX_SHOT_DURATION_SEC,
+    )
 
 
 class ShotSplitRequest(ApiModel):

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import select, update
 
 from app.db import utc_now
+from app.dynamic_pipeline.stage_catalog import get_stage_prerequisites
 from app.jobs.dynamic_bridge import DynamicJobBridge
 from app.jobs.repository import JobRepository, has_download_source
 from app.models.tables import job, workflow_run, workflow_stage
@@ -17,6 +18,8 @@ _PROTECTED_STAGE_RUN_STATUSES = _PROTECTED_WORKFLOW_STATUSES
 _TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 _SAFE_INTERRUPTED_RUN_STATUSES = {"queued", "running"}
 _SAFE_PARTIAL_FAILED_RUN_STATUSES = {"queued", "running"}
+
+_UPSTREAM_NON_EXECUTABLE_STATUSES = {"blocked", "cancelled", "stale"}
 
 _ALLOWED_STAGE_STATUSES_BY_JOB = {
     "queued": frozenset({"queued"}),
@@ -67,6 +70,71 @@ def _load_workflow_records(
                 )
             ).first()
     return _row_dict(run_row), _row_dict(stage_row)
+
+
+def _latest_stage_record(
+    repository: JobRepository,
+    run_id: str,
+    stage_key: str,
+) -> dict[str, Any] | None:
+    with repository.engine.connect() as connection:
+        row = connection.execute(
+            select(workflow_stage)
+            .where(
+                workflow_stage.c.workflow_run_id == run_id,
+                workflow_stage.c.stage_key == stage_key,
+            )
+            .order_by(
+                workflow_stage.c.attempt.desc(),
+                workflow_stage.c.updated_at.desc(),
+                workflow_stage.c.id.desc(),
+            )
+            .limit(1)
+        ).first()
+    return _row_dict(row)
+
+
+def _dependency_failure(
+    repository: JobRepository,
+    record: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    dependencies = record.get("depends_on")
+    if not isinstance(dependencies, list):
+        return None
+    for dependency_id in dependencies:
+        dependency = repository.get(str(dependency_id))
+        if dependency is None:
+            return str(dependency_id), "依赖 Job 不存在"
+        status = str(dependency.get("status") or "")
+        if status in {"failed", "cancelled", "interrupted", "stale"}:
+            return str(dependency_id), f"依赖 Job 状态为 {status}"
+    return None
+
+
+def _dependency_pending(repository: JobRepository, record: Mapping[str, Any]) -> bool:
+    dependencies = record.get("depends_on")
+    if not isinstance(dependencies, list):
+        return False
+    return any(
+        (dependency := repository.get(str(dependency_id))) is not None
+        and dependency.get("status") not in _TERMINAL_JOB_STATUSES
+        for dependency_id in dependencies
+    )
+
+
+def _stage_input_signature(record: Mapping[str, Any]) -> str:
+    """读取 Job 对应的 stage 输入签名；媒体 Job 自身使用 media signature。"""
+    if str(record.get("job_type") or "") == "dynamic_stage_generate":
+        return str(record.get("input_signature") or "")
+    input_data = record.get("input_data")
+    if isinstance(input_data, Mapping):
+        direct = str(input_data.get("workflow_stage_input_signature") or "")
+        if direct:
+            return direct
+        provenance = input_data.get("provenance_json") or input_data.get("provenance")
+        if isinstance(provenance, Mapping):
+            return str(provenance.get("upstream_input_signature") or "")
+    return ""
 
 
 def _update_workflow_state(
@@ -275,9 +343,157 @@ def _add_skipped_id(report: DynamicRecoveryReport, job_id: str) -> None:
         report.skipped_ids.append(job_id)
 
 
+def _has_non_executable_upstream(
+    repository: JobRepository,
+    stage_record: dict[str, Any],
+) -> bool:
+    try:
+        prerequisites = get_stage_prerequisites(str(stage_record.get("stage_key") or ""))
+    except ValueError:
+        return True
+    if not prerequisites:
+        return False
+    with repository.engine.connect() as connection:
+        statuses = connection.scalars(
+            select(workflow_stage.c.status).where(
+                workflow_stage.c.workflow_run_id == stage_record.get("workflow_run_id"),
+                workflow_stage.c.stage_key.in_(prerequisites),
+            )
+        ).all()
+    return any(status in _UPSTREAM_NON_EXECUTABLE_STATUSES for status in statuses)
+
+
+def _stage_dependency_state(
+    repository: JobRepository,
+    stage_record: Mapping[str, Any],
+) -> tuple[str, str | None]:
+    """按最新 attempt 检查动态阶段的隐式前置阶段。"""
+    run_id = str(stage_record.get("workflow_run_id") or "")
+    stage_key = str(stage_record.get("stage_key") or "")
+    try:
+        prerequisites = get_stage_prerequisites(stage_key)
+    except ValueError as exc:
+        return "failed", str(exc)
+    pending = False
+    for prerequisite_key in prerequisites:
+        prerequisite = _latest_stage_record(repository, run_id, prerequisite_key)
+        if prerequisite is None:
+            return "failed", f"动态任务前置阶段不存在：{prerequisite_key}"
+        status = str(prerequisite.get("status") or "")
+        if status in {
+            "failed",
+            "partial_failed",
+            "interrupted",
+            "cancelled",
+            "stale",
+            "blocked",
+        }:
+            return (
+                "failed",
+                f"动态任务前置阶段未成功完成：{prerequisite_key}（{status}）",
+            )
+        if status != "confirmed":
+            pending = True
+    return ("pending", None) if pending else ("ready", None)
+
+
+def _reconcile_queued_stage_jobs(repository: JobRepository) -> list[str]:
+    """只为当前 attempt 且前置阶段已确认的 queued stage 补建 Job。"""
+    bridge = DynamicJobBridge(repository)
+    with repository.engine.connect() as connection:
+        candidates = connection.execute(
+            select(workflow_run.c.id.label("run_id"), workflow_stage.c.id.label("stage_id"))
+            .select_from(
+                workflow_run.join(
+                    workflow_stage,
+                    workflow_stage.c.workflow_run_id == workflow_run.c.id,
+                )
+            )
+            .where(
+                workflow_run.c.status.not_in(_PROTECTED_WORKFLOW_STATUSES),
+                workflow_stage.c.status == "queued",
+            )
+            .order_by(workflow_run.c.id, workflow_stage.c.ordinal, workflow_stage.c.id)
+        ).all()
+
+    enqueue_ids: list[str] = []
+    for candidate in candidates:
+        run_id = str(candidate.run_id)
+        stage_id = str(candidate.stage_id)
+        with repository.engine.connect() as connection:
+            run_record = _row_dict(
+                connection.execute(select(workflow_run).where(workflow_run.c.id == run_id)).first()
+            )
+            stage_record = _row_dict(
+                connection.execute(
+                    select(workflow_stage).where(
+                        workflow_stage.c.id == stage_id,
+                        workflow_stage.c.workflow_run_id == run_id,
+                    )
+                ).first()
+            )
+            if run_record is None or stage_record is None:
+                continue
+            latest = _latest_stage_record(repository, run_id, str(stage_record.get("stage_key")))
+            if latest is None or latest.get("id") != stage_id:
+                continue
+            dependency_state, dependency_error = _stage_dependency_state(repository, stage_record)
+        if dependency_error is not None:
+            _update_workflow_state(
+                repository,
+                run_id=run_id,
+                stage_id=stage_id,
+                stage_target="partial_failed",
+                stage_error=dependency_error,
+                run_target="partial_failed",
+                run_error=dependency_error,
+                run_allowed_statuses=_SAFE_PARTIAL_FAILED_RUN_STATUSES,
+            )
+            continue
+        if dependency_state != "ready":
+            continue
+        with repository.engine.begin() as connection:
+            run_record = _row_dict(
+                connection.execute(select(workflow_run).where(workflow_run.c.id == run_id)).first()
+            )
+            stage_record = _row_dict(
+                connection.execute(
+                    select(workflow_stage).where(
+                        workflow_stage.c.id == stage_id,
+                        workflow_stage.c.workflow_run_id == run_id,
+                        workflow_stage.c.status == "queued",
+                    )
+                ).first()
+            )
+            if run_record is None or stage_record is None:
+                continue
+            existing = bridge._find_by_stage_signature(
+                connection,
+                stage_id,
+                str(stage_record.get("input_signature") or ""),
+            )
+            if existing is not None:
+                reference = bridge._existing_reference(
+                    connection,
+                    existing,
+                    str(stage_record.get("status") or ""),
+                    retry_failed=False,
+                )
+            else:
+                reference = bridge.ensure_stage_job_in_transaction(
+                    connection,
+                    run_record,
+                    stage_record,
+                )
+            if reference.status == "queued" and reference.job_id not in enqueue_ids:
+                enqueue_ids.append(reference.job_id)
+    return enqueue_ids
+
+
 def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
     report = DynamicRecoveryReport()
-    for job_id in DynamicJobBridge(repository).reconcile_queued_stage_jobs():
+    reconciled_ids = _reconcile_queued_stage_jobs(repository)
+    for job_id in reconciled_ids:
         _add_enqueue_id(report, job_id)
 
     for record in repository.list_non_terminal(include_dynamic=True):
@@ -309,6 +525,22 @@ def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
             )
             continue
 
+        latest_stage = _latest_stage_record(
+            repository,
+            str(run_id),
+            str(stage_record.get("stage_key") or ""),
+        )
+        if latest_stage is None or latest_stage.get("id") != stage_record.get("id"):
+            _mark_interrupted(
+                repository,
+                report,
+                record,
+                "动态任务关联的 stage attempt 已过期，禁止自动恢复旧 Job",
+                stage_target=None,
+                run_target=None,
+            )
+            continue
+
         stage_status = str(stage_record["status"])
         if stage_status in _PROTECTED_STAGE_STATUSES:
             if stage_status == "stale":
@@ -323,7 +555,42 @@ def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
                 _add_skipped_id(report, job_id)
             continue
 
-        job_signature = record.get("input_signature")
+        stage_dependency_state, stage_dependency_error = _stage_dependency_state(
+            repository,
+            stage_record,
+        )
+        if stage_dependency_error is not None:
+            _mark_failed(
+                repository,
+                report,
+                record,
+                stage_dependency_error,
+            )
+            continue
+        if stage_dependency_state == "pending":
+            if record["status"] != "queued":
+                if repository.requeue_for_recovery(
+                    job_id,
+                    expected_status=record["status"],
+                    message="动态任务前置阶段尚未确认，保持 queued",
+                ):
+                    _add_skipped_id(report, job_id)
+            else:
+                _add_skipped_id(report, job_id)
+            continue
+
+        dependency_failure = _dependency_failure(repository, record)
+        if dependency_failure is not None:
+            dependency_id, dependency_reason = dependency_failure
+            _mark_failed(
+                repository,
+                report,
+                record,
+                f"动态任务依赖 {dependency_id} 未成功完成：{dependency_reason}",
+            )
+            continue
+
+        job_signature = _stage_input_signature(record)
         stage_signature = stage_record.get("input_signature")
         if job_signature and stage_signature and job_signature != stage_signature:
             error = "输入签名已变化，禁止自动重新入队"
@@ -336,7 +603,10 @@ def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
             continue
 
         if status == "queued":
-            _add_enqueue_id(report, job_id)
+            if _dependency_pending(repository, record):
+                _add_skipped_id(report, job_id)
+            else:
+                _add_enqueue_id(report, job_id)
             continue
 
         if status == "running":

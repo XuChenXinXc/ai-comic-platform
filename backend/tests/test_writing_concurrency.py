@@ -5,15 +5,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import insert
 
 from app.db import Database
-from app.models.tables import novel_analysis
+from app.models.tables import asset, novel_analysis
 from app.prompts import load_prompt
 from app.schemas import NovelAnalysisOutput, ScreenplayOutput
 from app.services.chapter_service import ChapterService
 from app.services.file_service import FileService
 from app.services.project_service import ProjectService
-from app.services.utils import json_dumps
+from app.services.utils import json_dumps, utc_now
 from app.services.writing_service import WritingService
 
 
@@ -337,3 +338,132 @@ def test_analysis_provider_resolution_failure_marks_matching_revision_failed(
     current = service.get_analysis(chapter["id"])
     assert current["status"] == "failed"
     assert current["revision"] == 0
+
+
+def test_screenplay_generation_passes_existing_scene_asset_names_to_model(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """剧本生成必须把已有场景素材名喂给模型，否则 scene_name 无法与素材库对齐。
+
+    回归 2026-08 缺陷：素材提取读章节正文、剧本生成只读正文+分析，两步各自命名，
+    剧本的 scene_name 与场景素材名必然对不上，分镜保存时按名称绑定场景素材会
+    整批失败（「未匹配到场景素材：坐错桌」）。
+    """
+    database, service, jobs, project, chapter = writing_service
+    now = utc_now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(asset).values(
+                id="asset-scene-1",
+                project_id=project["id"],
+                asset_type="scene",
+                name="烧烤店",
+                profile_json=json_dumps({"aliases": ["路边烧烤"]}),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        # 角色素材不应出现在剧本的场景名清单里
+        connection.execute(
+            insert(asset).values(
+                id="asset-character-1",
+                project_id=project["id"],
+                asset_type="character",
+                name="林雪",
+                profile_json=json_dumps({}),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    provider = SequencedTextProvider()
+    monkeypatch.setattr(
+        service,
+        "_provider",
+        lambda _provider_id: (provider, {"id": "mock-text", "params": {}}),
+    )
+
+    service.queue_screenplay(chapter["id"], {})
+    asyncio.run(service.handle_screenplay(_queued_job(chapter["id"], jobs)))
+
+    screenplay_prompt = provider.calls[1]["user_prompt"]
+    assert "已有场景素材名称" in screenplay_prompt
+    assert "烧烤店" in screenplay_prompt
+    assert "路边烧烤" in screenplay_prompt
+    # 只传场景素材，不混入角色
+    assert "林雪" not in screenplay_prompt
+
+
+def test_screenplay_generation_warns_when_no_scene_assets_exist(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """素材库为空时生成剧本：返回 warnings 提示应先提取素材。
+
+    回归 2026-08 缺陷：剧本生成先于素材提取时，剧本模型拿不到任何场景素材
+    名称作为锚点，会把桥段标题（「坐错桌」）写进 scene_name；后续分镜按名称
+    绑定场景素材必然整批失败。现在生成结果里附带明确提示，引导用户先补素材
+    再重新生成剧本。
+    """
+    database, service, jobs, project, chapter = writing_service
+    provider = SequencedTextProvider()
+    monkeypatch.setattr(
+        service,
+        "_provider",
+        lambda _provider_id: (
+            provider,
+            {"id": "mock-text", "params": {}},
+        ),
+    )
+    # 该 fixture 的项目没有创建任何 scene 素材（含别名的场景素材测试在上一个用例）
+
+    service.queue_screenplay(chapter["id"], {})
+    result = asyncio.run(service.handle_screenplay(_queued_job(chapter["id"], jobs)))
+
+    assert result["content"]["title"] == "本次自动剧本"
+    assert result["warnings"]
+    assert any("尚无场景素材" in message for message in result["warnings"])
+
+
+def test_scene_asset_names_returns_only_scene_assets_of_project(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+) -> None:
+    """场景名清单按项目过滤且只含 scene 类型，别名缺失时返回空列表。"""
+    database, service, _jobs, project, _chapter = writing_service
+    other_project = ProjectService(database, FileService(database.database_url)).create(
+        {"name": "另一个项目"}
+    )
+    now = utc_now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(asset).values(
+                id="asset-scene-no-alias",
+                project_id=project["id"],
+                asset_type="scene",
+                name="出租车内",
+                profile_json=json_dumps({}),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        connection.execute(
+            insert(asset).values(
+                id="asset-scene-other-project",
+                project_id="other-project",
+                asset_type="scene",
+                name="别的项目场景",
+                profile_json=json_dumps({}),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    names = service._scene_asset_names(project["id"])
+
+    assert names == [{"name": "出租车内", "aliases": []}]

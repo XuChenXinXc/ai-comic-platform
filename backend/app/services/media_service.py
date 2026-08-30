@@ -2,20 +2,27 @@ import asyncio
 import base64
 import io
 import logging
-import math
+import re
 import subprocess
 import time
 import zipfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import delete, func, insert, or_, select, update
+from sqlalchemy import delete, exists, func, insert, or_, select, update
 
 from app.config import settings
 from app.db import Database, db
+from app.dynamic_pipeline.h3_adapter import (
+    Ref2VATextOutput,
+    build_ref2va_rewrite_request,
+    extract_dialogue_lines,
+    validate_ref2va_sections,
+)
 from app.models.tables import (
     api_provider,
     asset,
@@ -26,6 +33,8 @@ from app.models.tables import (
     project,
     shot,
     video_version,
+    workflow_run,
+    workflow_stage,
 )
 from app.schemas import ProviderPollResult
 from app.services.constants import MAX_IMAGE_SIZE, MAX_VIDEO_SIZE
@@ -33,6 +42,7 @@ from app.services.errors import ServiceError, bad_request, conflict, not_found
 from app.services.file_service import (
     FileServiceError,
     atomic_copy,
+    download_url_atomic,
     file_service,
     project_media_url,
 )
@@ -42,6 +52,7 @@ from app.services.prompt_service import (
     compile_asset_prompt,
     compile_keyframe_prompt,
     compile_video_prompt,
+    effective_video_duration,
     resolve_asset_negative_prompt,
     resolve_video_description,
     resolve_visual_aspect_ratio,
@@ -74,6 +85,13 @@ class JobCancelledError(RuntimeError):
     """任务被用户取消，媒体处理器应尽快中止轮询。"""
 
 
+class MediaDependencyError(ServiceError):
+    """媒体任务的前置依赖不存在或未成功完成。"""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(409, detail)
+
+
 _MEDIA_TABLES = {
     "asset_image": (asset_image, "asset_id"),
     "keyframe": (keyframe_version, "shot_id"),
@@ -81,6 +99,15 @@ _MEDIA_TABLES = {
 }
 _DELETED_MEDIA_ERROR = "__deleted_by_user__"
 _ACTIVE_MEDIA_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+_TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
+_DYNAMIC_PROTECTED_STATUSES = {
+    "blocked",
+    "cancelled",
+    "failed",
+    "interrupted",
+    "partial_failed",
+    "stale",
+}
 _MEDIA_VERSION_FILE_LOCK = RLock()
 _GPT_IMAGE_2_SIZES = {
     # apib 按分辨率档位出图：这些像素尺寸只作为比例提示，
@@ -92,10 +119,6 @@ _GPT_IMAGE_2_SIZES = {
     "scene": "2048x1152",
     "prop": "2048x1360",
     "keyframe": "2048x1152",
-}
-_INTEGER_DURATION_VIDEO_MODELS = {
-    "grok-imagine-1.5-video-apimart",
-    "grok-imagine-1.5-video-ext",
 }
 _ASSET_VISUAL_PROFILE_FIELDS = {
     "character": (
@@ -189,9 +212,7 @@ class MediaService:
 
     @staticmethod
     def _effective_video_duration(model: str, duration_sec: float) -> float | int:
-        if model.strip().lower() in _INTEGER_DURATION_VIDEO_MODELS:
-            return max(6, math.ceil(duration_sec))
-        return duration_sec
+        return effective_video_duration(model, duration_sec)
 
     @staticmethod
     def _has_visual_value(value: Any) -> bool:
@@ -300,6 +321,506 @@ class MediaService:
         except OSError:
             return None
         return None
+
+    @staticmethod
+    def _is_dynamic_media_input(input_data: Mapping[str, Any]) -> bool:
+        return bool(
+            input_data.get("workflow_run_id")
+            and input_data.get("workflow_stage_id")
+            and (
+                input_data.get("plan")
+                or input_data.get("reference_plan")
+                or input_data.get("reference_inputs")
+            )
+        )
+
+    @staticmethod
+    def _dynamic_reference_plan(input_data: Mapping[str, Any]) -> dict[str, Any]:
+        direct = input_data.get("reference_plan")
+        if isinstance(direct, Mapping):
+            return dict(direct)
+        plan = input_data.get("plan")
+        if isinstance(plan, Mapping):
+            provenance = plan.get("provenance_json") or plan.get("provenance")
+            if isinstance(provenance, Mapping):
+                reference_plan = provenance.get("reference_plan")
+                if isinstance(reference_plan, Mapping):
+                    return dict(reference_plan)
+        provenance = input_data.get("provenance_json") or input_data.get("provenance")
+        if isinstance(provenance, Mapping) and isinstance(
+            provenance.get("reference_plan"), Mapping
+        ):
+            return dict(provenance["reference_plan"])
+        return {}
+
+    @classmethod
+    def _dynamic_reference_sources(
+        cls,
+        input_data: Mapping[str, Any],
+    ) -> list[tuple[str, str]]:
+        """按 ReferencePlan index 保留本地文件和 URL 的混合顺序。"""
+        reference_plan = cls._dynamic_reference_plan(input_data)
+        raw_bindings = input_data.get("reference_bindings")
+        slots = reference_plan.get("slots")
+        if not isinstance(slots, list):
+            slots = raw_bindings if isinstance(raw_bindings, list) else []
+        mapping = reference_plan.get("text_mapping")
+        mapping = mapping if isinstance(mapping, Mapping) else {}
+
+        result: list[tuple[str, str]] = []
+        consumed_local: set[str] = set()
+        consumed_url: set[str] = set()
+        ordered_slots = sorted(
+            (item for item in slots if isinstance(item, Mapping)),
+            key=lambda item: int(item.get("index", 0) or 0),
+        )
+        for slot in ordered_slots:
+            index = int(slot.get("index", 0) or 0)
+            mapped = mapping.get(f"@Image{index}", {})
+            mapped = mapped if isinstance(mapped, Mapping) else {}
+            source = str(mapped.get("source") or "").strip().casefold()
+            local = str(
+                mapped.get("local_file")
+                or mapped.get("local")
+                or mapped.get("path")
+                or (slot.get("relative_path") or "")
+            ).strip()
+            url = str(
+                mapped.get("url")
+                or (slot.get("provider_url") or "")
+            ).strip()
+            if source == "url" and url:
+                result.append(("url", url))
+                consumed_url.add(url)
+            elif source == "local" and local:
+                result.append(("local", local))
+                consumed_local.add(local)
+            elif local:
+                result.append(("local", local))
+                consumed_local.add(local)
+            elif url:
+                result.append(("url", url))
+                consumed_url.add(url)
+
+        raw_inputs = input_data.get("reference_inputs")
+        if isinstance(raw_inputs, Mapping):
+            local_values = raw_inputs.get("local", [])
+            url_values = raw_inputs.get("url", [])
+        else:
+            local_values = input_data.get("reference_files", [])
+            url_values = input_data.get("reference_urls", [])
+        for value in local_values if isinstance(local_values, list) else []:
+            text = str(value or "").strip()
+            if text and text not in consumed_local:
+                result.append(("local", text))
+                consumed_local.add(text)
+        for value in url_values if isinstance(url_values, list) else []:
+            text = str(value or "").strip()
+            if text and text not in consumed_url:
+                result.append(("url", text))
+                consumed_url.add(text)
+        return result
+
+    @staticmethod
+    def _dynamic_local_path(project_id: str, value: str) -> Path | None:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            return MediaService._readable_project_file(project_id, value)
+        try:
+            root = file_service.project_path(project_id).resolve()
+            resolved = candidate.resolve()
+            resolved.relative_to(root)
+            if resolved.is_file() and resolved.stat().st_size > 0:
+                return resolved
+        except (FileServiceError, OSError, ValueError):
+            return None
+        return None
+
+    async def _dynamic_reference_files(
+        self,
+        project_id: str,
+        job_id: str,
+        input_data: Mapping[str, Any],
+    ) -> tuple[list[Path], list[str]]:
+        """将动态 ReferencePlan 的本地路径和 URL 转为有序的本地输入文件。"""
+        sources = self._dynamic_reference_sources(input_data)
+        paths: list[Path] = []
+        temporary: list[str] = []
+        for index, (kind, value) in enumerate(sources, start=1):
+            if kind == "local":
+                path = self._dynamic_local_path(project_id, value)
+                if path is None:
+                    raise conflict(f"动态参考图文件不存在或为空：{value}")
+                paths.append(path)
+                continue
+            if not self._provider_url_usable(value):
+                raise conflict(f"动态参考图 URL 无效或已过期：{value}")
+            relative = (
+                Path("temp")
+                / "dynamic-references"
+                / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', job_id)}-{index}.img"
+            ).as_posix()
+            try:
+                target = await asyncio.to_thread(
+                    download_url_atomic,
+                    value,
+                    file_service.resolve_project_path(project_id, relative),
+                    timeout=120,
+                )
+            except (FileServiceError, OSError) as exc:
+                raise conflict(f"动态参考图 URL 下载失败：{value}") from exc
+            if not target.is_file() or target.stat().st_size <= 0:
+                raise conflict(f"动态参考图 URL 下载后为空：{value}")
+            paths.append(target)
+            temporary.append(relative)
+        return paths, temporary
+
+    @staticmethod
+    def _cleanup_dynamic_reference_files(project_id: str, paths: list[str]) -> None:
+        for relative in paths:
+            try:
+                file_service.delete_file(project_id, relative)
+            except (FileServiceError, OSError) as exc:
+                # 不抛错导致任务失败：临时文件残留可以下次清理，
+                # 但要日志可见，便于巡检 /workspace/projects/<id>/temp/dynamic-references。
+                logger.warning(
+                    "动态参考图临时文件清理失败：project=%s path=%s error=%s",
+                    project_id,
+                    relative,
+                    sanitize_error_message(exc),
+                )
+
+    @staticmethod
+    def _prompt_reference_count(prompt: str) -> int:
+        indexes = [int(value) for value in re.findall(r"@Image(\d+)", prompt or "")]
+        return max(indexes, default=0)
+
+    @staticmethod
+    def _safe_storage_token(value: Any) -> str:
+        raw = str(value or "")
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", raw) or "media"
+        return safe if len(safe) <= 80 else f"media-{calculate_signature(raw)[:40]}"
+
+    async def _wait_for_job_dependencies(self, job_record: Mapping[str, Any]) -> None:
+        raw_dependencies = job_record.get("depends_on")
+        if not isinstance(raw_dependencies, list):
+            input_data = job_record.get("input_data")
+            raw_dependencies = (
+                input_data.get("depends_on", [])
+                if isinstance(input_data, Mapping)
+                else []
+            )
+        dependencies = [str(item).strip() for item in raw_dependencies if str(item).strip()]
+        if not dependencies:
+            return
+        async with asyncio.timeout(120):
+            while True:
+                pending = False
+                for dependency_id in dependencies:
+                    dependency = self.jobs.repository.get(dependency_id)
+                    if dependency is None:
+                        raise MediaDependencyError(f"媒体任务依赖不存在：{dependency_id}")
+                    status = str(dependency.get("status") or "")
+                    if status == "completed":
+                        continue
+                    if status in _TERMINAL_JOB_STATUSES:
+                        raise MediaDependencyError(
+                            f"媒体任务依赖未成功完成：{dependency_id}（{status}）"
+                        )
+                    pending = True
+                if not pending:
+                    return
+                await asyncio.sleep(settings.provider_poll_interval_sec)
+
+    def _record_dynamic_media_failure(
+        self,
+        job_record: Mapping[str, Any],
+        input_data: Mapping[str, Any],
+        error: Any,
+    ) -> None:
+        run_id = str(job_record.get("workflow_run_id") or input_data.get("workflow_run_id") or "")
+        stage_id = str(
+            job_record.get("workflow_stage_id") or input_data.get("workflow_stage_id") or ""
+        )
+        if not run_id or not stage_id:
+            return
+        message = sanitize_error_message(error) or "动态媒体任务失败"
+        job_id = str(job_record.get("id") or "")
+        try:
+            with self.database.engine.begin() as connection:
+                current_job = row_dict(
+                    connection.execute(select(job).where(job.c.id == job_id)).first()
+                )
+                run = row_dict(
+                    connection.execute(
+                        select(workflow_run).where(workflow_run.c.id == run_id)
+                    ).first()
+                )
+                stage = row_dict(
+                    connection.execute(
+                        select(workflow_stage).where(
+                            workflow_stage.c.id == stage_id,
+                            workflow_stage.c.workflow_run_id == run_id,
+                        )
+                    ).first()
+                )
+                if (
+                    current_job is None
+                    or run is None
+                    or stage is None
+                    or current_job.get("status") not in _ACTIVE_MEDIA_STATUSES
+                    or str(current_job.get("input_signature") or "")
+                    != str(job_record.get("input_signature") or "")
+                ):
+                    return
+                latest = row_dict(
+                    connection.execute(
+                        select(workflow_stage)
+                        .where(
+                            workflow_stage.c.workflow_run_id == run_id,
+                            workflow_stage.c.stage_key == stage.get("stage_key"),
+                        )
+                        .order_by(
+                            workflow_stage.c.attempt.desc(),
+                            workflow_stage.c.updated_at.desc(),
+                            workflow_stage.c.id.desc(),
+                        )
+                        .limit(1)
+                    ).first())
+                expected_signature = str(
+                    input_data.get("workflow_stage_input_signature")
+                    or json_loads(
+                        stage.get("provenance_json") if stage else None,
+                        {},
+                    ).get("upstream_input_signature", "")
+                )
+                if (
+                    latest is None
+                    or latest.get("id") != stage_id
+                    or (
+                        expected_signature
+                        and str(stage.get("input_signature") or "") != expected_signature
+                    )
+                    or str(run.get("status")) in {"cancelled", "stale", "blocked"}
+                    or str(stage.get("status")) in {"cancelled", "stale", "blocked"}
+                ):
+                    return
+                now = utc_now()
+                failure_ref = {
+                    "capture_mode": "dynamic_media_failure",
+                    "job_id": job_id,
+                    "input_signature": current_job.get("input_signature") or "",
+                    "error": message,
+                }
+                output_refs = json_loads(stage.get("output_refs_json"), [])
+                output_refs = output_refs if isinstance(output_refs, list) else []
+                output_refs.append(failure_ref)
+                stage_result = connection.execute(
+                    update(workflow_stage)
+                    .where(
+                        workflow_stage.c.id == stage_id,
+                        workflow_stage.c.workflow_run_id == run_id,
+                        workflow_stage.c.attempt == latest.get("attempt"),
+                        workflow_stage.c.input_signature == stage.get("input_signature"),
+                        workflow_stage.c.updated_at == stage.get("updated_at"),
+                        workflow_stage.c.status.not_in(("cancelled", "stale", "blocked")),
+                    )
+                    .values(
+                        status="partial_failed",
+                        error=f"媒体任务 {job_id} 失败：{message}",
+                        output_refs_json=json_dumps(output_refs),
+                        finished_at=now,
+                        updated_at=now,
+                    )
+                )
+                if stage_result.rowcount != 1:
+                    return
+                run_result = connection.execute(
+                    update(workflow_run)
+                    .where(
+                        workflow_run.c.id == run_id,
+                        workflow_run.c.revision == run.get("revision"),
+                        workflow_run.c.updated_at == run.get("updated_at"),
+                        workflow_run.c.status.not_in(("cancelled", "stale", "blocked")),
+                    )
+                    .values(
+                        status="partial_failed",
+                        error=f"动态媒体任务 {job_id} 失败：{message}",
+                        revision=workflow_run.c.revision + 1,
+                        updated_at=now,
+                    )
+                )
+                if run_result.rowcount != 1:
+                    return
+        except Exception:
+            # 媒体 Job 的原始失败仍由 Runner 记录；状态汇总失败不能掩盖原始错误。
+            return
+
+    def _enqueue_dynamic_dependents(self, completed_job_id: str) -> None:
+        runner = getattr(self.jobs, "runner", None)
+        enqueue = getattr(runner, "enqueue", None)
+        if not callable(enqueue):
+            return
+        try:
+            with self.database.engine.connect() as connection:
+                rows = connection.execute(
+                    select(job).where(
+                        job.c.workflow_run_id.is_not(None),
+                        job.c.status.in_(tuple(_ACTIVE_MEDIA_STATUSES | {"queued"})),
+                    )
+                ).all()
+            for row in rows:
+                record = row_dict(row) or {}
+                dependencies = json_loads(record.get("depends_on_json"), [])
+                if not isinstance(dependencies, list) or completed_job_id not in dependencies:
+                    continue
+                all_completed = True
+                with self.database.engine.connect() as connection:
+                    for dependency_id in dependencies:
+                        status = (
+                            "completed"
+                            if str(dependency_id) == completed_job_id
+                            else connection.scalar(
+                                select(job.c.status).where(job.c.id == str(dependency_id))
+                            )
+                        )
+                        if status != "completed":
+                            all_completed = False
+                            break
+                if all_completed and record.get("status") == "queued":
+                    try:
+                        enqueue(str(record["id"]))
+                    except Exception:
+                        # 入队失败不掩盖主流程；记录告警后交给恢复流程重新入队。
+                        logger.warning(
+                            "动态媒体任务 %s 入队失败，等待恢复流程重新入队",
+                            record["id"],
+                            exc_info=True,
+                        )
+        except Exception:
+            return
+
+    def _complete_dynamic_media_job(
+        self,
+        job_record: Mapping[str, Any],
+        input_data: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> bool:
+        if not self._is_dynamic_media_input(input_data):
+            return False
+        job_id = str(job_record.get("id") or "")
+        if not job_id:
+            return False
+        try:
+            with self.database.engine.begin() as connection:
+                updated = connection.execute(
+                    update(job)
+                    .where(
+                        job.c.id == job_id,
+                        job.c.status.in_(tuple(_ACTIVE_MEDIA_STATUSES)),
+                        job.c.input_signature == job_record.get("input_signature"),
+                    )
+                    .values(
+                        status="completed",
+                        progress_current=job.c.progress_total,
+                        message="任务完成",
+                        error="",
+                        result_json=json_dumps(dict(result)),
+                        finished_at=utc_now(),
+                        updated_at=utc_now(),
+                    )
+                )
+            return updated.rowcount == 1
+        except Exception:
+            return False
+
+    def _validate_dynamic_media_state(
+        self,
+        job_record: Mapping[str, Any],
+        input_data: Mapping[str, Any],
+        version: Mapping[str, Any],
+    ) -> None:
+        run_id = str(job_record.get("workflow_run_id") or input_data.get("workflow_run_id") or "")
+        stage_id = str(
+            job_record.get("workflow_stage_id") or input_data.get("workflow_stage_id") or ""
+        )
+        if not run_id and not stage_id:
+            return
+        if not run_id or not stage_id:
+            raise conflict("动态媒体任务缺少完整的 run/stage 关联")
+        provenance = json_loads(version.get("provenance_json"), {})
+        expected_signature = str(
+            input_data.get("workflow_stage_input_signature")
+            or (
+                provenance.get("upstream_input_signature", "")
+                if isinstance(provenance, dict)
+                else ""
+            )
+            or ""
+        )
+        with self.database.engine.connect() as connection:
+            run = connection.execute(
+                select(workflow_run).where(workflow_run.c.id == run_id)
+            ).first()
+            stage = connection.execute(
+                select(workflow_stage).where(
+                    workflow_stage.c.id == stage_id,
+                    workflow_stage.c.workflow_run_id == run_id,
+                )
+            ).first()
+            latest_stage = None
+            if stage is not None:
+                latest_stage = connection.execute(
+                    select(workflow_stage)
+                    .where(
+                        workflow_stage.c.workflow_run_id == run_id,
+                        workflow_stage.c.stage_key == stage.stage_key,
+                    )
+                    .order_by(
+                        workflow_stage.c.attempt.desc(),
+                        workflow_stage.c.updated_at.desc(),
+                        workflow_stage.c.id.desc(),
+                    )
+                    .limit(1)
+                ).first()
+            current_job = connection.execute(
+                select(
+                    job.c.input_signature,
+                    job.c.workflow_run_id,
+                    job.c.workflow_stage_id,
+                    job.c.status,
+                ).where(job.c.id == job_record.get("id"))
+            ).first()
+        if run is None or stage is None or latest_stage is None:
+            raise conflict("动态媒体任务关联的 run/stage 不存在")
+        if str(latest_stage.id) != stage_id:
+            raise conflict("动态媒体任务关联的 stage attempt 已过期，拒绝覆盖新结果")
+        if current_job is None or str(current_job.workflow_stage_id or "") != stage_id:
+            raise conflict("动态媒体任务关联的 Job 已切换到新的 stage，拒绝覆盖新结果")
+        if str(current_job.workflow_run_id or "") != run_id:
+            raise conflict("动态媒体任务关联的 Job 已切换到新的 run，拒绝覆盖新结果")
+        if str(current_job.status or "") not in _ACTIVE_MEDIA_STATUSES:
+            raise conflict("动态媒体 Job 已不处于可提交状态，拒绝激活旧结果")
+        job_signature = str(current_job.input_signature or input_data.get("input_signature") or "")
+        version_signature = str(version.get("input_signature") or "")
+        if job_signature and str(
+            job_record.get("input_signature") or job_signature
+        ) != job_signature:
+            raise conflict("动态媒体 Job input_signature 已变化，拒绝覆盖新结果")
+        if version_signature and job_signature and version_signature != job_signature:
+            raise conflict("动态媒体版本与 Job input_signature 不一致，拒绝覆盖新结果")
+        if (
+            str(run.status) in _DYNAMIC_PROTECTED_STATUSES
+            or str(stage.status) in _DYNAMIC_PROTECTED_STATUSES
+        ):
+            raise conflict("动态媒体任务关联的 run/stage 已取消或过期，拒绝激活旧媒体")
+        if expected_signature and str(stage.input_signature or "") != expected_signature:
+            raise conflict("动态媒体任务的 stage 签名已变化，拒绝激活旧媒体")
+        expected_attempt = input_data.get("workflow_stage_attempt") or (
+            provenance.get("workflow_stage_attempt") if isinstance(provenance, dict) else None
+        )
+        if expected_attempt is not None and str(latest_stage.attempt) != str(expected_attempt):
+            raise conflict("动态媒体任务的 stage attempt 已变化，拒绝激活旧媒体")
 
     def _binding_reference_items(
         self,
@@ -1110,6 +1631,7 @@ class MediaService:
         video_prompt = video_prompt_override or str(current["video_prompt"] or "").strip()
         if not video_prompt:
             raise bad_request("分镜缺少明确的视频提示词")
+        depends_on: list[str] = []
         with self.database.engine.connect() as connection:
             keyframe = row_dict(
                 connection.execute(
@@ -1120,6 +1642,18 @@ class MediaService:
                     )
                 ).first()
             )
+            if keyframe is not None:
+                keyframe_job_id = connection.execute(
+                    select(job.c.id)
+                    .where(
+                        job.c.target_type == "keyframe",
+                        job.c.target_id == keyframe["id"],
+                    )
+                    .order_by(job.c.created_at.desc(), job.c.id.desc())
+                    .limit(1)
+                ).scalar()
+                if keyframe_job_id:
+                    depends_on.append(str(keyframe_job_id))
 
             # 上一镜视频末帧：仅在本镜声明动作与上一镜连续（continuous）时引用。
             # 不能用「场景素材是否相同」推断——同场景可能是对切或时间跳跃，
@@ -1143,7 +1677,7 @@ class MediaService:
                     ).strip()
                     if current.get("transition_from_prev") == "continuous":
                         prev_video_row = connection.execute(
-                            select(video_version.c.end_frame_path)
+                            select(video_version.c.id, video_version.c.end_frame_path)
                             .where(
                                 video_version.c.shot_id == prev_shot_row.id,
                                 video_version.c.is_current.is_(True),
@@ -1153,8 +1687,19 @@ class MediaService:
                             .limit(1)
                         ).first()
 
-                        if prev_video_row and prev_video_row[0]:
-                            prev_end_frame_relative = str(prev_video_row[0])
+                        if prev_video_row and prev_video_row.end_frame_path:
+                            prev_end_frame_relative = str(prev_video_row.end_frame_path)
+                            previous_video_job_id = connection.execute(
+                                select(job.c.id)
+                                .where(
+                                    job.c.target_type == "video",
+                                    job.c.target_id == prev_video_row.id,
+                                )
+                                .order_by(job.c.created_at.desc(), job.c.id.desc())
+                                .limit(1)
+                            ).scalar()
+                            if previous_video_job_id:
+                                depends_on.append(str(previous_video_job_id))
 
         if keyframe is None or not keyframe.get("file_path"):
             raise conflict("分镜缺少已完成的当前关键帧")
@@ -1290,9 +1835,11 @@ class MediaService:
                 "prev_end_frame_path": prev_end_frame_relative,
                 "prev_end_frame_first": prev_end_frame_first,
                 "supports_multiple_input_images": supports_multiple_input_images,
+                "depends_on": depends_on,
                 "provider_updated_at": str(config.get("updated_at") or ""),
                 "params": options.get("params", {}),
             },
+            depends_on=depends_on,
             batch_id=options.get("_batch_id"),
         )
 
@@ -1667,9 +2214,13 @@ class MediaService:
         parent = self._shot(record["shot_id"])
         chapter_no, chapter_title = self._chapter_folder_info(parent.get("chapter_id"))
         path_builder = file_service.keyframe_path if kind == "keyframe" else file_service.video_path
+        provenance = json_loads(record.get("provenance_json"), {})
+        storage_shot_id = parent["id"]
+        if isinstance(provenance, Mapping) and provenance.get("workflow_run_id"):
+            storage_shot_id = self._safe_storage_token(storage_shot_id)
         return parent["project_id"], path_builder(
             parent["project_id"],
-            parent["id"],
+            storage_shot_id,
             record["version_no"],
             suffix,
             shot_no=parent["shot_no"],
@@ -1695,6 +2246,103 @@ class MediaService:
         if errors:
             raise FileServiceError("媒体文件回滚失败：" + "；".join(errors))
 
+    def _dynamic_activation_guard(
+        self,
+        connection: Any,
+        job_record: Mapping[str, Any],
+        input_data: Mapping[str, Any],
+        version: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """在激活事务内读取并固定当前 Job/stage/run 的条件快照。"""
+        run_id = str(
+            job_record.get("workflow_run_id") or input_data.get("workflow_run_id") or ""
+        )
+        stage_id = str(
+            job_record.get("workflow_stage_id") or input_data.get("workflow_stage_id") or ""
+        )
+        if not run_id or not stage_id:
+            raise conflict("动态媒体任务缺少完整的 run/stage 关联")
+        current_job = row_dict(
+            connection.execute(select(job).where(job.c.id == job_record.get("id"))).first()
+        )
+        run = row_dict(
+            connection.execute(select(workflow_run).where(workflow_run.c.id == run_id)).first()
+        )
+        stage = row_dict(
+            connection.execute(
+                select(workflow_stage).where(
+                    workflow_stage.c.id == stage_id,
+                    workflow_stage.c.workflow_run_id == run_id,
+                )
+            ).first()
+        )
+        if current_job is None or run is None or stage is None:
+            raise conflict("动态媒体任务关联的 run/stage 不存在")
+        if current_job.get("status") not in _ACTIVE_MEDIA_STATUSES:
+            raise conflict("动态媒体 Job 已不处于可提交状态，拒绝激活旧结果")
+        if (
+            str(current_job.get("workflow_run_id") or "") != run_id
+            or str(current_job.get("workflow_stage_id") or "") != stage_id
+            or str(current_job.get("input_signature") or "")
+            != str(job_record.get("input_signature") or "")
+        ):
+            raise conflict("动态媒体 Job 关联或 input_signature 已发生变化")
+
+        latest = row_dict(
+            connection.execute(
+                select(workflow_stage)
+                .where(
+                    workflow_stage.c.workflow_run_id == run_id,
+                    workflow_stage.c.stage_key == stage.get("stage_key"),
+                )
+                .order_by(
+                    workflow_stage.c.attempt.desc(),
+                    workflow_stage.c.updated_at.desc(),
+                    workflow_stage.c.id.desc(),
+                )
+                .limit(1)
+            ).first()
+        )
+        if latest is None or latest.get("id") != stage_id:
+            raise conflict("动态媒体任务关联的 stage attempt 已过期，拒绝激活旧结果")
+        provenance = json_loads(version.get("provenance_json"), {})
+        expected_signature = str(
+            input_data.get("workflow_stage_input_signature")
+            or (
+                provenance.get("upstream_input_signature", "")
+                if isinstance(provenance, Mapping)
+                else ""
+            )
+            or ""
+        )
+        if expected_signature and str(stage.get("input_signature") or "") != expected_signature:
+            raise conflict("动态媒体任务的 stage 签名已变化，拒绝激活旧媒体")
+        expected_attempt = input_data.get("workflow_stage_attempt") or (
+            provenance.get("workflow_stage_attempt")
+            if isinstance(provenance, Mapping)
+            else None
+        )
+        if expected_attempt is not None and str(latest.get("attempt")) != str(expected_attempt):
+            raise conflict("动态媒体任务的 stage attempt 已变化，拒绝激活旧媒体")
+        if (
+            str(run.get("status")) in _DYNAMIC_PROTECTED_STATUSES
+            or str(stage.get("status")) in _DYNAMIC_PROTECTED_STATUSES
+        ):
+            raise conflict("动态媒体任务关联的 run/stage 已取消或过期，拒绝激活旧媒体")
+        if (
+            str(version.get("input_signature") or "")
+            != str(current_job.get("input_signature") or "")
+        ):
+            raise conflict("动态媒体版本与 Job input_signature 不一致，拒绝激活旧媒体")
+        return {
+            "run_id": run_id,
+            "stage_id": stage_id,
+            "run_revision": run.get("revision"),
+            "stage_key": stage.get("stage_key"),
+            "stage_attempt": latest.get("attempt"),
+            "stage_signature": stage.get("input_signature"),
+        }
+
     def _activate_media_version(
         self,
         kind: MediaKind,
@@ -1703,6 +2351,7 @@ class MediaService:
         source_relative: str | None = None,
         complete: bool = False,
         actual_duration_sec: float | None = None,
+        job_record: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         table, parent_column = _MEDIA_TABLES[kind]
         with _MEDIA_VERSION_FILE_LOCK:
@@ -1716,6 +2365,11 @@ class MediaService:
                     record["file_path"] = source_relative
                 if not record.get("file_path"):
                     raise FileServiceError("媒体版本缺少文件路径")
+                if job_record is not None:
+                    input_data = job_record.get("input_data")
+                    if not isinstance(input_data, Mapping):
+                        input_data = json_loads(job_record.get("input_json"), {})
+                    self._validate_dynamic_media_state(job_record, input_data, record)
                 old_current = row_dict(
                     connection.execute(
                         select(table).where(
@@ -1755,6 +2409,11 @@ class MediaService:
                 if source != current_target:
                     file_service.move_file(project_id, source, current_target)
                     moves.append((source, current_target))
+                if job_record is not None:
+                    input_data = job_record.get("input_data")
+                    if not isinstance(input_data, Mapping):
+                        input_data = json_loads(job_record.get("input_json"), {})
+                    self._validate_dynamic_media_state(job_record, input_data, record)
                 current_relative = file_service.relative_project_path(
                     project_id,
                     current_target,
@@ -1768,20 +2427,103 @@ class MediaService:
                 if kind == "video" and complete:
                     values["actual_duration_sec"] = actual_duration_sec
                 with self.database.engine.begin() as connection:
-                    connection.execute(
-                        update(table)
-                        .where(table.c[parent_column] == record[parent_column])
-                        .values(is_current=False)
+                    activation_guard = None
+                    activation_job: Mapping[str, Any] | None = None
+                    if job_record is not None:
+                        activation_job = job_record
+                        input_data = job_record.get("input_data")
+                        if not isinstance(input_data, Mapping):
+                            input_data = json_loads(job_record.get("input_json"), {})
+                        activation_guard = self._dynamic_activation_guard(
+                            connection,
+                            activation_job,
+                            input_data,
+                            record,
+                        )
+                    current_update = update(table).where(
+                        table.c[parent_column] == record[parent_column],
+                        table.c.is_current.is_(True),
                     )
+                    target_update = update(table).where(
+                        table.c.id == version_id,
+                        table.c[parent_column] == record[parent_column],
+                    )
+                    if old_current is not None:
+                        current_update = current_update.where(table.c.id == old_current["id"])
+                    else:
+                        target_update = target_update.where(
+                            ~exists(
+                                select(table.c.id).where(
+                                    table.c[parent_column] == record[parent_column],
+                                    table.c.is_current.is_(True),
+                                )
+                            )
+                        )
+                    if activation_guard is not None:
+                        if activation_job is None:
+                            raise FileServiceError("动态媒体激活缺少 Job 条件")
+                        active_state = (
+                            select(job.c.id)
+                            .select_from(
+                                job.join(
+                                    workflow_stage,
+                                    job.c.workflow_stage_id == workflow_stage.c.id,
+                                ).join(
+                                    workflow_run,
+                                    job.c.workflow_run_id == workflow_run.c.id,
+                                )
+                            )
+                            .where(
+                                job.c.id == activation_job.get("id"),
+                                job.c.status.in_(tuple(_ACTIVE_MEDIA_STATUSES)),
+                                job.c.input_signature == activation_job.get("input_signature"),
+                                workflow_stage.c.id == activation_guard["stage_id"],
+                                workflow_stage.c.workflow_run_id == activation_guard["run_id"],
+                                workflow_stage.c.attempt == activation_guard["stage_attempt"],
+                                workflow_stage.c.input_signature
+                                == activation_guard["stage_signature"],
+                                workflow_stage.c.status.not_in(
+                                    tuple(_DYNAMIC_PROTECTED_STATUSES)
+                                ),
+                                workflow_run.c.id == activation_guard["run_id"],
+                                workflow_run.c.revision == activation_guard["run_revision"],
+                                workflow_run.c.status.not_in(
+                                    tuple(_DYNAMIC_PROTECTED_STATUSES)
+                                ),
+                                ~exists(
+                                    select(workflow_stage.c.id).where(
+                                        workflow_stage.c.workflow_run_id
+                                        == activation_guard["run_id"],
+                                        workflow_stage.c.stage_key
+                                        == activation_guard["stage_key"],
+                                        workflow_stage.c.attempt
+                                        > activation_guard["stage_attempt"],
+                                    )
+                                ),
+                            )
+                            .exists()
+                        )
+                        current_update = current_update.where(active_state)
+                        target_update = target_update.where(active_state)
+                        target_update = target_update.where(
+                            table.c.input_signature == activation_job.get("input_signature"),
+                            table.c.status.in_(tuple(_ACTIVE_MEDIA_STATUSES)),
+                            table.c.is_current.is_(False),
+                        )
+                    current_result = connection.execute(current_update.values(is_current=False))
+                    if old_current and current_result.rowcount != 1:
+                        raise FileServiceError("旧媒体 current 条件更新未命中")
                     if old_current and old_history_relative:
-                        connection.execute(
+                        history_result = connection.execute(
                             update(table)
                             .where(table.c.id == old_current["id"])
                             .values(file_path=old_history_relative)
                         )
-                    connection.execute(
-                        update(table).where(table.c.id == version_id).values(**values)
-                    )
+                        if history_result.rowcount != 1:
+                            raise FileServiceError("旧媒体历史路径更新未命中")
+                    activation_result = connection.execute(target_update.values(**values))
+                    if job_record is not None and activation_result.rowcount != 1:
+                        raise FileServiceError("动态媒体版本激活条件未命中，结果已过期")
             except Exception as exc:
                 try:
                     self._rollback_media_moves(project_id, moves)
@@ -1849,7 +2591,9 @@ class MediaService:
         relative = file_service.relative_project_path(project_id, target)
         working_target = file_service.resolve_project_path(
             project_id,
-            Path("temp") / "media-results" / f"{version_id}{target.suffix}",
+            Path("temp")
+            / "media-results"
+            / f"{self._safe_storage_token(version_id)}{target.suffix}",
         )
         working_relative = file_service.relative_project_path(project_id, working_target)
         target_created = False
@@ -1888,7 +2632,9 @@ class MediaService:
                 end_frame_target = current_video.with_name(f"{current_video.stem}-end.jpg")
                 end_frame_working = file_service.resolve_project_path(
                     project_id,
-                    Path("temp") / "media-results" / f"{version_id}-end.jpg",
+                    Path("temp")
+                    / "media-results"
+                    / f"{self._safe_storage_token(version_id)}-end.jpg",
                 )
                 end_frame_working.parent.mkdir(parents=True, exist_ok=True)
                 self._extract_last_frame(current_video, end_frame_working)
@@ -2086,8 +2832,18 @@ class MediaService:
         target: Path | None = None
         working_target: Path | None = None
         target_created = False
+        temporary_references: list[str] = []
+        input_data: dict[str, Any] = {}
         try:
-            input_data = json_loads(job_record.get("input_json"), {})
+            raw_input = job_record.get("input_data")
+            input_data = (
+                dict(raw_input)
+                if isinstance(raw_input, Mapping)
+                else json_loads(job_record.get("input_json"), {})
+            )
+            await self._wait_for_job_dependencies(job_record)
+            version = self._get_version(kind, version_id)
+            self._validate_dynamic_media_state(job_record, input_data, version)
             if kind == "asset_image":
                 current = self._asset(version["asset_id"])
                 project_id = current["project_id"]
@@ -2107,23 +2863,39 @@ class MediaService:
             else:
                 current = self._shot(version["shot_id"])
                 project_id = current["project_id"]
-                bound_items = self._binding_reference_items(
-                    project_id,
-                    version.get("reference_bindings") or [],
-                )
-                references = [path for path, _ in bound_items]
-                if (version.get("reference_bindings") or []) and len(bound_items) < len(
-                    version.get("reference_bindings") or []
-                ):
-                    # 参考图绑定存在但文件缺失/记录失效：不允许静默降级（含部分缺失）
-                    raise conflict(
-                        "关键帧参考图文件缺失或失效（分镜已绑定素材图，但磁盘文件不存在或"
-                        "记录无法解析），请先在素材库重新生成或上传图片后重试"
+                if self._is_dynamic_media_input(input_data):
+                    references, temporary_references = await self._dynamic_reference_files(
+                        project_id,
+                        str(job_record["id"]),
+                        input_data,
                     )
+                    expected_references = self._prompt_reference_count(
+                        str(version.get("prompt_snapshot") or "")
+                    )
+                    if expected_references and len(references) < expected_references:
+                        raise conflict(
+                            "动态关键帧参考图输入不完整，提示词中的 @Image 编号无法对应"
+                        )
+                else:
+                    bound_items = self._binding_reference_items(
+                        project_id,
+                        version.get("reference_bindings") or [],
+                    )
+                    references = [path for path, _ in bound_items]
+                    if (version.get("reference_bindings") or []) and len(bound_items) < len(
+                        version.get("reference_bindings") or []
+                    ):
+                        # 参考图绑定存在但文件缺失/记录失效：不允许静默降级（含部分缺失）
+                        raise conflict(
+                            "关键帧参考图文件缺失或失效（分镜已绑定素材图，但磁盘文件不存在或"
+                            "记录无法解析），请先在素材库重新生成或上传图片后重试"
+                        )
                 chapter_no, chapter_title = self._chapter_folder_info(current.get("chapter_id"))
                 target = file_service.keyframe_path(
                     project_id,
-                    current["id"],
+                    self._safe_storage_token(current["id"])
+                    if self._is_dynamic_media_input(input_data)
+                    else current["id"],
                     version["version_no"],
                     shot_no=current["shot_no"],
                     storage_name=self._project_storage_name(project_id),
@@ -2132,7 +2904,9 @@ class MediaService:
                 )
             working_target = file_service.resolve_project_path(
                 project_id,
-                Path("temp") / "media-results" / f"{version_id}{target.suffix}",
+                Path("temp")
+                / "media-results"
+                / f"{self._safe_storage_token(version_id)}{target.suffix}",
             )
             provider, config = self.providers.resolve(
                 kind="image",
@@ -2178,19 +2952,126 @@ class MediaService:
             file_service.move_file(project_id, working_target, target)
             target_created = True
             relative = file_service.relative_project_path(project_id, target)
-            completed = self._complete_media(table, version_id, relative)
+            self._validate_dynamic_media_state(job_record, input_data, version)
+            completed = self._complete_media(
+                table,
+                version_id,
+                relative,
+                job_record=job_record,
+            )
             self._store_provider_url(table, version_id, result.result_url)
             self._delete_staged_provider_result(project_id, result)
-            return {"version_id": version_id, "file_path": completed["file_path"]}
+            self._cleanup_dynamic_reference_files(project_id, temporary_references)
+            completed_result = {"version_id": version_id, "file_path": completed["file_path"]}
+            if self._complete_dynamic_media_job(job_record, input_data, completed_result):
+                self._enqueue_dynamic_dependents(str(job_record["id"]))
+            return completed_result
         except Exception as exc:
             self._delete_failed_target(project_id, working_target)
             if target_created:
                 self._delete_failed_target(project_id, target)
+            self._cleanup_dynamic_reference_files(project_id, temporary_references)
             self._set_media_status(table, version_id, "failed", str(exc))
+            self._record_dynamic_media_failure(job_record, input_data, exc)
+            if isinstance(exc, MediaDependencyError):
+                self.jobs.repository.fail(str(job_record["id"]), str(exc))
+                return {
+                    "status": "failed",
+                    "version_id": version_id,
+                    "error": sanitize_error_message(exc),
+                }
             raise
 
     def _resolve_binding_files(self, project_id: str, bindings: list[dict[str, Any]]) -> list[Path]:
         return [path for path, _ in self._binding_reference_items(project_id, bindings)]
+
+    @staticmethod
+    def _uses_h3_video_protocol(config: Mapping[str, Any]) -> bool:
+        params = config.get("params")
+        params = params if isinstance(params, Mapping) else {}
+        protocol = str(params.get("protocol", "")).strip().lower()
+        if protocol:
+            return protocol == "h3"
+        hostname = (urlsplit(str(config.get("base_url") or "")).hostname or "").lower()
+        return hostname == "h3.zhongbiao.cloud"
+
+    @staticmethod
+    def _ref2va_dialogue_lines(
+        input_data: Mapping[str, Any],
+        source: str,
+    ) -> list[tuple[str, str] | tuple[str, str, tuple[float, float]]]:
+        """提取 Ref2VA 改写所需对白：动态链路优先结构化 cues，旧链路回退文本解析。"""
+
+        plan = input_data.get("plan")
+        bundle = plan.get("prompt_bundle") if isinstance(plan, Mapping) else None
+        semantic = bundle.get("semantic_plan") if isinstance(bundle, Mapping) else None
+        cues = semantic.get("cues") if isinstance(semantic, Mapping) else None
+        dialogue = cues.get("dialogue") if isinstance(cues, Mapping) else None
+        lines: list[tuple[str, str] | tuple[str, str, tuple[float, float]]] = []
+        if isinstance(dialogue, list):
+            for item in dialogue:
+                if not isinstance(item, Mapping):
+                    continue
+                speaker = str(item.get("speaker") or "").strip()
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                start = item.get("start_time")
+                end = item.get("end_time")
+                if isinstance(start, int | float) and isinstance(end, int | float):
+                    lines.append((speaker, text, (float(start), float(end))))
+                else:
+                    lines.append((speaker, text))
+        if lines:
+            return lines
+        return list(extract_dialogue_lines(source))
+
+    async def _ref2va_video_prompt(
+        self,
+        *,
+        source: str,
+        duration_sec: float,
+        dialogue_lines: Sequence[tuple[str, str] | tuple[str, str, tuple[float, float]]],
+    ) -> str:
+        """H3 原生六段改写；改写或校验失败时回退原提示词，不阻塞视频生成。"""
+
+        if not source.strip():
+            return source
+        try:
+            request = build_ref2va_rewrite_request(
+                source,
+                dialogue_lines=dialogue_lines,
+                duration_sec=duration_sec,
+            )
+            text_provider, text_config = self.providers.resolve(kind="text", provider_id=None)
+            text_params = dict(text_config.get("params") or {})
+            text_params.setdefault("reasoning_effort", "medium")
+            output = await text_provider.generate_json(
+                system_prompt=request.system_prompt,
+                user_prompt=request.user_payload,
+                schema=Ref2VATextOutput,
+                params=text_params,
+            )
+            rewritten = str(getattr(output, "prompt", "") or "").strip()
+            errors = validate_ref2va_sections(
+                rewritten,
+                expect_dialogue=bool(dialogue_lines),
+                expect_dialogue_count=len(dialogue_lines) if dialogue_lines else None,
+                expected_dialogue_texts=[item[1] for item in dialogue_lines],
+                expected_duration_sec=duration_sec,
+            )
+            if errors:
+                logger.warning(
+                    "H3 Ref2VA 改写校验失败，回退原提示词：%s",
+                    "；".join(errors[:3]),
+                )
+                return source
+            return rewritten
+        except Exception:
+            # 改写是可选的增强出口：任何失败都退回原提示词并保留完整堆栈日志，
+            # 不能因此中断视频生成。
+            logger.exception("H3 Ref2VA 改写失败，回退原提示词")
+            return source
 
     async def handle_video(self, job_record: dict[str, Any]) -> dict[str, Any]:
         version_id = job_record["target_id"]
@@ -2199,12 +3080,53 @@ class MediaService:
         target: Path | None = None
         working_target: Path | None = None
         target_created = False
+        temporary_references: list[str] = []
+        input_data: dict[str, Any] = {}
         try:
             current = self._shot(version["shot_id"])
             project_id = current["project_id"]
+            raw_input = job_record.get("input_data")
+            input_data = (
+                dict(raw_input)
+                if isinstance(raw_input, Mapping)
+                else json_loads(job_record.get("input_json"), {})
+            )
+            # 视频只能在关键帧和上一镜视频依赖成功后读取任何媒体路径；否则
+            # 失败依赖也会被误读成文件缺失，甚至提前触发 Provider。
+            await self._wait_for_job_dependencies(job_record)
+            self._validate_dynamic_media_state(job_record, input_data, version)
+            # 依赖完成后重新读取关键帧版本，避免等待期间完成的新文件仍被旧快照遮蔽。
             keyframe = self._get_version("keyframe", version["keyframe_version_id"])
+            version = self._get_version("video", version_id)
+            self._validate_dynamic_media_state(job_record, input_data, version)
+            dynamic_input = self._is_dynamic_media_input(input_data)
+            dynamic_paths: list[Path] = []
+            legacy_reference_sources: list[dict[str, Any]] = []
+            if dynamic_input:
+                dynamic_paths, temporary_references = await self._dynamic_reference_files(
+                    project_id,
+                    str(job_record["id"]),
+                    input_data,
+                )
+            else:
+                bindings = input_data.get("reference_bindings")
+                if not isinstance(bindings, list):
+                    bindings = current["reference_bindings"]
+                if bindings:
+                    legacy_reference_sources = self._binding_reference_sources(
+                        project_id,
+                        bindings,
+                    )
+                    if len(legacy_reference_sources) < len(bindings):
+                        raise conflict(
+                            "视频参考图文件缺失或失效（分镜已绑定素材图，但磁盘文件不存在或"
+                            "记录无法解析），请先在素材库重新生成或上传图片后重试"
+                        )
+            if not keyframe.get("file_path"):
+                raise conflict("视频依赖的关键帧缺少文件路径")
             keyframe_path = file_service.resolve_project_path(project_id, keyframe["file_path"])
-            input_data = json_loads(job_record.get("input_json"), {})
+            if not keyframe_path.is_file() or keyframe_path.stat().st_size <= 0:
+                raise conflict("视频依赖的当前关键帧文件不存在或为空")
             provider, config = self.providers.resolve(
                 kind="video",
                 provider_id=version["provider_id"],
@@ -2213,7 +3135,9 @@ class MediaService:
             chapter_no, chapter_title = self._chapter_folder_info(current.get("chapter_id"))
             target = file_service.video_path(
                 project_id,
-                current["id"],
+                self._safe_storage_token(current["id"])
+                if dynamic_input
+                else current["id"],
                 version["version_no"],
                 shot_no=current["shot_no"],
                 storage_name=self._project_storage_name(project_id),
@@ -2222,7 +3146,9 @@ class MediaService:
             )
             working_target = file_service.resolve_project_path(
                 project_id,
-                Path("temp") / "media-results" / f"{version_id}{target.suffix}",
+                Path("temp")
+                / "media-results"
+                / f"{self._safe_storage_token(version_id)}{target.suffix}",
             )
             self._set_media_status(video_version, version_id, "running")
             if self._has_saved_result(job_record):
@@ -2247,11 +3173,31 @@ class MediaService:
                 prefer_public_urls = bool(
                     getattr(provider, "prefers_public_reference_urls", False)
                 )
-                if supports_multiple_input_images:
+                if dynamic_input:
+                    all_input_paths = [keyframe_path, *dynamic_paths]
+                    expected_references = self._prompt_reference_count(
+                        str(version.get("prompt_snapshot") or "")
+                    )
+                    if expected_references and len(all_input_paths) < expected_references:
+                        raise conflict(
+                            "动态视频参考图输入不完整，提示词中的 @Image 编号无法对应"
+                        )
+                    if len(all_input_paths) > 1 and not supports_multiple_input_images:
+                        raise RuntimeError("动态视频任务需要 Provider 支持多参考图输入")
+                    if len(all_input_paths) > 1:
+                        if prepare_multiple is None:
+                            raise RuntimeError("视频 Provider 缺少多参考图准备方法")
+                        prepared = await prepare_multiple(all_input_paths)
+                    else:
+                        prepared = await provider.prepare_input_image(keyframe_path)
+                elif supports_multiple_input_images:
                     bindings = input_data.get("reference_bindings")
                     if not isinstance(bindings, list):
                         bindings = current["reference_bindings"]
-                    reference_sources = self._binding_reference_sources(project_id, bindings)
+                    reference_sources = legacy_reference_sources or self._binding_reference_sources(
+                        project_id,
+                        bindings,
+                    )
                     reference_paths = [Path(item["path"]) for item in reference_sources]
                     if bindings and len(reference_paths) < len(bindings):
                         # 参考图绑定存在但文件缺失/记录失效：不允许静默降级（含部分缺失）
@@ -2308,11 +3254,20 @@ class MediaService:
                                 )
                         prepared = {"values": values, "mode": "url"}
                     else:
+                        if prepare_multiple is None:
+                            raise RuntimeError("视频 Provider 缺少多参考图准备方法")
                         prepared = await prepare_multiple(all_input_paths)
                 else:
                     prepared = await provider.prepare_input_image(keyframe_path)
+                submit_prompt = str(version["prompt_snapshot"] or "")
+                if self._uses_h3_video_protocol(config):
+                    submit_prompt = await self._ref2va_video_prompt(
+                        source=submit_prompt,
+                        duration_sec=float(version["requested_duration_sec"]),
+                        dialogue_lines=self._ref2va_dialogue_lines(input_data, submit_prompt),
+                    )
                 submission = await provider.submit(
-                    prompt=version["prompt_snapshot"],
+                    prompt=submit_prompt,
                     input_image=prepared,
                     duration_sec=version["requested_duration_sec"],
                     params=params,
@@ -2336,11 +3291,13 @@ class MediaService:
             file_service.move_file(project_id, working_target, target)
             target_created = True
             relative = file_service.relative_project_path(project_id, target)
+            self._validate_dynamic_media_state(job_record, input_data, version)
             completed = self._complete_media(
                 video_version,
                 version_id,
                 relative,
                 actual_duration_sec=actual_duration_sec,
+                job_record=job_record,
             )
 
             # 提取视频末帧，供下一镜衔接引用。失败不影响本次视频生成成功
@@ -2355,7 +3312,9 @@ class MediaService:
                 end_frame_target = current_video.with_name(f"{current_video.stem}-end.jpg")
                 end_frame_working = file_service.resolve_project_path(
                     project_id,
-                    Path("temp") / "media-results" / f"{version_id}-end.jpg",
+                    Path("temp")
+                    / "media-results"
+                    / f"{self._safe_storage_token(version_id)}-end.jpg",
                 )
                 end_frame_working.parent.mkdir(parents=True, exist_ok=True)
                 self._extract_last_frame(current_video, end_frame_working)
@@ -2380,12 +3339,25 @@ class MediaService:
                 )
 
             self._delete_staged_provider_result(project_id, result)
-            return {"version_id": version_id, "file_path": completed["file_path"]}
+            self._cleanup_dynamic_reference_files(project_id, temporary_references)
+            completed_result = {"version_id": version_id, "file_path": completed["file_path"]}
+            if self._complete_dynamic_media_job(job_record, input_data, completed_result):
+                self._enqueue_dynamic_dependents(str(job_record["id"]))
+            return completed_result
         except Exception as exc:
             self._delete_failed_target(project_id, working_target)
             if target_created:
                 self._delete_failed_target(project_id, target)
+            self._cleanup_dynamic_reference_files(project_id, temporary_references)
             self._set_media_status(video_version, version_id, "failed", str(exc))
+            self._record_dynamic_media_failure(job_record, input_data, exc)
+            if isinstance(exc, MediaDependencyError):
+                self.jobs.repository.fail(str(job_record["id"]), str(exc))
+                return {
+                    "status": "failed",
+                    "version_id": version_id,
+                    "error": sanitize_error_message(exc),
+                }
             raise
 
     async def _await_provider_result(
@@ -2470,7 +3442,8 @@ class MediaService:
             except ValueError as exc:
                 raise FileServiceError("Provider 返回的 Base64 文件无效") from exc
             job_record = self.jobs.repository.require(job_id)
-            relative = f"temp/provider-results/{job_id}.bin"
+            safe_job_id = re.sub(r"[^A-Za-z0-9_.-]", "_", job_id)
+            relative = f"temp/provider-results/{safe_job_id}.bin"
             staged = file_service.write_bytes_atomic(
                 job_record["project_id"],
                 relative,
@@ -2544,7 +3517,14 @@ class MediaService:
         if provider_task_id is not None:
             values["provider_task_id"] = provider_task_id
         with self.database.engine.begin() as connection:
-            connection.execute(update(table).where(table.c.id == version_id).values(**values))
+            connection.execute(
+                update(table)
+                .where(
+                    table.c.id == version_id,
+                    table.c.status.in_(tuple(_ACTIVE_MEDIA_STATUSES)),
+                )
+                .values(**values)
+            )
 
     def _complete_media(
         self,
@@ -2553,6 +3533,7 @@ class MediaService:
         relative: str,
         *,
         actual_duration_sec: float | None = None,
+        job_record: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         kind: MediaKind = (
             "asset_image"
@@ -2561,12 +3542,20 @@ class MediaService:
             if table is video_version
             else "keyframe"
         )
+        activation_job = job_record
+        if activation_job is not None:
+            activation_input = activation_job.get("input_data")
+            if not isinstance(activation_input, Mapping):
+                activation_input = json_loads(activation_job.get("input_json"), {})
+            if not self._is_dynamic_media_input(activation_input):
+                activation_job = None
         activated = self._activate_media_version(
             kind,
             version_id,
             source_relative=relative,
             complete=True,
             actual_duration_sec=actual_duration_sec,
+            job_record=activation_job,
         )
         if kind == "asset_image":
             ShotService(self.database, self.jobs).sync_asset_image_binding(

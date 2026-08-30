@@ -157,3 +157,54 @@ class SettingService:
                 probe_file.unlink(missing_ok=True)
             if probe_dir is not None and probe_dir.exists():
                 probe_dir.rmdir()
+
+
+# ImgBB 是平台共享的辅助服务密钥，存到 platform_setting 里并用 secret_service 加密。
+# 数据库读取优先级高于 .env，避免明文密钥落盘。
+IMGBB_API_KEY_SETTING = "imgbb_api_key"
+
+
+def get_imagbb_api_key_override(database: Database) -> str:
+    """从平台设置中读取已加密的 ImgBB Key；解密失败或未配置时返回空字符串。"""
+    from app.services.secret_service import SecretServiceError, decrypt_secret
+
+    try:
+        with database.engine.connect() as connection:
+            ciphertext = connection.scalar(
+                select(platform_setting.c.value).where(
+                    platform_setting.c.key == IMGBB_API_KEY_SETTING
+                )
+            )
+    except SQLAlchemyError:
+        return ""
+    if not ciphertext:
+        return ""
+    try:
+        return decrypt_secret(ciphertext)
+    except SecretServiceError:
+        return ""
+
+
+def set_imagbb_api_key(database: Database, plaintext: str) -> None:
+    """加密后写入平台设置；空字符串视为清除。"""
+    from app.services.secret_service import SecretServiceError, encrypt_secret
+
+    if plaintext:
+        try:
+            ciphertext = encrypt_secret(plaintext)
+        except SecretServiceError as exc:
+            raise ServiceError(500, f"加密 ImgBB API Key 失败：{exc}") from exc
+    else:
+        ciphertext = ""
+    now = utc_now()
+    statement = sqlite_insert(platform_setting).values(
+        key=IMGBB_API_KEY_SETTING,
+        value=ciphertext,
+        updated_at=now,
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=[platform_setting.c.key],
+        set_={"value": ciphertext, "updated_at": now},
+    )
+    with database.engine.begin() as connection:
+        connection.execute(statement)

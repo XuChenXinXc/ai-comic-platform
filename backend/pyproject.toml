@@ -8,21 +8,29 @@ version = "0.1.0"
 description = "AI 漫剧本地平台后端"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-    "alembic>=1.14,<1.15",
-    "edge-tts>=7.0,<7.1",
-    "fastapi>=0.115,<0.116",
-    "pillow>=11,<12",
-    "pydantic>=2.10,<2.11",
-    "pydantic-settings>=2.7,<2.8",
+    # 版本下界与 backend/.venv 实际锁定版本对齐（2026-08 审查发现原上界与
+    # 现网环境严重脱节，按 pyproject 全新安装会得到另一套旧版本组合）。
+    "alembic>=1.18,<1.19",
+    "edge-tts>=7.2,<7.3",
+    "fastapi>=0.140,<0.141",
+    # macOS 的 SecretBackend（app/services/secret_service.py 的 MacOSKeychainBackend）
+    # 在运行时 import keyring；Windows 走 DPAPI 用不到它，但依赖必须声明，
+    # 否则 macOS 上 `pip install -e .` 后填写直接 API Key 会 ModuleNotFoundError。
+    "keyring>=25,<26",
+    "pillow>=12,<13",
+    "pydantic>=2.13,<2.14",
+    "pydantic-settings>=2.14,<2.15",
     "python-dotenv>=1.0,<2",
     "python-multipart>=0.0.20,<1",
     "requests>=2.32,<3",
     "sqlalchemy>=2.0,<2.1",
-    "uvicorn[standard]>=0.34,<0.35",
+    "uvicorn[standard]>=0.51,<0.52",
 ]
 
 [project.optional-dependencies]
 dev = [
+    # httpx2 是 httpx 的 2.x 发布线；starlette>=1.3 的 full extra 同时接受
+    # httpx2>=2 与 httpx<0.29。本环境 TestClient 走 httpx2，勿改回旧包名。
     "httpx2>=2,<3",
     "pytest>=8.3,<9",
     "pytest-cov>=6,<8",
@@ -49,3 +57,5 @@ ignore = ["B008"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+# 依赖上界遵循「与 backend/.venv 实际锁定版本一致」原则；升级时务必先在 CI 跑 pip-compile 验证再合并。

@@ -366,3 +366,187 @@ export interface Chapter {
   created_at: string;
   updated_at: string;
 }
+
+// 动态漫 PipelineWorkspace 的独立工作流类型。
+export type DynamicStageKey =
+  | "0-source"
+  | "1-character-bios"
+  | "2-rhythm"
+  | "3-script"
+  | "4-storyboard"
+  | "5a-image-prompts"
+  | "5b-video-prompts"
+  | "6-delivery";
+
+export type DynamicWorkflowStatus =
+  | "pending"
+  | "queued"
+  | "running"
+  | "blocked"
+  | "ready"
+  | "confirmed"
+  | "stale"
+  | "partial_failed"
+  | "failed"
+  | "interrupted"
+  | "cancelled";
+
+export type DynamicStageStatus = DynamicWorkflowStatus;
+export type DynamicSourceKind = "full_text" | "synopsis";
+export type DynamicDiagnosticLevel = "warning" | "blocking";
+export type DynamicGateStatus =
+  | "ready"
+  | "warning"
+  | "blocked"
+  | "partial_failed";
+
+export type DynamicJsonObject = Record<string, unknown>;
+
+export interface DynamicDiagnostic {
+  level: DynamicDiagnosticLevel;
+  code: string;
+  message: string;
+  path?: string | null;
+  details?: DynamicJsonObject;
+}
+
+export interface DynamicGateResult {
+  status: DynamicGateStatus;
+  passed: boolean;
+  diagnostics: DynamicDiagnostic[];
+  checked_at?: string | null;
+  can_confirm: boolean;
+}
+
+export interface DynamicAssetMapping {
+  workflow_asset_id: string;
+  asset_id?: string | null;
+  usage: string;
+  locked_revision?: number | null;
+  reuse_mode?: "new" | "approved_existing" | string;
+  [key: string]: unknown;
+}
+
+export interface DynamicWorkflowRun {
+  id: string;
+  project_id?: string | null;
+  chapter_id?: string | null;
+  title?: string | null;
+  chapter_title?: string | null;
+  kind: string;
+  schema_version: string;
+  status: DynamicWorkflowStatus;
+  current_stage: DynamicStageKey;
+  source_kind: DynamicSourceKind;
+  source_snapshot: DynamicJsonObject;
+  config_snapshot: DynamicJsonObject;
+  asset_mapping: DynamicAssetMapping[];
+  input_signature: string;
+  revision: number;
+  error: string;
+  created_at: string;
+  started_at?: string | null;
+  updated_at: string;
+  finished_at?: string | null;
+  [key: string]: unknown;
+}
+
+export interface DynamicWorkflowStage {
+  id: string;
+  workflow_run_id: string;
+  stage_key: DynamicStageKey;
+  ordinal: number;
+  status: DynamicStageStatus;
+  input_signature: string;
+  raw_output: DynamicJsonObject;
+  normalized_output: DynamicJsonObject;
+  draft_output: DynamicJsonObject;
+  output_refs: DynamicJsonObject[];
+  gate_result: DynamicGateResult;
+  attempt: number;
+  error: string;
+  created_at: string;
+  started_at?: string | null;
+  updated_at: string;
+  finished_at?: string | null;
+  confirmed_at?: string | null;
+  confirmed_revision?: number | null;
+  [key: string]: unknown;
+}
+
+export interface DynamicWorkflowAction {
+  run: DynamicWorkflowRun;
+  stages: DynamicWorkflowStage[];
+}
+
+export interface DynamicRunCreateInput {
+  project_id?: string | null;
+  title: string;
+  chapter_title: string;
+  source_text?: string;
+  synopsis?: string;
+  target_duration_sec: number;
+  aspect_ratio: string;
+  style_prompt: string;
+  auto_run: boolean;
+  generate_audio: boolean;
+  generate_subtitle: boolean;
+  generate_bgm: boolean;
+  generate_composition: boolean;
+  reuse_approved_assets?: boolean;
+}
+
+export interface DynamicStageDraftUpdate {
+  expected_revision: number;
+  draft_output: DynamicJsonObject;
+  // 通过的门禁作为请求上下文传递；阻塞草稿由服务端根据新内容重新计算。
+  gate_result?: DynamicGateResult;
+}
+
+export interface DynamicDeliveryChecklistItem {
+  key: string;
+  label: string;
+  status: string;
+  completed: number;
+  total: number;
+  reason: string;
+  details?: DynamicJsonObject;
+  [key: string]: unknown;
+}
+
+export interface DynamicPreflightItem {
+  kind: string;
+  id: string;
+  status: string;
+  path?: string | null;
+  reason: string;
+  required: boolean;
+  [key: string]: unknown;
+}
+
+export interface DynamicPreflightResult {
+  workflow_run_id: string;
+  project_id: string;
+  chapter_id: string;
+  strict: boolean;
+  allow_partial: boolean;
+  status: "ready" | "warning" | "blocked";
+  items: DynamicPreflightItem[];
+  missing: DynamicPreflightItem[];
+  failed: DynamicPreflightItem[];
+  skipped: DynamicPreflightItem[];
+  estimated_jobs: number;
+  input_signature: string;
+  provenance: DynamicJsonObject;
+}
+
+export interface DynamicChecklistResponse {
+  checklist: DynamicDeliveryChecklistItem[];
+  preflight: DynamicPreflightResult;
+}
+
+export interface DynamicDeliveryOptions {
+  strict?: boolean;
+  allow_partial?: boolean;
+  exported_at?: string;
+}

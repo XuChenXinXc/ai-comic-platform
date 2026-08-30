@@ -18,6 +18,14 @@ from app.dependencies import (
     get_dynamic_workflow_service,
     get_project_service,
 )
+from app.dynamic_pipeline.prompt_ir import (
+    CompiledPromptBundle,
+    ImagePromptBundle,
+    TimelineSegment,
+    VideoPromptBundle,
+)
+from app.dynamic_pipeline.prompt_stage import PromptStageOutput, stage_output_to_stage_json
+from app.dynamic_pipeline.schemas import ArtifactMeta
 from app.dynamic_pipeline.stage_catalog import STAGE_KEYS
 from app.main import app as main_app
 from app.models.tables import chapter, project, workflow_run, workflow_stage
@@ -90,6 +98,57 @@ def _run_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+def _source_draft() -> dict[str, Any]:
+    return {
+        "artifact_meta": {
+            "schema_version": "dynamic-source-v1",
+            "normalizer_version": "dynamic-normalizer-v1",
+            "input_signature": "api-source-input",
+            "content_signature": "api-source-content",
+            "source_attempt": 1,
+        },
+        "metadata": {
+            "source_kind": "synopsis",
+            "title": "动态测试漫画",
+            "chapter_title": "第一章：旧屋",
+            "source_signature": "api-source-signature",
+            "target_duration_sec": 30,
+            "aspect_ratio": "9:16",
+        },
+        "episode_logline": "主角在旧屋发现发光的戒指。",
+        "scenes": [
+            {
+                "scene_id": "scene-1",
+                "ordinal": 1,
+                "location": "旧屋",
+                "time_weather": "夜，阴",
+                "characters": [],
+                "narrative_task": "建立线索",
+                "plot_event": "主角发现发光的戒指",
+                "conflict_or_turn": "戒指引出未知危险",
+                "visual_focus": "主角拿起发光的戒指",
+                "estimated_duration_sec": 30,
+                "shootability": {
+                    "status": "shootable",
+                    "visible_action": "主角拿起发光的戒指",
+                    "required_asset_keys": [],
+                    "production_risks": [],
+                    "adaptation_note": None,
+                },
+                "source_refs": ["synopsis:1"],
+            }
+        ],
+        "character_roster": [],
+        "conflict_turns": [],
+        "visualizable_content": ["旧屋和发光的戒指"],
+        "hard_to_visualize": [],
+        "rewrite_requirements": [],
+        "assumptions": [],
+        "open_questions": [],
+        "continuation_outline": [],
+    }
+
+
 def _create_free_run(api: ApiContext, **overrides: Any) -> dict[str, Any]:
     response = api.client.post("/api/free-create/dynamic-runs", json=_run_payload(**overrides))
     assert response.status_code == 201, response.text
@@ -135,6 +194,7 @@ def test_free_create_synopsis_creates_free_project_chapter_run_and_eight_stages(
     assert run["status"] == "pending"
     assert run["current_stage"] == "0-source"
     assert run["source_kind"] == "synopsis"
+    assert run["config_snapshot"]["strong_dynamic_max_events"] == 3
     assert run["source_snapshot"] == {
         "source_kind": "synopsis",
         "text": payload["synopsis"],
@@ -165,6 +225,14 @@ def test_free_create_synopsis_creates_free_project_chapter_run_and_eight_stages(
             select(project.c.is_free_create).where(project.c.id == run["project_id"])
         )
     assert persisted_free_flag == 1
+
+
+def test_dynamic_run_persists_controlled_strong_dynamic_budget_setting(
+    api_context: ApiContext,
+) -> None:
+    created = _create_free_run(api_context, strong_dynamic_max_events=1)
+
+    assert created["run"]["config_snapshot"]["strong_dynamic_max_events"] == 1
 
 
 def test_project_dynamic_run_rejects_regular_project_and_mismatched_project_id(
@@ -299,6 +367,132 @@ def test_stage_draft_gate_and_confirmation_bump_revision_and_advance_current_sta
 ) -> None:
     created = _create_free_run(api_context)
     run_id = created["run"]["id"]
+
+    draft_without_gate_response = api_context.client.put(
+        f"/api/dynamic-runs/{run_id}/stages/0-source/draft",
+        json={"expected_revision": 1, "draft_output": {"summary": ""}},
+    )
+    assert draft_without_gate_response.status_code == 200
+    blocked_body = draft_without_gate_response.json()
+    assert blocked_body["run"]["revision"] == 2
+    blocked_stage = blocked_body["stages"][0]
+    assert blocked_stage["status"] == "blocked"
+    assert blocked_stage["gate_result"]["status"] == "blocked"
+
+    repaired_response = api_context.client.put(
+        f"/api/dynamic-runs/{run_id}/stages/0-source/draft",
+        json={
+            "expected_revision": 2,
+            "draft_output": _source_draft(),
+        },
+    )
+    assert repaired_response.status_code == 200
+    repaired_body = repaired_response.json()
+    assert repaired_body["run"]["revision"] == 3
+    assert repaired_body["stages"][0]["status"] == "ready"
+    assert repaired_body["stages"][0]["gate_result"]["status"] == "ready"
+
+    confirm_response = api_context.client.post(
+        f"/api/dynamic-runs/{run_id}/stages/0-source/confirm",
+        json={"expected_revision": 3},
+    )
+    assert confirm_response.status_code == 200
+    confirmed_body = confirm_response.json()
+    assert confirmed_body["run"]["revision"] == 4
+    assert confirmed_body["run"]["current_stage"] == "1-character-bios"
+    assert confirmed_body["stages"][0]["status"] == "confirmed"
+    assert confirmed_body["stages"][0]["confirmed_revision"] == 4
+
+
+def test_legacy_summary_draft_uses_server_gate_and_can_confirm_without_client_gate(
+    api_context: ApiContext,
+) -> None:
+    created = _create_free_run(api_context)
+    run_id = created["run"]["id"]
+
+    saved = api_context.client.put(
+        f"/api/dynamic-runs/{run_id}/stages/0-source/draft",
+        json={
+            "expected_revision": 1,
+            "draft_output": {"summary": "旧 API 摘要"},
+            "gate_result": {
+                "status": "blocked",
+                "passed": False,
+                "diagnostics": [],
+                "can_confirm": False,
+            },
+        },
+    )
+
+    assert saved.status_code == 200
+    assert saved.json()["stages"][0]["status"] == "ready"
+    assert saved.json()["stages"][0]["gate_result"]["status"] == "warning"
+    assert saved.json()["stages"][0]["gate_result"]["diagnostics"][0]["code"] == (
+        "legacy_summary_compatibility"
+    )
+
+    confirmed = api_context.client.post(
+        f"/api/dynamic-runs/{run_id}/stages/0-source/confirm",
+        json={"expected_revision": 2},
+    )
+
+    assert confirmed.status_code == 200
+    assert confirmed.json()["stages"][0]["status"] == "confirmed"
+
+
+def _prompt_stage_draft(stage_key: str, input_signature: str) -> dict[str, Any]:
+    artifact_meta = ArtifactMeta(
+        schema_version=f"dynamic-{stage_key}-test-v1",
+        normalizer_version="dynamic-prompt-test-v1",
+        input_signature=input_signature,
+        content_signature=f"{stage_key}-content",
+        source_attempt=1,
+    )
+    if stage_key == "5a-image-prompts":
+        image = ImagePromptBundle(prompt="合法静止画 Prompt", negative_prompt="文字")
+        bundle = CompiledPromptBundle(
+            status="ready",
+            image=image,
+            generated={"image": image},
+            final={"image": image},
+        )
+    else:
+        video = VideoPromptBundle(
+            prompt="合法视频 Prompt",
+            negative_prompt="文字",
+            edit_duration_sec=6,
+            generation_duration_sec=6,
+            timeline=[TimelineSegment(start=0, end=6, action="稳定动作")],
+            end_state="动作结束",
+        )
+        bundle = CompiledPromptBundle(
+            status="ready",
+            video=video,
+            generated={"video": video},
+            final={"video": video},
+        )
+    output = PromptStageOutput(
+        stage_key=stage_key,  # type: ignore[arg-type]
+        artifact_meta=artifact_meta,
+        bundles={"shot-1": bundle},
+        target_duration_sec=30,
+        status="ready",
+        provenance={"input_signature": input_signature},
+    )
+    return stage_output_to_stage_json(output)
+
+
+@pytest.mark.parametrize("stage_key", ["5a-image-prompts", "5b-video-prompts"])
+def test_prompt_stage_confirmation_recalculates_modified_draft_instead_of_old_gate(
+    api_context: ApiContext,
+    stage_key: str,
+) -> None:
+    created = _create_free_run(api_context)
+    run_id = created["run"]["id"]
+    input_signature = f"{stage_key}-input"
+    draft = _prompt_stage_draft(stage_key, input_signature)
+    channel = "image" if stage_key == "5a-image-prompts" else "video"
+    draft["bundles"]["shot-1"][channel]["prompt"] = ""
     ready_gate = {
         "status": "ready",
         "passed": True,
@@ -306,84 +500,48 @@ def test_stage_draft_gate_and_confirmation_bump_revision_and_advance_current_sta
         "can_confirm": True,
     }
 
-    draft_without_gate_response = api_context.client.put(
-        f"/api/dynamic-runs/{run_id}/stages/0-source/draft",
-        json={"expected_revision": 1, "draft_output": {"summary": "缺少门禁"}},
-    )
-    assert draft_without_gate_response.status_code == 409
-    assert draft_without_gate_response.json() == {"detail": "保存阶段草稿必须提供门禁结果"}
-
-    pending_confirm_response = api_context.client.post(
-        f"/api/dynamic-runs/{run_id}/stages/0-source/confirm",
-        json={"expected_revision": 1},
-    )
-    assert pending_confirm_response.status_code == 409
-    assert pending_confirm_response.json() == {"detail": "阶段 0-source 尚未满足确认门禁"}
-
     with api_context.database.engine.begin() as connection:
         connection.execute(
-            update(workflow_stage)
-            .where(
-                workflow_stage.c.workflow_run_id == run_id,
-                workflow_stage.c.stage_key == "0-source",
-            )
-            .values(status="ready", gate_result_json=json_dumps({}))
+            update(workflow_run)
+            .where(workflow_run.c.id == run_id)
+            .values(status="ready", current_stage=stage_key)
         )
-    ready_without_gate_response = api_context.client.post(
-        f"/api/dynamic-runs/{run_id}/stages/0-source/confirm",
-        json={"expected_revision": 1},
-    )
-    assert ready_without_gate_response.status_code == 409
-    assert ready_without_gate_response.json() == {"detail": "阶段 0-source 尚未满足确认门禁"}
-
-    with api_context.database.engine.begin() as connection:
         connection.execute(
             update(workflow_stage)
             .where(
                 workflow_stage.c.workflow_run_id == run_id,
-                workflow_stage.c.stage_key == "0-source",
+                workflow_stage.c.stage_key == "4-storyboard",
             )
-            .values(status="pending", gate_result_json=json_dumps({}))
+            .values(status="confirmed")
         )
-
-    draft_response = api_context.client.put(
-        f"/api/dynamic-runs/{run_id}/stages/0-source/draft",
-        json={
-            "expected_revision": 1,
-            "draft_output": {"summary": "已保存的源文摘要"},
-            "gate_result": ready_gate,
-        },
-    )
-    assert draft_response.status_code == 200
-    draft_body = draft_response.json()
-    assert draft_body["run"]["revision"] == 2
-    assert draft_body["stages"][0]["status"] == "pending"
-    assert draft_body["stages"][0]["draft_output"] == {"summary": "已保存的源文摘要"}
-    assert draft_body["stages"][0]["gate_result"] == ready_gate | {"checked_at": None}
-
-    with api_context.database.engine.begin() as connection:
         connection.execute(
             update(workflow_stage)
             .where(
                 workflow_stage.c.workflow_run_id == run_id,
-                workflow_stage.c.stage_key == "0-source",
+                workflow_stage.c.stage_key == stage_key,
             )
             .values(
                 status="ready",
+                input_signature=input_signature,
+                draft_output_json=json_dumps(draft),
+                normalized_output_json=json_dumps(draft),
                 gate_result_json=json_dumps(ready_gate),
             )
         )
 
-    confirm_response = api_context.client.post(
-        f"/api/dynamic-runs/{run_id}/stages/0-source/confirm",
-        json={"expected_revision": 2},
+    response = api_context.client.post(
+        f"/api/dynamic-runs/{run_id}/stages/{stage_key}/confirm",
+        json={"expected_revision": 1},
     )
-    assert confirm_response.status_code == 200
-    confirmed_body = confirm_response.json()
-    assert confirmed_body["run"]["revision"] == 3
-    assert confirmed_body["run"]["current_stage"] == "1-character-bios"
-    assert confirmed_body["stages"][0]["status"] == "confirmed"
-    assert confirmed_body["stages"][0]["confirmed_revision"] == 3
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": f"阶段 {stage_key} 尚未满足确认门禁"}
+    stage = api_context.client.get(f"/api/dynamic-runs/{run_id}/stages/{stage_key}").json()
+    assert stage["status"] == "ready"
+    assert stage["gate_result"]["status"] == "blocked"
+    assert "prompt_missing" in {
+        item["code"] for item in stage["gate_result"]["diagnostics"]
+    }
 
 
 def test_downstream_stage_confirmation_with_unconfirmed_prerequisite_returns_409(

@@ -9,6 +9,7 @@ import {
   Settings2,
   Sparkles,
   Video,
+  Workflow,
 } from "lucide-react";
 import { NavLink, Outlet, useNavigate } from "react-router";
 import { formatError } from "../lib/utils";
@@ -35,6 +36,7 @@ const productionSteps: ProductionStep[] = [
   { to: "/audio", label: "配音工作台", short: "配音", icon: Mic, requiresChapter: true },
   { to: "/composition", label: "视频合成", short: "合成", icon: Video, requiresProject: true },
   { to: "/custom-shots", label: "自由制作", short: "自由", icon: PenLine },
+  { to: "/free-create", label: "动态漫工作区", short: "动态漫", icon: Workflow },
 ];
 
 export function AppShell() {
@@ -159,6 +161,7 @@ export function AppShell() {
               <NavLink
                 key={item.to}
                 to={linkTo}
+                aria-label={item.label}
                 className={({ isActive }) =>
                   [
                     "group flex min-w-max items-center gap-3 rounded-md border px-3 py-2.5 text-sm font-semibold transition lg:w-full",

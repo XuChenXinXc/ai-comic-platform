@@ -1,23 +1,36 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from sqlalchemy import select, update
 
 from app.db import Database, utc_now
+from app.dynamic_pipeline.delivery import DeliveryExecutionError, DynamicDeliveryJobService
+from app.dynamic_pipeline.prompt_stage_service import (
+    DynamicPromptStageService,
+    PromptStageExecutionError,
+)
+from app.dynamic_pipeline.stage_service import DynamicStageService, StageExecutionError
 from app.jobs.repository import NON_TERMINAL_STATUSES, JobRepository
 from app.models.tables import job, workflow_run, workflow_stage
+from app.services.utils import json_loads
 
 _EXECUTABLE_WORKFLOW_STATUSES = frozenset({"queued", "running"})
 _PROTECTED_WORKFLOW_STATUSES = frozenset({"blocked", "cancelled", "stale", "confirmed"})
+_DYNAMIC_STAGE_KEYS = frozenset(
+    {"0-source", "1-character-bios", "2-rhythm", "3-script", "4-storyboard"}
+)
+_PROMPT_STAGE_KEYS = frozenset({"5a-image-prompts", "5b-video-prompts"})
+_TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "interrupted", "cancelled"})
 _UNIMPLEMENTED_ERROR = (
     "Phase 2 动态 Stage handler 尚未实现：当前仅执行安全占位处理，未调用 Provider"
 )
 
 
 class _ConcurrentStateChange(Exception):
-    """工作流或 Job 在占位处理期间发生了并发状态变化。"""
+    """工作流或 Job 在处理期间发生了并发状态变化。"""
 
 
 def _row_dict(row: Any) -> dict[str, Any] | None:
@@ -90,6 +103,18 @@ def _mark_non_executable(
     )
 
 
+def _mark_obsolete_dynamic_job(
+    connection: Any,
+    current_job: Mapping[str, Any],
+    message: str,
+) -> None:
+    _update_job(
+        connection,
+        current_job,
+        status="interrupted",
+        error=message,
+        message="任务因 attempt 或 input_signature 过期而中断",
+    )
 def _block_workflow_and_fail_job(
     connection: Any,
     current_job: Mapping[str, Any],
@@ -156,15 +181,142 @@ def _block_workflow_and_fail_job(
         raise _ConcurrentStateChange
 
 
+def _input_data(record: Mapping[str, Any], current_job: Mapping[str, Any]) -> dict[str, Any]:
+    stored = current_job.get("input_data")
+    if not isinstance(stored, Mapping):
+        stored = json_loads(current_job.get("input_json"), {})
+    incoming = record.get("input_data")
+    if not isinstance(incoming, Mapping):
+        incoming = {}
+    stored_data = dict(stored) if isinstance(stored, Mapping) else {}
+    return {**stored_data, **dict(incoming)}
+
+
+def _stage_key(
+    record: Mapping[str, Any],
+    current_job: Mapping[str, Any],
+    stage_record: Mapping[str, Any],
+) -> str:
+    associated_key = stage_record.get("stage_key")
+    if associated_key:
+        return str(associated_key)
+    input_stage_key = _input_data(record, current_job).get("stage_key")
+    return str(input_stage_key or "")
+
+
+def _current_stage_status(
+    current_repository: JobRepository,
+    current_job: Mapping[str, Any],
+    fallback: Any,
+) -> Any:
+    stage_id = current_job.get("workflow_stage_id")
+    if not stage_id:
+        return fallback
+    with current_repository.engine.connect() as connection:
+        status = connection.scalar(
+            select(workflow_stage.c.status).where(workflow_stage.c.id == stage_id)
+        )
+    return fallback if status is None else status
+
+
+def _phase2_error_result(
+    current_repository: JobRepository,
+    job_id: str,
+    error: StageExecutionError | PromptStageExecutionError,
+    fallback_stage_status: Any,
+) -> dict[str, Any]:
+    current_job = current_repository.get(job_id)
+    if current_job is None:
+        raise error
+
+    current_status = current_job.get("status")
+    if current_status in NON_TERMINAL_STATUSES:
+        current_job = current_repository.interrupt(job_id, str(error))
+    elif current_status not in _TERMINAL_JOB_STATUSES:
+        raise error
+
+    result_data = current_job.get("result_data")
+    if isinstance(result_data, Mapping) and result_data:
+        return dict(result_data)
+    return {
+        "stage_status": _current_stage_status(
+            current_repository,
+            current_job,
+            fallback_stage_status,
+        ),
+        "error": str(error),
+    }
+
+
+async def _execute_phase2_stage(
+    stage_service: Any,
+    current_repository: JobRepository,
+    record: Mapping[str, Any],
+    fallback_stage_status: Any,
+) -> Any:
+    job_id = str(record["id"])
+    try:
+        result = stage_service.execute_job(record)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    except StageExecutionError as error:
+        return _phase2_error_result(
+            current_repository,
+            job_id,
+            error,
+            fallback_stage_status,
+        )
+    except PromptStageExecutionError as error:
+        return _phase2_error_result(
+            current_repository,
+            job_id,
+            error,
+            fallback_stage_status,
+        )
+
+
+async def _execute_delivery_stage(
+    delivery_service: Any,
+    current_repository: JobRepository,
+    record: Mapping[str, Any],
+) -> Any:
+    job_id = str(record["id"])
+    try:
+        result = delivery_service.execute_job(record)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    except DeliveryExecutionError as error:
+        current_job = current_repository.get(job_id)
+        if current_job is not None and current_job.get("status") in NON_TERMINAL_STATUSES:
+            current_repository.fail(job_id, str(error))
+        return {"status": "failed", "job_id": job_id, "error": str(error)}
 def make_dynamic_stage_generate_handler(
     database: Database,
     repository: JobRepository | None = None,
+    stage_service: Any | None = None,
+    prompt_stage_service: Any | None = None,
+    delivery_service: Any | None = None,
 ) -> Callable:
-    """创建 Phase 1C-C 的动态阶段安全占位处理器。"""
+    """创建动态阶段处理器，并执行 6-delivery 子任务编排。"""
 
     current_repository = repository or JobRepository(database)
+    current_stage_service = (
+        stage_service if stage_service is not None else DynamicStageService(database)
+    )
+    current_prompt_stage_service = (
+        prompt_stage_service
+        if prompt_stage_service is not None
+        else DynamicPromptStageService(database)
+    )
+    current_delivery_service = (
+        delivery_service
+        if delivery_service is not None
+        else DynamicDeliveryJobService(database, repository=current_repository)
+    )
 
-    def handle(record: dict[str, Any]) -> None:
+    def handle(record: dict[str, Any]) -> Any:
         job_id = record.get("id")
         if not job_id:
             return
@@ -223,6 +375,60 @@ def make_dynamic_stage_generate_handler(
                         "无法安全执行；未伪造 Workflow Stage",
                     )
                     return
+
+                latest_stage = _row_dict(
+                    connection.execute(
+                        select(workflow_stage)
+                        .where(
+                            workflow_stage.c.workflow_run_id == run_id,
+                            workflow_stage.c.stage_key == stage_record.get("stage_key"),
+                        )
+                        .order_by(
+                            workflow_stage.c.attempt.desc(),
+                            workflow_stage.c.updated_at.desc(),
+                            workflow_stage.c.id.desc(),
+                        )
+                        .limit(1)
+                    ).first()
+                )
+                if latest_stage is None or latest_stage.get("id") != stage_id:
+                    _mark_obsolete_dynamic_job(
+                        connection,
+                        current_job,
+                        "动态 Job 关联的 stage attempt 已过期，禁止覆盖新结果",
+                    )
+                    return
+                job_signature = str(current_job.get("input_signature") or "")
+                stage_signature = str(stage_record.get("input_signature") or "")
+                if job_signature and stage_signature and job_signature != stage_signature:
+                    _mark_obsolete_dynamic_job(
+                        connection,
+                        current_job,
+                        "动态 Job 与当前 stage input_signature 不一致，禁止覆盖新结果",
+                    )
+                    return
+
+                stage_key = _stage_key(record, current_job, stage_record)
+                if stage_key in _DYNAMIC_STAGE_KEYS:
+                    return _execute_phase2_stage(
+                        current_stage_service,
+                        current_repository,
+                        record,
+                        stage_record.get("status"),
+                    )
+                if stage_key in _PROMPT_STAGE_KEYS:
+                    return _execute_phase2_stage(
+                        current_prompt_stage_service,
+                        current_repository,
+                        record,
+                        stage_record.get("status"),
+                    )
+                if stage_key == "6-delivery":
+                    return _execute_delivery_stage(
+                        current_delivery_service,
+                        current_repository,
+                        record,
+                    )
 
                 run_status = run_record["status"]
                 stage_status = stage_record["status"]

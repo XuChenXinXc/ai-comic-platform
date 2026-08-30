@@ -73,8 +73,10 @@ export function ChapterProvider({ children }: { children: ReactNode }) {
     setActiveChapterId(readStored(activeProjectId));
   }, [activeProjectId]);
 
-  // 章节列表变化后校正选中项：无效则回落到第一章
+  // 章节列表变化后校正选中项：仅在数据已就绪时清空/回落，
+  // 避免加载中（isLoading 期间列表为空）覆盖用户已选项。
   useEffect(() => {
+    if (chaptersQuery.isLoading) return;
     if (!chapters.length) {
       if (activeChapterId) setActiveChapterId("");
       return;
@@ -82,7 +84,7 @@ export function ChapterProvider({ children }: { children: ReactNode }) {
     if (!chapters.some((item) => item.id === activeChapterId)) {
       setActiveChapterId(chapters[0].id);
     }
-  }, [activeChapterId, chapters]);
+  }, [activeChapterId, chapters, chaptersQuery.isLoading]);
 
   useEffect(() => {
     writeStored(activeProjectId, activeChapterId);

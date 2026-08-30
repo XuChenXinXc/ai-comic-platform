@@ -1,5 +1,5 @@
-import { Component, ErrorInfo } from "react";
-import type { ReactNode } from "react";
+import { Component } from "react";
+import type { ErrorInfo, ReactNode } from "react";
 import { Button } from "./ui";
 
 interface Props {

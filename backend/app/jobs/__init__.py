@@ -1,4 +1,5 @@
 from app.jobs.recovery import recover_jobs
+from app.jobs.recovery_all import recover_all_once
 from app.jobs.repository import (
     NON_TERMINAL_STATUSES,
     TERMINAL_STATUSES,
@@ -21,5 +22,6 @@ __all__ = [
     "JobStateError",
     "job_repository",
     "job_runner",
+    "recover_all_once",
     "recover_jobs",
 ]

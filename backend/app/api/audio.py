@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, File, Form, Response, UploadFile, status
 from app.api.schemas import ShotAudioGenerateRequest
 from app.dependencies import get_audio_service
 from app.services.audio_service import AudioService
+from app.services.constants import MAX_BGM_SIZE
 from app.services.errors import bad_request
 
 router = APIRouter(prefix="/audio", tags=["audio"])
@@ -122,12 +123,10 @@ async def upload_bgm(
     """上传 BGM 文件"""
     from app.services.utils import json_loads
 
-    # 限制文件大小为 50MB
-    MAX_FILE_SIZE = 50 * 1024 * 1024
-    file_data = await file.read()
-
-    if len(file_data) > MAX_FILE_SIZE:
-        raise bad_request("文件大小超过限制（最大 50MB）")
+    # 有界读取：多读 1 字节即可判定超限，避免先把整个文件读进内存再检查大小。
+    file_data = await file.read(MAX_BGM_SIZE + 1)
+    if len(file_data) > MAX_BGM_SIZE:
+        raise bad_request(f"文件大小超过限制（最大 {MAX_BGM_SIZE // (1024 * 1024)}MB）")
 
     # 验证文件类型
     if file.content_type and not file.content_type.startswith("audio/"):

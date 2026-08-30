@@ -115,6 +115,41 @@ def test_shot_extraction_prompt_requires_verbatim_screenplay_facts_and_dialogue(
     assert "不得新增或改变剧情事实" in prompt
 
 
+def test_screenplay_prompt_constrains_scene_name_to_location_and_asset_library() -> None:
+    """scene_name 必须是地点名且与场景素材库同名。
+
+    回归 2026-08 缺陷：screenplay.md 原先对 scene_name 零约束（schema 也是裸 str），
+    模型填成「坐错桌」这类桥段标题；而素材提取读正文、剧本生成读正文+分析，
+    两步各自命名必然对不齐，分镜保存时按名称绑定场景素材就会整批失败。
+    """
+    prompt = load_prompt("screenplay")
+
+    assert "`scene_name` 只能是场景的地点名称" in prompt
+    assert "不得写桥段标题" in prompt
+    assert "必须与场景素材库保持同名" in prompt
+    assert "逐字复用" in prompt
+
+
+def test_screenplay_scene_prompt_forbids_renaming_existing_scene_name() -> None:
+    """单场重写不得改动已与素材库对齐的 scene_name。"""
+    prompt = load_prompt("screenplay_scene")
+
+    assert "`scene_name` 只能是场景的地点名称" in prompt
+    assert "不要改动原场次已有的 `scene_name`" in prompt
+
+
+def test_shot_extraction_prompt_delegates_scene_name_to_screenplay() -> None:
+    """分镜阶段只能转抄剧本场次名，不该被要求自行对齐素材库。
+
+    分镜提取读的是剧本，无法凭空知道素材库用哪个名；对齐责任在剧本阶段。
+    """
+    prompt = load_prompt("shot_extract")
+
+    assert "逐字沿用剧本本场的场次名称" in prompt
+    # 旧文案把对齐责任错放在分镜阶段，不应再出现
+    assert "`scene_name` 必须使用素材库中的准确名称" not in prompt
+
+
 def _shot_context_with_positions_and_expressions() -> dict[str, object]:
     return shot_template_context(
         {
@@ -606,7 +641,8 @@ def test_compile_video_prompt_uses_v2_template_and_reference_order() -> None:
     # 验证新模板的核心特征
     assert "严格保持每位角色的身份、面部特征、发型、服装、体型、左右位置关系不变" in prompt
     assert "重点道具的外观、尺寸、颜色和材质保持一致" in prompt
-    assert "其余静止物体不得在动画中移动、旋转或重新生成" in prompt
+    assert "枝叶可受风力影响产生幅度克制、方向一致的自然摆动" in prompt
+    assert "不得在动画中移动、旋转、重构或重新生成" in prompt
 
 
 def test_compile_video_prompt_includes_positions_and_expressions() -> None:
@@ -827,6 +863,42 @@ def test_compile_video_prompt_binds_each_dialogue_to_structured_speaker() -> Non
     assert "按第2句对白执行对应口型" in prompt
     assert "2-7秒：她开口说出台词" not in prompt
     assert "7-10秒：顾沉舟平静地回答" not in prompt
+
+
+def test_compile_video_prompt_binds_quote_text_when_speaker_order_is_swapped() -> None:
+    """时间轴调整了说话顺序时，口型编号必须跟随引号原文而不是出现顺序。"""
+    context = shot_template_context(
+        {
+            "dialogue": [
+                {"speaker": "苏瑶", "text": "你只是送外卖的，也配进这里？"},
+                {"speaker": "顾沉舟", "text": "我是来送餐的。"},
+            ],
+            "character_ids": [],
+            "scene_asset_id": "",
+            "prop_ids": [],
+        },
+        {},
+    )
+
+    prompt = compile_video_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        # 先说顾沉舟（数组里的第 2 句），再说苏瑶（第 1 句）
+        video_prompt=(
+            "0-4秒：顾沉舟开口说出台词“我是来送餐的。”；"
+            "4-10秒：苏瑶质问“你只是送外卖的，也配进这里？”。"
+        ),
+        duration_sec=10,
+        anchors=["@Image1：当前分镜关键帧。"],
+        shot_context=context,
+    )
+
+    # 口型编号必须出现在各自引号原文所在的时间段里（先“我是来送餐的”→第2句）
+    assert "按第2句对白执行对应口型" in prompt
+    assert "按第1句对白执行对应口型" in prompt
+    assert prompt.index("按第2句对白执行对应口型") < prompt.index(
+        "按第1句对白执行对应口型"
+    )
 
 
 def test_compile_video_prompt_removes_narration_from_action_timeline() -> None:

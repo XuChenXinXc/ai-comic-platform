@@ -16,6 +16,7 @@ from pydantic import (
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 MIN_SHOT_DURATION_SEC = 5
+MAX_SHOT_DURATION_SEC = 15
 
 
 def _has_content(value: Any) -> bool:
@@ -131,6 +132,59 @@ class ScreenplayScene(OutputModel):
     narration: list[str]
     emotion: str
     transition_to_next: str
+    # 本场预估成片时长（秒）：由剧本阶段按台词量与动作密度估算，
+    # 分镜阶段据此换算每场镜头数上限，从源头控制分镜总量。
+    target_duration_sec: int | None = Field(default=None, ge=15, le=600)
+
+    _DURATION_ALIASES: ClassVar[tuple[str, ...]] = (
+        "estimated_duration_sec",
+        "estimated_seconds",
+        "target_duration",
+        "duration_sec",
+    )
+
+    @staticmethod
+    def _parse_seconds(value: Any) -> int | None:
+        """把任意来源的秒数收敛为 15-600 内的安全整数；无法解析时返回 None。"""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int | float):
+            seconds = float(value)
+        elif isinstance(value, str):
+            match = re.search(r"\d+(?:\.\d+)?", value)
+            if match is None:
+                return None
+            seconds = float(match.group())
+        else:
+            return None
+        if seconds <= 0:
+            return None
+        parsed = int(round(seconds))
+        return parsed if 15 <= parsed <= 600 else None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_target_duration(cls, value: Any) -> Any:
+        """吸收剧本模型的时长别名输出并统一收紧为合法值，坏值降级为 None。"""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        current = normalized.get("target_duration_sec")
+        if _has_content(current):
+            resolved = cls._parse_seconds(current)
+        else:
+            resolved = None
+            for alias in cls._DURATION_ALIASES:
+                if alias in normalized and _has_content(normalized.get(alias)):
+                    resolved = cls._parse_seconds(normalized[alias])
+                    break
+        if resolved is not None:
+            normalized["target_duration_sec"] = resolved
+        else:
+            normalized.pop("target_duration_sec", None)
+        for alias in cls._DURATION_ALIASES:
+            normalized.pop(alias, None)
+        return normalized
 
 
 class ScreenplayOutput(OutputModel):
@@ -480,7 +534,7 @@ class ShotOutput(OutputModel):
     shot_type: str
     camera_angle: str
     camera_move: str
-    duration_sec: int = Field(ge=MIN_SHOT_DURATION_SEC)
+    duration_sec: int = Field(ge=MIN_SHOT_DURATION_SEC, le=MAX_SHOT_DURATION_SEC)
     end_state: str
     next_hook: str
     frame_description: str
@@ -583,6 +637,65 @@ class ShotOutput(OutputModel):
         return not any(marker in action_text for marker in cls._NON_SPEECH_ACTION_MARKERS)
 
     @classmethod
+    def dialogue_rate_for(cls, action: Any) -> float:
+        """返回当前镜头用于对白承载校验的有效语速。"""
+        return 2.5 if cls._is_dialogue_focused(str(action or "")) else 2 * 0.8
+
+    @classmethod
+    def dialogue_capacity_for(cls, duration_sec: float, action: Any) -> int:
+        """返回指定时长和动作条件下可承载的对白字数。"""
+        return int(float(duration_sec) * cls.dialogue_rate_for(action))
+
+    @classmethod
+    def dialogue_char_count(cls, dialogue: Any) -> int:
+        if not isinstance(dialogue, list):
+            return 0
+        total = 0
+        for item in dialogue:
+            if isinstance(item, dict):
+                text = item.get("text")
+            else:
+                text = getattr(item, "text", "")
+            total += len(str(text or ""))
+        return total
+
+    @classmethod
+    def dialogue_duration_warning_for(
+        cls,
+        dialogue: Any,
+        duration_sec: float,
+        action: str,
+    ) -> str:
+        """返回对白承载警告；超过单镜上限时明确要求拆镜。"""
+        total_chars = cls.dialogue_char_count(dialogue)
+        if total_chars <= 0:
+            return ""
+        usable_rate = cls.dialogue_rate_for(action)
+        duration = float(duration_sec)
+        threshold = cls.dialogue_capacity_for(duration, action)
+        if total_chars <= threshold:
+            return ""
+        rate_label = (
+            "2.5字/秒（纯对白）"
+            if cls._is_dialogue_focused(str(action or ""))
+            else "2字/秒+20%动作余量"
+        )
+        max_threshold = cls.dialogue_capacity_for(MAX_SHOT_DURATION_SEC, action)
+        recommended_sec = math.ceil(total_chars / usable_rate)
+        if recommended_sec <= MAX_SHOT_DURATION_SEC:
+            return (
+                f"{duration:g}秒内台词共{total_chars}字，超出建议阈值{threshold}字"
+                f"（按{rate_label}计算）。建议延长至{recommended_sec}秒"
+                f"（不超过{MAX_SHOT_DURATION_SEC}秒），或拆分台词。"
+            )
+        required_shots = math.ceil(total_chars / max_threshold)
+        return (
+            f"{duration:g}秒内台词共{total_chars}字，超过单镜最长{MAX_SHOT_DURATION_SEC}秒"
+            f"可承载的{max_threshold}字（按{rate_label}计算），"
+            f"必须拆分为至少{required_shots}个分镜。"
+        )
+
+    @classmethod
     def timeline_conflict_warning(cls, video_prompt: str) -> str:
         """检测时间轴是否出现多套划分或分段重叠，返回警告文本。"""
         matches = list(cls._TIMELINE_PATTERN.finditer(video_prompt or ""))
@@ -628,19 +741,10 @@ class ShotOutput(OutputModel):
         纯对白镜头按 2.5 字/秒；有动作镜头按 2 字/秒并留 20% 动作余量。
         无问题返回空字符串。
         """
-        if not self.dialogue or self.duration_sec >= 12:
-            return ""
-        total_chars = sum(len(item.text) for item in self.dialogue)
-        dialogue_focused = self._is_dialogue_focused(self.action)
-        usable_rate = 2.5 if dialogue_focused else 2 * 0.8
-        threshold = int(self.duration_sec * usable_rate)
-        if total_chars <= threshold:
-            return ""
-        recommended_sec = math.ceil(total_chars / usable_rate)
-        return (
-            f"{self.duration_sec}秒内台词共{total_chars}字，超出建议阈值{threshold}字"
-            f"（按{'2.5字/秒（纯对白）' if dialogue_focused else '2字/秒+20%动作余量'}计算）。"
-            f"建议延长时长至{recommended_sec}秒以上，或压缩台词。"
+        return self.dialogue_duration_warning_for(
+            self.dialogue,
+            self.duration_sec,
+            self.action,
         )
 
     def quality_warnings(self) -> list[str]:
@@ -695,7 +799,7 @@ ReferenceBinding = Annotated[
 
 class ProviderConfig(BaseModel):
     id: str
-    kind: Literal["text", "image", "video"]
+    kind: Literal["text", "image", "video", "tts"]
     name: str = ""
     adapter: str
     base_url: str = ""
@@ -833,7 +937,11 @@ class ShotContinuityTransition(OutputModel):
     action: NonEmptyText
     start_state: NonEmptyText
     end_state: NonEmptyText
-    duration_sec: int = Field(default=MIN_SHOT_DURATION_SEC, ge=MIN_SHOT_DURATION_SEC)
+    duration_sec: int = Field(
+        default=MIN_SHOT_DURATION_SEC,
+        ge=MIN_SHOT_DURATION_SEC,
+        le=MAX_SHOT_DURATION_SEC,
+    )
 
 
 class ShotContinuityPairOutput(OutputModel):
@@ -870,7 +978,11 @@ class BatchRefinedPromptsOutput(OutputModel):
 class ShotQualityFixOutput(OutputModel):
     """单镜质量修复结果：只返回被修改的字段，未修改的字段应缺省。"""
 
-    duration_sec: int | None = Field(default=None, ge=MIN_SHOT_DURATION_SEC, le=12)
+    duration_sec: int | None = Field(
+        default=None,
+        ge=MIN_SHOT_DURATION_SEC,
+        le=MAX_SHOT_DURATION_SEC,
+    )
     end_state: str | None = None
     video_prompt: str | None = None
     dialogue: list[ScreenplayDialogue] | None = None

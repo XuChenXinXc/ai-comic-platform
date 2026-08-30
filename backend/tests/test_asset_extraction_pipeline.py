@@ -8,7 +8,7 @@ import pytest
 
 from app.db import Database
 from app.schemas import AssetExtractionOutput
-from app.services.asset_service import AssetService
+from app.services.asset_service import _EXTRACT_EMPTY_RETRIES, AssetService
 from app.services.chapter_service import ChapterService
 from app.services.file_service import FileService
 from app.services.project_service import ProjectService
@@ -353,3 +353,112 @@ def test_extract_warns_when_analysis_main_character_has_no_asset(
     )
 
     assert result["warnings"] == ["核心角色「李四」尚未在素材库中"]
+
+
+def test_extract_first_empty_retry_with_content_saves_asset(
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """首次提取、第一次返回空、重试返回内容：provider 被调 2 次，且二次调用带强化措辞。"""
+    _database, service, project, chapter = asset_extraction_services
+    provider = SequencedAssetProvider(
+        [
+            {"characters": [], "scenes": [], "props": []},
+            {"characters": [_character("小明")], "scenes": [], "props": []},
+        ]
+    )
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_values: (provider, {"params": {}}),
+    )
+
+    result = asyncio.run(
+        service.handle_extract(_extract_job(str(chapter["id"]), str(project["id"])))
+    )
+
+    assert len(provider.calls) == 2
+    # 首次调用 user_prompt 保持原拼装方式不变
+    assert provider.calls[0]["user_prompt"] == (
+        f"本章正文：\n{chapter['source_text']}\n\n"
+        "已有素材目录（已存在，本章若出现同一对象请勿重复提取）：\n[]"
+    )
+    # 第二次调用在原 user_prompt 基础上追加了首次提取的强化措辞
+    assert provider.calls[1]["user_prompt"].startswith(provider.calls[0]["user_prompt"])
+    assert "首次素材提取" in provider.calls[1]["user_prompt"]
+    assert "不得返回空数组" in provider.calls[1]["user_prompt"]
+    characters = service.list(str(project["id"]), "character")
+    assert {item["name"] for item in characters} == {"小明"}
+    assert result["count"] == 1
+
+
+def test_extract_first_always_empty_raises_and_saves_nothing(
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """首次提取、始终返回空：抛出异常，且 asset 表无新记录。"""
+    _database, service, project, chapter = asset_extraction_services
+    calls: list[dict[str, Any]] = []
+
+    class EmptyAssetProvider:
+        async def generate_json(self, **values: Any) -> AssetExtractionOutput:
+            calls.append(values)
+            return AssetExtractionOutput.model_validate(
+                {"characters": [], "scenes": [], "props": []}
+            )
+
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_values: (EmptyAssetProvider(), {"params": {}}),
+    )
+
+    with pytest.raises(RuntimeError, match="首次素材提取未返回任何素材"):
+        asyncio.run(
+            service.handle_extract(_extract_job(str(chapter["id"]), str(project["id"])))
+        )
+
+    # 首调 + 重试各一次
+    assert len(calls) == 1 + _EXTRACT_EMPTY_RETRIES
+    assert service.list(str(project["id"]), "character") == []
+    assert service.list(str(project["id"]), "scene") == []
+    assert service.list(str(project["id"]), "prop") == []
+
+
+def test_extract_incremental_empty_is_valid_no_retry(
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """增量提取（素材库已有内容）返回空：合法正常结果，不重试不抛异常。"""
+    _database, service, project, chapter = asset_extraction_services
+    service.create(
+        str(project["id"]),
+        {
+            "asset_type": "character",
+            "name": "小明",
+            "profile": {"appearance": "黑色短发"},
+            "prompt": "黑色短发",
+            "negative_prompt": "身份漂移",
+        },
+    )
+    provider = SequencedAssetProvider(
+        [
+            {
+                "characters": [],
+                "scenes": [],
+                "props": [],
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_values: (provider, {"params": {}}),
+    )
+
+    result = asyncio.run(
+        service.handle_extract(_extract_job(str(chapter["id"]), str(project["id"])))
+    )
+
+    assert len(provider.calls) == 1
+    assert result["count"] == 0

@@ -18,6 +18,7 @@ from ..base import (
     compress_reference_image,
     extract_path,
     normalize_provider_status,
+    reference_jpeg_part,
 )
 
 
@@ -27,6 +28,9 @@ class HttpImageProvider(HttpProviderBase):
 
     def _options(self) -> dict[str, Any]:
         options = dict(self.config.params)
+        # 未识别的图片模型也要有通用 OpenAI 兼容提交路径，避免 submit_path
+        # 为空时把请求直接打到 base_url（网关返回 Invalid URL (POST /v1)）。
+        options.setdefault("submit_path", "images/generations")
         if self.config.model.strip().lower() == "gpt-image-2":
             # POST 提交允许重试：供应商瞬时错误（5xx/断连/限流）可自动重试，
             # 与 Provider 配置的 max_retries 配合；用户 params 显式传值可覆盖。
@@ -235,16 +239,7 @@ class HttpImageProvider(HttpProviderBase):
             for path in reference_files:
                 if not path.is_file() or path.stat().st_size <= 0:
                     raise ProviderError(f"参考图不存在或为空：{path}")
-                files.append(
-                    (
-                        field,
-                        (
-                            Path(path.name).with_suffix(".jpg").name,
-                            compress_reference_image(path),
-                            "image/jpeg",
-                        ),
-                    )
-                )
+                files.append((field, reference_jpeg_part(path)))
             headers = {
                 name: value
                 for name, value in self._headers(options).items()

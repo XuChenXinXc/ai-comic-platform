@@ -1,4 +1,4 @@
-﻿function Invoke-NativeChecked {
+function Invoke-NativeChecked {
     param(
         [Parameter(Mandatory = $true)]
         [string]$FilePath,
@@ -809,9 +809,13 @@ function Wait-PlatformEndpoint {
                 -TimeoutSec 2 `
                 -ErrorAction Stop
             $PayloadOk = $true
+            $PayloadStatus = ""
             if ($RequireHealthPayload) {
                 $Payload = $Response.Content | ConvertFrom-Json
-                $PayloadOk = [string]$Payload.status -eq "ok"
+                $PayloadStatus = [string]$Payload.status
+                # 实际契约：/api/health 的 status 取值 healthy/degraded/unhealthy。
+                # degraded 仅表示 FFmpeg 异常或磁盘预警，服务仍可用，视为已就绪。
+                $PayloadOk = $PayloadStatus -in @("ok", "healthy", "degraded")
             }
 
             $OwnsListener = $false
@@ -827,7 +831,21 @@ function Wait-PlatformEndpoint {
             if ($Response.StatusCode -eq 200 -and $PayloadOk -and $OwnsListener) {
                 return
             }
-            $LastFailure = "响应或端口所有权校验未通过"
+            $Problems = @()
+            if ($RequireHealthPayload -and -not $PayloadOk) {
+                $Problems += "health.status='$PayloadStatus'"
+            }
+            if ($Response.StatusCode -ne 200) {
+                $Problems += "HTTP $($Response.StatusCode)"
+            }
+            if (-not $OwnsListener) {
+                $Problems += (
+                    "端口 {0} 未被跟踪进程（PID {1}）及其子进程占用" -f
+                    $State.port,
+                    $State.pid
+                )
+            }
+            $LastFailure = "响应或端口所有权校验未通过（" + ($Problems -join "；") + "）"
         }
         catch {
             $LastFailure = $_.Exception.Message

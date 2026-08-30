@@ -181,9 +181,17 @@ class JobRepository:
             raise JobRepositoryError("任务创建后无法读取")
         return created
 
-    def get(self, job_id: str) -> dict[str, Any] | None:
-        with self.engine.connect() as connection:
+    def get(
+        self,
+        job_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> dict[str, Any] | None:
+        if connection is not None:
             row = connection.execute(select(job).where(job.c.id == job_id)).first()
+            return self._decode(row)
+        with self.engine.connect() as conn:
+            row = conn.execute(select(job).where(job.c.id == job_id)).first()
         return self._decode(row)
 
     def require(self, job_id: str) -> dict[str, Any]:
@@ -351,7 +359,8 @@ class JobRepository:
         status: str = "waiting_provider",
         result_data: Mapping[str, Any] | None = None,
         message: str = "",
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
+        """写入 provider_task_id。任务已进入终态（例如刚被取消）时返回 ``None``。"""
         if not provider_task_id:
             raise JobStateError("provider_task_id 不能为空")
         values: dict[str, Any] = {
@@ -444,6 +453,50 @@ class JobRepository:
         )
 
     mark_interrupted = interrupt
+
+    def batch_fail(
+        self,
+        job_ids: Sequence[str],
+        message: str,
+        *,
+        connection: Any | None = None,
+    ) -> int:
+        """批量把一组 job 标记为 interrupted（被新 generation 取代的语义）。
+
+        仅命中非终态的 job；终态行不会被打扰。返回实际更新的行数。
+        """
+        ids = [str(value) for value in job_ids if str(value).strip()]
+        if not ids:
+            return 0
+        now = utc_now()
+        values = {
+            "status": "interrupted",
+            "error": message,
+            "message": "任务因服务重启中断",
+            "started_at": None,
+            "finished_at": now,
+            "updated_at": now,
+        }
+        if connection is None:
+            with self.engine.begin() as owned:
+                result = owned.execute(
+                    update(job)
+                    .where(
+                        job.c.id.in_(ids),
+                        job.c.status.in_(NON_TERMINAL_STATUSES),
+                    )
+                    .values(**values)
+                )
+            return int(result.rowcount or 0)
+        result = connection.execute(
+            update(job)
+            .where(
+                job.c.id.in_(ids),
+                job.c.status.in_(NON_TERMINAL_STATUSES),
+            )
+            .values(**values)
+        )
+        return int(result.rowcount or 0)
 
     def retry(self, job_id: str) -> dict[str, Any]:
         current = self.require(job_id)

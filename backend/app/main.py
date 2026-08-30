@@ -1,3 +1,5 @@
+import shutil
+import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePath
@@ -6,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import select, text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 from starlette.types import Scope
@@ -27,13 +29,16 @@ from app.api import (
 from app.api import settings as settings_api
 from app.config import get_settings
 from app.db import Database, db, init_db
-from app.jobs.dynamic_recovery import enqueue_recovered_dynamic_jobs
+from app.jobs.recovery_all import recover_all_once
 from app.jobs.repository import JobRepository
 from app.jobs.runner import job_runner
 from app.models.tables import project
 from app.services.errors import ServiceError
+from app.services.ffmpeg_utils import shutdown_ffmpeg_executor
 from app.services.file_service import file_service, is_reparse_point
+from app.services.setting_service import get_imagbb_api_key_override
 from app.services.task_handlers import register_handlers
+from app.services.utils import utc_now
 
 
 class SPAStaticFiles(StaticFiles):
@@ -129,14 +134,23 @@ class ProjectMediaStaticFiles(StaticFiles):
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     init_db(seed_mock_providers=True)
+    # ImgBB 是平台级辅助密钥，优先从加密的 platform_setting 读取，
+    # 避免明文密钥在 .env 中长期存在。空值时回退到 settings.imgbb_api_key（环境变量）。
+    override_key = get_imagbb_api_key_override(db)
+    if override_key:
+        settings.imgbb_api_key = override_key
     file_service.migrate_categorized_media_layouts(strict=False)
     register_handlers()
-    job_runner.start(recover=True)
-    enqueue_recovered_dynamic_jobs(JobRepository(db), job_runner.enqueue)
+    job_runner.start(recover=False)
+    repository = JobRepository(db)
+    for job_id in recover_all_once(repository):
+        job_runner.enqueue(job_id)
     try:
         yield
     finally:
         job_runner.shutdown()
+        # 等待在途 ffmpeg/ffprobe 任务结束后再释放数据库连接。
+        shutdown_ffmpeg_executor()
         db.dispose()
 
 
@@ -157,8 +171,81 @@ async def handle_service_error(_: Request, exc: ServiceError) -> JSONResponse:
 
 
 @app.get("/api/health", tags=["system"])
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, object]:
+    """系统健康检查：数据库 / FFmpeg / 磁盘 / 活跃 Job 状态。
+
+    任一关键依赖异常时返回 ``status: unhealthy``，FFmpeg 失败时为 ``degraded``。
+    任何异常仅记录在 checks 字段内，HTTP 状态码统一 200，由调用方根据 status 判断。
+    """
+    checks: dict[str, dict[str, object]] = {}
+    overall = "healthy"
+
+    # 1) 数据库
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        checks["database"] = {"status": "healthy"}
+    except Exception as exc:  # noqa: BLE001 — 健康检查吞所有异常
+        checks["database"] = {"status": "unhealthy", "error": str(exc)}
+        overall = "unhealthy"
+
+    # 2) FFmpeg（degraded，不影响整体健康）
+    try:
+        result = subprocess.run(
+            [settings.ffmpeg_path, "-version"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg exit={result.returncode}: {result.stderr.decode(errors='replace')[:200]}"
+            )
+        first_line = (result.stdout or b"").decode(errors="replace").splitlines()[0]
+        checks["ffmpeg"] = {"status": "healthy", "version": first_line}
+    except Exception as exc:  # noqa: BLE001
+        checks["ffmpeg"] = {"status": "unhealthy", "error": str(exc)}
+        if overall == "healthy":
+            overall = "degraded"
+
+    # 3) 磁盘空间（工作区所在盘）
+    try:
+        usage = shutil.disk_usage(settings.workspace_dir)
+        free_gb = usage.free / (1024**3)
+        if free_gb < 0.5:
+            disk_status = "unhealthy"
+            overall = "unhealthy"
+        elif free_gb < 1.0:
+            disk_status = "warning"
+            if overall == "healthy":
+                overall = "degraded"
+        else:
+            disk_status = "healthy"
+        # 不返回 workspace 绝对路径：/api/health 无鉴权，路径属于不必要的信息泄露。
+        checks["disk"] = {
+            "status": disk_status,
+            "free_gb": round(free_gb, 2),
+        }
+    except Exception as exc:  # noqa: BLE001
+        checks["disk"] = {"status": "unknown", "error": str(exc)}
+
+    # 4) Worker 状态
+    try:
+        active_jobs = job_runner.active_job_ids()
+        checks["workers"] = {
+            "status": "healthy",
+            "active_jobs": len(active_jobs),
+            "limits": job_runner.worker_limits,
+        }
+    except Exception as exc:  # noqa: BLE001
+        checks["workers"] = {"status": "unhealthy", "error": str(exc)}
+        overall = "unhealthy"
+
+    return {
+        "status": overall,
+        "timestamp": utc_now(),
+        "checks": checks,
+    }
 
 
 for api_router in (

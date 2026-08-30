@@ -320,20 +320,20 @@ export function ShotsPage() {
     onError: (error) => toast.error(formatError(error)),
   });
 
-  // 重新生成提示词：把当前源字段重新编译为图片/视频提示词。
+  // 重新生成提示词：只把当前源字段重新编译为视频提示词，不动图片提示词。
   // 审校修正写回源字段后必须执行这一步，否则旧提示词仍会被使用。
   const promptBatchMutation = useMutation({
     mutationFn: () =>
       api.shots.batchPrompts(activeChapterId, {
         ids: batchIds,
-        prompt_types: ["image", "video"],
+        prompt_types: ["video"],
       }),
     onSuccess: async (result) => {
       await queryClient.invalidateQueries({
         queryKey: queryKeys.jobs(activeProjectId),
       });
       toast.success(`已入队 ${result.jobs.length} 个提示词任务`, {
-        description: "完成后请重新生成关键帧与视频，修正才会进入画面",
+        description: "完成后请重新生成视频，修正才会进入画面",
       });
     },
     onError: (error) => toast.error(formatError(error)),
@@ -342,7 +342,7 @@ export function ShotsPage() {
   const handlePromptBatch = () => {
     if (
       !window.confirm(
-        "将重新生成提示词并覆盖现有提示词（含手工覆盖的版本），确定继续吗？",
+        "将重新生成视频提示词并覆盖现有视频提示词（含手工覆盖的版本），确定继续吗？",
       )
     ) {
       return;
@@ -372,7 +372,7 @@ export function ShotsPage() {
         queryKey: queryKeys.jobs(activeProjectId),
       });
       toast.success(`已入队 ${job.progress_total ?? qualityIssues.length} 个分镜的修复任务`, {
-        description: "完成后会自动调整时长与时间轴，可在分镜列表查看结果",
+        description: "完成后会在5-15秒范围内调整时长，超长对白会自动拆成多个分镜",
       });
     },
     onError: (error) => toast.error(formatError(error)),
@@ -541,15 +541,15 @@ export function ShotsPage() {
                 variant="secondary"
                 busy={promptBatchMutation.isPending}
                 disabled={!shots.length}
-                title="把所选（或全部）分镜的最新字段重新编译为图片与视频提示词；会覆盖现有提示词与手工覆盖"
+                title="把所选（或全部）分镜的最新字段重新编译为视频提示词；会覆盖现有视频提示词与手工覆盖，不影响图片提示词"
                 onClick={handlePromptBatch}
               >
                 <RefreshCw className="h-4 w-4" />
                 {selected.size
-                  ? `重新生成所选提示词（${selected.size}）`
+                  ? `重新生成所选视频提示词（${selected.size}）`
                   : scope === "scene"
-                    ? "重新生成当前场次提示词"
-                    : "重新生成全部提示词"}
+                    ? "重新生成当前场次视频提示词"
+                    : "重新生成全部视频提示词"}
               </Button>
               <Button
                 variant="secondary"
@@ -594,7 +594,7 @@ export function ShotsPage() {
               <Button
                 variant="secondary"
                 busy={qualityFixMutation.isPending}
-                title="调用文字模型逐个修复：优先延长时长并补齐时间轴，不改动剧情内容"
+                title="在5-15秒范围内修复时长与时间轴，超长对白自动拆分，不改动剧情内容"
                 onClick={() => qualityFixMutation.mutate()}
               >
                 <Wrench className="h-4 w-4" />
@@ -1222,6 +1222,7 @@ export function ShotsPage() {
                   !form.action?.trim() ||
                   !form.duration_sec ||
                   form.duration_sec < 5 ||
+                  form.duration_sec > 15 ||
                   !jsonValid
                 }
                 onClick={() => saveMutation.mutate()}
@@ -1463,6 +1464,7 @@ export function ShotsPage() {
                 <Input
                   type="number"
                   min={5}
+                  max={15}
                   step={1}
                   value={form.duration_sec || ""}
                   onChange={(event) =>

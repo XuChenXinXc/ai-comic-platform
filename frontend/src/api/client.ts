@@ -5,6 +5,15 @@ import type {
   AssetType,
   BatchResponse,
   ContentRecord,
+  DynamicChecklistResponse,
+  DynamicDeliveryOptions,
+  DynamicPreflightResult,
+  DynamicRunCreateInput,
+  DynamicStageDraftUpdate,
+  DynamicStageKey,
+  DynamicWorkflowAction,
+  DynamicWorkflowRun,
+  DynamicWorkflowStage,
   Job,
   MediaVersion,
   Project,
@@ -17,7 +26,38 @@ import type {
   ShotQualityReport,
 } from "../types/api";
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || "/api").replace(/\/$/, "");
+export function getDynamicRunTitle(
+  run: Pick<DynamicWorkflowRun, "title" | "source_snapshot">,
+) {
+  // 兼容旧接口把项目名放在 title 的情况；source_snapshot 保存真正的运行标题。
+  const snapshotTitle = run.source_snapshot?.title;
+  if (typeof snapshotTitle === "string" && snapshotTitle.trim()) {
+    return snapshotTitle.trim();
+  }
+  if (typeof run.title === "string" && run.title.trim()) {
+    return run.title.trim();
+  }
+  return "未命名运行";
+}
+
+/**
+ * 解析 VITE_API_BASE_URL。空、相对路径、原型 localhost 的相对形式都接受；
+ * 非法的绝对 URL（如 `http://`）降级为相对路径 `/api`，避免请求 host 错乱。
+ */
+function resolveApiBase(raw: string | undefined): string {
+  const candidate = (raw || "/api").replace(/\/$/, "");
+  if (!candidate) return "/api";
+  if (candidate.startsWith("/")) return candidate;
+  try {
+    // 仅做合法性校验（构造失败即抛错），URL 解析失败时降级为 /api
+    new URL(candidate);
+    return candidate;
+  } catch {
+    return "/api";
+  }
+}
+
+const API_BASE = resolveApiBase(import.meta.env.VITE_API_BASE_URL);
 
 export class ApiError extends Error {
   status: number;
@@ -188,11 +228,23 @@ export function mediaUrl(version?: MediaVersion | null) {
 }
 
 export async function download(path: string, filename: string) {
-  const response = await fetch(`${API_BASE}${path}`);
+  return downloadBlob(path, filename, { method: "GET" });
+}
+
+async function downloadBlob(path: string, filename: string, init?: RequestInit) {
+  const headers = new Headers(init?.headers);
+  if (init?.body && !(init.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
+  headers.set("Accept", "application/zip");
+  const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
   if (!response.ok) {
     let payload: unknown;
     try {
-      payload = await response.json();
+      const contentType = response.headers.get("content-type") || "";
+      payload = contentType.includes("application/json")
+        ? await response.json()
+        : await response.text();
     } catch {
       payload = null;
     }
@@ -213,6 +265,10 @@ export async function download(path: string, filename: string) {
   URL.revokeObjectURL(url);
 }
 
+function safeDownloadFilename(value: string) {
+  return value.replace(/[\\/:*?"<>|]+/g, "-").trim() || "dynamic-delivery";
+}
+
 export const queryKeys = {
   projects: ["projects"] as const,
   project: (id: string) => ["projects", id] as const,
@@ -226,6 +282,8 @@ export const queryKeys = {
   providers: ["providers"] as const,
   projectStorage: ["settings", "project-storage"] as const,
   jobs: (projectId?: string) => ["jobs", projectId || "all"] as const,
+  dynamicRuns: (projectId?: string) => ["dynamic-runs", projectId || "all"] as const,
+  dynamicRun: (runId: string) => ["dynamic-runs", runId] as const,
 };
 
 export const api = {
@@ -592,6 +650,103 @@ export const api = {
       request<{ batch_id: string; jobs: Job[] }>(`/jobs/batches/${id}`),
   },
 
+  dynamicRuns: {
+    createFreeCreate: (body: DynamicRunCreateInput) =>
+      request<DynamicWorkflowAction>("/free-create/dynamic-runs", json("POST", body)),
+    createForProject: (projectId: string, body: DynamicRunCreateInput) =>
+      request<DynamicWorkflowAction>(
+        `/projects/${projectId}/dynamic-runs`,
+        json("POST", { ...body, project_id: projectId }),
+      ),
+    list: async (projectId: string) =>
+      asList(
+        await request<DynamicWorkflowRun[] | { items: DynamicWorkflowRun[] }>(
+          `/projects/${projectId}/dynamic-runs`,
+        ),
+      ),
+    get: (runId: string) =>
+      request<DynamicWorkflowRun>(`/dynamic-runs/${runId}`),
+    getWithStages: (runId: string) =>
+      request<DynamicWorkflowAction>(`/dynamic-runs/${runId}/stages`),
+    getStage: (runId: string, stageKey: DynamicStageKey) =>
+      request<DynamicWorkflowStage>(`/dynamic-runs/${runId}/stages/${stageKey}`),
+    start: (runId: string, expectedRevision: number) =>
+      request<DynamicWorkflowAction>(
+        `/dynamic-runs/${runId}/start`,
+        json("POST", { expected_revision: expectedRevision }),
+      ),
+    pause: (runId: string, expectedRevision: number) =>
+      request<DynamicWorkflowAction>(
+        `/dynamic-runs/${runId}/pause`,
+        json("POST", { expected_revision: expectedRevision }),
+      ),
+    resume: (runId: string, expectedRevision: number) =>
+      request<DynamicWorkflowAction>(
+        `/dynamic-runs/${runId}/resume`,
+        json("POST", { expected_revision: expectedRevision }),
+      ),
+    cancel: (runId: string, expectedRevision: number) =>
+      request<DynamicWorkflowAction>(
+        `/dynamic-runs/${runId}/cancel`,
+        json("POST", { expected_revision: expectedRevision }),
+      ),
+    saveDraft: (
+      runId: string,
+      stageKey: DynamicStageKey,
+      body: DynamicStageDraftUpdate,
+    ) =>
+      request<DynamicWorkflowAction>(
+        `/dynamic-runs/${runId}/stages/${stageKey}/draft`,
+        json("PUT", body),
+      ),
+    confirmStage: (
+      runId: string,
+      stageKey: DynamicStageKey,
+      expectedRevision: number,
+    ) =>
+      request<DynamicWorkflowAction>(
+        `/dynamic-runs/${runId}/stages/${stageKey}/confirm`,
+        json("POST", { expected_revision: expectedRevision }),
+      ),
+    regenerateStage: (
+      runId: string,
+      stageKey: DynamicStageKey,
+      expectedRevision: number,
+    ) =>
+      request<DynamicWorkflowAction>(
+        `/dynamic-runs/${runId}/stages/${stageKey}/regenerate`,
+        json("POST", { expected_revision: expectedRevision }),
+      ),
+    checklist: (runId: string) =>
+      request<DynamicChecklistResponse>(`/dynamic-runs/${runId}/delivery/checklist`),
+    preflight: (
+      runId: string,
+      options: DynamicDeliveryOptions = {},
+    ) =>
+      request<DynamicPreflightResult>(
+        `/dynamic-runs/${runId}/delivery/preflight`,
+        json("POST", {
+          strict: options.strict ?? true,
+          allow_partial: options.allow_partial ?? false,
+        }),
+      ),
+    exportZip: async (
+      runId: string,
+      options: DynamicDeliveryOptions = {},
+    ) => {
+      const fallbackName = `dynamic-delivery-${safeDownloadFilename(runId)}.zip`;
+      await downloadBlob(
+        `/dynamic-runs/${runId}/delivery/export`,
+        fallbackName,
+        json("POST", {
+          strict: options.strict ?? true,
+          allow_partial: options.allow_partial ?? false,
+          exported_at: options.exported_at,
+        }),
+      );
+    },
+  },
+
   audio: {
     getEdgeTTSVoices: () =>
       request<Array<{
@@ -772,9 +927,28 @@ export const api = {
         outline_color: string;
       }>>(`/composition/subtitle-styles`),
 
-    exportChapterSRT: (chapterId: string) =>
-      fetch(`${API_BASE}/composition/chapters/${chapterId}/subtitles/srt`)
-        .then(r => r.blob()),
+    exportChapterSRT: async (chapterId: string) => {
+      const response = await fetch(
+        `${API_BASE}/composition/chapters/${chapterId}/subtitles/srt`,
+      );
+      if (!response.ok) {
+        let payload: unknown = null;
+        try {
+          const contentType = response.headers.get("content-type") || "";
+          payload = contentType.includes("application/json")
+            ? await response.json()
+            : await response.text();
+        } catch {
+          payload = null;
+        }
+        throw new ApiError(
+          errorMessage(payload, `下载失败（${response.status}）`),
+          response.status,
+          payload,
+        );
+      }
+      return response.blob();
+    },
 
     composeChapter: (chapterId: string, config: {
       resolution?: "720p" | "1080p" | "4k";

@@ -17,6 +17,7 @@ Create Date: 2026-08-08
 from collections.abc import Sequence
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "20260808_0011"
@@ -53,7 +54,10 @@ def upgrade() -> None:
             sa.Column("dialogue_volume", sa.Float(), nullable=False, server_default="1.0"),
             sa.Column("sound_effect_volume", sa.Float(), nullable=False, server_default="0.5"),
             sa.Column("updated_at", sa.Text(), nullable=False),
-            sa.CheckConstraint("bgm_volume >= 0 AND bgm_volume <= 1", name="ck_audio_config_bgm_volume"),
+            sa.CheckConstraint(
+                "bgm_volume >= 0 AND bgm_volume <= 1",
+                name="ck_audio_config_bgm_volume",
+            ),
             sa.CheckConstraint(
                 "dialogue_volume >= 0 AND dialogue_volume <= 1",
                 name="ck_audio_config_dialogue_volume",
@@ -190,7 +194,10 @@ def upgrade() -> None:
                 "status IN ('pending','processing','completed','failed')",
                 name="ck_chapter_composition_status",
             ),
-            sa.CheckConstraint("resolution IN ('720p','1080p','4k')", name="ck_chapter_composition_resolution"),
+            sa.CheckConstraint(
+                "resolution IN ('720p','1080p','4k')",
+                name="ck_chapter_composition_resolution",
+            ),
             sa.ForeignKeyConstraint(
                 ["chapter_id"],
                 ["chapter.id"],

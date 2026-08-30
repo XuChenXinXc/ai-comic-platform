@@ -151,6 +151,32 @@ def test_start_enqueues_after_commit_and_creates_dynamic_job(
     assert json_loads(dynamic_job["input_json"], {})["stage_key"] == "0-source"
 
 
+def test_create_auto_run_queues_first_stage_after_commit_idempotently(
+    job_integration_context: JobIntegrationContext,
+) -> None:
+    context = job_integration_context
+    fake_enqueue = FakeEnqueue(context.database)
+
+    with context.client(fake_enqueue) as client:
+        response = client.post(
+            "/api/free-create/dynamic-runs",
+            json={**_payload(), "auto_run": True},
+        )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    run_id = body["run"]["id"]
+    assert body["run"]["status"] == "queued"
+    assert body["stages"][0]["status"] == "queued"
+    jobs = _jobs_for(context, run_id)
+    assert len(jobs) == 1
+    assert jobs[0]["status"] == "queued"
+    assert fake_enqueue.called == [jobs[0]["id"]]
+    assert fake_enqueue.visible_statuses[jobs[0]["id"]] == "queued"
+    assert DynamicJobBridge(context.repository).reconcile_queued_stage_jobs() == [jobs[0]["id"]]
+    assert len(_jobs_for(context, run_id)) == 1
+
+
 @pytest.mark.parametrize(
     ("result", "error"),
     [(False, None), (True, RuntimeError("模拟队列不可用"))],
@@ -232,6 +258,49 @@ def test_resume_retries_failed_or_interrupted_job_in_place(
     assert retried["idempotency_key"] == original_job["idempotency_key"]
     assert retried["retry_count"] == original_job["retry_count"] + 1
     assert retried["status"] == "queued"
+
+
+def test_resume_retries_partial_failed_stage_with_failed_dynamic_job(
+    job_integration_context: JobIntegrationContext,
+) -> None:
+    context = job_integration_context
+    fake_enqueue = FakeEnqueue(context.database, result=False)
+
+    with context.client(fake_enqueue) as client:
+        created = _create_run(client)
+        run_id = created["run"]["id"]
+        started = client.post(
+            f"/api/dynamic-runs/{run_id}/start",
+            json={"expected_revision": 1},
+        )
+        assert started.status_code == 200, started.text
+
+        original_job = _jobs_for(context, run_id)[0]
+        with context.database.engine.begin() as connection:
+            connection.execute(
+                update(workflow_run)
+                .where(workflow_run.c.id == run_id)
+                .values(status="partial_failed")
+            )
+            connection.execute(
+                update(workflow_stage)
+                .where(workflow_stage.c.id == original_job["workflow_stage_id"])
+                .values(status="partial_failed")
+            )
+            connection.execute(
+                update(job).where(job.c.id == original_job["id"]).values(status="failed")
+            )
+
+        response = client.post(
+            f"/api/dynamic-runs/{run_id}/resume",
+            json={"expected_revision": 2},
+        )
+
+    assert response.status_code == 200, response.text
+    retried = _jobs_for(context, run_id)[0]
+    assert retried["id"] == original_job["id"]
+    assert retried["status"] == "queued"
+    assert retried["retry_count"] == original_job["retry_count"] + 1
 
 
 def test_regenerate_creates_new_attempt_job_and_stales_descendants(
@@ -353,8 +422,14 @@ def test_terminal_job_rejects_queued_stage_and_rolls_back(
     assert tuple(state) == ("pending", 2, "pending", terminal_status)
 
 
-def test_dynamic_recovery_is_after_legacy_runner_start_without_starting_runner() -> None:
+def test_main_lifespan_uses_recover_all_once() -> None:
     source = inspect.getsource(lifespan)
-    assert source.index("job_runner.start(recover=True)") < source.index(
-        "enqueue_recovered_dynamic_jobs(JobRepository(db), job_runner.enqueue)"
-    )
+    assert "job_runner.start(recover=False)" in source
+    # 应当使用统一的 recover_all_once 入口（包含 dynamic + 普通路径去重）
+    assert "recover_all_once(repository)" in source
+    # 不再分别调用两条旧路径
+    assert "enqueue_recovered_dynamic_jobs(repository" not in source
+    # for 循环应该对 recover_all_once 的返回值做 enqueue
+    start_index = source.index("job_runner.start(recover=False)")
+    recover_index = source.index("recover_all_once(repository)")
+    assert start_index < recover_index

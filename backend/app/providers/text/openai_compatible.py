@@ -99,7 +99,9 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
         payload: dict[str, Any] = {"model": model, "messages": messages, **options}
         if json_response and response_format:
             payload["response_format"] = response_format
-        payload["reasoning_effort"] = "xhigh"
+        # 推理强度默认 high，但允许 provider 配置或任务 params 覆盖；
+        # 大输出结构化任务（如分镜）用 medium/low 可大幅缩短单次调用耗时。
+        payload["reasoning_effort"] = options.pop("reasoning_effort", "high")
         attempts = self.config.max_retries + 1
         last_reason = ""
         for attempt in range(attempts):

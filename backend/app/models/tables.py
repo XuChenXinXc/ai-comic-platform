@@ -560,10 +560,12 @@ shot_audio = Table(
     UniqueConstraint("shot_id", "version_no", name="uq_shot_audio_shot_version"),
 )
 Index(
-    "ux_shot_audio_current",
+    "ux_shot_audio_current_line",
     shot_audio.c.shot_id,
+    shot_audio.c.dialogue_line_id,
     unique=True,
     sqlite_where=shot_audio.c.is_current == 1,
+    postgresql_where=shot_audio.c.is_current == 1,
 )
 
 

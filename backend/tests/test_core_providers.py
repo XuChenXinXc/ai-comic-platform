@@ -481,9 +481,10 @@ def test_openai_compatible_with_invalid_first_response_repairs_once(
     assert responses == []
 
 
-def test_openai_compatible_text_request_forces_high_reasoning_after_param_merge(
+def test_openai_compatible_text_request_respects_reasoning_effort_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # 推理强度默认 high，但 provider 配置/任务 params 可覆盖（分镜批次提速用）
     provider = OpenAICompatibleTextProvider(
         ProviderConfig(
             id="text-real",
@@ -525,10 +526,11 @@ def test_openai_compatible_text_request_forces_high_reasoning_after_param_merge(
         )
     )
 
-    assert [payload["reasoning_effort"] for payload in payloads] == ["high"]
+    # 任务 params 覆盖 provider 配置，最终生效 medium
+    assert [payload["reasoning_effort"] for payload in payloads] == ["medium"]
 
 
-def test_openai_compatible_text_repair_request_keeps_high_reasoning(
+def test_openai_compatible_text_repair_request_keeps_reasoning_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = OpenAICompatibleTextProvider(
@@ -575,7 +577,8 @@ def test_openai_compatible_text_repair_request_keeps_high_reasoning(
         )
     )
 
-    assert [payload["reasoning_effort"] for payload in payloads] == ["high", "high"]
+    # 首次生成与修复重试都尊重 params 覆盖
+    assert [payload["reasoning_effort"] for payload in payloads] == ["low", "low"]
 
 
 def test_openai_compatible_plain_text_schema_keeps_prompts_plain_and_parses_sentence(
@@ -736,6 +739,21 @@ def test_http_image_with_custom_paths_maps_async_submission_and_poll(
     assert submission.status == "waiting_provider"
     assert result.status == "completed"
     assert result.result_url == "https://example.invalid/result.png"
+
+
+def test_unknown_image_model_keeps_default_generations_submit_path() -> None:
+    """未识别的图片模型不能把 submit_path 留空，否则请求会打到 base_url 本身。"""
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-tianyue-gz",
+            kind="image",
+            adapter="http_image",
+            base_url="https://api.tianyue.xyz/v1",
+            model="GZ-gpt-image-2-2K",
+        )
+    )
+
+    assert provider._options()["submit_path"] == "images/generations"
 
 
 def test_http_image_does_not_send_connection_test_control_params(
@@ -1796,3 +1814,513 @@ def test_grok_video_upload_retries_transient_status_with_complete_content(
     assert sent_contents[0] == sent_contents[1]
     assert sent_contents[0][:2] == b"\xff\xd8"
     assert prepared["value"] == "https://getapib.org/image/keyframe.png"
+
+
+def test_h3_video_submits_multipart_references_and_downloads_content_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H3 ref2va 接口：multipart 表单直接携带参考文件，完成后走同源 /content 下载。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3",
+            kind="video",
+            adapter="http_video",
+            base_url="https://h3.zhongbiao.cloud/api",
+            model="h3-ref2va-x",
+            api_key="h3-secret",
+            params={
+                "protocol": "h3",
+                "default_params": {
+                    "mode": "ref2va",
+                    "resolution": "576P",
+                    "steps": 10,
+                    "aspectRatio": "16:9",
+                },
+            },
+        )
+    )
+    first = _write_reference_png(tmp_path / "character-front.png")
+    second = _write_reference_png(tmp_path / "character-side.png")
+    calls: list[dict[str, Any]] = []
+    responses = [
+        {"job_id": "JOB123", "status": "queued"},
+        {"job_id": "JOB123", "status": "completed"},
+    ]
+
+    async def fake_request_json(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"method": method, "path": path, **kwargs})
+        return responses.pop(0)
+
+    monkeypatch.setattr(provider, "_request_json", fake_request_json)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="雨夜霓虹街头镜头",
+            input_image={"values": [first, second]},
+            duration_sec=5.0,
+            params={},
+        )
+    )
+    result = asyncio.run(provider.poll(submission.task_id))
+
+    assert submission.task_id == "JOB123"
+    assert submission.status == "waiting_provider"
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["path"] == "videos"
+    form = calls[0]["data"]
+    assert form["prompt"] == "雨夜霓虹街头镜头"
+    assert form["mode"] == "ref2va"
+    assert form["resolution"] == "576P"
+    assert form["steps"] == 10
+    assert form["aspectRatio"] == "16:9"
+    assert form["duration"] == 5
+    assert type(form["duration"]) is int
+    assert "model" not in form
+    assert "protocol" not in form
+    assert "default_params" not in form
+    files = calls[0]["files"]
+    assert [field for field, _ in files] == ["referenceImages", "referenceImages"]
+    assert [part[0] for _, part in files] == ["character-front.jpg", "character-side.jpg"]
+    assert all(isinstance(part[1], bytes) and part[1][:2] == b"\xff\xd8" for _, part in files)
+    headers = calls[0]["headers"]
+    assert headers["Authorization"] == "Bearer h3-secret"
+    # Content-Type 必须由 requests 自动生成（含 boundary），不得手动指定
+    assert "Content-Type" not in headers
+
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["path"] == "videos/JOB123"
+    assert result.status == "completed"
+    # 兜底端点必须是绝对地址（与 grok/tianyue 的持久化契约一致，重试不受 base_url 变更影响）
+    assert result.result_url == "https://h3.zhongbiao.cloud/api/videos/JOB123/content"
+
+    downloads: list[dict[str, Any]] = []
+
+    def fake_download(url: str, target: Path, **kwargs: Any) -> Path:
+        downloads.append({"url": url, **kwargs})
+        target.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+        return target
+
+    monkeypatch.setattr("app.providers.base.download_url_atomic", fake_download)
+    target = asyncio.run(provider.download(result, tmp_path / "out.mp4"))
+
+    assert target.read_bytes().startswith(b"\x00\x00\x00\x18ftyp")
+    # 不用 provider._url 做期望值：两侧同管道的自指断言会掩盖 resolve_provider_url 的回归
+    assert downloads[0]["url"] == "https://h3.zhongbiao.cloud/api/videos/JOB123/content"
+    assert downloads[0]["headers"]["Authorization"] == "Bearer h3-secret"
+
+
+def test_h3_video_reads_official_job_wrapped_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H3Studio 官方响应是 {job:{...}} 包装：task/status/error 都要从 job 内提取。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-official",
+            kind="video",
+            adapter="http_video",
+            base_url="https://h3.zhongbiao.cloud/api",
+            model="h3-video",
+            api_key="h3-secret",
+            params={"protocol": "h3"},
+        )
+    )
+    reference = _write_reference_png(tmp_path / "reference.png")
+    responses = [
+        {"job": {"id": "JOB-9F2", "progress": 0, "status": "queued"}},
+        {"job": {"id": "JOB-9F2", "progress": 40, "status": "running"}},
+        {"job": {"id": "JOB-9F2", "progress": 100, "status": "succeeded"}},
+        {"job": {"id": "JOB-9F2", "status": "timed_out", "error": "generation timeout"}},
+    ]
+
+    async def fake_request_json(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        assert method == ("POST" if len(responses) == 4 else "GET")
+        return responses.pop(0)
+
+    monkeypatch.setattr(provider, "_request_json", fake_request_json)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="官方包装结构",
+            input_image={"values": [reference]},
+            duration_sec=5.0,
+            params={},
+        )
+    )
+    waiting = asyncio.run(provider.poll(submission.task_id))
+    done = asyncio.run(provider.poll(submission.task_id))
+    failed = asyncio.run(provider.poll(submission.task_id))
+
+    # 提交即拿到 job.id，后续轮询用它拼 URL
+    assert submission.task_id == "JOB-9F2"
+    assert submission.status == "waiting_provider"
+    assert waiting.status == "waiting_provider"
+    # succeeded 映射为 completed；无直链时回填官方 content 端点（同源附 Bearer）
+    assert done.status == "completed"
+    assert done.result_url == "https://h3.zhongbiao.cloud/api/videos/JOB-9F2/content"
+    # timed_out 属于计费失败终态，不能永远停在等待
+    assert failed.status == "failed"
+    assert failed.error == "generation timeout"
+
+
+def test_h3_video_prepare_keeps_local_files_and_reports_multi_reference_support(
+    tmp_path: Path,
+) -> None:
+    """H3 参考文件透传本地路径（提交时才压缩并入表单），并支持多参考图。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-gateway",
+            kind="video",
+            adapter="http_video",
+            base_url="https://gateway.example.com/v1",
+            model="h3-video",
+            params={"protocol": "h3"},
+        )
+    )
+    first = _write_reference_png(tmp_path / "keyframe.png")
+    second = _write_reference_png(tmp_path / "reference.webp")
+
+    prepared = asyncio.run(provider.prepare_input_images([first, second]))
+
+    assert prepared["mode"] == "attach_file"
+    assert prepared["values"] == [first, second]
+    assert provider.supports_multiple_input_images is True
+
+    options = provider._options()
+    assert options["submit_transport"] == "multipart"
+    assert options["input_image_field"] == "referenceImages"
+    assert options["input_image_mode"] == "attach_file"
+    assert options["poll_path"] == "videos/{task_id}"
+
+
+def test_h3_video_protocol_is_detected_by_host_name_without_explicit_param() -> None:
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-host",
+            kind="video",
+            adapter="http_video",
+            base_url="https://h3.zhongbiao.cloud/api",
+            model="h3-video",
+        )
+    )
+
+    options = provider._options()
+
+    assert provider._uses_h3_video_protocol(options) is True
+    assert options["submit_path"] == "videos"
+    assert options["submit_transport"] == "multipart"
+    assert options["max_reference_files"] == 9
+
+
+def test_h3_video_forces_wire_format_against_misconfigured_page_params() -> None:
+    """协议决定线格式：页面误改 submit_transport/input_image_mode/mode 也强制回正。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-misconfig",
+            kind="video",
+            adapter="http_video",
+            base_url="https://gateway.example.com/v1",
+            model="h3-video",
+            params={
+                "protocol": "h3",
+                "submit_transport": "json",
+                "input_image_mode": "base64",
+                "mode": "sync",
+            },
+        )
+    )
+
+    options = provider._options()
+
+    assert options["submit_transport"] == "multipart"
+    assert options["input_image_mode"] == "attach_file"
+    assert options["mode"] == "async"
+    assert options["input_image_list"] is True
+
+
+def test_h3_video_post_202_without_error_body_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """202 Accepted + 任务 JSON 是异步接口的正常接受形态：不得重发导致重复付费任务。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-202",
+            kind="video",
+            adapter="http_video",
+            base_url="https://h3.zhongbiao.cloud/api",
+            model="h3-video",
+            api_key="h3-secret",
+            max_retries=2,
+            params={"protocol": "h3"},
+        )
+    )
+    reference = _write_reference_png(tmp_path / "kf.png")
+    posted: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> requests.Response:
+        del method, kwargs
+        posted.append(url)
+        response = requests.Response()
+        response.status_code = 202
+        response._content = json.dumps({"job_id": "J1", "status": "queued"}).encode("utf-8")
+        return response
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="测试",
+            input_image={"values": [reference]},
+            duration_sec=5,
+            params={},
+        )
+    )
+
+    assert len(posted) == 1
+    assert submission.task_id == "J1"
+    assert submission.status == "waiting_provider"
+
+
+def test_h3_video_completed_submission_falls_back_to_content_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """提交即终态：结果地址必须在提交响应里就补上，否则下载阶段必然失败。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-syncdone",
+            kind="video",
+            adapter="http_video",
+            base_url="https://h3.zhongbiao.cloud/api",
+            model="h3-video",
+            params={"protocol": "h3"},
+        )
+    )
+    responses = [{"job_id": "X1", "state": "completed"}]
+
+    async def fake_request_json(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        del method, path, kwargs
+        return responses.pop(0)
+
+    monkeypatch.setattr(provider, "_request_json", fake_request_json)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="测试",
+            input_image={"values": [_write_reference_png(tmp_path / "a.png")]},
+            duration_sec=5,
+            params={},
+        )
+    )
+
+    assert submission.status == "completed"
+    assert submission.result["result_url"] == "https://h3.zhongbiao.cloud/api/videos/X1/content"
+
+
+def test_h3_video_poll_failed_error_extracts_nested_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """失败轮询返回嵌套 error 对象时向用户呈现消息文本而不是 dict repr。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-fail",
+            kind="video",
+            adapter="http_video",
+            base_url="https://h3.zhongbiao.cloud/api",
+            model="h3-video",
+            params={"protocol": "h3"},
+        )
+    )
+    responses = [
+        {"job_id": "J2", "status": "failed", "error": {"message": "内容审核未通过", "code": 400}}
+    ]
+
+    async def fake_request_json(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        del method, path, kwargs
+        return responses.pop(0)
+
+    monkeypatch.setattr(provider, "_request_json", fake_request_json)
+    result = asyncio.run(provider.poll("J2"))
+
+    assert result.status == "failed"
+    assert result.error == "内容审核未通过"
+
+
+def test_h3_video_poll_sanitizes_task_id_before_building_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """任务 ID 来自服务端字符串：拼 URL 前必须过滤 ../ 与查询串等注入字符。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-inject",
+            kind="video",
+            adapter="http_video",
+            base_url="https://h3.zhongbiao.cloud/api",
+            model="h3-video",
+            params={"protocol": "h3"},
+        )
+    )
+    requested_paths: list[str] = []
+
+    async def fake_request_json(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        del method, kwargs
+        requested_paths.append(path)
+        return {"job_id": "J3", "status": "queued"}
+
+    monkeypatch.setattr(provider, "_request_json", fake_request_json)
+    result = asyncio.run(provider.poll("../evil?x=1#y"))
+
+    # 白名单只保留 [A-Za-z0-9_-]："../evil?x=1#y" -> "evilx1y"
+    assert requested_paths == ["videos/evilx1y"]
+    assert result.status == "waiting_provider"
+
+
+def test_h3_video_rejects_more_references_than_configured_limit(tmp_path: Path) -> None:
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-limit",
+            kind="video",
+            adapter="http_video",
+            base_url="https://gateway.example.com/v1",
+            model="h3-video",
+            params={"protocol": "h3", "max_reference_files": 1},
+        )
+    )
+    first = _write_reference_png(tmp_path / "a.png")
+    second = _write_reference_png(tmp_path / "b.png")
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            provider.submit(
+                prompt="测试",
+                input_image={"values": [first, second]},
+                duration_sec=5,
+                params={},
+            )
+        )
+
+    assert "视频参考图数量不能超过 1" in str(exc_info.value)
+
+
+def test_h3_multipart_form_fields_coerce_scalars_safely() -> None:
+    fields = HttpVideoProvider._form_fields(
+        {
+            "prompt": "雨夜霓虹街头镜头",
+            "steps": 10,
+            "with_sound": True,
+            "muted": False,
+            "tags": ["a", "b"],
+            "extra": {"k": "v"},
+            "blank": None,
+        }
+    )
+
+    assert fields == {
+        "prompt": "雨夜霓虹街头镜头",
+        "steps": 10,
+        "with_sound": "true",
+        "muted": "false",
+        "tags": '["a", "b"]',
+        "extra": '{"k": "v"}',
+    }
+
+
+def test_h3_video_field_extraction_prefers_explicit_config_over_candidates() -> None:
+    """页面显式配置的提取路径优先生效；未配置时才走候选路径兜底。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-extract",
+            kind="video",
+            adapter="http_video",
+            base_url="https://h3.zhongbiao.cloud/api",
+            model="h3-video",
+        )
+    )
+    options = provider._options()
+    response = {"job_id": "JOB123", "data": {"task_id": "INNER"}}
+
+    # 显式配置 task_id_path 时按配置提取（与调用方一致：主路径取自 task_id_path）
+    override = dict(options, task_id_path="data.task_id")
+    assert (
+        HttpVideoProvider._extract_value(
+            response,
+            override,
+            str(override.get("task_id_path", "task_id")),
+            "task_id_candidate_paths",
+        )
+        == "INNER"
+    )
+    # 未显式配置时按候选顺序兜底命中 job_id（优先于 data.task_id）
+    assert (
+        HttpVideoProvider._extract_value(
+            response,
+            options,
+            str(options.get("task_id_path", "task_id")),
+            "task_id_candidate_paths",
+        )
+        == "JOB123"
+    )
+    # 全部候选都缺失时返回空串，由调用方报"缺少 task_id"
+    assert HttpVideoProvider._extract_value({}, options, "task_id", "task_id_candidate_paths") == ""
+
+
+def test_h3_video_poll_success_message_noise_stays_out_of_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功信封的 message 字段不得伪装成错误信息；完成且无直链时仍补下载端点。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-noise",
+            kind="video",
+            adapter="http_video",
+            base_url="https://h3.zhongbiao.cloud/api",
+            model="h3-video",
+            params={"protocol": "h3"},
+        )
+    )
+    responses = [{"job_id": "J5", "status": "completed", "message": "success"}]
+
+    async def fake_request_json(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        del method, kwargs
+        return responses.pop(0)
+
+    monkeypatch.setattr(provider, "_request_json", fake_request_json)
+    result = asyncio.run(provider.poll("J5"))
+
+    assert result.status == "completed"
+    assert result.error == ""
+    assert result.result_url == "https://h3.zhongbiao.cloud/api/videos/J5/content"
+
+
+def test_h3_video_submit_rejects_unusable_task_ids_before_persisting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """服务端返回完全非法的任务 ID 时在提交期就报错，避免脏 ID 被持久化。"""
+    provider = HttpVideoProvider(
+        ProviderConfig(
+            id="video-h3-badid",
+            kind="video",
+            adapter="http_video",
+            base_url="https://h3.zhongbiao.cloud/api",
+            model="h3-video",
+            params={"protocol": "h3"},
+        )
+    )
+    responses = [{"job_id": "!!!", "status": "queued"}]
+
+    async def fake_request_json(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        del method, path, kwargs
+        return responses.pop(0)
+
+    monkeypatch.setattr(provider, "_request_json", fake_request_json)
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            provider.submit(
+                prompt="测试",
+                input_image={"values": [_write_reference_png(tmp_path / "a.png")]},
+                duration_sec=5,
+                params={},
+            )
+        )
+
+    assert "任务 ID" in str(exc_info.value)

@@ -1,14 +1,13 @@
 import asyncio
 import base64
 import time
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from media_test_helpers import _PNG, _shot_create
 from sqlalchemy import insert, select, update
 
-from app.api.schemas import ShotCreate
 from app.db import Database
 from app.jobs.repository import JobRepository
 from app.jobs.runner import JobRunner
@@ -34,22 +33,14 @@ from app.services.project_service import ProjectService
 from app.services.shot_service import ShotService
 from app.services.utils import utc_now
 
-_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-)
 _PROVIDER_RESOLVE_ERROR = (
     "Provider 配置失效：https://provider.invalid/task?token=secret-token\n"
     "Authorization: Bearer top-secret"
 )
 
 
-def _shot_create(**values: Any) -> ShotCreate:
-    values.setdefault("duration_sec", 6)
-    return ShotCreate(**values)
-
-
 @pytest.fixture
-def job_service(tmp_path: Path) -> JobService:
+def job_service(tmp_path: Path) -> Any:
     database = Database(f"sqlite:///{(tmp_path / 'jobs.db').as_posix()}")
     database.initialize(seed_mock_providers=True)
     project = ProjectService(database, FileService(tmp_path)).create({"name": "任务测试"})
@@ -62,42 +53,6 @@ def job_service(tmp_path: Path) -> JobService:
     service.project_id = project["id"]  # type: ignore[attr-defined]
     service.chapter_id = chapter["id"]  # type: ignore[attr-defined]
     yield service
-    runner.shutdown()
-    database.dispose()
-
-
-@pytest.fixture
-def media_job_services(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[dict[str, Any]]:
-    database = Database(f"sqlite:///{(tmp_path / 'media-jobs.db').as_posix()}")
-    database.initialize(seed_mock_providers=True)
-    monkeypatch.setattr(file_service, "workspace_dir", tmp_path.resolve())
-    monkeypatch.setattr(file_service, "projects_dir", (tmp_path / "projects").resolve())
-    file_service.projects_dir.mkdir(parents=True, exist_ok=True)
-    repository = JobRepository(database)
-    runner = JobRunner(repository, {"text": 1, "image": 1, "video": 1})
-    jobs = JobService(database, repository=repository, runner=runner)
-    project = ProjectService(database).create({"name": "媒体任务测试"})
-    chapter = ChapterService(database).create(project["id"], {"title": "第一章"})
-    media = MediaService(database, jobs)
-    scene = AssetService(database, jobs).create(
-        project["id"],
-        {"asset_type": "scene", "name": "默认场景", "prompt": "默认场景设定"},
-    )
-    scene_image = media.upload_asset_image(scene["id"], "scene.png", "image/png", _PNG)
-    yield {
-        "database": database,
-        "repository": repository,
-        "runner": runner,
-        "jobs": jobs,
-        "media": media,
-        "project": project,
-        "chapter": chapter,
-        "scene": scene,
-        "scene_image": scene_image,
-    }
     runner.shutdown()
     database.dispose()
 
@@ -2139,6 +2094,99 @@ def test_video_job_manual_continuous_puts_previous_end_frame_first(
     snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
     assert "@Image1：上一镜结束帧" in snapshot
     assert "@Image2：当前分镜关键帧" in snapshot
+
+
+def test_manual_continuous_preview_matches_actual_queue_video_prompt(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """预览编译与实际入队的视频提示词必须一致：@Image 顺序与有效时长相同。"""
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    scene_id = media_job_services["scene"]["id"]
+    chapter_id = media_job_services["chapter"]["id"]
+    shots = ShotService(database, jobs)
+
+    class FakeVideoProvider:
+        supports_multiple_input_images = True
+
+        async def prepare_input_images(self, paths: list[Path]) -> dict[str, Any]:
+            return {"values": [f"image-{index}" for index in range(len(paths))]}
+
+    fake_config = {
+        "id": "mock-video",
+        "model": "grok-imagine-1.5-video-apimart",
+        "params": {},
+        "timeout_sec": 60,
+    }
+
+    def fake_resolve(**_kwargs: Any) -> tuple[FakeVideoProvider, dict[str, Any]]:
+        return FakeVideoProvider(), dict(fake_config)
+
+    # 必须在任何分镜创建/读取之前打桩：create() 内部会编译提示词并缓存默认型号，
+    # 预览与入队要保证解析到同一份 provider 配置。
+    monkeypatch.setattr(media.providers, "resolve", fake_resolve)
+    monkeypatch.setattr(shots.providers, "resolve", fake_resolve)
+
+    previous_shot = shots.create(
+        chapter_id,
+        _shot_create(scene_asset_id=scene_id, action="林雪走到门前").model_dump(),
+    )
+    current_shot = shots.create(
+        chapter_id,
+        _shot_create(
+            scene_asset_id=scene_id,
+            action="林雪推开木门",
+            video_prompt="0-3秒：林雪推门；3-5秒：门扇完全打开。",
+            transition_from_prev="continuous",
+            source_ref="manual",
+            duration_sec=5,
+        ).model_dump(),
+    )
+
+    end_frame_relative = "分镜视频/prev-preview-end.jpg"
+    file_service.write_bytes_atomic(
+        media_job_services["project"]["id"],
+        end_frame_relative,
+        _PNG,
+    )
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(video_version).values(
+                id="video-prev-preview-end",
+                shot_id=previous_shot["id"],
+                version_no=1,
+                file_path="分镜视频/prev-preview.mp4",
+                end_frame_path=end_frame_relative,
+                prompt_snapshot="",
+                negative_prompt_snapshot="",
+                requested_duration_sec=6,
+                model="grok-imagine-1.5-video-apimart",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="",
+                source="generated",
+                error="",
+                created_at=utc_now(),
+            )
+        )
+    media.upload_keyframe(current_shot["id"], "frame.png", "image/png", _PNG)
+
+    queued = media.queue_video(current_shot["id"], {})
+    repository = media_job_services["repository"]
+    assert repository.require(queued["id"]) is not None
+    preview = shots.get(current_shot["id"])["compiled_video_prompt"]
+    snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
+
+    assert "@Image1：上一镜结束帧" in preview
+    assert "@Image2：当前分镜关键帧" in preview
+    # 整数秒模型最短 6 秒：预览与实际提交都必须按 6 秒编译时间轴
+    assert "总时长：6秒" in preview
+    assert "总时长：5秒" not in preview
+    assert "总时长：6秒" in snapshot
+    assert preview == snapshot
 
 
 def test_tianyue_video_execution_prefers_provider_urls_and_falls_back_for_end_frame(

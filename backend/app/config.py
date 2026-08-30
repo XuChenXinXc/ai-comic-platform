@@ -76,8 +76,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("VIDEO_WORKERS", "APP_VIDEO_WORKERS"),
     )
     provider_poll_interval_sec: float = Field(default=0.25, gt=0)
-    ffmpeg_path: str = "ffmpeg"
-    ffprobe_path: str = "ffprobe"
+    ffmpeg_path: str = Field(
+        default="ffmpeg",
+        validation_alias=AliasChoices("APP_FFMPEG_PATH", "FFMPEG_PATH"),
+    )
+    ffprobe_path: str = Field(
+        default="ffprobe",
+        validation_alias=AliasChoices("APP_FFPROBE_PATH", "FFPROBE_PATH"),
+    )
     imgbb_api_key: str = Field(
         default="",
         validation_alias=AliasChoices("APP_IMGBB_API_KEY", "IMGBB_API_KEY"),

@@ -1,6 +1,14 @@
 """服务层常量定义
 
 集中管理服务层使用的常量，避免硬编码魔法数字。
+
+⚠️ 本文件多数常量目前**没有任何代码引用**（2026-08 审查确认：45 个常量中仅
+``FFMPEG_DEFAULT_TIMEOUT`` / ``FFMPEG_SHORT_TIMEOUT`` /
+``FFMPEG_EXECUTOR_MAX_WORKERS`` / ``MAX_IMAGE_SIZE`` / ``MAX_VIDEO_SIZE`` /
+``MAX_BGM_SIZE`` / ``MAX_DOWNLOAD_SIZE`` / ``PROVIDER_REFERENCE_*`` 在用）。
+未引用的值是预留占位，**不代表对应功能已实现**——尤其「速率限制」与「缓存」
+两节：平台当前既没有限流中间件也没有缓存层，不要因为看到常量就以为有。
+接线时请把常量真正引用起来，或直接删除对应条目。
 """
 
 # ==================== Job 相关 ====================
@@ -33,12 +41,15 @@ VIDEO_MAX_BITRATE = "5M"  # 最大码率
 # 文件大小限制（字节）
 MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_VIDEO_SIZE = 100 * 1024 * 1024  # 100 MB
-MAX_AUDIO_SIZE = 20 * 1024 * 1024  # 20 MB
+MAX_AUDIO_SIZE = 20 * 1024 * 1024  # 20 MB（单条分镜配音）
+MAX_BGM_SIZE = 50 * 1024 * 1024  # 50 MB（整首背景音乐，比单条配音宽）
 MIN_FILE_SIZE = 1  # 最小文件大小（避免空文件）
 
 # 文件下载
 DOWNLOAD_DEFAULT_TIMEOUT = 120  # 下载超时 120 秒
 DOWNLOAD_CHUNK_SIZE = 8192  # 下载块大小（8KB）
+# Provider 返回的下载地址不可信，单个文件写入上限，避免故障或恶意响应写满磁盘
+MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
 
 # ==================== Provider 相关 ====================
 

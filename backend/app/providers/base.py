@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import logging
 import os
 import re
 import time
@@ -33,6 +34,9 @@ class ProviderConfigurationError(ProviderError):
     pass
 
 
+logger = logging.getLogger(__name__)
+
+
 def compress_reference_image(
     local_file: Path,
     *,
@@ -61,7 +65,31 @@ def compress_reference_image(
         data = buffer.getvalue()
         if len(data) <= max_bytes:
             return data
+    # 质量降到下限仍超限时，按比例继续缩小分辨率兜底，直到达标或到达最小边长。
+    while len(data) > max_bytes and min(rgb.size) > 64:
+        smaller_width = max(64, round(rgb.size[0] * 0.8))
+        smaller_height = max(64, round(rgb.size[1] * 0.8))
+        if (smaller_width, smaller_height) == rgb.size:
+            break
+        rgb = rgb.resize((smaller_width, smaller_height), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        rgb.save(buffer, format="JPEG", quality=max(quality, 50))
+        data = buffer.getvalue()
+    if len(data) > max_bytes:
+        logger.warning(
+            "参考图压缩后仍超过大小上限：%s（%d 字节 > %d 字节）",
+            local_file,
+            len(data),
+            max_bytes,
+        )
     return data
+
+
+def reference_jpeg_part(local_file: Path) -> tuple[str, bytes, str]:
+    """压缩参考图并产出 multipart files 三元组：文件名统一清洗非法字符并定型 .jpg。"""
+    content = compress_reference_image(local_file)
+    filename = re.sub(r"[^A-Za-z0-9_.-]", "_", local_file.name)
+    return Path(filename).with_suffix(".jpg").name, content, "image/jpeg"
 
 
 _SENSITIVE_QUERY_PARTS = {
@@ -91,6 +119,9 @@ _SENSITIVE_QUERY_ALIASES = {
 
 
 def _is_sensitive_query_name(name: str) -> bool:
+    # 与 provider_service._is_sensitive_name 保持一致：超长输入直接放行，避免 ReDoS。
+    if len(name) > 200:
+        return False
     normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
     parts = {part for part in re.split(r"[^a-z0-9]+", normalized.lower()) if part}
     collapsed = re.sub(r"[^a-z0-9]", "", normalized.lower())
@@ -355,20 +386,26 @@ class HttpProviderBase:
         safe_method = method_name in {"GET", "HEAD", "OPTIONS"} or retry_unsafe_methods
         # 非安全方法（POST 等）默认不重试；但瞬时性错误（429/5xx 过载、限流）除外，
         # 这类错误重试不会造成重复提交语义问题，能显著提升上游短暂过载时的可用性。
-        transient_statuses = {429, 500, 502, 503, 504}
+        # 202 是中转渠道返回 error JSON 的瞬时形态（见下方判断），同样需要可重试。
+        transient_statuses = {202, 429, 500, 502, 503, 504}
         for attempt in range(attempts):
             try:
                 response = requests.request(
                     method,
                     url,
                     timeout=self.config.timeout_sec,
+                    # verify_ssl 仅供自建/中转服务使用自签证书时关闭；
+                    # 关闭后不校验 TLS 证书，存在中间人风险，不要对公网服务关闭。
                     verify=bool(options.get("verify_ssl", True)),
                     **kwargs,
                 )
                 response.raise_for_status()
                 # 中转渠道偶发 202 + error JSON（如“上游服务暂时不可用”），
                 # 按瞬时错误处理，允许重试而不是当成成功响应。
-                if response.status_code == 202 and self._http_failure_message(response):
+                # 注意只认响应体里明确携带的 error/message 文本；没有错误体的
+                # 正常 202（异步接口的 Accepted 接受形态）必须放行，否则
+                # multipart/JSON 提交会被整单重发、产生重复付费任务。
+                if response.status_code == 202 and self._provider_error_text(response):
                     raise requests.HTTPError(response=response)
                 return response
             except requests.HTTPError as exc:
@@ -392,26 +429,35 @@ class HttpProviderBase:
         raise ProviderError(f"Provider 请求失败：{last_error}") from last_error
 
     @staticmethod
-    def _http_failure_message(response: requests.Response | None) -> str:
+    def _provider_error_text(response: requests.Response | None) -> str:
+        """仅当响应体明确携带 error/message 错误信息时才返回该文本，否则空串。"""
         if response is None:
             return ""
-        provider_message = ""
         try:
             payload = response.json()
         except requests.JSONDecodeError:
-            payload = None
-        if isinstance(payload, Mapping):
-            error = payload.get("error")
-            if isinstance(error, Mapping):
-                provider_message = str(error.get("message") or error.get("detail") or "")
-            elif isinstance(error, str):
-                provider_message = error
-            if not provider_message:
-                provider_message = str(payload.get("message") or payload.get("detail") or "")
+            return ""
+        if not isinstance(payload, Mapping):
+            return ""
+        error = payload.get("error")
+        provider_message = ""
+        if isinstance(error, Mapping):
+            provider_message = str(error.get("message") or error.get("detail") or "")
+        elif isinstance(error, str):
+            provider_message = error
+        if not provider_message:
+            provider_message = str(payload.get("message") or payload.get("detail") or "")
+        return provider_message
+
+    @classmethod
+    def _http_failure_message(cls, response: requests.Response | None) -> str:
+        if response is None:
+            return ""
+        provider_message = sanitize_error_message(cls._provider_error_text(response))
         prefix = f"Provider 请求失败（HTTP {response.status_code}）"
         if not provider_message:
             return prefix
-        return f"{prefix}：{sanitize_error_message(provider_message)}"
+        return f"{prefix}：{provider_message}"
 
     async def _request_json(
         self,
@@ -449,6 +495,8 @@ class HttpProviderBase:
             return await asyncio.to_thread(atomic_write_bytes, target, content)
         local_file = result.data.get("local_file")
         if local_file:
+            # 契约：只有本机 Provider（mock）会返回 local_file，路径由 Provider
+            # 自行生成；远程 Provider 实现不得返回该字段，否则等同于任意文件读取。
             from app.services.file_service import atomic_copy
 
             return await asyncio.to_thread(atomic_copy, local_file, target)

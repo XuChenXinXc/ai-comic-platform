@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -117,9 +118,24 @@ def build_ffmpeg_command(
     return cmd
 
 
+def _run_ffprobe_sync(cmd: list[str], timeout: int) -> str:
+    """同步执行 ffprobe 并返回标准输出（JSON）。"""
+    result = subprocess.run(
+        cmd,
+        check=True,
+        timeout=timeout,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout
+
+
 async def get_video_duration(file_path: str | Path) -> float:
     """
     获取视频时长（秒）
+
+    通过 ffprobe 读取容器元数据，避免解析 ffmpeg 的 stderr 文本。
 
     Args:
         file_path: 视频文件路径
@@ -128,32 +144,37 @@ async def get_video_duration(file_path: str | Path) -> float:
         视频时长（秒）
 
     Raises:
-        ValueError: 无法获取视频时长
+        ValueError: ffprobe 执行失败或无法解析时长
     """
     settings = get_settings()
     cmd = [
-        str(settings.ffmpeg_path),
-        "-i", str(file_path),
+        str(settings.ffprobe_path),
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(file_path),
     ]
 
+    loop = asyncio.get_event_loop()
     try:
-        result = await run_ffmpeg_async(cmd, timeout=FFMPEG_SHORT_TIMEOUT, check=False)
-        stderr = result.stderr
-
-        # 从 stderr 中解析时长
-        # Duration: 00:00:10.50, ...
-        import re
-        match = re.search(r"Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})", stderr)
-        if match:
-            hours, minutes, seconds = match.groups()
-            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-
-        raise ValueError(f"无法解析视频时长：{stderr[:200]}")
-
+        stdout = await loop.run_in_executor(
+            _ffmpeg_executor,
+            lambda: _run_ffprobe_sync(cmd, FFMPEG_SHORT_TIMEOUT),
+        )
     except subprocess.CalledProcessError as exc:
-        raise ValueError(f"FFmpeg 执行失败：{exc.stderr[:200]}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise ValueError("获取视频时长超时") from exc
+        stderr = exc.stderr or ""
+        raise ValueError(f"ffprobe 执行失败：{stderr[:200]}") from exc
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise ValueError(f"获取视频时长失败：{exc}") from exc
+
+    try:
+        duration = float(json.loads(stdout)["format"]["duration"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("无法解析视频时长：ffprobe 输出无效") from exc
+    return duration
 
 
 def shutdown_ffmpeg_executor() -> None:

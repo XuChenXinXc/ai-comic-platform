@@ -211,7 +211,7 @@ describe("分镜视频统一页面", () => {
     expect(confirmSpy).toHaveBeenCalled();
     expect(batchSpy).toHaveBeenCalledWith("chapter-1", {
       ids: undefined,
-      prompt_types: ["image", "video"],
+      prompt_types: ["video"],
     });
   });
 

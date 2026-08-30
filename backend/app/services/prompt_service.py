@@ -1,3 +1,4 @@
+import math
 import re
 from collections.abc import Iterable
 from typing import Any
@@ -788,6 +789,7 @@ def compile_asset_prompt(
     consistency_keywords: list[str],
     composition: str,
     reference_mode: bool = False,
+    use_template: bool = True,
 ) -> str:
     effective_negative_prompt = resolve_asset_negative_prompt(asset_type, negative_prompt)
     effective_aspect_ratio = resolve_visual_aspect_ratio(asset_type, aspect_ratio)
@@ -810,6 +812,23 @@ def compile_asset_prompt(
             return apply_content_safety(
                 join_non_empty([style_anchor(style_prompt, effective_aspect_ratio), body])
             )
+    if use_template and asset_type in {"character", "prop", "scene"}:
+        # 设定图正文优先由落盘模板渲染；内置函数保留为 use_template=False 的回退路径。
+        # 延迟导入避免与 prompt_template_renderer 顶部的 prompt_service 导入成环。
+        from app.services.prompt_template_renderer import render_asset_body
+
+        body = render_asset_body(
+            asset_type=asset_type,
+            asset_name=asset_name,
+            profile=profile,
+            prompt=prompt,
+            negative_prompt=effective_negative_prompt,
+            consistency_keywords=consistency_keywords,
+            composition=composition,
+        )
+        return apply_content_safety(
+            join_non_empty([style_anchor(style_prompt, effective_aspect_ratio), body])
+        )
     template = {
         "character": _character_setting_sheet,
         "prop": _prop_setting_sheet,
@@ -1121,26 +1140,46 @@ def _strip_narration_clause(text: str) -> str:
     return _join_prompt_clauses(before, after)
 
 
+def _squash_dialogue_text(value: str) -> str:
+    return re.sub(r"\s+", "", value)
+
+
+def _match_dialogue_by_quote(
+    quoted_text: str,
+    dialogue_entries: list[dict[str, str]],
+    unconsumed: set[int],
+) -> int | None:
+    """用时间轴中的引号原文精确匹配未消费的对白条目，防止说话顺序被调整时错位。"""
+    needle = _squash_dialogue_text(quoted_text)
+    if not needle:
+        return None
+    for index in sorted(unconsumed):
+        if _squash_dialogue_text(dialogue_entries[index]["text"]) == needle:
+            return index
+    return None
+
+
 def _replace_speech_clause(
     text: str,
     dialogue_entries: list[dict[str, str]],
-    dialogue_index: int,
-) -> tuple[str, int]:
-    """用结构化对白序号替换自由文本中的说话人/引号，避免角色串台。"""
+    unconsumed: set[int],
+) -> str:
+    """用结构化对白序号替换自由文本中的说话人/引号，避免角色串台。
+
+    口型编号优先绑定引号原文能精确命中的未消费条目；匹配不到时退化为
+    按出现顺序取下一个未消费条目。
+    """
     speech_match = _SPEECH_CUE_PATTERN.search(text)
     quoted = _QUOTED_TEXT_PATTERN.search(text)
     if not speech_match and not quoted:
-        return text.strip(), dialogue_index
+        return text.strip()
 
     if (
         not dialogue_entries
         and speech_match
         and any(marker in text[: speech_match.start()] for marker in ("背景音", "环境声", "声音"))
     ):
-        return (
-            f"{text[:speech_match.start()]}环境声{text[speech_match.end() :]}",
-            dialogue_index,
-        )
+        return f"{text[:speech_match.start()]}环境声{text[speech_match.end() :]}"
 
     boundary = speech_match.start() if speech_match else quoted.start()
     prefix = _clean_speech_prefix(text[:boundary], {item["speaker"] for item in dialogue_entries})
@@ -1149,11 +1188,16 @@ def _replace_speech_clause(
     )
     suffix = text[suffix_start:].strip(" ，,；;")
 
-    if dialogue_entries and dialogue_index < len(dialogue_entries):
-        dialogue_index += 1
-        replacement = f"按第{dialogue_index}句对白执行对应口型"
-    else:
+    selected: int | None = None
+    if quoted:
+        selected = _match_dialogue_by_quote(quoted.group("text"), dialogue_entries, unconsumed)
+    if selected is None and unconsumed:
+        selected = min(unconsumed)
+    if selected is None:
         replacement = "人物保持闭口，不生成台词"
+    else:
+        unconsumed.discard(selected)
+        replacement = f"按第{selected + 1}句对白执行对应口型"
     if prefix.endswith(("：", ":")):
         result = f"{prefix}{replacement}"
     elif prefix:
@@ -1162,29 +1206,48 @@ def _replace_speech_clause(
         result = replacement
     if suffix:
         result = f"{result}；{suffix}"
-    return result, dialogue_index
+    return result
 
 
 def _sanitize_video_prompt_speech(
     video_prompt: str,
     dialogue_entries: list[dict[str, str]],
 ) -> str:
-    """只保留视觉动作时间轴，实际对白统一由结构化对白段落提供。"""
+    """只保留视觉动作时间轴，实际对白统一由结构化对白段落提供。
+
+    时间轴中的口型编号按「引号原文精确匹配 → 出现顺序兜底」绑定到具体对白，
+    避免模型调整说话顺序时把编号错配到相邻句子。
+    """
     clauses = re.split(r"[；;]", str(video_prompt or "").strip())
     cleaned_clauses: list[str] = []
-    dialogue_index = 0
+    unconsumed = set(range(len(dialogue_entries)))
     for clause in clauses:
         current = _strip_narration_clause(clause.strip())
         if not current:
             continue
-        current, dialogue_index = _replace_speech_clause(
+        current = _replace_speech_clause(
             current,
             dialogue_entries,
-            dialogue_index,
+            unconsumed,
         )
         if current:
             cleaned_clauses.append(current)
     return "；".join(cleaned_clauses)
+
+
+# 这些视频模型只接受整数秒时长（且最短 6 秒）；预览与实际入队必须使用同一
+# 有效时长编译时间轴，否则页面展示与提交给模型的提示词对不上。
+_INTEGER_DURATION_VIDEO_MODELS = {
+    "grok-imagine-1.5-video-apimart",
+    "grok-imagine-1.5-video-ext",
+}
+_MIN_INTEGER_VIDEO_DURATION_SEC = 6
+
+
+def effective_video_duration(model: str, duration_sec: float) -> float | int:
+    if model.strip().lower() in _INTEGER_DURATION_VIDEO_MODELS:
+        return max(_MIN_INTEGER_VIDEO_DURATION_SEC, math.ceil(duration_sec))
+    return duration_sec
 
 
 def compile_video_prompt(
@@ -1367,8 +1430,9 @@ def compile_video_prompt(
         )
     elif transition == "same_scene_cut":
         sections.append(
-            "本镜与上一镜同处一个场景，但属于独立机位（对切/反打/景别切换），"
-            "不承接上一镜的构图与人物站位，按本镜描述独立成画。"
+            "本镜与上一镜同处一个场景，属于独立机位（对切/反打/景别切换）；"
+            "不承接上一镜画面构图，但必须承接人物在场景中的空间位置、朝向、"
+            "持有物与剧情状态，并以本镜关键帧作为新的画面构图基准。"
         )
     else:
         sections.append("场景已切换，本镜为全新画面，不承接上一镜的任何构图元素。")
@@ -1392,11 +1456,15 @@ def compile_video_prompt(
         "除非动作明确交代转身。"
     )
     static_objects_rule = (
-        "初始帧画面内所有静止物体（背景建筑、家具、地面道具、树木等）的位置、姿态、光影已经固定；"
+        "初始帧画面内固定场景结构、岩石、地面与主要陈设的位置、姿态、光影已经固定；"
+        "树木主体位置和结构保持固定，但枝叶可受风力影响产生幅度克制、方向一致的自然摆动；"
     )
     if props and props != "当前分镜物品":
         static_objects_rule += f"除本镜剧情明确由人物拿取/移动的{props}外，"
-    static_objects_rule += "其余静止物体不得在动画中移动、旋转或重新生成。"
+    static_objects_rule += (
+        "除可随风摆动的树木枝叶外，"
+        "其余物体不得在动画中移动、旋转、重构或重新生成。"
+    )
     sections.append(static_objects_rule)
     sections.append("")
 

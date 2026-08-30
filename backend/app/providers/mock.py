@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw
 from pydantic import BaseModel
 
 from app.config import get_settings
+from app.dynamic_pipeline.schemas import CharacterBiosOutput, RhythmOutput, SourceAnalysisOutput
 from app.schemas import (
     AssetExtractionOutput,
     AssetPromptOutput,
@@ -53,6 +54,169 @@ class MockTextProvider:
 
     def _payload(self, schema: type[BaseModel], user_prompt: str) -> dict[str, Any]:
         excerpt = " ".join(user_prompt.split())[:80] or "一段待创作的故事"
+        # 这里必须用 `is` 比较类对象：schema 传入的是类本身而不是实例，
+        # `match schema: case SourceAnalysisOutput()` 是类模式（isinstance 语义），
+        # 对类对象永不匹配，会静默落到兜底分支产出空壳数据。
+        if schema is SourceAnalysisOutput:
+            character = {
+                "character_key": "hero",
+                "canonical_name": "主角",
+                "aliases": [],
+                "importance": "core",
+                "story_function": "推动并完成当前冲突",
+                "source_refs": [],
+            }
+            return {
+                "artifact_meta": self._dynamic_artifact_meta(),
+                "metadata": {
+                    "source_kind": "full_text",
+                    "title": "Mock 动态故事",
+                    "chapter_title": "第一章",
+                    "source_signature": "mock-source",
+                    "target_duration_sec": 30,
+                    "aspect_ratio": "9:16",
+                },
+                "episode_logline": f"围绕“{excerpt}”展开的 30 秒可拍片段。",
+                "scenes": [
+                    {
+                        "scene_id": "scene-1",
+                        "ordinal": 1,
+                        "location": "主要场景",
+                        "time_weather": "白天，晴",
+                        "characters": [character],
+                        "narrative_task": "建立目标与冲突",
+                        "plot_event": f"主角在主要场景中处理“{excerpt}”。",
+                        "conflict_or_turn": "主角发现线索并作出反应",
+                        "visual_focus": "主角的动作与关键线索",
+                        "estimated_duration_sec": 30,
+                        "shootability": {
+                            "status": "shootable",
+                            "visible_action": "主角走入场景并完成一个清晰动作",
+                            "required_asset_keys": ["hero"],
+                            "production_risks": [],
+                            "adaptation_note": None,
+                        },
+                        "source_refs": [],
+                    }
+                ],
+                "character_roster": [character],
+                "conflict_turns": [
+                    {
+                        "kind": "conflict",
+                        "summary": "主角发现线索并面对阻碍",
+                        "scene_id": "scene-1",
+                        "participants": ["hero"],
+                        "source_refs": [],
+                    }
+                ],
+                "visualizable_content": ["主角进入主要场景并完成动作"],
+                "hard_to_visualize": [],
+                "rewrite_requirements": [],
+                "assumptions": [],
+                "open_questions": [],
+                "continuation_outline": [],
+            }
+        if schema is CharacterBiosOutput:
+            return {
+                "artifact_meta": self._dynamic_artifact_meta(),
+                "characters": [
+                    {
+                        "basic_info": {
+                            "character_key": "hero",
+                            "canonical_name": "主角",
+                            "aliases": [],
+                            "importance": "core",
+                            "identity": "故事主角",
+                            "age": "成年",
+                            "gender": "未设定",
+                        },
+                        "background": f"主角的故事背景围绕“{excerpt}”展开。",
+                        "personality_behavior_logic": "先观察局势，再用明确动作解决眼前问题。",
+                        "dynamic_comic_setting": "行动时保持清晰的正面轮廓和稳定服装。",
+                        "plot_relation": "当前冲突的承受者与解决者。",
+                        "visual_anchor": {
+                            "visual_facts": ["面部轮廓清晰", "深色短发"],
+                            "face": "清晰的面部轮廓",
+                            "hair": "黑色短发",
+                            "body": "身形匀称",
+                            "costume": "深色外套",
+                            "accessories": [],
+                            "immutable_features": ["黑色短发", "深色外套"],
+                            "forbidden_changes": ["不得改变发型和外套主色"],
+                            "makeup_keyword_string": "清晰面部轮廓|黑色短发|深色外套",
+                            "variants": [],
+                            "current_variant": None,
+                            "approved_reference_ids": ["mock-reference-hero"],
+                        },
+                        "behavior_evidence": {
+                            "trigger": "发现关键线索或遭遇眼前阻碍",
+                            "action": "先观察，再用明确动作处理线索",
+                            "expression": "目光专注，表情保持警觉",
+                            "voice": "用克制而清晰的声音回应",
+                            "source_refs": [],
+                        },
+                    }
+                ],
+                "ensemble_anchors": [],
+                "unresolved_character_refs": [],
+            }
+        if schema is RhythmOutput:
+            event = {
+                "event_id": "dynamic-1",
+                "summary": f"主角完成对“{excerpt}”的关键回应",
+                "segment_id": "segment-1",
+                "dynamic_level": 1.0,
+                "visual_action": "主角完成一个明确且可拍的动作",
+                "source_refs": [],
+            }
+            return {
+                "target_duration_sec": 30,
+                "artifact_meta": self._dynamic_artifact_meta(),
+                "timeline": [
+                    {
+                        "segment_id": "segment-1",
+                        "ordinal": 1,
+                        "start_sec": 0,
+                        "end_sec": 30,
+                        "beat_type": "payoff",
+                        "narrative_task": "建立冲突并完成关键回应",
+                        "event_summary": f"主角处理“{excerpt}”并完成反击。",
+                        "visual_action": "主角走入场景、观察线索并完成关键动作",
+                        "focus_characters": ["hero"],
+                        "dynamic_level": 0.8,
+                        "strong_dynamic_event_id": "dynamic-1",
+                        "source_refs": [],
+                    }
+                ],
+                "core_payoff": "主角完成关键回应",
+                "small_beats": ["主角发现线索"],
+                "strong_dynamic_budget": {
+                    "max_events": 1,
+                    "event_ids": ["dynamic-1"],
+                    "events": [event],
+                },
+                "foreshadowing": ["线索将在后续内容中继续发挥作用"],
+                "open_space": ["保留后续揭示动机的空间"],
+                "dialogue_suggestions": [
+                    {
+                        "segment_id": "segment-1",
+                        "speaker": "主角",
+                        "text": "就是这里。",
+                        "purpose": "确认线索位置",
+                        "source_refs": [],
+                    }
+                ],
+                "sound_suggestions": [
+                    {
+                        "segment_id": "segment-1",
+                        "kind": "action",
+                        "description": "脚步声与关键动作声",
+                        "intensity": 0.6,
+                        "source_refs": [],
+                    }
+                ],
+                "assumptions": ["默认当前片段目标时长为 30 秒"],
+            }
         if schema is NovelAnalysisOutput:
             return {
                 "summary": f"故事围绕“{excerpt}”展开。",
@@ -275,6 +439,16 @@ class MockTextProvider:
                 ),
             }
         return self._generic_model_payload(schema)
+
+    @staticmethod
+    def _dynamic_artifact_meta() -> dict[str, Any]:
+        return {
+            "schema_version": "mock-dynamic-v1",
+            "normalizer_version": "mock-normalizer-v1",
+            "input_signature": "mock-input",
+            "content_signature": "mock-content",
+            "source_attempt": 1,
+        }
 
     def _generic_model_payload(self, schema: type[BaseModel]) -> dict[str, Any]:
         return {
@@ -563,14 +737,54 @@ class MockTTSProvider:
 
         # 生成一个简单的静音 MP3（44 字节的最小 MP3 文件）
         # 这只是一个占位符，实际使用时应该生成真实的音频
-        silent_mp3 = bytes([
-            0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-        ])
+        silent_mp3 = bytes(
+            [
+                0xFF,
+                0xFB,
+                0x90,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+            ]
+        )
 
         return silent_mp3
 

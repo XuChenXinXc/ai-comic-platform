@@ -498,6 +498,18 @@ def test_shot_create_requires_duration_and_forces_screenplay_source(
     assert created.json()["duration_sec"] == 5
 
 
+def test_shot_create_rejects_duration_above_fifteen(api_client: TestClient) -> None:
+    project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
+
+    response = api_client.post(
+        f"/api/chapters/{chapter['id']}/shots",
+        json={"action": "主角进入房间。", "duration_sec": 16},
+    )
+
+    assert response.status_code == 422
+
+
 def test_shot_create_with_legacy_nested_fields_normalizes_aliases(
     api_client: TestClient,
 ) -> None:
@@ -583,6 +595,23 @@ def test_shot_update_rejects_duration_below_five(api_client: TestClient) -> None
     response = api_client.put(
         f"/api/shots/{created.json()['id']}",
         json={"duration_sec": 4},
+    )
+
+    assert response.status_code == 422
+
+
+def test_shot_update_rejects_duration_above_fifteen(api_client: TestClient) -> None:
+    project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
+    created = api_client.post(
+        f"/api/chapters/{chapter['id']}/shots",
+        json={"action": "主角进入房间。", "duration_sec": 5},
+    )
+    assert created.status_code == 201
+
+    response = api_client.put(
+        f"/api/shots/{created.json()['id']}",
+        json={"duration_sec": 16},
     )
 
     assert response.status_code == 422

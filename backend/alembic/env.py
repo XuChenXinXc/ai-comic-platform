@@ -42,14 +42,22 @@ def run_migrations_online() -> None:
     connectable = create_database_engine(get_settings().database_url)
     try:
         with connectable.connect() as connection:
+            is_sqlite = connection.dialect.name == "sqlite"
+            if is_sqlite:
+                connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                connection.commit()
             context.configure(
                 connection=connection,
                 target_metadata=target_metadata,
                 compare_type=True,
                 render_as_batch=True,
             )
-            with context.begin_transaction():
-                context.run_migrations()
+            try:
+                with context.begin_transaction():
+                    context.run_migrations()
+            finally:
+                if is_sqlite:
+                    connection.exec_driver_sql("PRAGMA foreign_keys=ON")
     finally:
         connectable.dispose()
 

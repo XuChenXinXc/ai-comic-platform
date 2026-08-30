@@ -39,6 +39,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const refetchProjects = projectsQuery.refetch;
 
   useEffect(() => {
+    if (projectsQuery.isLoading) return;
     if (!projects.length) {
       if (activeProjectId) setActiveProjectId("");
       return;
@@ -46,7 +47,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     if (!projects.some((item) => item.id === activeProjectId)) {
       setActiveProjectId(projects[0].id);
     }
-  }, [activeProjectId, projects]);
+  }, [activeProjectId, projects, projectsQuery.isLoading]);
 
   useEffect(() => {
     if (activeProjectId) {

@@ -3,6 +3,7 @@ from typing import Annotated
 from fastapi import Depends
 
 from app.db import Database, get_database
+from app.dynamic_pipeline.media_queue_service import DynamicMediaQueueService
 from app.jobs.dynamic_bridge import DynamicJobBridge
 from app.jobs.repository import JobRepository
 from app.jobs.runner import job_runner
@@ -102,5 +103,16 @@ def get_composition_service(
 def get_dynamic_workflow_service(
     database: Annotated[Database, Depends(get_database)],
 ) -> DynamicWorkflowService:
-    job_bridge = DynamicJobBridge(JobRepository(database), enqueue=job_runner.enqueue)
-    return DynamicWorkflowService(database, job_bridge=job_bridge)
+    repository = JobRepository(database)
+    enqueue = job_runner.enqueue
+    job_bridge = DynamicJobBridge(repository, enqueue=enqueue)
+    media_queue = DynamicMediaQueueService(
+        database,
+        job_repository=repository,
+        enqueue=enqueue,
+    )
+    return DynamicWorkflowService(
+        database,
+        job_bridge=job_bridge,
+        media_queue_service=media_queue,
+    )

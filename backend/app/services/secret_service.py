@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import base64
 import binascii
-import ctypes
+import logging
 import os
 import sys
+import threading
 from abc import ABC, abstractmethod
-from ctypes import wintypes
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class SecretServiceError(RuntimeError):
@@ -25,58 +28,81 @@ class SecretBackend(ABC):
         """解密数据库中的密文/引用，返回明文。"""
 
 
-class _DataBlob(ctypes.Structure):
-    _fields_ = [
-        ("cbData", wintypes.DWORD),
-        ("pbData", ctypes.POINTER(ctypes.c_byte)),
-    ]
-
-
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
+# DPAPI 附加熵：同一 Windows 用户下的无关进程拿到密文也无法直接解密。
+_DPAPI_ENTROPY = b"ai-comic-platform/api-key/v1"
 
 
 class WindowsDPAPIBackend(SecretBackend):
-    """Windows DPAPI 实现。"""
+    """Windows DPAPI 实现。
+
+    ``ctypes.wintypes`` 只能在 Windows 导入（``VARIANT_BOOL._type_ = "v"`` 仅在
+    Windows 编译），因此 ctypes 相关的导入与结构体定义全部推迟到实例化时，
+    避免 macOS/Linux 上 import 本模块即失败。
+    """
 
     def __init__(self) -> None:
         if os.name != "nt":
             raise SecretServiceError("直接 API Key 仅支持 Windows DPAPI")
+        import ctypes
+        from ctypes import wintypes
+
+        class _DataBlob(ctypes.Structure):
+            _fields_ = [
+                ("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_byte)),
+            ]
+
+        self._ctypes = ctypes
+        self._blob_type = _DataBlob
         self._crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
-    def _last_error(self, message: str) -> SecretServiceError:
-        error = ctypes.get_last_error()
-        return SecretServiceError(f"{message}：{ctypes.WinError(error)}")
+        blob_pointer = ctypes.POINTER(_DataBlob)
+        self._crypt32.CryptProtectData.argtypes = [
+            blob_pointer,
+            ctypes.c_wchar_p,
+            blob_pointer,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            blob_pointer,
+        ]
+        self._crypt32.CryptProtectData.restype = wintypes.BOOL
+        self._crypt32.CryptUnprotectData.argtypes = [
+            blob_pointer,
+            ctypes.POINTER(ctypes.c_wchar_p),
+            blob_pointer,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            blob_pointer,
+        ]
+        self._crypt32.CryptUnprotectData.restype = wintypes.BOOL
+        self._kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        self._kernel32.LocalFree.restype = ctypes.c_void_p
 
-    @staticmethod
-    def _input_blob(value: bytes) -> tuple[_DataBlob, ctypes.Array[ctypes.c_char]]:
-        buffer = ctypes.create_string_buffer(value)
-        blob = _DataBlob(
+    def _last_error(self, message: str) -> SecretServiceError:
+        error = self._ctypes.get_last_error()
+        return SecretServiceError(f"{message}：{self._ctypes.WinError(error)}")
+
+    def _input_blob(self, value: bytes) -> tuple[Any, Any]:
+        buffer = self._ctypes.create_string_buffer(value)
+        blob = self._blob_type(
             len(value),
-            ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)),
+            self._ctypes.cast(buffer, self._ctypes.POINTER(self._ctypes.c_byte)),
         )
         return blob, buffer
 
     def encrypt(self, plaintext: str) -> str:
-        self._crypt32.CryptProtectData.argtypes = [
-            ctypes.POINTER(_DataBlob),
-            ctypes.c_wchar_p,
-            ctypes.POINTER(_DataBlob),
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            ctypes.POINTER(_DataBlob),
-        ]
-        self._crypt32.CryptProtectData.restype = wintypes.BOOL
-        self._kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-        self._kernel32.LocalFree.restype = ctypes.c_void_p
-
+        ctypes = self._ctypes
         input_blob, _input_buffer = self._input_blob(plaintext.encode("utf-8"))
-        output_blob = _DataBlob()
+        entropy_blob, _entropy_buffer = self._input_blob(_DPAPI_ENTROPY)
+        output_blob = self._blob_type()
         if not self._crypt32.CryptProtectData(
             ctypes.byref(input_blob),
             None,
-            None,
+            ctypes.byref(entropy_blob),
             None,
             None,
             _CRYPTPROTECT_UI_FORBIDDEN,
@@ -89,38 +115,27 @@ class WindowsDPAPIBackend(SecretBackend):
         finally:
             self._kernel32.LocalFree(output_blob.pbData)
 
-    def decrypt(self, ciphertext: str) -> str:
-        try:
-            encrypted = base64.b64decode(ciphertext.encode("ascii"), validate=True)
-        except (UnicodeEncodeError, binascii.Error) as exc:
-            raise SecretServiceError("DPAPI 密文格式无效") from exc
-
-        self._crypt32.CryptUnprotectData.argtypes = [
-            ctypes.POINTER(_DataBlob),
-            ctypes.POINTER(ctypes.c_wchar_p),
-            ctypes.POINTER(_DataBlob),
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            ctypes.POINTER(_DataBlob),
-        ]
-        self._crypt32.CryptUnprotectData.restype = wintypes.BOOL
-        self._kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-        self._kernel32.LocalFree.restype = ctypes.c_void_p
-
+    def _try_unprotect(self, encrypted: bytes, entropy: bytes | None) -> str | None:
+        """按指定附加熵尝试解密；失败返回 ``None`` 交由调用方回退。"""
+        ctypes = self._ctypes
         input_blob, _input_buffer = self._input_blob(encrypted)
-        output_blob = _DataBlob()
+        if entropy is None:
+            entropy_reference = None
+        else:
+            entropy_blob, _entropy_buffer = self._input_blob(entropy)
+            entropy_reference = ctypes.byref(entropy_blob)
+        output_blob = self._blob_type()
         description = ctypes.c_wchar_p()
         if not self._crypt32.CryptUnprotectData(
             ctypes.byref(input_blob),
             ctypes.byref(description),
-            None,
+            entropy_reference,
             None,
             None,
             _CRYPTPROTECT_UI_FORBIDDEN,
             ctypes.byref(output_blob),
         ):
-            raise self._last_error("DPAPI 解密失败")
+            return None
         try:
             return ctypes.string_at(output_blob.pbData, output_blob.cbData).decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -129,6 +144,20 @@ class WindowsDPAPIBackend(SecretBackend):
             self._kernel32.LocalFree(output_blob.pbData)
             if description:
                 self._kernel32.LocalFree(description)
+
+    def decrypt(self, ciphertext: str) -> str:
+        try:
+            encrypted = base64.b64decode(ciphertext.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, binascii.Error) as exc:
+            raise SecretServiceError("DPAPI 密文格式无效") from exc
+        # 新密文带附加熵；升级前保存的旧密文没有熵，必须仍能解开。
+        for entropy in (_DPAPI_ENTROPY, None):
+            plaintext = self._try_unprotect(encrypted, entropy)
+            if plaintext is not None:
+                if entropy is None:
+                    logger.info("DPAPI legacy ciphertext detected")
+                return plaintext
+        raise self._last_error("DPAPI 解密失败")
 
 
 class MacOSKeychainBackend(SecretBackend):
@@ -179,16 +208,31 @@ def _get_backend() -> SecretBackend:
     raise SecretServiceError(f"当前平台不支持直接 API Key：{sys.platform}")
 
 
-_backend = _get_backend()
+_backend: SecretBackend | None = None
+_backend_lock = threading.Lock()
+
+
+def get_backend() -> SecretBackend:
+    """惰性获取后端。
+
+    不支持的平台只在真正使用「直接 API Key」时报错，而不是 import 本模块即失败，
+    否则整个后端在 Linux 上都无法启动。
+    """
+    global _backend
+    if _backend is None:
+        with _backend_lock:
+            if _backend is None:
+                _backend = _get_backend()
+    return _backend
 
 
 def encrypt_secret(value: str) -> str:
     if not value:
         return ""
-    return _backend.encrypt(value)
+    return get_backend().encrypt(value)
 
 
 def decrypt_secret(ciphertext: str) -> str:
     if not ciphertext:
         return ""
-    return _backend.decrypt(ciphertext)
+    return get_backend().decrypt(ciphertext)

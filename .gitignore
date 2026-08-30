@@ -108,3 +108,6 @@ Desktop.ini
 # Alembic
 # 保留迁移文件，忽略临时文件
 alembic/versions/*.pyc
+
+# Deepwork 审计过程状态
+.slim/deepwork/
