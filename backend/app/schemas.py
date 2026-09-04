@@ -225,7 +225,6 @@ class CharacterAssetOutput(AssetVisualPromptFields):
     shoes: str = ""
     accessories: str = ""
     carried_item: str = ""
-    style_tone: str = ""
     lighting: str = ""
     atmosphere: str = ""
     expression_group: list[str] = Field(default_factory=list)

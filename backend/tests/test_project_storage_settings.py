@@ -322,3 +322,35 @@ def test_migrate_schema_from_0003_backfills_existing_project_storage(
     assert setting_columns == {"key", "value", "updated_at"}
     database.dispose()
     get_settings.cache_clear()
+
+
+def test_camera_policy_default_conservative_and_roundtrip(tmp_path: Path) -> None:
+    database = _create_database(tmp_path)
+    service = SettingService(database, settings=_create_settings(tmp_path))
+    client = _create_client(service)
+
+    response = client.get("/api/settings/camera-policy")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["policy"] == "克制"
+    assert body["options"] == ["克制", "标准", "丰富"]
+
+    response = client.post("/api/settings/camera-policy", json={"policy": "标准"})
+    assert response.status_code == 200
+    assert response.json()["policy"] == "标准"
+
+    assert client.get("/api/settings/camera-policy").json()["policy"] == "标准"
+    database.dispose()
+
+
+def test_camera_policy_rejects_unknown_value(tmp_path: Path) -> None:
+    database = _create_database(tmp_path)
+    service = SettingService(database, settings=_create_settings(tmp_path))
+    client = _create_client(service)
+
+    response = client.post("/api/settings/camera-policy", json={"policy": "随便"})
+    assert response.status_code == 400
+
+    # 拒绝后仍保持默认克制
+    assert client.get("/api/settings/camera-policy").json()["policy"] == "克制"
+    database.dispose()

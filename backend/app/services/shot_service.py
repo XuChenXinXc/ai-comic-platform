@@ -58,6 +58,7 @@ from app.services.prompt_service import (
     shot_template_context,
 )
 from app.services.provider_service import ProviderService
+from app.services.setting_service import get_camera_policy
 from app.services.signature_service import shot_signature
 from app.services.utils import (
     json_dumps,
@@ -134,6 +135,12 @@ _ACTIVE_JOB_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
 # 模型，补建后必然再调用一次分镜模型重新提取验证；超过轮数后按最后一次提取
 # 结果报缺失清单，交由用户决定补建。
 _MAX_MISSING_REFILL_ROUNDS = 2
+# 场次镜头密度超限后的「带修正指令重新生成」最大轮数：模型首次输出过密时，
+# 把合并指令（同场相邻连续动作与对话回合合并进同一镜头、只保留独立结果与
+# 转场）作为显式修正回注进下一次生成的用户消息，而不是直接中止保存。
+_MAX_DENSITY_RETRY_ROUNDS = 2
+# 密度门禁冲突消息的稳定标识：只对这类失败自动重试，其余错误照常抛出。
+_DENSITY_CONFLICT_MARKER = "已中止保存，避免镜头数量失控"
 _PROMPT_GENERATED_FIELDS = {
     "image_prompt",
     "image_prompt_override",
@@ -578,6 +585,7 @@ class ShotService:
                         current_project, current["duration_sec"]
                     ),
                     prev_end_state=prev_end_state,
+                    camera_policy=get_camera_policy(self.database),
                 )
             ]
 
@@ -1885,71 +1893,85 @@ class ShotService:
             if isinstance(screenplay_content, dict)
             else None
         )
-        all_shots: list[dict[str, Any]] = []
-        all_warnings: list[dict[str, Any]] = []
-        missing_assets: list[dict[str, Any]] = []
-        all_shots, round_warnings = await self._extract_shots_payload(
-            job=job,
-            current_project=current_project,
-            source_type=source_type,
-            input_data=input_data,
-            screenplay_content=screenplay_content,
-            scenes=scenes,
-            content_raw=content_raw,
-        )
-        missing_assets = self._collect_missing_assets(all_shots)
-        # 跨轮保留：前一轮的质量警告与补素材警告不能被子轮覆盖
-        all_warnings = [*all_warnings, *round_warnings]
-        for _round in range(_MAX_MISSING_REFILL_ROUNDS):
-            if not missing_assets:
-                break
-            detail = "、".join(
-                f"{item['asset_type']}「{item['suggested_name']}」"
-                for item in missing_assets
-            )
-            all_warnings.append({
-                "scene_no": 0,
-                "message": (
-                    f"检测到素材缺失（{detail}），已自动补建素材并重新提取分镜；"
-                    "未强行绑定近似素材，剧情完整性优先。"
-                ),
-            })
-            await self._refill_missing_assets(
-                current_chapter["id"],
-                job.get("provider_id"),
-                missing_assets,
-            )
-            # 补建后立即重新提取验证：只有重新提取仍报告缺失才允许报错，
-            # 避免最后一轮补建成功后仍按补建前的缺失清单误报失败。
-            all_shots, round_warnings = await self._extract_shots_payload(
-                job=job,
-                current_project=current_project,
-                source_type=source_type,
-                input_data=input_data,
-                screenplay_content=screenplay_content,
-                scenes=scenes,
-                content_raw=content_raw,
-            )
-            missing_assets = self._collect_missing_assets(all_shots)
-            all_warnings = [*all_warnings, *round_warnings]
-        if missing_assets:
-            # 自动补素材已重试多轮仍无法覆盖：明确报缺失清单，禁止把缺素材的分镜
-            # 静默保存（既不强行绑定近似素材，也不得删改剧情）。
-            detail = "、".join(
-                f"{item['asset_type']}「{item['suggested_name']}」"
-                for item in missing_assets
-            )
-            raise bad_request(
-                f"分镜素材缺失：{detail}。已自动尝试补建素材仍无法覆盖，"
-                "请先补齐对应素材后重新提取分镜，或在分镜中修正素材绑定。"
-            )
-        return self._save_extracted(
-            current_chapter,
-            source_type,
-            input_data,
-            all_shots,
-            all_warnings,
-        )
+        # 密度修正：模型首次输出过密被门禁拒绝时，把合并指令作为显式修正
+        # 回注进下一轮生成的用户消息（同场相邻连续动作与对话回合合并进
+        # 同一镜头、只保留独立结果与转场），而不是直接让任务失败。
+        correction_note = ""
+        for _density_round in range(_MAX_DENSITY_RETRY_ROUNDS + 1):
+            try:
+                all_shots, round_warnings = await self._extract_shots_payload(
+                    job=job,
+                    current_project=current_project,
+                    source_type=source_type,
+                    input_data=input_data,
+                    screenplay_content=screenplay_content,
+                    scenes=scenes,
+                    content_raw=content_raw,
+                    correction_note=correction_note,
+                )
+                missing_assets = self._collect_missing_assets(all_shots)
+                # 每次尝试的警告只属于该次产物；失败的尝试不保留警告，避免重试重复刷屏。
+                all_warnings: list[dict[str, Any]] = [*round_warnings]
+                for _round in range(_MAX_MISSING_REFILL_ROUNDS):
+                    if not missing_assets:
+                        break
+                    detail = "、".join(
+                        f"{item['asset_type']}「{item['suggested_name']}」"
+                        for item in missing_assets
+                    )
+                    all_warnings.append({
+                        "scene_no": 0,
+                        "message": (
+                            f"检测到素材缺失（{detail}），已自动补建素材并重新提取分镜；"
+                            "未强行绑定近似素材，剧情完整性优先。"
+                        ),
+                    })
+                    await self._refill_missing_assets(
+                        current_chapter["id"],
+                        job.get("provider_id"),
+                        missing_assets,
+                    )
+                    # 补建后立即重新提取验证：只有重新提取仍报告缺失才允许报错，
+                    # 避免最后一轮补建成功后仍按补建前的缺失清单误报失败。
+                    all_shots, round_warnings = await self._extract_shots_payload(
+                        job=job,
+                        current_project=current_project,
+                        source_type=source_type,
+                        input_data=input_data,
+                        screenplay_content=screenplay_content,
+                        scenes=scenes,
+                        content_raw=content_raw,
+                        correction_note=correction_note,
+                    )
+                    missing_assets = self._collect_missing_assets(all_shots)
+                    all_warnings = [*all_warnings, *round_warnings]
+                if missing_assets:
+                    # 自动补素材已重试多轮仍无法覆盖：明确报缺失清单，禁止把缺素材的分镜
+                    # 静默保存（既不强行绑定近似素材，也不得删改剧情）。
+                    detail = "、".join(
+                        f"{item['asset_type']}「{item['suggested_name']}」"
+                        for item in missing_assets
+                    )
+                    raise bad_request(
+                        f"分镜素材缺失：{detail}。已自动尝试补建素材仍无法覆盖，"
+                        "请先补齐对应素材后重新提取分镜，或在分镜中修正素材绑定。"
+                    )
+                return self._save_extracted(
+                    current_chapter,
+                    source_type,
+                    input_data,
+                    all_shots,
+                    all_warnings,
+                )
+            except ServiceError as exc:
+                # 仅密度超限且还有重试额度时回注修正指令重试；其余错误照常抛出。
+                if not self._is_scene_density_conflict(exc) or (
+                    _density_round >= _MAX_DENSITY_RETRY_ROUNDS
+                ):
+                    raise
+                correction_note = self._scene_density_correction_note(exc.detail)
+        # 理论不可达：循环耗尽后必然在 except 分支重新抛出最后一次冲突。
+        raise conflict("分镜提取密度修正重试后仍不满足预算，请检查剧本场次时长")
 
     async def _refill_missing_assets(
         self,
@@ -2010,8 +2032,13 @@ class ShotService:
         screenplay_content: Any,
         scenes: Any,
         content_raw: str,
+        correction_note: str = "",
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """单轮分镜生成：读取最新素材目录，注入缺失提示，按模式生成全部分镜。"""
+        """单轮分镜生成：读取最新素材目录，注入缺失提示，按模式生成全部分镜。
+
+        correction_note 非空时作为显式修正指令前置进用户消息（密度修正重试用），
+        让模型把同场相邻的连续动作与对话回合合并进同一镜头后再输出。
+        """
         asset_catalog = self._asset_catalog(current_project["id"])
         if not any(item["asset_type"] == "scene" for item in asset_catalog):
             raise conflict("请先提取场景素材，再提取分镜")
@@ -2048,6 +2075,11 @@ class ShotService:
                     "不得强行绑定近似素材，也不得因此删减剧情。"
                 )
         provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
+
+        def _with_correction(text: str) -> str:
+            """把密度修正指令前置进用户消息；无修正时为原文。"""
+            return f"{correction_note}\n\n{text}" if correction_note else text
+
         all_shots: list[dict[str, Any]] = []
         all_warnings: list[dict[str, Any]] = []
         if isinstance(scenes, list) and scenes:
@@ -2061,7 +2093,7 @@ class ShotService:
                 )
                 output = await provider.generate_json(
                     system_prompt=load_prompt("shot_extract"),
-                    user_prompt=(
+                    user_prompt=_with_correction(
                         f"来源类型：{source_type}\n"
                         "范围：全部剧本场次（必须一次性返回全部场次的分镜，不得只返回部分场次）\n"
                         f"{self._build_shot_budget_table(scenes)}\n"
@@ -2173,7 +2205,7 @@ class ShotService:
                 )
                 output = await provider.generate_json(
                     system_prompt=load_prompt("shot_extract"),
-                    user_prompt=(
+                    user_prompt=_with_correction(
                         f"来源类型：{source_type}\n"
                         f"范围：{input_data.get('scope', 'all')}\n"
                         f"目标场次：{scene_no}\n"
@@ -2243,7 +2275,7 @@ class ShotService:
             # 旧格式/无 scenes 结构：整份内容单次提取，保持兼容
             output = await provider.generate_json(
                 system_prompt=load_prompt("shot_extract"),
-                user_prompt=(
+                user_prompt=_with_correction(
                     f"来源类型：{source_type}\n"
                     f"范围：{input_data.get('scope', 'all')}\n"
                     f"目标场次：{input_data.get('scene_no') or '全部'}\n"
@@ -2960,6 +2992,33 @@ class ShotService:
                     f"秒预算允许的 {allowed} 个；已中止保存，避免镜头数量失控。"
                     "请把同场相邻的连续动作与对话回合合并进同一镜头，只保留独立结果与转场。"
                 )
+
+    @staticmethod
+    def _is_scene_density_conflict(exc: Exception) -> bool:
+        """只识别密度门禁抛出的冲突，避免对无关错误盲目重试。"""
+        return (
+            isinstance(exc, ServiceError)
+            and _DENSITY_CONFLICT_MARKER in str(getattr(exc, "detail", exc))
+        )
+
+    @staticmethod
+    def _scene_density_correction_note(detail: str) -> str:
+        """把密度门禁的拒绝原因编译成给模型的显式修正指令。
+
+        与 shot_extract.md 第 7.2 条口径一致：先把不可省略的情节单元列全，
+        再把同场相邻的连续动作与对话回合合并进同一镜头，只保留独立结果与
+        转场；合并不得删除或改写对白，时长必须能承载台词。
+        """
+        return (
+            "\n\n【分镜密度修正指令（必须遵守，否则本轮结果仍会被保存门禁拒绝）】\n"
+            f"上一轮分镜被拒绝：{detail}\n"
+            "请重新拆镜：把同场相邻的连续动作与对话回合合并进同一镜头，"
+            "只保留独立结果与转场；每个场次的分镜数不得超过预算表上限。\n"
+            "合并时不得删除、压缩或改写任何对白、动作与剧情结果：多条对白可以放进"
+            "同一镜头，但该镜 duration_sec 必须足以承载全部台词（纯对白镜头按 2.5 字/秒、"
+            "含动作镜头按约 1.6 字/秒计算）且不得超过 15 秒；单镜承载不下时，应重新调整"
+            "对白在各镜头间的分配，而不是删减台词。"
+        )
 
     @staticmethod
     def _quality_warnings_for_shots(
@@ -3802,6 +3861,7 @@ class ShotService:
                 dialogue_bindings=bundle.dialogue_bindings,
                 duration_sec=float(current["duration_sec"]),
                 prev_end_state=prev_end_state,
+                camera_policy=get_camera_policy(self.database),
             )
         ]
         for _attempt in range(2):

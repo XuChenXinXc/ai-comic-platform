@@ -31,6 +31,10 @@ describe("平台设置", () => {
       path: "D:\\旧项目目录",
       source: "database",
     });
+    vi.spyOn(api.settings.cameraPolicy, "get").mockResolvedValue({
+      policy: "克制",
+      options: ["克制", "标准", "丰富"],
+    });
   });
 
   test("test_project_storage_load_displays_current_path_and_scope_notice", async () => {
@@ -109,5 +113,29 @@ describe("平台设置", () => {
     await user.click(button);
 
     expect(button).toBeDisabled();
+  });
+
+  test("test_camera_policy_load_displays_current_and_hint", async () => {
+    renderPage();
+
+    expect(await screen.findByLabelText("当前策略")).toHaveValue("克制");
+    expect(screen.getAllByText(/定镜优先/).length).toBeGreaterThan(0);
+  });
+
+  test("test_camera_policy_change_updates_policy_and_shows_success", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api.settings.cameraPolicy, "set").mockResolvedValue({
+      policy: "标准",
+      options: ["克制", "标准", "丰富"],
+    });
+    renderPage();
+
+    await user.selectOptions(
+      await screen.findByLabelText("当前策略"),
+      "标准",
+    );
+
+    expect(await screen.findByLabelText("当前策略")).toHaveValue("标准");
+    expect(toast.success).toHaveBeenCalledWith("运镜策略已更新");
   });
 });

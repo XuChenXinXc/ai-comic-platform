@@ -69,6 +69,7 @@ def test_main_app_registers_project_storage_settings_routes() -> None:
 
     assert "/api/settings/project-storage" in route_paths
     assert "/api/settings/project-storage/select" in route_paths
+    assert "/api/settings/camera-policy" in route_paths
 
 
 def test_project_media_static_files_serves_existing_project_file(

@@ -58,6 +58,7 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
   const queryClient = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
   const [editingPrompt, setEditingPrompt] = useState(false);
+  const [referenceMode, setReferenceMode] = useState(false);
   const canGenerate = canGenerateAssetImage(asset);
   const query = useQuery({
     queryKey: queryKeys.assetImages(asset.id),
@@ -99,7 +100,8 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
   };
 
   const generateMutation = useMutation({
-    mutationFn: () => api.assets.images.generate(asset.id),
+    mutationFn: () =>
+      api.assets.images.generate(asset.id, { reference_mode: referenceMode }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({
         queryKey: queryKeys.jobs(asset.project_id),
@@ -145,7 +147,19 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
             生成和上传都会保留历史版本，成功版本自动成为当前版本。
           </p>
         </div>
-        <div className="flex shrink-0 flex-wrap gap-2">
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          <label
+            className="flex cursor-pointer items-center gap-1.5 text-xs text-muted"
+            title="单张干净设定图：无多视图展板、无资料卡文字，适合写意水墨等与白底展板冲突的画风"
+          >
+            <input
+              type="checkbox"
+              checked={referenceMode}
+              onChange={(event) => setReferenceMode(event.target.checked)}
+              className="h-4 w-4 accent-[#d95c3a]"
+            />
+            单图参考模式
+          </label>
           <input
             ref={fileRef}
             type="file"

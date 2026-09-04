@@ -28,13 +28,13 @@ def test_default_visual_style_is_structured_and_executable() -> None:
     assert not any(word in style.medium for word in ("超高质量", "极致", "震撼"))
 
 
-def test_style_prompt_is_supplemental_and_overrides_are_applied() -> None:
+def test_style_prompt_is_unique_style_source_and_overrides_are_applied() -> None:
     style = build_visual_style_spec(
-        style_prompt="用户补充的青灰色夜景偏好",
+        style_prompt="项目统一画风：青灰色夜景",
         overrides={"medium": "二维水墨动画", "mood": "冷静压迫"},
     )
 
-    assert style.style_prompt == "用户补充的青灰色夜景偏好"
+    assert style.style_prompt == "项目统一画风：青灰色夜景"
     assert style.medium == "二维水墨动画"
     assert style.mood == "冷静压迫"
     assert style.line_style

@@ -9,6 +9,7 @@ import {
   GripVertical,
   ImageOff,
   Images,
+  Lightbulb,
   Link2,
   Merge,
   Pencil,
@@ -505,6 +506,21 @@ export function ShotsPage() {
       await invalidate();
       toast.success(editing === "new" ? "分镜已添加" : "分镜已保存");
       setEditing(null);
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
+  const applyCameraSuggestionMutation = useMutation({
+    mutationFn: async ({
+      shot,
+      cameraMove,
+    }: {
+      shot: Shot;
+      cameraMove: string;
+    }) => api.shots.update(shot.id, { ...shot, camera_move: cameraMove }),
+    onSuccess: async (_, variables) => {
+      await invalidate();
+      toast.success(`运镜已改为「${variables.cameraMove}」`);
     },
     onError: (error) => toast.error(formatError(error)),
   });
@@ -1226,24 +1242,56 @@ export function ShotsPage() {
                           )}
                           {shot.consistency_issues?.length ? (
                             <ul className="mt-2 space-y-1">
-                              {shot.consistency_issues.map((issue, issueIndex) => (
-                                <li
-                                  key={`${issue.code}-${issueIndex}`}
-                                  className={`flex items-start gap-1 text-xs leading-5 ${
-                                    issue.severity === "blocking"
-                                      ? "text-red-700"
-                                      : "text-amber-700"
-                                  }`}
-                                >
-                                  <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                                  <span>
-                                    {issue.severity === "blocking"
-                                      ? "阻断："
-                                      : ""}
-                                    {issue.message}
-                                  </span>
-                                </li>
-                              ))}
+                              {shot.consistency_issues.map((issue, issueIndex) => {
+                                const recommendedMove =
+                                  issue.details?.recommended_camera_move;
+                                const adoptable =
+                                  typeof recommendedMove === "string" &&
+                                  recommendedMove.length > 0;
+                                return (
+                                  <li
+                                    key={`${issue.code}-${issueIndex}`}
+                                    className={`flex items-start gap-1 text-xs leading-5 ${
+                                      issue.severity === "blocking"
+                                        ? "text-red-700"
+                                        : issue.severity === "suggestion"
+                                          ? "text-sky-700"
+                                          : "text-amber-700"
+                                    }`}
+                                  >
+                                    {issue.severity === "suggestion" ? (
+                                      <Lightbulb className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                                    ) : (
+                                      <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                                    )}
+                                    <span className="min-w-0">
+                                      {issue.severity === "blocking"
+                                        ? "阻断："
+                                        : ""}
+                                      {issue.message}
+                                    </span>
+                                    {adoptable ? (
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        className="ml-auto shrink-0 px-1.5 py-0 text-xs"
+                                        busy={
+                                          applyCameraSuggestionMutation.isPending
+                                        }
+                                        title={`采纳建议，把运镜改为「${String(recommendedMove)}」`}
+                                        onClick={() =>
+                                          applyCameraSuggestionMutation.mutate({
+                                            shot,
+                                            cameraMove: String(recommendedMove),
+                                          })
+                                        }
+                                      >
+                                        采纳
+                                      </Button>
+                                    ) : null}
+                                  </li>
+                                );
+                              })}
                             </ul>
                           ) : null}
                         </div>

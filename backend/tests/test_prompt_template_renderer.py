@@ -55,7 +55,6 @@ def _character_profile() -> dict:
         "outer": "无",
         "shoes": "黑色布鞋",
         "accessories": "腰间旧铜铃",
-        "style_tone": "沉静疏离",
         "expression_group": ["平静倾听", "惊讶屏息", "执拗追问", "沉默悲伤"],
     }
 

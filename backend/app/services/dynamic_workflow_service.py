@@ -2845,6 +2845,24 @@ class DynamicWorkflowService:
                         raise not_found("项目")
                     if not bool(existing_project.get("is_free_create")):
                         raise bad_request("动态运行只能创建于 free-create 项目")
+                    # 画风唯一来源是项目统一画风字段：payload 填了画风就写回项目，
+                    # 没填则沿用项目当前值，run 快照始终与项目统一画风一致。
+                    if str(payload.style_prompt or "").strip():
+                        connection.execute(
+                            update(project)
+                            .where(project.c.id == selected_project_id)
+                            .values(
+                                style_prompt=str(payload.style_prompt or "").strip(),
+                                updated_at=now,
+                            )
+                        )
+                        config_snapshot["style_prompt"] = str(
+                            payload.style_prompt or ""
+                        ).strip()
+                    else:
+                        config_snapshot["style_prompt"] = str(
+                            existing_project.get("style_prompt") or ""
+                        ).strip()
 
                 config_snapshot = {
                     **config_snapshot,

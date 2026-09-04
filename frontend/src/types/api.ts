@@ -75,6 +75,11 @@ export interface ProjectStorageSelection extends ProjectStorageSetting {
   selected: boolean;
 }
 
+export interface CameraPolicySetting {
+  policy: string;
+  options: string[];
+}
+
 export interface ContentRecord<T = Record<string, unknown>> {
   id: string;
   project_id: string;
@@ -251,7 +256,7 @@ export interface DirectorPlan {
 
 export interface ConsistencyIssue {
   code: string;
-  severity: "warning" | "blocking";
+  severity: "warning" | "blocking" | "suggestion";
   message: string;
   details?: Record<string, unknown>;
 }

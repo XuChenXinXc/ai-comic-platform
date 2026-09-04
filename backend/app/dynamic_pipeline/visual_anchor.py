@@ -31,13 +31,13 @@ _ALLOWED_REFERENCE_PURPOSES = frozenset(
     }
 )
 _DEFAULT_STYLE: dict[str, Any] = {
-    "medium": "二维动画/插画管线，角色、场景与道具使用同一媒介",
-    "line_style": "干净连续的中细线，轮廓明确，结构线克制，细节线随材质变化",
-    "color_palette": "低至中饱和的统一综合色盘，主体色明确，少量受控强调色",
-    "lighting_style": "符合场景光源逻辑的柔和主光与轻微轮廓光，保留阴影层次和关键细节",
-    "material_style": "以二维上色表现可区分的布料、木石、金属、玻璃和皮革纹理，不使用塑料化高光",
-    "realism_level": "稳定的半写实二维动画比例与结构，不是真人摄影或三维写实渲染",
-    "mood": "克制、清晰、具有叙事氛围，情绪通过色彩、光线和表演细节表达",
+    "medium": "媒介与质感完全遵循项目统一画风（style_prompt）的要求",
+    "line_style": "线条表现完全遵循项目统一画风（style_prompt）的要求",
+    "color_palette": "配色完全遵循项目统一画风（style_prompt）的要求",
+    "lighting_style": "光影处理遵循项目统一画风（style_prompt）的要求，并符合场景光源逻辑",
+    "material_style": "材质表现完全遵循项目统一画风（style_prompt）的要求",
+    "realism_level": "写实度与结构比例遵循项目统一画风（style_prompt）的要求",
+    "mood": "情绪氛围通过构图、光线与表演细节表达，不另行限定画风",
     "text_policy": "画面默认不生成字幕、对白、标题、标识、水印或无意义文字；文字由后期处理",
     "global_negative_rules": [
         "真人摄影、影视实拍、产品摄影",
@@ -357,7 +357,11 @@ def build_visual_style_spec(
     style_version: str = "dynamic-style-v1",
     overrides: Mapping[str, Any] | None = None,
 ) -> VisualStyleSpec:
-    """构造可执行的默认视觉规范，用户文本只作为补充信息。"""
+    """构造视觉规范：画风唯一来源是项目统一画风（style_prompt）。
+
+    默认字段只提供不指定具体画风的中性占位与一致性技术约束，
+    不引入任何与统一画风无关的线条、配色、材质或写实度要求。
+    """
 
     values = copy.deepcopy(_DEFAULT_STYLE)
     if overrides:

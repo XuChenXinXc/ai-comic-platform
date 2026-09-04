@@ -1527,6 +1527,18 @@ class DynamicPromptStageService:
                     video_stage=context.stage_key == "5b-video-prompts",
                 )
             )
+            # 画风唯一来源是项目统一画风字段：动态管线运行时读取项目当前值，
+            # run 配置快照中的 style_prompt 仅作项目画风为空的兜底。
+            project_id = _text(context.run_record.get("project_id") or "")
+            project_style_prompt = ""
+            if project_id:
+                project_row = connection.execute(
+                    select(project.c.style_prompt).where(project.c.id == project_id)
+                ).first()
+                if project_row is not None:
+                    project_style_prompt = _text(
+                        dict(project_row._mapping).get("style_prompt") or ""
+                    )
 
         reference_blocking = [
             item
@@ -1541,7 +1553,9 @@ class DynamicPromptStageService:
                 stage_key=context.stage_key,
             )
 
-        style = build_visual_style_spec(style_prompt=_text(config.get("style_prompt")))
+        style = build_visual_style_spec(
+            style_prompt=project_style_prompt or _text(config.get("style_prompt"))
+        )
         signature = _text(context.stage_record.get("input_signature"))
         if not signature or signature != _text(context.job_record.get("input_signature")):
             raise PromptStageExecutionError(

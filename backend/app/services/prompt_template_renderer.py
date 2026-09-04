@@ -106,7 +106,6 @@ def _character_context(
     outer = _profile_value(profile, "outer", "outerwear", fallback=costume)
     shoes = _profile_value(profile, "shoes", "footwear", fallback=costume)
     accessories = _profile_value(profile, "accessories", fallback=immutable)
-    style_tone = _profile_value(profile, "style_tone", fallback=detail)
     expression_group = _profile_value(
         profile,
         "expression_group",
@@ -144,7 +143,6 @@ def _character_context(
         "outer": outer,
         "shoes": shoes,
         "accessories": accessories,
-        "style_tone": style_tone,
         "expression_group": expression_group,
         "expression_count": expression_count,
         "anchors": anchors,

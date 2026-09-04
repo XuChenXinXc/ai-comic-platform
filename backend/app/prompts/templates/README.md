@@ -46,7 +46,6 @@
 | `material` | costume_material → material | 服装材质以素材资料为准 |
 | `upper` `lower` `outer` `shoes` | upper → top / lower → bottom / outer → outerwear / shoes → footwear | 回退 costume |
 | `accessories` | accessories | 回退 immutable |
-| `style_tone` | style_tone | 回退 detail |
 | `expression_group` `expression_count` | expression_group → acting_traits；count 按条目数计算，空时按 3 | — |
 | `anchors` | consistency_keywords（拼接） | 空则不渲染该片段 |
 | `detail` | 素材 prompt（空时由档案字段拼接） | 空则不渲染该段 |

@@ -259,6 +259,78 @@ def test_extract_shots_uses_one_full_chapter_request_for_multiple_scenes(
     assert result["count"] == 2
 
 
+def test_extract_retries_with_merge_instruction_when_scene_density_rejected(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """场次镜头密度超限时：把合并指令回注进下一轮生成并重试，而不是直接失败。
+
+    回归 2026-09 缺陷：模型整章输出过密（如场次 1 返回 6 镜、超 45 秒预算），
+    自动合并兜底也压不回上限，任务直接失败。修复后应带着「同场相邻的连续动作
+    与对话回合合并进同一镜头」的修正指令重新生成一次。
+    """
+    database, service, _jobs, chapter = storyboard_services
+    scene = AssetService(database).create(
+        chapter["project_id"],
+        {
+            "asset_type": "scene",
+            "name": "青云山巅",
+            "profile": {"concept": "云海环绕的山巅平台"},
+        },
+    )
+    captured: list[str] = []
+    call_count = {"n": 0}
+
+    class DensityFlakyProvider:
+        async def generate_json(self, **values: Any) -> ExtractionOutput:
+            captured.append(str(values["user_prompt"]))
+            call_count["n"] += 1
+            # 场次 1 无时长字段：预算按文本量兜底为 15 秒 → 硬上限 3 镜。
+            # 第一轮返回 5 镜触发密度拒绝，第二轮返回 3 镜保存成功。
+            count = 5 if call_count["n"] == 1 else 3
+            shots = []
+            for index in range(count):
+                item = _extracted_shot(scene["id"])
+                item["shot_no"] = index + 1
+                item["scene_no"] = 1
+                # 全部用转场/省略边界，确保自动合并兜底无法压回上限，
+                # 覆盖「只有重新生成才能修正」的路径。
+                item["transition_from_prev"] = "elliptical" if index else "scene_change"
+                shots.append(item)
+            return ExtractionOutput(shots)
+
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_kwargs: (
+            DensityFlakyProvider(),
+            {"id": "mock-text", "params": {}},
+        ),
+    )
+    job = {
+        "project_id": chapter["project_id"],
+        "chapter_id": chapter["id"],
+        "provider_id": "mock-text",
+        "input_json": json_dumps(
+            {
+                "source_type": "screenplay",
+                "scope": "all",
+                "scene_no": None,
+                "params": {},
+            }
+        ),
+    }
+
+    result = asyncio.run(service.handle_extract(job))
+
+    assert call_count["n"] == 2
+    assert "分镜密度修正指令" in captured[1]
+    assert "合并进同一镜头" in captured[1]
+    assert "只保留独立结果与转场" in captured[1]
+    assert result["count"] == 3
+    assert len(service.list(chapter["id"])) == 3
+
+
 def test_scene_density_rejects_excessive_shots_before_save() -> None:
     # 30 秒场次：下限 ceil(30/15)=2 镜，硬上限 2+2=4 镜
     scenes = [{"scene_no": 1, "duration_sec": 30}]

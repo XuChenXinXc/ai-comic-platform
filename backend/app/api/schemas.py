@@ -100,9 +100,21 @@ class ImgbbKeyStatus(ApiModel):
     source: Literal["database", "environment", "default"]
 
 
+class CameraPolicySetting(ApiModel):
+    policy: str
+    options: list[str]
+
+
+class CameraPolicyUpdate(ApiModel):
+    policy: str
+
+
 class GenerateRequest(ApiModel):
     provider_id: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
+    # 素材图生成为 true 时走干净参考图模式：单张设定图（无多视图展板、无资料卡文字），
+    # 适合写意水墨等与白底展板版式冲突的画风；其余请求类型忽略该字段。
+    reference_mode: bool = False
 
     _validate_params = field_validator("params")(_validate_public_params)
 

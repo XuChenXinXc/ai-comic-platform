@@ -7,7 +7,7 @@ import re
 import subprocess
 import time
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from threading import RLock
@@ -19,12 +19,6 @@ from sqlalchemy import delete, exists, func, insert, or_, select, update
 
 from app.config import settings
 from app.db import Database, db
-from app.dynamic_pipeline.h3_adapter import (
-    Ref2VATextOutput,
-    build_ref2va_rewrite_request,
-    extract_dialogue_lines,
-    validate_ref2va_sections,
-)
 from app.models.tables import (
     api_provider,
     asset,
@@ -72,6 +66,7 @@ from app.services.prompt_service import (
     shot_template_context,
 )
 from app.services.provider_service import ProviderService
+from app.services.setting_service import get_camera_policy
 from app.services.shot_service import ShotService
 from app.services.signature_service import (
     asset_image_signature,
@@ -1895,6 +1890,7 @@ class MediaService:
                         "provider_id": options.get("provider_id")
                         or current_project["default_image_provider_id"],
                         "params": options.get("params", {}),
+                        "reference_mode": bool(options.get("reference_mode")),
                         "_batch_id": batch_id,
                     },
                 )
@@ -2196,6 +2192,7 @@ class MediaService:
                     dialogue_bindings=bundle.dialogue_bindings,
                     duration_sec=effective_duration,
                     prev_end_state=prev_end_state,
+                    camera_policy=get_camera_policy(self.database),
                 )
             ]
             blocking_issues = [
@@ -3557,94 +3554,6 @@ class MediaService:
     def _resolve_binding_files(self, project_id: str, bindings: list[dict[str, Any]]) -> list[Path]:
         return [path for path, _ in self._binding_reference_items(project_id, bindings)]
 
-    @staticmethod
-    def _uses_h3_video_protocol(config: Mapping[str, Any]) -> bool:
-        params = config.get("params")
-        params = params if isinstance(params, Mapping) else {}
-        protocol = str(params.get("protocol", "")).strip().lower()
-        if protocol:
-            return protocol == "h3"
-        hostname = (urlsplit(str(config.get("base_url") or "")).hostname or "").lower()
-        return hostname == "h3.zhongbiao.cloud"
-
-    @staticmethod
-    def _ref2va_dialogue_lines(
-        input_data: Mapping[str, Any],
-        source: str,
-    ) -> list[tuple[str, str] | tuple[str, str, tuple[float, float]]]:
-        """提取 Ref2VA 改写所需对白：动态链路优先结构化 cues，旧链路回退文本解析。"""
-
-        plan = input_data.get("plan")
-        bundle = plan.get("prompt_bundle") if isinstance(plan, Mapping) else None
-        semantic = bundle.get("semantic_plan") if isinstance(bundle, Mapping) else None
-        cues = semantic.get("cues") if isinstance(semantic, Mapping) else None
-        dialogue = cues.get("dialogue") if isinstance(cues, Mapping) else None
-        lines: list[tuple[str, str] | tuple[str, str, tuple[float, float]]] = []
-        if isinstance(dialogue, list):
-            for item in dialogue:
-                if not isinstance(item, Mapping):
-                    continue
-                speaker = str(item.get("speaker") or "").strip()
-                text = str(item.get("text") or "").strip()
-                if not text:
-                    continue
-                start = item.get("start_time")
-                end = item.get("end_time")
-                if isinstance(start, int | float) and isinstance(end, int | float):
-                    lines.append((speaker, text, (float(start), float(end))))
-                else:
-                    lines.append((speaker, text))
-        if lines:
-            return lines
-        return list(extract_dialogue_lines(source))
-
-    async def _ref2va_video_prompt(
-        self,
-        *,
-        source: str,
-        duration_sec: float,
-        dialogue_lines: Sequence[tuple[str, str] | tuple[str, str, tuple[float, float]]],
-    ) -> str:
-        """H3 原生六段改写；改写或校验失败时回退原提示词，不阻塞视频生成。"""
-
-        if not source.strip():
-            return source
-        try:
-            request = build_ref2va_rewrite_request(
-                source,
-                dialogue_lines=dialogue_lines,
-                duration_sec=duration_sec,
-            )
-            text_provider, text_config = self.providers.resolve(kind="text", provider_id=None)
-            text_params = dict(text_config.get("params") or {})
-            text_params.setdefault("reasoning_effort", "medium")
-            output = await text_provider.generate_json(
-                system_prompt=request.system_prompt,
-                user_prompt=request.user_payload,
-                schema=Ref2VATextOutput,
-                params=text_params,
-            )
-            rewritten = str(getattr(output, "prompt", "") or "").strip()
-            errors = validate_ref2va_sections(
-                rewritten,
-                expect_dialogue=bool(dialogue_lines),
-                expect_dialogue_count=len(dialogue_lines) if dialogue_lines else None,
-                expected_dialogue_texts=[item[1] for item in dialogue_lines],
-                expected_duration_sec=duration_sec,
-            )
-            if errors:
-                logger.warning(
-                    "H3 Ref2VA 改写校验失败，回退原提示词：%s",
-                    "；".join(errors[:3]),
-                )
-                return source
-            return rewritten
-        except Exception:
-            # 改写是可选的增强出口：任何失败都退回原提示词并保留完整堆栈日志，
-            # 不能因此中断视频生成。
-            logger.exception("H3 Ref2VA 改写失败，回退原提示词")
-            return source
-
     async def handle_video(self, job_record: dict[str, Any]) -> dict[str, Any]:
         version_id = job_record["target_id"]
         version = self._get_version("video", version_id)
@@ -3832,12 +3741,6 @@ class MediaService:
                 else:
                     prepared = await provider.prepare_input_image(keyframe_path)
                 submit_prompt = str(version["prompt_snapshot"] or "")
-                if self._uses_h3_video_protocol(config):
-                    submit_prompt = await self._ref2va_video_prompt(
-                        source=submit_prompt,
-                        duration_sec=float(version["requested_duration_sec"]),
-                        dialogue_lines=self._ref2va_dialogue_lines(input_data, submit_prompt),
-                    )
                 submission = await provider.submit(
                     prompt=submit_prompt,
                     input_image=prepared,

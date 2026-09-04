@@ -1,15 +1,20 @@
 from fastapi import APIRouter, Depends
 
 from app.api.schemas import (
+    CameraPolicySetting,
+    CameraPolicyUpdate,
     ImgbbKeyStatus,
     ProjectStorageSelectionResult,
     ProjectStorageSetting,
 )
 from app.dependencies import get_setting_service
+from app.services.camera_library import SUPPORTED_POLICIES
 from app.services.errors import bad_request
 from app.services.setting_service import (
     SettingService,
+    get_camera_policy,
     get_imagbb_api_key_override,
+    set_camera_policy,
     set_imagbb_api_key,
 )
 
@@ -58,3 +63,21 @@ def set_imgbb_key(
         raise bad_request("ImgBB API Key 长度不能超过 200 字符")
     set_imagbb_api_key(service.database, plaintext)
     return get_imgbb_key_status(service=service)  # type: ignore[arg-type]
+
+
+@router.get("/camera-policy", response_model=CameraPolicySetting)
+def get_camera_policy_setting(
+    service: SettingService = Depends(get_setting_service),
+) -> dict:
+    """读取平台运镜策略（克制 / 标准 / 丰富）。"""
+    return {"policy": get_camera_policy(service.database), "options": list(SUPPORTED_POLICIES)}
+
+
+@router.post("/camera-policy", response_model=CameraPolicySetting)
+def set_camera_policy_setting(
+    body: CameraPolicyUpdate,
+    service: SettingService = Depends(get_setting_service),
+) -> dict:
+    """保存平台运镜策略。"""
+    policy = set_camera_policy(service.database, body.policy)
+    return {"policy": policy, "options": list(SUPPORTED_POLICIES)}

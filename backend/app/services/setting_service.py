@@ -208,3 +208,49 @@ def set_imagbb_api_key(database: Database, plaintext: str) -> None:
     )
     with database.engine.begin() as connection:
         connection.execute(statement)
+
+
+# 运镜策略：平台级设置，控制「加不加运镜」的激进程度。
+# 克制（默认）：定镜优先，漏加不提醒；标准：双方向提醒；丰富：倾向运镜。
+CAMERA_POLICY_SETTING = "camera_policy"
+
+
+def get_camera_policy(database: Database) -> str:
+    """读取平台运镜策略；未配置或非法值一律回落「克制」。"""
+    from app.services.camera_library import DEFAULT_CAMERA_POLICY, normalize_policy
+
+    try:
+        with database.engine.connect() as connection:
+            stored = connection.scalar(
+                select(platform_setting.c.value).where(
+                    platform_setting.c.key == CAMERA_POLICY_SETTING
+                )
+            )
+    except SQLAlchemyError:
+        stored = None
+    return normalize_policy(stored) if stored else DEFAULT_CAMERA_POLICY
+
+
+def set_camera_policy(database: Database, policy: str) -> str:
+    """写入平台运镜策略；非法值拒绝。"""
+    from app.services.camera_library import SUPPORTED_POLICIES, normalize_policy
+
+    if policy not in SUPPORTED_POLICIES:
+        raise bad_request(f"运镜策略必须是 {'/'.join(SUPPORTED_POLICIES)} 之一")
+    normalized = normalize_policy(policy)
+    now = utc_now()
+    statement = sqlite_insert(platform_setting).values(
+        key=CAMERA_POLICY_SETTING,
+        value=normalized,
+        updated_at=now,
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=[platform_setting.c.key],
+        set_={"value": normalized, "updated_at": now},
+    )
+    try:
+        with database.engine.begin() as connection:
+            connection.execute(statement)
+    except SQLAlchemyError as exc:
+        raise ServiceError(500, "保存运镜策略失败，请重试") from exc
+    return normalized

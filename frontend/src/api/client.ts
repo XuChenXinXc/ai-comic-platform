@@ -16,6 +16,7 @@ import type {
   DynamicWorkflowStage,
   Job,
   MediaVersion,
+  CameraPolicySetting,
   Project,
   ProjectInput,
   ProjectStorageSelection,
@@ -296,6 +297,7 @@ export const queryKeys = {
   videos: (id: string) => ["videos", id] as const,
   providers: ["providers"] as const,
   projectStorage: ["settings", "project-storage"] as const,
+  cameraPolicy: ["settings", "camera-policy"] as const,
   jobs: (projectId?: string) => ["jobs", projectId || "all"] as const,
   dynamicRuns: (projectId?: string) => ["dynamic-runs", projectId || "all"] as const,
   dynamicRun: (runId: string) => ["dynamic-runs", runId] as const,
@@ -310,6 +312,15 @@ export const api = {
         request<ProjectStorageSelection>(
           "/settings/project-storage/select",
           json("POST"),
+        ),
+    },
+    cameraPolicy: {
+      get: () =>
+        request<CameraPolicySetting>("/settings/camera-policy"),
+      set: (policy: string) =>
+        request<CameraPolicySetting>(
+          "/settings/camera-policy",
+          json("POST", { policy }),
         ),
     },
   },

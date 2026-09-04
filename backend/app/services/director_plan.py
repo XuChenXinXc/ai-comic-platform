@@ -19,6 +19,13 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.services.camera_library import (
+    DEFAULT_CAMERA_POLICY,
+    camera_decision_diagnostics,
+    is_static_camera,
+    normalize_policy,
+)
+
 # ---------------------------------------------------------------------------
 # 结构定义
 # ---------------------------------------------------------------------------
@@ -255,11 +262,14 @@ def director_bundle_from_llm(output: Mapping[str, Any]) -> DirectorShotBundle:
 
 @dataclass(frozen=True)
 class ConsistencyIssue:
-    """一致性校验发现的单个问题。"""
+    """一致性校验发现的单个问题。
+
+    severity：blocking=阻断视频入队；warning=需要人工核对；suggestion=可选优化建议。
+    """
 
     code: str
     message: str
-    severity: Literal["warning", "blocking"] = "warning"
+    severity: Literal["warning", "blocking", "suggestion"] = "warning"
     details: dict[str, Any] = field(default_factory=dict)
 
 
@@ -745,6 +755,7 @@ def validate_shot_consistency(
     duration_sec: float = 0.0,
     prev_end_state: str = "",
     next_start_state: str = "",
+    camera_policy: str = DEFAULT_CAMERA_POLICY,
 ) -> list[ConsistencyIssue]:
     """最终一致性校验器：对单个分镜执行结构性 + 语义性检查。
 
@@ -792,6 +803,39 @@ def validate_shot_consistency(
     issues.extend(
         _camera_issues(camera_motivation, composition, _text(shot.get("camera_move")))
     )
+    policy = normalize_policy(camera_policy)
+    for suggestion in camera_decision_diagnostics(
+        shot,
+        camera_motivation=camera_motivation,
+        policy=policy,
+    ):
+        issues.append(
+            ConsistencyIssue(
+                code=suggestion.code,
+                message=suggestion.message,
+                severity=suggestion.severity,
+                details={
+                    **(suggestion.details or {}),
+                    **(
+                        {"recommended_camera_move": suggestion.recommended_camera_move}
+                        if suggestion.recommended_camera_move
+                        else {}
+                    ),
+                },
+            )
+        )
+    camera_move_text = _text(shot.get("camera_move"))
+    if is_static_camera(camera_move_text) and _has_word(
+        camera_motivation, "推近", "推进", "拉", "摇", "跟", "甩", "环绕", "俯冲"
+    ):
+        issues.append(
+            ConsistencyIssue(
+                "camera_motive_conflict",
+                "导演运镜动机包含镜头运动，但分镜运镜字段为固定/未填写，请核对机位",
+                "warning",
+                {"camera_motivation": camera_motivation.strip()},
+            )
+        )
     issues.extend(
         _premature_result_issues(
             _text(shot.get("action")),
