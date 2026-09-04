@@ -27,6 +27,11 @@ class RecordingJobService:
         return {"id": "job-recorded", **values}
 
 
+class FailingCreateJobService:
+    def create(self, **values: Any) -> dict[str, Any]:
+        raise RuntimeError("模拟建任务失败")
+
+
 class FailingTextProvider:
     async def generate_json(self, **_values: Any) -> Any:
         raise RuntimeError("模拟生成失败")
@@ -429,6 +434,28 @@ def test_screenplay_generation_warns_when_no_scene_assets_exist(
     assert any("尚无场景素材" in message for message in result["warnings"])
 
 
+def test_screenplay_scene_queue_create_failure_reverts_generating_status(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+) -> None:
+    """queue_screenplay_scene 建任务失败时回退 generating 状态。
+
+    回归：jobs.create 抛异常时剧本行永久停在 generating，前端一直显示「生成中」。
+    """
+    database, service, _jobs, _project, chapter = writing_service
+    service.update_screenplay(
+        chapter["id"],
+        {"content": _screenplay_content("人工剧本")},
+    )
+    service.jobs = FailingCreateJobService()  # type: ignore[assignment]
+    with pytest.raises(RuntimeError):
+        service.queue_screenplay_scene(chapter["id"], {"scene_no": 1})
+    current = service.get_screenplay(chapter["id"])
+    assert current["status"] == "ready"
+    assert current["revision"] == 1  # 失败不推进 revision
+
+
 def test_scene_asset_names_returns_only_scene_assets_of_project(
     writing_service: tuple[
         Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
@@ -436,7 +463,9 @@ def test_scene_asset_names_returns_only_scene_assets_of_project(
 ) -> None:
     """场景名清单按项目过滤且只含 scene 类型，别名缺失时返回空列表。"""
     database, service, _jobs, project, _chapter = writing_service
-    other_project = ProjectService(database, FileService(database.database_url)).create(
+    # FileService 需要目录而非 database_url：从 sqlite URL 还原工作区目录。
+    workspace_path = Path(database.database_url.removeprefix("sqlite:///")).parent
+    other_project = ProjectService(database, FileService(workspace_path)).create(
         {"name": "另一个项目"}
     )
     now = utc_now()
@@ -455,7 +484,7 @@ def test_scene_asset_names_returns_only_scene_assets_of_project(
         connection.execute(
             insert(asset).values(
                 id="asset-scene-other-project",
-                project_id="other-project",
+                project_id=other_project["id"],
                 asset_type="scene",
                 name="别的项目场景",
                 profile_json=json_dumps({}),

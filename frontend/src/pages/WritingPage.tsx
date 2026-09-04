@@ -90,6 +90,26 @@ function screenplayContent(
   };
 }
 
+// 对白行按首个冒号切分说话人：仅当冒号前文本短（≤12 字符）且不含句末标点
+// （。！？，;）时才视为 speaker，否则整句作台词、speaker 为空。
+const SPEAKER_TERMINAL_PUNCTUATION = /[。！？，;]/;
+
+function parseDialogueLine(line: string): { speaker: string; text: string } {
+  const colonIndex = line.search(/[：:]/);
+  if (colonIndex > 0) {
+    const candidate = line.slice(0, colonIndex).trim();
+    const text = line.slice(colonIndex + 1).trim();
+    if (
+      candidate &&
+      candidate.length <= 12 &&
+      !SPEAKER_TERMINAL_PUNCTUATION.test(candidate)
+    ) {
+      return { speaker: candidate, text };
+    }
+  }
+  return { speaker: "", text: line.trim() };
+}
+
 export function WritingPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -125,6 +145,17 @@ export function WritingPage() {
   const saveInFlight = useRef(false);
   const activeProjectIdRef = useRef(activeProjectId);
   activeProjectIdRef.current = activeProjectId;
+  // 记录上一个章节：切换章节时把未保存草稿保存到原章节，避免串写
+  const previousChapterIdRef = useRef(activeChapterId);
+  // 正文输入实时镜像：切换章节时用于把旧章节未保存正文存回原章节。
+  const chapterSourceRef = useRef(chapterSource);
+  chapterSourceRef.current = chapterSource;
+  // 画风输入 dirty 实时镜像：保存请求在途时判断是否有新输入，避免被响应回填覆盖。
+  const stylePromptDirtyRef = useRef(stylePromptDirty);
+  stylePromptDirtyRef.current = stylePromptDirty;
+  // 各章节已加载内容的状态（按 chapterId 记忆）：切章自动保存草稿时保持
+  // confirmed 不被静默降级为 ready。
+  const statusByChapterRef = useRef<Record<string, Record<WritingTab, string>>>({});
 
   const analysisQuery = useQuery({
     queryKey: queryKeys.analysis(activeChapterId),
@@ -156,9 +187,11 @@ export function WritingPage() {
   }, [activeProject?.style_prompt, stylePromptDirty]);
 
   useEffect(() => {
+    // 只随章节切换重置正文；保存后服务端 source_text 变化不应覆盖本地内容。
     setChapterSource(activeChapter?.source_text || "");
     setChapterSourceDirty(false);
-  }, [activeChapter?.id, activeChapter?.source_text]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeChapter?.id]);
 
   useEffect(() => {
     if (
@@ -182,6 +215,13 @@ export function WritingPage() {
     }
     setAnalysis(recordContent(analysisQuery.data, {}));
     hydratedVersion.current.analysis = version;
+    if (analysisQuery.data?.chapter_id) {
+      const byChapter = statusByChapterRef.current;
+      byChapter[analysisQuery.data.chapter_id] = {
+        ...byChapter[analysisQuery.data.chapter_id],
+        analysis: analysisQuery.data.status || "",
+      };
+    }
     setServerUpdateAvailable((current) =>
       current.analysis ? { ...current, analysis: false } : current,
     );
@@ -209,6 +249,13 @@ export function WritingPage() {
     }
     setScreenplay(screenplayContent(screenplayQuery.data));
     hydratedVersion.current.screenplay = version;
+    if (screenplayQuery.data?.chapter_id) {
+      const byChapter = statusByChapterRef.current;
+      byChapter[screenplayQuery.data.chapter_id] = {
+        ...byChapter[screenplayQuery.data.chapter_id],
+        screenplay: screenplayQuery.data.status || "",
+      };
+    }
     setServerUpdateAvailable((current) =>
       current.screenplay ? { ...current, screenplay: false } : current,
     );
@@ -245,8 +292,11 @@ export function WritingPage() {
     }) => api.projects.update(projectId, { style_prompt: value }),
     onSuccess: async (project, { projectId }) => {
       if (activeProjectIdRef.current === projectId) {
-        setStylePrompt(project.style_prompt);
-        setStylePromptDirty(false);
+        // 仅在保存期间没有继续输入时才回填，避免覆盖在途编辑。
+        if (!stylePromptDirtyRef.current) {
+          setStylePrompt(project.style_prompt);
+          setStylePromptDirty(false);
+        }
       }
       await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
     },
@@ -311,6 +361,11 @@ export function WritingPage() {
       const isCurrentChapter = activeChapterId === chapterId;
       const hasNewerEdits =
         editRevision.current[contentType] !== submittedRevision;
+      const byChapter = statusByChapterRef.current;
+      byChapter[chapterId] = {
+        ...byChapter[chapterId],
+        [contentType]: status,
+      };
 
       if (isCurrentChapter) {
         hydratedVersion.current[contentType] = recordVersion(record);
@@ -344,6 +399,53 @@ export function WritingPage() {
       saveInFlight.current = false;
     },
   });
+
+  // 切换章节时：若存在未保存草稿，先保存到原章节，再重置本地草稿状态，
+  // 避免把上一章内容串写到新章节。
+  useEffect(() => {
+    const previous = previousChapterIdRef.current;
+    previousChapterIdRef.current = activeChapterId;
+    if (!previous || previous === activeChapterId) return;
+    // 未保存的「小说原文」存回原章节，避免切章静默丢稿。
+    if (chapterSourceDirty && chapterSourceRef.current) {
+      void api.chapters
+        .update(previous, { source_text: chapterSourceRef.current })
+        .then(() =>
+          queryClient.invalidateQueries({ queryKey: ["chapters", activeProjectId] }),
+        )
+        .catch((error) =>
+          toast.error(`章节正文保存失败：${formatError(error)}`),
+        );
+    }
+    const pendingTab: WritingTab | null = dirty.analysis
+      ? "analysis"
+      : dirty.screenplay
+        ? "screenplay"
+        : null;
+    if (pendingTab) {
+      // 保持原章节原状态：confirmed 的剧本不被静默降级为 ready。
+      const previousStatus =
+        statusByChapterRef.current[previous]?.[pendingTab] || "";
+      saveMutation.mutate({
+        chapterId: previous,
+        status: previousStatus === "confirmed" ? "confirmed" : "ready",
+        contentType: pendingTab,
+        content: pendingTab === "analysis" ? analysis : screenplay,
+        editRevision: editRevision.current[pendingTab],
+      });
+    }
+    // 无论是否保存，都把本地草稿清空，防止旧章节内容残留显示在新章节上。
+    setAnalysis({});
+    setAnalysisValid(true);
+    setScreenplay(emptyScreenplay);
+    setDirty({ analysis: false, screenplay: false });
+    setServerUpdateAvailable({ analysis: false, screenplay: false });
+    setChapterSourceDirty(false);
+    hydratedVersion.current = { analysis: "", screenplay: "" };
+    editRevision.current = { analysis: 0, screenplay: 0 };
+    // 该 effect 只在章节切换时运行，刻意不依赖 dirty/analysis/screenplay。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeChapterId]);
 
   const sceneMutation = useMutation({
     mutationFn: ({
@@ -655,7 +757,7 @@ export function WritingPage() {
                               stylePromptMutation.isPending ||
                               (generateMutation.isPending &&
                                 generateMutation.variables?.chapterId ===
-                                  activeProjectId &&
+                                  activeChapterId &&
                                 generateMutation.variables.contentType === tab)
                             }
                             onClick={() => void generateCurrent()}
@@ -760,7 +862,7 @@ export function WritingPage() {
                                 stylePromptMutation.isPending ||
                                 (generateMutation.isPending &&
                                   generateMutation.variables?.chapterId ===
-                                    activeProjectId &&
+                                    activeChapterId &&
                                   generateMutation.variables.contentType === tab)
                               }
                               onClick={() => void generateCurrent()}
@@ -907,15 +1009,7 @@ export function WritingPage() {
                                       dialogue: event.target.value
                                         .split("\n")
                                         .filter(Boolean)
-                                        .map((line) => {
-                                          const [speaker, ...rest] = line.split(/[：:]/);
-                                          return {
-                                            speaker: rest.length ? speaker.trim() : "",
-                                            text: rest.length
-                                              ? rest.join("：").trim()
-                                              : speaker.trim(),
-                                          };
-                                        }),
+                                        .map((line) => parseDialogueLine(line)),
                                     })
                                   }
                                 />
@@ -961,7 +1055,7 @@ export function WritingPage() {
                                   busy={
                                     sceneMutation.isPending &&
                                     sceneMutation.variables?.chapterId ===
-                                      activeProjectId &&
+                                      activeChapterId &&
                                     sceneMutation.variables.sceneNo ===
                                       scene.scene_no
                                   }

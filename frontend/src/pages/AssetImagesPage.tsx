@@ -49,9 +49,9 @@ function hasVisualValue(value: unknown): boolean {
 function canGenerateAssetImage(asset: Asset): boolean {
   if (hasVisualValue(asset.prompt)) return true;
   const profile = asset.profile ?? parseJson<Record<string, unknown>>(asset.profile_json, {});
-  return visualProfileFields[asset.asset_type].some((field) =>
-    hasVisualValue(profile[field]),
-  );
+  // 未知素材类型时回退为空数组，避免整张卡片渲染崩溃。
+  const fields = visualProfileFields[asset.asset_type] ?? [];
+  return fields.some((field) => hasVisualValue(profile[field]));
 }
 
 export function AssetImagePanel({ asset }: { asset: Asset }) {
@@ -65,6 +65,15 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
   });
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey: queryKeys.assetImages(asset.id) });
+  // 上传/设当前/删除都会更新素材的当前图片；素材卡片主图来自 assets 查询，
+  // 需要同时失效两者，否则素材列表中的主图不会刷新。
+  const invalidateWithAssets = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.assetImages(asset.id) }),
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.assets(asset.project_id),
+      }),
+    ]);
   const currentVersion = query.data?.find((item) => item.is_current);
   const currentPrompt = asset.prompt_override || currentVersion?.prompt_snapshot || "";
 
@@ -102,7 +111,7 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
   const uploadMutation = useMutation({
     mutationFn: (file: File) => api.assets.images.upload(asset.id, file),
     onSuccess: async () => {
-      await invalidate();
+      await invalidateWithAssets();
       toast.success("图片已上传并设为当前版本");
     },
     onError: (error) => toast.error(formatError(error)),
@@ -111,7 +120,7 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
     mutationFn: (version: MediaVersion) =>
       api.assets.images.current(version.id),
     onSuccess: async () => {
-      await invalidate();
+      await invalidateWithAssets();
       toast.success("已切换当前版本");
     },
     onError: (error) => toast.error(formatError(error)),
@@ -119,7 +128,7 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
   const deleteMutation = useMutation({
     mutationFn: (version: MediaVersion) => api.assets.images.remove(version.id),
     onSuccess: async () => {
-      await invalidate();
+      await invalidateWithAssets();
       toast.success("版本已删除");
     },
     onError: (error) => toast.error(formatError(error)),

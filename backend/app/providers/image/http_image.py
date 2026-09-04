@@ -21,6 +21,53 @@ from ..base import (
     reference_jpeg_part,
 )
 
+# B-M8：图片协议控制字段清单（参照视频适配器的 _VIDEO_PROTOCOL_CONTROL_FIELDS）。
+# 这些键只驱动 Provider 行为（提交路径、轮询、参考图编码方式、TLS/重试开关等），
+# 绝不能混进发往上游的 JSON/multipart 载荷；per-request params 透传前统一过滤。
+_IMAGE_PROTOCOL_CONTROL_FIELDS = [
+    "protocol",
+    "submit_path",
+    "submit_method",
+    "edit_path",
+    "poll_path",
+    "poll_method",
+    "poll_payload",
+    "poll_task_id_field",
+    "task_id_path",
+    "submit_status_path",
+    "status_path",
+    "result_url_path",
+    "result_base64_path",
+    "error_path",
+    "message_path",
+    "prompt_field",
+    "negative_prompt_field",
+    "model_field",
+    "size_field",
+    "references_field",
+    "reference_mode",
+    "reference_file_field",
+    "reference_anchor_style",
+    "reference_data_url",
+    "multipart_data_fields",
+    "send_negative_prompt",
+    "send_empty_negative_prompt",
+    "max_reference_files",
+    "supports_negative_prompt",
+    "supported_sizes",
+    "mode",
+    "completed_values",
+    "failed_values",
+    "default_params",
+    "payload",
+    "headers",
+    "verify_ssl",
+    "retry_unsafe_methods",
+    "test_path",
+    "test_method",
+    "ignored_payload_fields",
+]
+
 
 class HttpImageProvider(HttpProviderBase):
     def __init__(self, config: ProviderConfig) -> None:
@@ -135,9 +182,13 @@ class HttpImageProvider(HttpProviderBase):
         )
         payload = dict(options.get("payload", {}))
         payload.update(options.get("default_params", {}))
+        # B-M8：过滤 per-request params 中的协议控制字段（headers/verify_ssl/
+        # retry_unsafe_methods/submit_path 等），只让业务载荷进入请求体；
+        # 控制键清单可通过 params.ignored_payload_fields 覆盖（与视频适配器
+        # 的机制一致）。
         filtered_params = dict(params)
-        for field in ("test_path", "test_method"):
-            filtered_params.pop(field, None)
+        for field in options.get("ignored_payload_fields", _IMAGE_PROTOCOL_CONTROL_FIELDS):
+            filtered_params.pop(str(field), None)
         payload.update(filtered_params)
         effective_prompt = prompt
         if multipart_references and options.get("reference_anchor_style") == "chinese":
@@ -279,9 +330,18 @@ class HttpImageProvider(HttpProviderBase):
             return json.dumps(value, ensure_ascii=False)
         return str(value)
 
+    @staticmethod
+    def _safe_task_segment(task_id: str) -> str:
+        """任务 ID 拼进同源相对 URL 前做字符白名单过滤（服务端字符串不可信）。"""
+        segment = re.sub(r"[^A-Za-z0-9_-]", "", str(task_id or ""))
+        if not segment:
+            raise ProviderError("Provider 返回的任务 ID 不包含合法的 URL 字符")
+        return segment
+
     async def poll(self, task_id: str) -> ProviderPollResult:
         options = self._options()
-        path = str(options.get("poll_path", "tasks/{task_id}")).format(task_id=task_id)
+        safe_task_id = self._safe_task_segment(task_id)
+        path = str(options.get("poll_path", "tasks/{task_id}")).format(task_id=safe_task_id)
         method = str(options.get("poll_method", "GET"))
         kwargs: dict[str, Any] = {"headers": self._headers(options)}
         if method.upper() != "GET":

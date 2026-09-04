@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import subprocess
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -62,10 +64,37 @@ async def run_ffmpeg_async(
         subprocess.CalledProcessError: 命令执行失败
         subprocess.TimeoutExpired: 命令超时
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         _ffmpeg_executor,
         lambda: _run_ffmpeg_sync(cmd, timeout, check),
+    )
+
+
+async def run_in_ffmpeg_executor(
+    func: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """
+    把同步的 FFmpeg/ffprobe 相关调用放入 FFmpeg 线程池执行。
+
+    供 async 路由 / Job handler 复用，避免同步 subprocess 在事件循环中
+    直接执行导致阻塞。monkeypatch 替换后的同步替身同样适用。
+
+    Args:
+        func: 同步函数（含实例方法）
+        *args: 位置参数
+        **kwargs: 关键字参数
+
+    Returns:
+        func 的返回值
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _ffmpeg_executor,
+        functools.partial(func, *args, **kwargs),
     )
 
 
@@ -109,7 +138,10 @@ def build_ffmpeg_command(
         # 例如 vcodec -> -vcodec
         flag = f"-{key.replace('_', '-')}"
         cmd.append(flag)
-        if value is not None:
+        if value is True:
+            # 布尔开关：仅追加 flag（如 -y、-overwrite），不追加 "True"
+            continue
+        if value is not None and value is not False:
             cmd.append(str(value))
 
     if output_file:
@@ -158,7 +190,7 @@ async def get_video_duration(file_path: str | Path) -> float:
         str(file_path),
     ]
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         stdout = await loop.run_in_executor(
             _ffmpeg_executor,
@@ -175,6 +207,40 @@ async def get_video_duration(file_path: str | Path) -> float:
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise ValueError("无法解析视频时长：ffprobe 输出无效") from exc
     return duration
+
+
+async def has_audio_stream(file_path: str | Path) -> bool:
+    """探测文件是否包含音频流（BGM 上传时防止视频/图片文件冒充音频）。"""
+    settings = get_settings()
+    cmd = [
+        str(settings.ffprobe_path),
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "json",
+        str(file_path),
+    ]
+    loop = asyncio.get_running_loop()
+    try:
+        stdout = await loop.run_in_executor(
+            _ffmpeg_executor,
+            lambda: _run_ffprobe_sync(cmd, FFMPEG_SHORT_TIMEOUT),
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr or ""
+        raise ValueError(f"ffprobe 执行失败：{stderr[:200]}") from exc
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise ValueError(f"音频流探测失败：{exc}") from exc
+    try:
+        streams = json.loads(stdout).get("streams") or []
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("音频流探测失败：ffprobe 输出无效") from exc
+    return any(
+        isinstance(stream, dict) and str(stream.get("codec_type", "")) == "audio"
+        for stream in streams
+    )
 
 
 def shutdown_ffmpeg_executor() -> None:

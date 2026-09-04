@@ -7,6 +7,7 @@ from app.api.schemas import (
     RefinePromptsRequest,
     ShotCopyRequest,
     ShotCreate,
+    ShotDirectorPlanBatchRequest,
     ShotExtractRequest,
     ShotMergeRequest,
     ShotPromptBatchRequest,
@@ -70,7 +71,7 @@ def reorder_shots(
     body: ShotReorderRequest,
     service: ShotService = Depends(get_shot_service),
 ) -> list[dict]:
-    return service.reorder(chapter_id, body.ids or [])
+    return service.reorder(chapter_id, body.ids)
 
 
 @router.post("/shots/{shot_id}/split")
@@ -125,6 +126,30 @@ def generate_shot_video_prompt(
     service: ShotService = Depends(get_shot_service),
 ) -> dict:
     return service.queue_prompt(shot_id, "video", body.model_dump())
+
+
+@router.post(
+    "/shots/{shot_id}/director-plan/generate",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def generate_shot_director_plan(
+    shot_id: str,
+    body: GenerateRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return service.queue_director_plan(shot_id, body.model_dump())
+
+
+@router.post(
+    "/chapters/{chapter_id}/shots/director-plans/batch",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def generate_shot_director_plans_batch(
+    chapter_id: str,
+    body: ShotDirectorPlanBatchRequest,
+    service: ShotService = Depends(get_shot_service),
+) -> dict:
+    return service.queue_director_plan_batch(chapter_id, body.model_dump())
 
 
 @router.post(

@@ -262,10 +262,11 @@ class DynamicAudioJobService:
             line_order = int(line_order_value)
         except (TypeError, ValueError) as exc:
             raise DynamicAudioJobError("动态音频 Job 缺少有效的 line_order") from exc
-        if line_order < 1 or str(line_order) != str(line_order_value).strip():
-            # 允许 JSON 中的 1.0，但拒绝负数、小数和非数字字符串。
-            if not isinstance(line_order_value, int) or line_order < 1:
-                raise DynamicAudioJobError("dialogue line_order 必须为正整数")
+        # 接受整数与整数值浮点（JSON 中的 1.0），拒绝负数/小数/非数字。
+        if line_order < 1 or (
+            isinstance(line_order_value, float) and line_order_value != float(line_order)
+        ):
+            raise DynamicAudioJobError("dialogue line_order 必须为正整数")
 
         text_value = _mapping_value(input_data, "text", "dialogue_text", "dialogue", "content")
         snapshot_value = _mapping_value(input_data, "source_text_snapshot")

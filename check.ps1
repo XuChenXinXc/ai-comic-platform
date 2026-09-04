@@ -40,6 +40,10 @@ try {
         -FilePath "npm.cmd" `
         -ArgumentList @("run", "build") `
         -FailureMessage "前端构建失败"
+    Invoke-NativeChecked `
+        -FilePath "npm.cmd" `
+        -ArgumentList @("run", "test:e2e") `
+        -FailureMessage "前端 e2e 测试失败"
 }
 finally {
     Pop-Location

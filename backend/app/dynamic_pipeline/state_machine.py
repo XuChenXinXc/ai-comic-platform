@@ -46,17 +46,30 @@ class StageBlocked(WorkflowStateError):
 
 
 _ALLOWED_TRANSITIONS: Mapping[str, frozenset[str]] = {
-    "pending": frozenset({"queued", "running", "blocked", "cancelled"}),
-    "queued": frozenset({"running", "blocked", "cancelled"}),
+    # pending→stale：上游阶段重跑（regenerate_stage）或保存草稿时，
+    # mark_descendants_stale 会直接写 stale；未开始阶段标 stale 语义安全
+    # （stale→queued 合法），契约与写入保持一致。
+    "pending": frozenset({"queued", "running", "blocked", "stale", "cancelled"}),
+    # queued→ready：save_stage_draft 对排队中的阶段先中断在途 Job 再按门禁
+    # 落 ready/blocked（用户手工内容接管阶段），与 running→ready 语义一致。
+    "queued": frozenset({"running", "ready", "blocked", "stale", "cancelled"}),
     "running": frozenset(
-        {"ready", "blocked", "partial_failed", "failed", "interrupted", "cancelled"}
+        {
+            "ready",
+            "blocked",
+            "partial_failed",
+            "failed",
+            "interrupted",
+            "stale",
+            "cancelled",
+        }
     ),
     "ready": frozenset({"confirmed", "stale", "failed"}),
     "confirmed": frozenset({"stale"}),
-    "blocked": frozenset({"queued", "cancelled"}),
-    "failed": frozenset({"queued", "cancelled"}),
-    "interrupted": frozenset({"queued", "cancelled"}),
-    "partial_failed": frozenset({"queued", "cancelled"}),
+    "blocked": frozenset({"queued", "stale", "cancelled"}),
+    "failed": frozenset({"queued", "stale", "cancelled"}),
+    "interrupted": frozenset({"queued", "stale", "cancelled"}),
+    "partial_failed": frozenset({"queued", "stale", "cancelled"}),
     "stale": frozenset({"queued", "cancelled"}),
     "cancelled": frozenset(),
 }

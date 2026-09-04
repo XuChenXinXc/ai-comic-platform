@@ -3,12 +3,20 @@
 支持通用的 HTTP TTS API 接口。
 """
 
+import asyncio
 from typing import Any
 
 import requests
 
-from app.providers.base import ProviderError, validate_custom_headers
+from app.providers.base import (
+    ProviderError,
+    resolve_provider_url,
+    validate_custom_headers,
+    validate_provider_base_url,
+)
+from app.providers.tts.openai_tts import _error_message
 from app.schemas import ProviderConfig
+from app.services.constants import MAX_AUDIO_SIZE
 from app.services.utils import sanitize_error_message
 
 
@@ -20,6 +28,8 @@ class HttpTTSProvider:
         self.api_key = api_key
         if not config.base_url:
             raise ProviderError("HTTP TTS Provider 必须配置 base_url")
+        # B-H/TTS：构造时校验 base_url（拒绝 userinfo / 敏感查询参数）。
+        validate_provider_base_url(config.base_url)
         self.base_url = config.base_url.rstrip("/")
         self.timeout = config.timeout_sec or 120
         self.custom_headers = validate_custom_headers(config.params)
@@ -49,9 +59,11 @@ class HttpTTSProvider:
         返回: 音频字节流（MP3/WAV 等）
         """
         try:
-            # 构建请求 URL
-            endpoint = params.pop("endpoint", "/tts")
-            url = f"{self.base_url}{endpoint}"
+            # 构建请求 URL：endpoint 通过 resolve_provider_url 拼接，
+            # 校验与 base_url 同源，防止相对路径注入穿越。
+            # 使用 params.get 而不是 pop：params 是调用方字典，不能就地修改。
+            endpoint = str(params.get("endpoint", "/tts") or "/tts")
+            url = resolve_provider_url(self.base_url, endpoint)
 
             # 构建请求头
             headers = {
@@ -60,15 +72,17 @@ class HttpTTSProvider:
                 **self.custom_headers,
             }
 
-            # 构建请求体
+            # 构建请求体：endpoint 是路由控制键，不进入请求体（与原 pop 语义一致）。
             body = {
                 "text": text,
                 "voice": voice_id,
-                **params,
+                **{key: value for key, value in params.items() if key != "endpoint"},
             }
 
-            # 发送请求
-            response = requests.post(
+            # 发送请求：synthesize 是 async 函数，同步 requests.post 会阻塞
+            # 事件循环；移入线程执行，保持函数签名与返回契约不变。
+            response = await asyncio.to_thread(
+                requests.post,
                 url,
                 json=body,
                 headers=headers,
@@ -84,20 +98,32 @@ class HttpTTSProvider:
             ):
                 try:
                     error_data = response.json()
-                    error_msg = error_data.get("error", error_data.get("message", str(error_data)))
-                    raise ProviderError(f"TTS API 返回错误：{error_msg}")
                 except (ValueError, KeyError):
-                    raise ProviderError(f"TTS 返回非音频数据：{content_type}") from None
+                    error_data = None
+                raise ProviderError(
+                    f"TTS 生成失败：{_error_message(error_data, f'非音频数据（{content_type}）')}"
+                )
 
-            return response.content
+            content = response.content
+            if len(content) > MAX_AUDIO_SIZE:
+                raise ProviderError(
+                    f"TTS 返回音频超过大小上限（{len(content)} > {MAX_AUDIO_SIZE} 字节）"
+                )
+            return content
 
         except requests.HTTPError as exc:
             try:
-                error_data = exc.response.json()
-                error_msg = error_data.get("error", {}).get("message", str(error_data))
+                error_payload = exc.response.json() if exc.response is not None else None
             except (ValueError, KeyError):
-                error_msg = exc.response.text[:200]
-            raise ProviderError(f"HTTP TTS API 请求失败：{error_msg}") from exc
+                error_payload = None
+            fallback = (
+                exc.response.text[:200]
+                if exc.response is not None and exc.response.text
+                else str(exc)
+            )
+            raise ProviderError(
+                f"HTTP TTS API 请求失败：{_error_message(error_payload, fallback)}"
+            ) from exc
         except requests.RequestException as exc:
             raise ProviderError(f"HTTP TTS 网络请求失败：{sanitize_error_message(exc)}") from exc
 

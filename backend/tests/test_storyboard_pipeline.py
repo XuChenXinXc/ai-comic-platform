@@ -1259,6 +1259,35 @@ def test_extract_shots_saves_when_only_prop_name_unmatched(
     )
 
 
+def test_extract_shots_saves_with_warning_when_character_name_unmatched(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+) -> None:
+    """角色纯名字未匹配时正常保存并携带降级警告（与物品处理对齐，不再静默丢弃）。"""
+    database, service, _jobs, chapter = storyboard_services
+    scene = AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "scene", "name": "青云山巅"},
+    )
+    extracted = _extracted_shot(scene["id"])
+    extracted["character_names"] = ["律师", "前台"]
+
+    result = service._save_extracted(
+        chapter,
+        "screenplay",
+        {"scope": "all", "scene_no": None},
+        [extracted],
+    )
+
+    saved = service.list(chapter["id"])
+    assert result["count"] == 1
+    assert saved[0]["character_ids"] == []
+    assert any(
+        "分镜角色名未匹配到素材库" in warning["message"]
+        and "律师" in warning["message"]
+        for warning in result["warnings"]
+    )
+
+
 def test_extract_shots_rejects_unresolvable_prop_id_but_allows_missing_name(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
@@ -1287,9 +1316,11 @@ def test_extract_shots_rejects_unresolvable_prop_id_but_allows_missing_name(
     assert service.list(chapter["id"]) == []
 
 
-def test_extract_shot_with_mismatched_scene_id_and_name_raises_and_saves_nothing(
+def test_extract_shot_binds_by_scene_id_even_when_name_differs(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
+    """绑定以 scene_asset_id 为准：模型给出的 ID 合法时直接采用，
+    名称只是展示字段，名称与素材不一致不再报错（新绑定协议）。"""
     database, service, _jobs, chapter = storyboard_services
     AssetService(database).create(
         chapter["project_id"],
@@ -1301,22 +1332,23 @@ def test_extract_shot_with_mismatched_scene_id_and_name_raises_and_saves_nothing
     )
     extracted = _extracted_shot(wrong_scene["id"])
 
-    with pytest.raises(ServiceError) as exc_info:
-        service._save_extracted(
-            chapter,
-            "screenplay",
-            {"scope": "all", "scene_no": None},
-            [extracted],
-        )
+    result = service._save_extracted(
+        chapter,
+        "screenplay",
+        {"scope": "all", "scene_no": None},
+        [extracted],
+    )
 
-    assert exc_info.value.status_code == 400
-    assert "青云山巅" in exc_info.value.detail
-    assert service.list(chapter["id"]) == []
+    assert result["count"] == 1
+    saved = service.list(chapter["id"])
+    assert saved[0]["scene_asset_id"] == wrong_scene["id"]
 
 
-def test_extract_shot_with_mismatched_character_id_and_name_raises_and_saves_nothing(
+def test_extract_shot_binds_by_character_id_even_when_name_differs(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
+    """角色绑定以 character_asset_ids 为准，名称与 ID 不一致不再报错：
+    名称只作展示与兜底，ID 必须指向目录中真实素材。"""
     database, service, _jobs, chapter = storyboard_services
     scene = AssetService(database).create(
         chapter["project_id"],
@@ -1334,17 +1366,16 @@ def test_extract_shot_with_mismatched_character_id_and_name_raises_and_saves_not
     extracted["character_names"] = ["少年"]
     extracted["character_asset_ids"] = [wrong_character["id"]]
 
-    with pytest.raises(ServiceError) as exc_info:
-        service._save_extracted(
-            chapter,
-            "screenplay",
-            {"scope": "all", "scene_no": None},
-            [extracted],
-        )
+    result = service._save_extracted(
+        chapter,
+        "screenplay",
+        {"scope": "all", "scene_no": None},
+        [extracted],
+    )
 
-    assert exc_info.value.status_code == 400
-    assert "少年" in exc_info.value.detail
-    assert service.list(chapter["id"]) == []
+    assert result["count"] == 1
+    saved = service.list(chapter["id"])
+    assert saved[0]["character_ids"] == [wrong_character["id"]]
 
 
 def test_resolve_asset_ids_with_duplicate_ids_returns_unique_ids(
@@ -1441,17 +1472,13 @@ def test_extract_shots_auto_extends_dialogue_duration_on_save(
     assert "".join(item["text"] for shot in saved for item in shot["dialogue"]) == source_text
 
 
-def test_extract_shots_rejects_unmatched_scene_names_before_calling_model(
+def test_extract_shots_unmatched_scene_names_report_missing_instead_of_blocking(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """剧本场次名（桥段标题）无法匹配素材库时，调用模型前就拦截并给出素材清单。
-
-    回归 2026-08 缺陷：素材提取与剧本生成不同步时，剧本 scene_name 带桥段标题
-    （「坐错桌」），分镜提示词要求逐字沿用该名称，后端按名称绑定场景素材必然
-    整批失败（「分镜 1 未匹配到场景素材：坐错桌」）。此前模型白跑一整轮后才在
-    保存阶段报错；现在提取前直接拦截，报错信息直接指向剧本场次名与素材差异。
-    """
+    """剧本场次名无法匹配素材库时不再前置拦截整批提取：改为在 user_prompt 提示模型
+    报告 missing_assets（后续由补素材流程兜底），模型若既不给 ID 也不报告缺失，
+    保存阶段按绑定失败明确报错，绝不硬选近似素材兜底。"""
     database, service, _jobs, chapter = storyboard_services
     AssetService(database).create(
         chapter["project_id"],
@@ -1460,11 +1487,11 @@ def test_extract_shots_rejects_unmatched_scene_names_before_calling_model(
     content = _screenplay_content()
     content["scenes"][0]["scene_name"] = "坐错桌"
     WritingService(database).update_screenplay(chapter["id"], {"content": content})
-    called: list[str] = []
+    captured: dict[str, Any] = {}
 
     class UnexpectedProvider:
-        async def generate_json(self, **_values: Any) -> ExtractionOutput:
-            called.append("called")
+        async def generate_json(self, **values: Any) -> ExtractionOutput:
+            captured.update(values)
             return ExtractionOutput([_extracted_shot("")])
 
     monkeypatch.setattr(
@@ -1489,14 +1516,13 @@ def test_extract_shots_rejects_unmatched_scene_names_before_calling_model(
         ),
     }
 
+    # 模型被调用（不再前置拦截），且 user_prompt 收到不匹配提示
     with pytest.raises(ServiceError) as exc_info:
         asyncio.run(service.handle_extract(job))
 
-    assert "坐错桌" in exc_info.value.detail
-    assert "咖啡馆" in exc_info.value.detail
-    assert "场次 1" in exc_info.value.detail
-    # 前置拦截后模型不应被调用，避免白跑一轮提取
-    assert called == []
+    assert "坐错桌" in captured["user_prompt"]
+    # 模型未报告缺失素材时，保存阶段按绑定失败报错，不允许静默兜底
+    assert "未匹配到场景素材" in exc_info.value.detail
     assert service.list(chapter["id"]) == []
 
 
@@ -1553,3 +1579,181 @@ def test_extract_shots_single_scene_scope_only_checks_target_scene(
     saved = service.list(chapter["id"])
     assert len(saved) == 1
     assert saved[0]["scene_no"] == 2
+
+
+def test_extract_shots_missing_scene_triggers_refill_then_saves(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺失素材 → 自动补建 → 重新提取 → 保存：剧情完整性优先，不硬绑近似素材。
+
+    第一轮模型报告 missing_assets（场景「坐错桌」不在素材库），后端应调用
+    complete_missing 自动补建素材；第二轮模型拿到新素材目录（含补建的场景 ID）
+    正常绑定并保存分镜。
+    """
+    database, service, _jobs, chapter = storyboard_services
+    AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "scene", "name": "咖啡馆"},
+    )
+    content = _screenplay_content()
+    content["scenes"][0]["scene_name"] = "坐错桌"
+    WritingService(database).update_screenplay(chapter["id"], {"content": content})
+    calls: list[dict[str, Any]] = []
+    refilled: dict[str, Any] = {}
+
+    class RefillProvider:
+        """第一轮报告缺失；第二轮检查补建后正常绑定。"""
+
+        def __init__(self) -> None:
+            self.round = 0
+
+        async def generate_json(self, **values: Any) -> ExtractionOutput:
+            calls.append(values)
+            self.round += 1
+            if self.round == 1:
+                shot = _extracted_shot("")
+                shot["missing_assets"] = [
+                    {
+                        "asset_type": "scene",
+                        "reason": "剧本场次「坐错桌」无对应场景素材",
+                        "source_ref": "第一场",
+                        "suggested_name": "坐错桌",
+                    }
+                ]
+                return ExtractionOutput([shot])
+            shot = _extracted_shot(refilled["asset_ids"][0])
+            return ExtractionOutput([shot])
+
+    provider = RefillProvider()
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_kwargs: (provider, {"id": "mock-text", "params": {}}),
+    )
+
+    async def fake_complete_missing(self, _chapter_id, missing_assets, *, provider_id=None):  # type: ignore[no-untyped-def]
+        # 真实补建场景素材（名称取自缺失清单），供第二轮目录绑定
+        created = AssetService(database).create(
+            chapter["project_id"],
+            {
+                "asset_type": missing_assets[0]["asset_type"],
+                "name": missing_assets[0]["suggested_name"],
+            },
+        )
+        refilled.update({"asset_ids": [created["id"]], "count": 1, "warnings": []})
+        return refilled
+
+    monkeypatch.setattr(AssetService, "complete_missing", fake_complete_missing)
+    job = {
+        "project_id": chapter["project_id"],
+        "chapter_id": chapter["id"],
+        "provider_id": "mock-text",
+        "input_json": json_dumps(
+            {
+                "source_type": "screenplay",
+                "scope": "all",
+                "scene_no": None,
+                "params": {},
+            }
+        ),
+    }
+
+    result = asyncio.run(service.handle_extract(job))
+
+    # 第二轮 user_prompt 的素材目录必须包含补建场景「坐错桌」（ID 优先绑定）
+    assert len(calls) == 2
+    assert "坐错桌" in calls[1]["user_prompt"]
+    saved = service.list(chapter["id"])
+    assert len(saved) == 1
+    assert saved[0]["scene_asset_id"] == refilled["asset_ids"][0]
+    assert result["count"] == 1
+    assert any("检测到素材缺失" in warning["message"] for warning in result["warnings"])
+
+
+def test_extract_shots_last_round_refill_verified_before_failing(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最后一轮补建成功后必须重新提取验证，而不是按补建前的清单直接报失败。
+
+    复现真实故障：素材补建其实已经入库，但任务在同一秒仍以
+    「分镜素材缺失」失败结束。修复后补建成功的那一轮会再提取一次，
+    若重新提取不再报告缺失，任务应正常保存。
+    """
+    database, service, _jobs, chapter = storyboard_services
+    AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "scene", "name": "咖啡馆"},
+    )
+    content = _screenplay_content()
+    content["scenes"][0]["scene_name"] = "坐错桌"
+    WritingService(database).update_screenplay(chapter["id"], {"content": content})
+    calls: list[dict[str, Any]] = []
+    refilled: dict[str, Any] = {"asset_ids": []}
+
+    class RefillProvider:
+        """前两轮报告缺失；第二轮补建后第三轮正常绑定。"""
+
+        def __init__(self) -> None:
+            self.round = 0
+
+        async def generate_json(self, **values: Any) -> ExtractionOutput:
+            calls.append(values)
+            self.round += 1
+            if self.round <= 2:
+                shot = _extracted_shot("")
+                shot["missing_assets"] = [
+                    {
+                        "asset_type": "scene",
+                        "reason": "剧本场次「坐错桌」无对应场景素材",
+                        "source_ref": "第一场",
+                        "suggested_name": f"坐错桌第{self.round}别名",
+                    }
+                ]
+                return ExtractionOutput([shot])
+            # 第三轮：补建已入库，按 ID 正常绑定
+            shot = _extracted_shot(refilled["asset_ids"][-1])
+            return ExtractionOutput([shot])
+
+    provider = RefillProvider()
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_kwargs: (provider, {"id": "mock-text", "params": {}}),
+    )
+
+    async def fake_complete_missing(self, _chapter_id, missing_assets, *, provider_id=None):  # type: ignore[no-untyped-def]
+        created = AssetService(database).create(
+            chapter["project_id"],
+            {
+                "asset_type": missing_assets[0]["asset_type"],
+                "name": missing_assets[0]["suggested_name"],
+            },
+        )
+        refilled["asset_ids"].append(created["id"])
+        return {"asset_ids": [created["id"]], "count": 1, "warnings": []}
+
+    monkeypatch.setattr(AssetService, "complete_missing", fake_complete_missing)
+    job = {
+        "project_id": chapter["project_id"],
+        "chapter_id": chapter["id"],
+        "provider_id": "mock-text",
+        "input_json": json_dumps(
+            {
+                "source_type": "screenplay",
+                "scope": "all",
+                "scene_no": None,
+                "params": {},
+            }
+        ),
+    }
+
+    result = asyncio.run(service.handle_extract(job))
+
+    # 两次补建 + 每次补建后的验证提取 = 3 次分镜模型调用
+    assert len(calls) == 3
+    saved = service.list(chapter["id"])
+    assert len(saved) == 1
+    assert saved[0]["scene_asset_id"] == refilled["asset_ids"][-1]
+    assert result["count"] == 1

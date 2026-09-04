@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db import Database, db
-from app.models.tables import chapter, job, keyframe_version, project, shot, video_version
+from app.models.tables import (
+    chapter,
+    chapter_composition,
+    job,
+    keyframe_version,
+    project,
+    shot,
+    shot_audio,
+    video_version,
+)
 from app.services.errors import bad_request, conflict, not_found
-from app.services.file_service import FileService, file_service
+from app.services.file_service import FileService, FileServiceError, derive_file_service
 from app.services.signature_service import source_signature
 from app.services.utils import new_id, row_dict, utc_now
+
+logger = logging.getLogger(__name__)
 
 _ACTIVE_JOB_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
 
@@ -27,8 +39,16 @@ class ChapterService:
         storage: FileService | None = None,
     ) -> None:
         self.database = database or db
-        self.storage = storage or file_service
-        self.storage.database = self.database
+        if storage is not None:
+            # 不改写已绑定数据库的实例（如全局 file_service 单例），
+            # 避免跨实例污染；未绑定 database 的注入实例仍绑定当前数据库，
+            # 保持既有调用方（自建 FileService(workspace)）的兼容行为。
+            if storage.database is None:
+                storage.database = self.database
+            self.storage = storage
+        else:
+            # 默认派生绑定当前 database 的独立实例，不改写全局单例
+            self.storage = derive_file_service(self.database)
 
     def _project(self, project_id: str) -> dict[str, Any]:
         with self.database.engine.connect() as connection:
@@ -77,9 +97,18 @@ class ChapterService:
         return (current or 0) + 1
 
     def create(self, project_id: str, values: dict[str, Any]) -> dict[str, Any]:
-        self._project(project_id)
+        project_record = self._project(project_id)
         now = utc_now()
         text = str(values.get("source_text") or "")
+        if not text.strip() and str(project_record.get("source_text") or "").strip():
+            # 首章继承项目创建时录入的小说正文：项目正文在分章模型下不再被
+            # 任何生成链路读取，不继承会导致用户录入的小说直接丢失。
+            with self.database.engine.connect() as connection:
+                existing = connection.execute(
+                    select(chapter.c.id).where(chapter.c.project_id == project_id).limit(1)
+                ).first()
+            if existing is None:
+                text = str(project_record["source_text"])
         record: dict[str, Any] = {
             "id": new_id("chapter"),
             "project_id": project_id,
@@ -195,7 +224,7 @@ class ChapterService:
         }
 
     def delete(self, chapter_id: str) -> None:
-        """级联删除章节及其分镜、关键帧、视频与媒体文件；素材库不受影响。"""
+        """级联删除章节及其分镜、关键帧、视频、配音、成片与媒体文件；素材库不受影响。"""
         current = self.get(chapter_id)
         with self.database.engine.begin() as connection:
             self._ensure_no_active_jobs(connection, chapter_id)
@@ -206,7 +235,7 @@ class ChapterService:
             )
             media_paths: list[str] = []
             if shot_ids:
-                for table in (keyframe_version, video_version):
+                for table in (keyframe_version, video_version, shot_audio):
                     media_paths.extend(
                         connection.execute(
                             select(table.c.file_path).where(
@@ -224,6 +253,15 @@ class ChapterService:
                                 )
                             ).scalars()
                         )
+            # 本章成片文件（CASCADE 删除行之前收集）
+            media_paths.extend(
+                connection.execute(
+                    select(chapter_composition.c.file_path).where(
+                        chapter_composition.c.chapter_id == chapter_id,
+                        chapter_composition.c.file_path.is_not(None),
+                    )
+                ).scalars()
+            )
             # 清理本章遗留的已完成任务（进行中任务已在 _ensure_no_active_jobs 拦截）
             keyframe_ids = (
                 set(
@@ -256,7 +294,7 @@ class ChapterService:
                     | ((job.c.target_type == "video") & job.c.target_id.in_(video_ids or {""}))
                 )
             )
-            # novel_analysis / screenplay / shot 由外键 CASCADE 清理
+            # novel_analysis / screenplay / shot / 配音 / 成片行 由外键 CASCADE 清理
             connection.execute(delete(chapter).where(chapter.c.id == chapter_id))
             remaining = list(
                 connection.execute(
@@ -266,8 +304,20 @@ class ChapterService:
                 ).scalars()
             )
             self._renumber(connection, remaining)
+        # 文件删除失败只记录日志继续清理，不让单个失败中断后续删除或导致 500
+        failed_paths: list[str] = []
         for path in media_paths:
-            self.storage.delete_file(current["project_id"], path)
+            try:
+                self.storage.delete_file(current["project_id"], path)
+            except (FileServiceError, OSError) as exc:
+                logger.warning("删除章节媒体文件失败：%s（%s）", path, exc)
+                failed_paths.append(path)
+        if failed_paths:
+            logger.warning(
+                "章节删除完成，但有 %d 个媒体文件删除失败：%s",
+                len(failed_paths),
+                failed_paths,
+            )
 
     @staticmethod
     def _renumber(connection: Any, ordered_ids: list[str]) -> None:

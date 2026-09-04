@@ -163,18 +163,6 @@ class _ReferenceContext:
     diagnostics: tuple[Diagnostic, ...]
 
 
-@dataclass(frozen=True)
-class _DynamicInput:
-    sort_key: tuple[str, ...]
-    source_key: Any
-    bundle: Any
-    shot_id: str
-    external_key: str
-    keyframe_job_id: str | None
-    previous_video_job_id: str | None
-    metadata: dict[str, Any]
-
-
 def _copy_json(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return copy.deepcopy(value.model_dump(mode="json"))
@@ -188,11 +176,14 @@ def _copy_json(value: Any) -> Any:
 
 
 def _json_text(value: Any) -> str:
+    # allow_nan=False：NaN/Infinity 序列化成非标准 JSON 令牌会导致下游解析失败，
+    # 与 media_queue_service._json_text 保持一致。
     return json.dumps(
         _copy_json(value),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     )
 
 
@@ -803,9 +794,55 @@ def build_video_media_plan(
     requested_duration = context.prompt_bundle.edit_duration_sec
     generation_duration = context.prompt_bundle.generation_duration_sec
     # 编译器已经完成 Provider duration adaptation；桥接层只校验并保存，不再改值。
-    if context.prompt_bundle.timeline:
-        timeline_end = context.prompt_bundle.timeline[-1].end
-        if abs(timeline_end - generation_duration) > 1e-9:
+    # 入队边界校验：时间轴必须首段 start≈0、相邻段首尾相接、末段 end==生成时长；
+    # 空 timeline 同样视为阻断，不再静默跳过（A-H3）。
+    timeline = context.prompt_bundle.timeline
+    if not timeline:
+        diagnostics.append(
+            diagnostic(
+                "blocking",
+                "timeline_discontinuous",
+                "视频时间轴为空，缺少可执行的动作分段",
+                path="video.timeline",
+                details={"reason": "empty_timeline"},
+            )
+        )
+    else:
+        tolerance = 0.01
+        first_start = timeline[0].start
+        if abs(first_start) > tolerance:
+            diagnostics.append(
+                diagnostic(
+                    "blocking",
+                    "timeline_discontinuous",
+                    "视频时间轴首段 start 必须从 0 开始",
+                    path="video.timeline",
+                    details={
+                        "reason": "first_segment_start_nonzero",
+                        "first_start_sec": first_start,
+                    },
+                )
+            )
+        for position, (previous, current) in enumerate(
+            zip(timeline, timeline[1:], strict=False), start=1
+        ):
+            if abs(current.start - previous.end) > tolerance:
+                diagnostics.append(
+                    diagnostic(
+                        "blocking",
+                        "timeline_discontinuous",
+                        "视频时间轴相邻段必须首尾相接，不允许间隙或重叠",
+                        path="video.timeline",
+                        details={
+                            "reason": "segment_gap_or_overlap",
+                            "segment_index": position,
+                            "previous_end_sec": previous.end,
+                            "current_start_sec": current.start,
+                        },
+                    )
+                )
+        timeline_end = timeline[-1].end
+        if abs(timeline_end - generation_duration) > tolerance:
             diagnostics.append(
                 diagnostic(
                     "blocking",
@@ -813,6 +850,7 @@ def build_video_media_plan(
                     "视频时间轴末端与编译后的 generation_duration_sec 不一致",
                     path="video.timeline",
                     details={
+                        "reason": "last_segment_end_mismatch",
                         "timeline_end_sec": timeline_end,
                         "generation_duration_sec": generation_duration,
                     },
@@ -877,223 +915,6 @@ def build_video_media_plan(
     )
 
 
-def _metadata_mapping(value: Any) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        return {}
-    metadata = value.get("metadata")
-    result = dict(metadata) if isinstance(metadata, Mapping) else {}
-    result.update(
-        {
-            key: item
-            for key, item in value.items()
-            if key
-            in {
-                "shot_id",
-                "external_key",
-                "keyframe_job_id",
-                "previous_video_job_id",
-                "workflow_run_id",
-                "workflow_stage_id",
-            }
-        }
-    )
-    return _copy_json(result)
-
-
-def _dynamic_input(key: Any, value: Any) -> _DynamicInput:
-    metadata: dict[str, Any] = {}
-    bundle = value
-    if isinstance(value, Mapping) and "bundle" in value:
-        bundle = value["bundle"]
-        metadata = _metadata_mapping(value)
-    elif isinstance(value, Mapping) and "compiled_bundle" in value:
-        bundle = value["compiled_bundle"]
-        metadata = _metadata_mapping(value)
-    elif isinstance(value, tuple | list) and len(value) == 2 and isinstance(value[1], Mapping):
-        bundle = value[0]
-        metadata = _copy_json(value[1])
-
-    if isinstance(value, Mapping):
-        metadata = {
-            **metadata,
-            **{
-                name: _copy_json(value[name])
-                for name in ("reference_plan", "reference_snapshot", "previous_end_frame_path")
-                if name in value and name not in metadata
-            },
-        }
-        if "image" in value or "video" in value:
-            bundle = {
-                key: copy.deepcopy(value[key])
-                for key in (
-                    "schema_version",
-                    "compiler_version",
-                    "input_hash",
-                    "status",
-                    "image",
-                    "video",
-                    "diagnostics",
-                    "provenance",
-                    "generated",
-                    "human_override",
-                    "final",
-                    "base_compiler_hash",
-                    "override_status",
-                )
-                if key in value
-            }
-
-    key_values: tuple[str, ...]
-    if isinstance(key, tuple | list):
-        key_values = tuple(_text(item) for item in key)
-    else:
-        key_values = (_text(key),)
-    key_values = tuple(item for item in key_values if item)
-    if not key_values:
-        raise MediaBridgeError("compiled_bundles 的 key 不能为空")
-
-    compiled = _compiled_bundle(bundle)
-    if compiled is not None:
-        provenance = compiled.provenance
-        metadata = {
-            **metadata,
-            **{
-                key: provenance[key]
-                for key in ("shot_id", "external_key", "keyframe_job_id", "previous_video_job_id")
-                if key in provenance and key not in metadata
-            },
-        }
-
-    shot_id = _text(metadata.get("shot_id")) or (key_values[0] if key_values else "")
-    external_key = _text(metadata.get("external_key")) or (
-        key_values[1] if len(key_values) > 1 else shot_id
-    )
-    shot_id = _required_text(shot_id, "shot_id")
-    external_key = _required_text(external_key, "external_key")
-    sort_key = (*key_values, shot_id, external_key)
-    return _DynamicInput(
-        sort_key=sort_key,
-        source_key=key,
-        bundle=bundle,
-        shot_id=shot_id,
-        external_key=external_key,
-        keyframe_job_id=_text(metadata.get("keyframe_job_id")) or None,
-        previous_video_job_id=_text(metadata.get("previous_video_job_id")) or None,
-        metadata=metadata,
-    )
-
-
-def _previous_end_frame(
-    previous_end_frames: Mapping[Any, Any],
-    current: _DynamicInput,
-    previous: _DynamicInput | None,
-) -> str | None:
-    candidates: list[Any] = [current.external_key, current.shot_id, current.source_key]
-    if previous is not None:
-        candidates.extend((previous.external_key, previous.shot_id, previous.source_key))
-    for candidate in candidates:
-        try:
-            value = previous_end_frames.get(candidate)
-        except (TypeError, AttributeError):
-            value = None
-        if isinstance(value, Mapping):
-            value = value.get(
-                "previous_end_frame_path",
-                value.get("end_frame_path", value.get("path", value.get("local_file"))),
-            )
-        text = _text(value)
-        if text:
-            return text
-    return None
-
-
-def build_dynamic_media_bridge_plan(
-    compiled_bundles: Mapping[Any, Any],
-    *,
-    workflow_run_id: str,
-    workflow_stage_id: str,
-    input_signature: str,
-    provider_id: str,
-    provider_model: str,
-    previous_end_frames: Mapping[Any, Any] | None = None,
-) -> DynamicMediaBridgePlan:
-    """按稳定 key 顺序构造阶段内 image/video 目标，不提交 Provider。"""
-
-    if not isinstance(compiled_bundles, Mapping):
-        raise MediaBridgeError("compiled_bundles 必须是按 shot/external key 索引的 Mapping")
-    workflow_run_id = _required_text(workflow_run_id, "workflow_run_id")
-    workflow_stage_id = _required_text(workflow_stage_id, "workflow_stage_id")
-    input_signature = _required_text(input_signature, "input_signature")
-    provider_id = _required_text(provider_id, "provider_id")
-    provider_model = _required_text(provider_model, "provider_model")
-    previous_end_frames = previous_end_frames or {}
-
-    items = sorted(
-        (_dynamic_input(key, value) for key, value in compiled_bundles.items()),
-        key=lambda item: item.sort_key,
-    )
-    targets: list[MediaTargetPlan] = []
-    all_diagnostics: list[Diagnostic] = []
-    previous_item: _DynamicInput | None = None
-    previous_video: MediaTargetPlan | None = None
-
-    for item in items:
-        image = build_keyframe_media_plan(
-            item.bundle,
-            workflow_run_id=workflow_run_id,
-            workflow_stage_id=workflow_stage_id,
-            shot_id=item.shot_id,
-            external_key=item.external_key,
-            input_signature=input_signature,
-            provider_id=provider_id,
-            provider_model=provider_model,
-            reference_plan=item.metadata.get("reference_plan"),
-        )
-        targets.append(image)
-        all_diagnostics.extend(image.diagnostics)
-
-        keyframe_job_id = item.keyframe_job_id or image.idempotency_key
-        previous_video_job_id = item.previous_video_job_id
-        if previous_video_job_id is None and previous_video is not None:
-            previous_video_job_id = previous_video.idempotency_key
-        end_frame = _text(item.metadata.get("previous_end_frame_path")) or _previous_end_frame(
-            previous_end_frames, item, previous_item
-        )
-        video = build_video_media_plan(
-            item.bundle,
-            workflow_run_id=workflow_run_id,
-            workflow_stage_id=workflow_stage_id,
-            shot_id=item.shot_id,
-            external_key=item.external_key,
-            input_signature=input_signature,
-            provider_id=provider_id,
-            provider_model=provider_model,
-            reference_plan=item.metadata.get("reference_plan"),
-            keyframe_job_id=keyframe_job_id,
-            previous_video_job_id=previous_video_job_id,
-            previous_end_frame_path=end_frame,
-        )
-        targets.append(video)
-        all_diagnostics.extend(video.diagnostics)
-        previous_item = item
-        previous_video = video
-
-    gate = diagnostics_status(_dedupe_diagnostics(all_diagnostics))
-    try:
-        return DynamicMediaBridgePlan(
-            workflow_run_id=workflow_run_id,
-            stage_id=workflow_stage_id,
-            input_signature=input_signature,
-            provider_id=provider_id,
-            model=provider_model,
-            targets=targets,
-            status=cast("Literal['ready', 'warning', 'blocked']", gate.status),
-            diagnostics=list(gate.diagnostics),
-        )
-    except (TypeError, ValueError, ValidationError) as exc:
-        raise MediaBridgeError("动态媒体桥接计划无法通过严格 schema 校验") from exc
-
-
 def _as_plan(value: MediaTargetPlan | Mapping[str, Any]) -> MediaTargetPlan:
     if isinstance(value, MediaTargetPlan):
         return value.model_copy(deep=True)
@@ -1101,41 +922,6 @@ def _as_plan(value: MediaTargetPlan | Mapping[str, Any]) -> MediaTargetPlan:
         return MediaTargetPlan.model_validate(copy.deepcopy(value))
     except (TypeError, ValueError, ValidationError) as exc:
         raise MediaBridgeError("媒体目标计划无效") from exc
-
-
-def _common_metadata(plan: MediaTargetPlan) -> dict[str, Any]:
-    return {
-        "media_bridge_version": MEDIA_BRIDGE_VERSION,
-        "workflow_run_id": plan.workflow_run_id,
-        "workflow_stage_id": plan.stage_id,
-        "stage_id": plan.stage_id,
-        "shot_id": plan.shot_id,
-        "external_key": plan.external_key,
-        "kind": plan.kind,
-        "status": plan.status,
-        "diagnostics": [item.model_dump(mode="json") for item in plan.diagnostics],
-        "input_signature": plan.input_signature,
-        "idempotency_key": plan.idempotency_key,
-        "depends_on": list(plan.depends_on),
-        "provider_id": plan.provider_id,
-        "model": plan.model,
-        "provider_model": plan.model,
-        "requested_duration_sec": plan.requested_duration_sec,
-        "generation_duration_sec": plan.generation_duration_sec,
-        "reference_inputs": {
-            "local": list(plan.reference_inputs.local),
-            "url": list(plan.reference_inputs.url),
-        },
-        "prompt_bundle": plan.prompt_bundle.model_dump(mode="json"),
-        "prompt_ir_json": _copy_json(plan.prompt_ir_json),
-        "provenance_json": _copy_json(plan.provenance_json),
-    }
-
-
-def to_shot_pipeline_metadata(plan: MediaTargetPlan | Mapping[str, Any]) -> dict[str, Any]:
-    """返回可序列化到 Shot.pipeline_metadata_json 的单目标 metadata。"""
-
-    return _common_metadata(_as_plan(plan))
 
 
 def to_media_version_payload(plan: MediaTargetPlan | Mapping[str, Any]) -> dict[str, Any]:
@@ -1242,10 +1028,8 @@ __all__ = [
     "MediaBridgeError",
     "MediaReferenceInputs",
     "MediaTargetPlan",
-    "build_dynamic_media_bridge_plan",
     "build_keyframe_media_plan",
     "build_video_media_plan",
     "to_job_payload",
     "to_media_version_payload",
-    "to_shot_pipeline_metadata",
 ]

@@ -12,6 +12,7 @@ SHOT_SIGNATURE_FIELDS = (
     "source_type",
     "source_ref",
     "scene_asset_id",
+    "scene_view_id",
     "character_ids",
     "character_ids_json",
     "prop_ids",
@@ -125,10 +126,15 @@ def _reference_fingerprints(reference_files: Sequence[str | Path]) -> list[Any]:
     for reference in reference_files:
         path = Path(reference)
         if path.is_file():
+            # 分块流式哈希，避免把大参考图整份载入内存。
+            digest = hashlib.sha256()
+            with path.open("rb") as file_handle:
+                for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
             fingerprints.append(
                 {
                     "name": path.name,
-                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "sha256": digest.hexdigest(),
                 }
             )
         else:

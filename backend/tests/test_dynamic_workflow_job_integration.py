@@ -15,7 +15,9 @@ from app.api import dynamic_runs
 from app.db import Database, migrate_schema
 from app.dependencies import get_dynamic_workflow_service
 from app.jobs.dynamic_bridge import DynamicJobBridge
+from app.jobs.dynamic_recovery import _reconcile_queued_stage_jobs
 from app.jobs.repository import JobRepository
+from app.jobs.runner import JobRunner
 from app.main import lifespan
 from app.models.tables import job, workflow_run, workflow_stage
 from app.services.dynamic_workflow_service import DynamicWorkflowService
@@ -173,7 +175,7 @@ def test_create_auto_run_queues_first_stage_after_commit_idempotently(
     assert jobs[0]["status"] == "queued"
     assert fake_enqueue.called == [jobs[0]["id"]]
     assert fake_enqueue.visible_statuses[jobs[0]["id"]] == "queued"
-    assert DynamicJobBridge(context.repository).reconcile_queued_stage_jobs() == [jobs[0]["id"]]
+    assert _reconcile_queued_stage_jobs(context.repository) == [jobs[0]["id"]]
     assert len(_jobs_for(context, run_id)) == 1
 
 
@@ -211,7 +213,7 @@ def test_enqueue_failure_keeps_workflow_and_job_queued_for_recovery(
             )
         )
     assert (run_status, stage_status) == ("queued", "queued")
-    assert DynamicJobBridge(context.repository).reconcile_queued_stage_jobs() == [dynamic_job["id"]]
+    assert _reconcile_queued_stage_jobs(context.repository) == [dynamic_job["id"]]
 
 
 @pytest.mark.parametrize("failed_status", ["failed", "interrupted"])
@@ -424,12 +426,14 @@ def test_terminal_job_rejects_queued_stage_and_rolls_back(
 
 def test_main_lifespan_uses_recover_all_once() -> None:
     source = inspect.getsource(lifespan)
-    assert "job_runner.start(recover=False)" in source
-    # 应当使用统一的 recover_all_once 入口（包含 dynamic + 普通路径去重）
-    assert "recover_all_once(repository)" in source
-    # 不再分别调用两条旧路径
-    assert "enqueue_recovered_dynamic_jobs(repository" not in source
-    # for 循环应该对 recover_all_once 的返回值做 enqueue
-    start_index = source.index("job_runner.start(recover=False)")
-    recover_index = source.index("recover_all_once(repository)")
-    assert start_index < recover_index
+    # B-L10：恢复入口收敛为 job_runner.start(recover=True)，由 runner.recover()
+    # 内部统一调用 recover_all_once（dynamic + 普通路径去重后统一 enqueue），
+    # 不再在 lifespan 里手工重复一遍等价逻辑。
+    assert "job_runner.start(recover=True)" in source
+    assert "job_runner.start(recover=False)" not in source
+    assert "recover_all_once(repository)" not in source
+    # C3：恢复整体兜底 try/except，保证单个坏 run 不会让 lifespan 启动失败。
+    assert "except Exception" in source
+    # 统一恢复语义断言：runner.recover 内部使用 recover_all_once。
+    runner_source = inspect.getsource(JobRunner.recover)
+    assert "recover_all_once" in runner_source

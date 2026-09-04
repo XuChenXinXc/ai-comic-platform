@@ -8,7 +8,11 @@ from typing import Any, Literal, cast
 
 from pydantic import ValidationError
 
-from app.dynamic_pipeline.diagnostics import diagnostic, diagnostics_status
+from app.dynamic_pipeline.diagnostics import (
+    diagnostic,
+    diagnostics_status,
+    unknown_prompt_diagnostic_codes,
+)
 from app.dynamic_pipeline.prompt_ir import (
     AssetVisualAnchor,
     CompiledPromptBundle,
@@ -32,6 +36,7 @@ from app.dynamic_pipeline.provider_capabilities import (
     reference_limit,
 )
 from app.dynamic_pipeline.reference_plan import (
+    calculate_reference_plan_snapshot_hash,
     render_reference_text,
     stable_reference_plan_payload,
     validate_reference_text,
@@ -334,6 +339,13 @@ def _limit_reference_plan(
         update={"actual_local_files": local_files, "actual_urls": urls},
         deep=True,
     )
+    # 截断后计划内容已变化：使用与原计划相同的 hash 算法重算 snapshot_hash，
+    # 避免截断前的快照继续代表当前实际参考集。
+    effective = effective.model_copy(
+        update={
+            "snapshot_hash": calculate_reference_plan_snapshot_hash(effective),
+        }
+    )
     return effective, list(limit.diagnostics)
 
 
@@ -617,6 +629,7 @@ def _prepare_context(
     reference_plan: ReferencePlan | Mapping[str, Any] | None,
     capabilities: ProviderCapabilitiesSnapshot | Mapping[str, Any] | None,
     compiler_version: str,
+    channel: Literal["image", "video", "both"] = "both",
 ) -> _CompilerContext:
     if not isinstance(compiler_version, str) or not compiler_version.strip():
         raise PromptCompileError("compiler_version 不能为空")
@@ -656,15 +669,22 @@ def _prepare_context(
     )
 
     dialogue_cues, sound_cues, cue_diagnostics = _normalize_cues(normalized_shot, duration)
+    # 显式 channel：图片编译路径不生成视频专属诊断（action/end_state 缺失、
+    # continuous 末帧、Provider 时长适配），无需调用方注入占位值或事后过滤。
+    skip_video_diagnostics = channel == "image"
     diagnostics = [
-        *duration.diagnostics,
+        *(duration.diagnostics if not skip_video_diagnostics else []),
         *plan_diagnostics,
         *limit_diagnostics,
         *_reference_plan_diagnostics(effective_plan),
         *_anchor_diagnostics(normalized_anchors),
         *_style_diagnostics(normalized_style),
-        *_continuity_diagnostics(normalized_shot, normalized_continuity),
-        *_video_required_diagnostics(normalized_shot),
+        *(
+            []
+            if skip_video_diagnostics
+            else _continuity_diagnostics(normalized_shot, normalized_continuity)
+        ),
+        *([] if skip_video_diagnostics else _video_required_diagnostics(normalized_shot)),
         *cue_diagnostics,
     ]
     return _CompilerContext(
@@ -786,7 +806,9 @@ def _action_event_time(value: Mapping[str, Any], *names: str) -> float | None:
     return None
 
 
-def _timeline_events(context: _CompilerContext) -> list[tuple[float, float, str]]:
+def _timeline_events(
+    context: _CompilerContext,
+) -> tuple[list[tuple[float, float, str]], list[Diagnostic]]:
     raw_events = list(context.shot.action_events)
     if not raw_events:
         raw_events = [
@@ -811,24 +833,29 @@ def _timeline_events(context: _CompilerContext) -> list[tuple[float, float, str]
             )
         )
 
-    if not parsed:
-        return [
-            (
-                0,
-                context.duration.effective_duration_sec,
-                _text(context.shot.action) or "保持当前状态",
-            )
-        ]
-
     duration = context.duration.effective_duration_sec
+    if not parsed:
+        return (
+            [
+                (
+                    0,
+                    duration,
+                    _text(context.shot.action) or "保持当前状态",
+                )
+            ],
+            [],
+        )
+
     result: list[tuple[float, float, str]] = []
+    warnings: list[Diagnostic] = []
     cursor = 0.0
     implicit_count = sum(
         start is None and end is None and length is None
         for start, end, length, _ in parsed
     )
     remaining = duration
-    for start, end, length, text in parsed:
+    for index, (start, end, length, text) in enumerate(parsed):
+        raw_start, raw_end = start, end
         if start is None and end is None:
             start = cursor
             if length is None:
@@ -836,24 +863,84 @@ def _timeline_events(context: _CompilerContext) -> list[tuple[float, float, str]
             end = start + length
             implicit_count -= 1
         elif start is None and end is not None:
-            start = end - (length or 0)
+            if length is None:
+                # 只含 end 无 start/length：无法推导有效时间段，不能静默丢弃。
+                warnings.append(
+                    diagnostic(
+                        "warning",
+                        "timeline_event_dropped",
+                        f"action_events[{index}] 缺少 start/length，无法推导有效时间段，已被丢弃",
+                        path=f"shot.action_events[{index}]",
+                        details={
+                            "reason": "end_only_without_start_or_length",
+                            "event": text,
+                        },
+                    )
+                )
+                continue
+            start = end - length
         elif end is None and start is not None:
-            end = start + (length or 0)
+            if length is None:
+                # 只含 start 无 end/length：无法推导有效时间段，不能静默丢弃。
+                warnings.append(
+                    diagnostic(
+                        "warning",
+                        "timeline_event_dropped",
+                        f"action_events[{index}] 缺少 end/length，无法推导有效时间段，已被丢弃",
+                        path=f"shot.action_events[{index}]",
+                        details={
+                            "reason": "start_only_without_end_or_length",
+                            "event": text,
+                        },
+                    )
+                )
+                continue
+            end = start + length
         if start is None or end is None:
             continue
+        clamped = False
+        if start < 0 or start > duration:
+            clamped = True
+        if end < 0 or end > duration:
+            clamped = True
         start = max(0.0, min(start, duration))
         end = max(0.0, min(end, duration))
+        if clamped:
+            warnings.append(
+                diagnostic(
+                    "warning",
+                    "timeline_event_clamped",
+                    f"action_events[{index}] 时间段超出有效时长，已被裁剪到 [0, {duration:g}s]",
+                    path=f"shot.action_events[{index}]",
+                    details={
+                        "raw_start": raw_start,
+                        "raw_end": raw_end,
+                        "clamped_start": start,
+                        "clamped_end": end,
+                        "duration_sec": duration,
+                    },
+                )
+            )
         if end <= start:
+            warnings.append(
+                diagnostic(
+                    "warning",
+                    "timeline_event_dropped",
+                    f"action_events[{index}] 归一化后时间段为空，已被丢弃",
+                    path=f"shot.action_events[{index}]",
+                    details={"start": start, "end": end, "event": text},
+                )
+            )
             continue
         result.append((start, end, text))
         cursor = max(cursor, end)
         remaining = max(0.0, duration - cursor)
-    return sorted(result, key=lambda item: (item[0], item[1], item[2]))
+    return sorted(result, key=lambda item: (item[0], item[1], item[2])), warnings
 
 
-def _video_timeline(context: _CompilerContext) -> list[TimelineSegment]:
+def _video_timeline(context: _CompilerContext) -> tuple[list[TimelineSegment], list[Diagnostic]]:
     duration = context.duration.effective_duration_sec
-    action_events = _timeline_events(context)
+    action_events, timeline_warnings = _timeline_events(context)
     boundaries = {0.0, duration}
     for start, end, _ in action_events:
         boundaries.update((start, end))
@@ -897,7 +984,7 @@ def _video_timeline(context: _CompilerContext) -> list[TimelineSegment]:
                 )
             }
         )
-    return segments
+    return segments, timeline_warnings
 
 
 def _base_semantic_plan(context: _CompilerContext) -> dict[str, Any]:
@@ -978,7 +1065,7 @@ def _compile_video_bundle(context: _CompilerContext) -> VideoPromptBundle:
     if cue_text:
         audio = f"{audio}；cues: {'；'.join(cue_text)}"
 
-    timeline = _video_timeline(context)
+    timeline, timeline_warnings = _video_timeline(context)
     transition = _transition_type(shot, context.continuity)
     continuity_text = (
         f"transition={transition}; "
@@ -1022,6 +1109,9 @@ def _compile_video_bundle(context: _CompilerContext) -> VideoPromptBundle:
         if context.reference_plan is not None
         else [],
         semantic_plan=semantic_plan,
+        # 时间轴归一化过程中静默丢弃/裁剪的事件以 warning 诊断保留，
+        # 由上层入口合并到最终 bundle diagnostics。
+        diagnostics=list(timeline_warnings),
     )
 
 
@@ -1057,13 +1147,10 @@ def compile_image_prompt(
     continuity: ContinuityContext | Mapping[str, Any] | None = None,
     reference_plan: ReferencePlan | Mapping[str, Any] | None = None,
     capabilities: ProviderCapabilitiesSnapshot | Mapping[str, Any] | None = None,
-    overrides: HumanOverrideSet | Mapping[str, Any] | None = None,
     compiler_version: str = COMPILER_VERSION,
     _context: _CompilerContext | None = None,
 ) -> ImagePromptBundle:
-    """纯函数式编译图片静态关键帧。"""
-
-    del overrides
+    """纯函数式编译图片静态关键帧（channel=image，跳过视频专属诊断）。"""
     context = _context or _prepare_context(
         style=style,
         shot=shot,
@@ -1072,8 +1159,12 @@ def compile_image_prompt(
         reference_plan=reference_plan,
         capabilities=capabilities,
         compiler_version=compiler_version,
+        channel="image",
     )
-    return _compile_image_bundle(context)
+    bundle = _compile_image_bundle(context)
+    # 携带门禁诊断：单通道编译不再静默吞掉阻断问题（如锚点缺失、参考图超限）。
+    bundle.diagnostics = list(context.diagnostics)
+    return bundle
 
 
 def compile_video_prompt(
@@ -1084,13 +1175,10 @@ def compile_video_prompt(
     continuity: ContinuityContext | Mapping[str, Any] | None = None,
     reference_plan: ReferencePlan | Mapping[str, Any] | None = None,
     capabilities: ProviderCapabilitiesSnapshot | Mapping[str, Any] | None = None,
-    overrides: HumanOverrideSet | Mapping[str, Any] | None = None,
     compiler_version: str = COMPILER_VERSION,
     _context: _CompilerContext | None = None,
 ) -> VideoPromptBundle:
-    """纯函数式编译视频有序动作与声音时间轴。"""
-
-    del overrides
+    """纯函数式编译视频有序动作与声音时间轴（channel=video）。"""
     context = _context or _prepare_context(
         style=style,
         shot=shot,
@@ -1099,8 +1187,13 @@ def compile_video_prompt(
         reference_plan=reference_plan,
         capabilities=capabilities,
         compiler_version=compiler_version,
+        channel="video",
     )
-    return _compile_video_bundle(context)
+    bundle = _compile_video_bundle(context)
+    # 携带门禁诊断：单通道编译不再静默吞掉阻断问题；
+    # 并保留时间轴归一化产生的 warning 诊断。
+    bundle.diagnostics = [*context.diagnostics, *bundle.diagnostics]
+    return bundle
 
 
 def compile_prompt_bundle(
@@ -1113,8 +1206,13 @@ def compile_prompt_bundle(
     capabilities: ProviderCapabilitiesSnapshot | Mapping[str, Any] | None = None,
     overrides: HumanOverrideSet | Mapping[str, Any] | None = None,
     compiler_version: str = COMPILER_VERSION,
+    channel: Literal["image", "video", "both"] = "both",
 ) -> CompiledPromptBundle:
-    """编译图片和视频两套 Provider-neutral Prompt Bundle。"""
+    """编译图片和视频两套 Provider-neutral Prompt Bundle。
+
+    ``channel`` 显式声明编译通道：``image`` 只编译图片静态关键帧并跳过视频专属
+    诊断；``video`` 只编译视频时间轴；``both`` 保持双通道编译（默认，兼容旧调用）。
+    """
 
     context = _prepare_context(
         style=style,
@@ -1124,39 +1222,62 @@ def compile_prompt_bundle(
         reference_plan=reference_plan,
         capabilities=capabilities,
         compiler_version=compiler_version,
+        channel=channel,
     )
-    image_bundle = compile_image_prompt(
-        style=context.style,
-        shot=context.shot,
-        anchors=context.anchors,
-        continuity=context.continuity,
-        reference_plan=context.reference_plan,
-        capabilities=context.capabilities,
-        compiler_version=context.compiler_version,
-        _context=context,
-    )
-    video_bundle = compile_video_prompt(
-        style=context.style,
-        shot=context.shot,
-        anchors=context.anchors,
-        continuity=context.continuity,
-        reference_plan=context.reference_plan,
-        capabilities=context.capabilities,
-        compiler_version=context.compiler_version,
-        _context=context,
-    )
+    image_bundle: ImagePromptBundle | None = None
+    video_bundle: VideoPromptBundle | None = None
+    if channel in ("both", "image"):
+        image_bundle = compile_image_prompt(
+            style=context.style,
+            shot=context.shot,
+            anchors=context.anchors,
+            continuity=context.continuity,
+            reference_plan=context.reference_plan,
+            capabilities=context.capabilities,
+            compiler_version=context.compiler_version,
+            _context=context,
+        )
+    if channel in ("both", "video"):
+        video_bundle = compile_video_prompt(
+            style=context.style,
+            shot=context.shot,
+            anchors=context.anchors,
+            continuity=context.continuity,
+            reference_plan=context.reference_plan,
+            capabilities=context.capabilities,
+            compiler_version=context.compiler_version,
+            _context=context,
+        )
 
     diagnostics = [
         *context.diagnostics,
-        *_validate_bundle_reference_text(image_bundle, context.reference_plan),
-        *_validate_bundle_reference_text(video_bundle, context.reference_plan),
+        *(video_bundle.diagnostics if video_bundle is not None else []),
+        *(
+            _validate_bundle_reference_text(image_bundle, context.reference_plan)
+            if image_bundle is not None
+            else []
+        ),
+        *(
+            _validate_bundle_reference_text(video_bundle, context.reference_plan)
+            if video_bundle is not None
+            else []
+        ),
     ]
     diagnostics = _dedupe_diagnostics(diagnostics)
+    # 编译出口接线：bundle diagnostics 的 code 必须是已注册诊断代码，
+    # 防止未登记的新 code 静默进入下游门禁体系。
+    unknown_codes = unknown_prompt_diagnostic_codes(diagnostics)
+    if unknown_codes:
+        raise PromptCompileError(f"编译产生了未注册的诊断代码：{unknown_codes}")
     gate = diagnostics_status(diagnostics)
     ordered_diagnostics = gate.diagnostics
 
     normalized_override = _normalize_override(overrides)
-    generated: dict[str, Any] = {"image": image_bundle, "video": video_bundle}
+    generated: dict[str, Any] = {}
+    if image_bundle is not None:
+        generated["image"] = image_bundle
+    if video_bundle is not None:
+        generated["video"] = video_bundle
     if normalized_override.cleared:
         final: Any = copy.deepcopy(generated)
         override_status = "cleared"
@@ -1193,12 +1314,10 @@ def compile_prompt_bundle(
         final=final,
         override_status=override_status,
     )
-    base_compiler_hash, input_hash = calculate_prompt_bundle_hashes(
-        bundle,
-        asset_versions=provenance["asset_versions"],
-        provider_capabilities=provenance["provider_capabilities"],
-        effective_reference_plan=stable_reference,
-    )
+    # model_validator 已在构造时基于同一份 provenance 计算确定性 hash，
+    # 这里直接复用已算值，避免对同一输入重复计算两遍。
+    base_compiler_hash = bundle.base_compiler_hash
+    input_hash = bundle.input_hash
     provenance.update(
         {
             "input_hash": input_hash,

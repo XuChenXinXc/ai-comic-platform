@@ -245,11 +245,18 @@ def queue_context(tmp_path: Path) -> Iterator[QueueContext]:
     stage_5a_id = "queue-stage-5a"
     stage_5b_id = "queue-stage-5b"
     shot_ids = {"shot-a": "queue-shot-a", "shot-b": "queue-shot-b"}
+    # 项目目录持久化存储字段，供入队前校验上一镜末帧文件存在性。
+    project_root = tmp_path / "queue-project"
+    (project_root / "frames").mkdir(parents=True, exist_ok=True)
+    (project_root / "frames" / "shot-a-end.png").write_bytes(b"fake-end-frame")
     with database.engine.begin() as connection:
         connection.execute(
             insert(project).values(
                 id=project_id,
                 name="动态媒体队列测试项目",
+                storage_root=str(tmp_path),
+                storage_name="queue-project",
+                storage_layout="categorized",
                 created_at=now,
                 updated_at=now,
             )
@@ -601,6 +608,272 @@ def test_queue_5b_creates_video_jobs_with_keyframe_and_previous_video_dependenci
     assert {row.keyframe_version_id for row in video_rows} == {
         item["target_id"] for item in first["jobs"]
     }
+
+
+def test_queue_5b_skips_end_frame_check_while_previous_video_is_generating(
+    queue_context: QueueContext,
+) -> None:
+    context = queue_context
+    _write_stage(
+        context,
+        context.stage_5a_id,
+        _stage_json(
+            context,
+            context.stage_5a_id,
+            "5a-image-prompts",
+            signature="stage-5a-input",
+            prompts=MappingLike(
+                {
+                    "bundle-b": MappingLikeValue("shot-b", 2, "第二镜静止画"),
+                    "bundle-a": MappingLikeValue("shot-a", 1, "第一镜静止画"),
+                }
+            ),
+        ),
+    )
+    first = context.service.queue_confirmed_prompt_stage(
+        workflow_run_id=context.run_id,
+        workflow_stage_id=context.stage_5a_id,
+        expected_revision=1,
+        provider_id="mock-image",
+        provider_model="image-model",
+    )
+    assert first["revision"] == 2
+
+    _write_stage(
+        context,
+        context.stage_5b_id,
+        _stage_json(
+            context,
+            context.stage_5b_id,
+            "5b-video-prompts",
+            signature="stage-5b-input",
+            prompts=MappingLike(
+                {
+                    "bundle-b": MappingLikeValue(
+                        "shot-b",
+                        2,
+                        "第二镜视频",
+                        transition="continuous",
+                        # 上一镜视频尚在生成（queued），末帧将在生成后自动产生，
+                        # 此时即使文件还不存在也不得误阻断。
+                        previous_end_frame_path="frames/missing-until-generated.png",
+                    ),
+                    "bundle-a": MappingLikeValue("shot-a", 1, "第一镜视频"),
+                }
+            ),
+        ),
+    )
+    result = context.service.queue_confirmed_prompt_stage(
+        workflow_run_id=context.run_id,
+        workflow_stage_id=context.stage_5b_id,
+        expected_revision=2,
+        provider_id="mock-video",
+        provider_model="video-model",
+    )
+
+    assert result["status"] == "ready"
+    assert not [
+        item
+        for item in result["diagnostics"]
+        if item["code"] == "media_queue_previous_end_frame_unavailable"
+    ]
+    assert {item["input_data"]["external_key"] for item in result["jobs"]} == {"shot-a", "shot-b"}
+
+
+def test_queue_5b_blocks_missing_previous_end_frame_after_previous_video_terminal(
+    queue_context: QueueContext,
+) -> None:
+    context = queue_context
+    _write_stage(
+        context,
+        context.stage_5a_id,
+        _stage_json(
+            context,
+            context.stage_5a_id,
+            "5a-image-prompts",
+            signature="stage-5a-input",
+            prompts=MappingLike(
+                {
+                    "bundle-b": MappingLikeValue("shot-b", 2, "第二镜静止画"),
+                    "bundle-a": MappingLikeValue("shot-a", 1, "第一镜静止画"),
+                }
+            ),
+        ),
+    )
+    first = context.service.queue_confirmed_prompt_stage(
+        workflow_run_id=context.run_id,
+        workflow_stage_id=context.stage_5a_id,
+        expected_revision=1,
+        provider_id="mock-image",
+        provider_model="image-model",
+    )
+    assert first["revision"] == 2
+
+    _write_stage(
+        context,
+        context.stage_5b_id,
+        _stage_json(
+            context,
+            context.stage_5b_id,
+            "5b-video-prompts",
+            signature="stage-5b-input",
+            prompts=MappingLike(
+                {
+                    "bundle-b": MappingLikeValue(
+                        "shot-b",
+                        2,
+                        "第二镜视频",
+                        transition="continuous",
+                        previous_end_frame_path="frames/not-exist-end.png",
+                    ),
+                    "bundle-a": MappingLikeValue("shot-a", 1, "第一镜视频"),
+                }
+            ),
+        ),
+    )
+    second = context.service.queue_confirmed_prompt_stage(
+        workflow_run_id=context.run_id,
+        workflow_stage_id=context.stage_5b_id,
+        expected_revision=2,
+        provider_id="mock-video",
+        provider_model="video-model",
+    )
+    assert second["revision"] == 3
+
+    # 模拟上一镜视频已经生成完成（终态），而其末帧文件从未落盘。
+    with context.database.engine.begin() as connection:
+        connection.execute(
+            update(job)
+            .where(
+                job.c.workflow_run_id == context.run_id,
+                job.c.job_type == "generate_video",
+                job.c.input_json.like('%"external_key":"shot-a"%'),
+            )
+            .values(status="completed", finished_at=utc_now())
+        )
+
+    # 重新入队（幂等复用 shot-a 已完成的 Job）：上一镜已终态但末帧缺失，
+    # 必须在入队前显式阻断 shot-b，错误信息写明哪个镜头缺末帧。
+    result = context.service.queue_confirmed_prompt_stage(
+        workflow_run_id=context.run_id,
+        workflow_stage_id=context.stage_5b_id,
+        expected_revision=3,
+        provider_id="mock-video",
+        provider_model="video-model",
+    )
+
+    blocked_diagnostics = [
+        item
+        for item in result["diagnostics"]
+        if item["code"] == "media_queue_previous_end_frame_unavailable"
+    ]
+    assert blocked_diagnostics
+    assert "shot-b" in blocked_diagnostics[0]["message"]
+    assert blocked_diagnostics[0]["details"]["external_key"] == "shot-b"
+    blocked_target = next(
+        item for item in result["targets"] if item["external_key"] == "shot-b"
+    )
+    assert blocked_target["status"] == "blocked"
+    # 缺末帧的 shot-b 不入队，shot-a 复用已完成的 Job。
+    enqueued_external_keys = {
+        item["input_data"]["external_key"] for item in result["jobs"]
+    }
+    assert enqueued_external_keys == {"shot-a"}
+    with context.database.engine.connect() as connection:
+        video_rows = connection.execute(
+            select(video_version).where(
+                video_version.c.shot_id == context.shot_ids["shot-b"]
+            )
+        ).all()
+    assert len(video_rows) == 1  # 第一轮已创建，本轮不新增也不入队
+
+
+def test_queue_5b_passes_end_frame_check_when_file_exists_after_terminal(
+    queue_context: QueueContext,
+) -> None:
+    context = queue_context
+    _write_stage(
+        context,
+        context.stage_5a_id,
+        _stage_json(
+            context,
+            context.stage_5a_id,
+            "5a-image-prompts",
+            signature="stage-5a-input",
+            prompts=MappingLike(
+                {
+                    "bundle-b": MappingLikeValue("shot-b", 2, "第二镜静止画"),
+                    "bundle-a": MappingLikeValue("shot-a", 1, "第一镜静止画"),
+                }
+            ),
+        ),
+    )
+    first = context.service.queue_confirmed_prompt_stage(
+        workflow_run_id=context.run_id,
+        workflow_stage_id=context.stage_5a_id,
+        expected_revision=1,
+        provider_id="mock-image",
+        provider_model="image-model",
+    )
+    assert first["revision"] == 2
+
+    # fixture 已创建 frames/shot-a-end.png；上一镜终态后末帧确实存在，
+    # 检查必须通过而不是阻断。
+    _write_stage(
+        context,
+        context.stage_5b_id,
+        _stage_json(
+            context,
+            context.stage_5b_id,
+            "5b-video-prompts",
+            signature="stage-5b-input",
+            prompts=MappingLike(
+                {
+                    "bundle-b": MappingLikeValue(
+                        "shot-b",
+                        2,
+                        "第二镜视频",
+                        transition="continuous",
+                        previous_end_frame_path="frames/shot-a-end.png",
+                    ),
+                    "bundle-a": MappingLikeValue("shot-a", 1, "第一镜视频"),
+                }
+            ),
+        ),
+    )
+    second = context.service.queue_confirmed_prompt_stage(
+        workflow_run_id=context.run_id,
+        workflow_stage_id=context.stage_5b_id,
+        expected_revision=2,
+        provider_id="mock-video",
+        provider_model="video-model",
+    )
+    assert second["revision"] == 3
+
+    with context.database.engine.begin() as connection:
+        connection.execute(
+            update(job)
+            .where(
+                job.c.workflow_run_id == context.run_id,
+                job.c.job_type == "generate_video",
+                job.c.input_json.like('%"external_key":"shot-a"%'),
+            )
+            .values(status="completed", finished_at=utc_now())
+        )
+    result = context.service.queue_confirmed_prompt_stage(
+        workflow_run_id=context.run_id,
+        workflow_stage_id=context.stage_5b_id,
+        expected_revision=3,
+        provider_id="mock-video",
+        provider_model="video-model",
+    )
+
+    assert not [
+        item
+        for item in result["diagnostics"]
+        if item["code"] == "media_queue_previous_end_frame_unavailable"
+    ]
+    assert {item["input_data"]["external_key"] for item in result["jobs"]} == {"shot-a", "shot-b"}
 
 
 def test_queue_same_signature_is_idempotent_and_changed_signature_creates_new_version(

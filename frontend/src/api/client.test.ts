@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { api } from "./client";
+import { api, mediaUrl } from "./client";
+import type { MediaVersion } from "../types/api";
 
 function jsonResponse(payload: unknown) {
   return new Response(JSON.stringify(payload), {
@@ -166,5 +167,28 @@ describe("API 契约适配", () => {
     );
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: "POST" });
     expect(fetchMock.mock.calls[0][1].body).toBeUndefined();
+  });
+});
+
+describe("mediaUrl 路径构造", () => {
+  test("test_media_url_preserves_leading_slash_for_absolute_media_paths", () => {
+    // 回归：/media/ 前缀曾被清洗掉前导斜杠，嵌套路由下解析成相对路径导致 404。
+    expect(mediaUrl({ file_url: "/media/p1/assets/a.png" } as MediaVersion)).toBe(
+      "/media/p1/assets/a.png",
+    );
+  });
+
+  test("test_media_url_normalizes_relative_paths_and_strips_dot_segments", () => {
+    expect(mediaUrl({ file_path: "assets/a.png" } as MediaVersion)).toBe(
+      "/media/assets/a.png",
+    );
+    expect(
+      mediaUrl({ file_url: "/media/p1/../p2/a.png" } as MediaVersion),
+    ).toBe("/media/p1/p2/a.png");
+  });
+
+  test("test_media_url_returns_empty_for_missing_paths", () => {
+    expect(mediaUrl(null)).toBe("");
+    expect(mediaUrl({} as MediaVersion)).toBe("");
   });
 });

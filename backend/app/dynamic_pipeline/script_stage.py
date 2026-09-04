@@ -422,7 +422,14 @@ def _normalize_sound_cue(value: Any) -> str | dict[str, Any]:
 
 def _normalize_scene(value: Any, index: int, shared_refs: Sequence[str]) -> dict[str, Any]:
     source = _mapping(value) or {}
-    ordinal = _integer(_pick(source, "ordinal", "scene_no", "no", "index", default=index), index)
+    # 注意：别名不含 "index"——它是常见 0-based 数组下标，取到 0 会触发
+    # ScriptScene.ordinal ge=1 校验失败并打挂整份剧本归一化。
+    ordinal = _integer(
+        _pick(source, "ordinal", "scene_no", "no", default=None),
+        index + 1,
+    )
+    if ordinal is not None and ordinal < 1:
+        ordinal = index + 1
     scene_id = stable_scene_key(
         _pick(source, "scene_id", "id", "scene_key", "key", default=None),
         ordinal,

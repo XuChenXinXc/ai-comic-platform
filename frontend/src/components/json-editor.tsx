@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { prettyJson } from "../lib/utils";
 import { FieldError } from "./status";
 import { Textarea } from "./ui";
@@ -18,11 +18,27 @@ export function JsonEditor({
 }) {
   const [text, setText] = useState(() => prettyJson(value));
   const [error, setError] = useState("");
+  // 记录「最近一次同步进编辑器的外部值」；只有真正来自外部/父组件的
+  // 变更（如加载、保存后回填）才覆盖正在编辑的文本，避免每次按键后的
+  // 重渲染把输入重新 pretty 化导致光标跳动。
+  const lastSynced = useRef(prettyJson(value));
+  const focusedRef = useRef(false);
 
   useEffect(() => {
-    setText(prettyJson(value));
+    const next = prettyJson(value);
+    if (lastSynced.current === next) return;
+    if (focusedRef.current) {
+      if (text !== lastSynced.current) {
+        // 用户正在编辑（文本已偏离最近一次同步值）：不覆盖输入，避免光标
+        // 跳回文末；把当前文本记为已同步，后续相同外部值不再触发。
+        lastSynced.current = text;
+        return;
+      }
+    }
+    lastSynced.current = next;
+    setText(next);
     setError("");
-  }, [value]);
+  }, [value, text]);
 
   return (
     <div>
@@ -36,6 +52,13 @@ export function JsonEditor({
         spellCheck={false}
         className="font-mono text-xs leading-5"
         aria-invalid={Boolean(error)}
+        onFocus={() => {
+          focusedRef.current = true;
+        }}
+        onBlur={() => {
+          focusedRef.current = false;
+          lastSynced.current = text;
+        }}
         onChange={(event) => {
           const next = event.target.value;
           setText(next);

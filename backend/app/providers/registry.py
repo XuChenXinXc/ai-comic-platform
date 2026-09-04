@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from pydantic import ValidationError
+
 from app.schemas import ProviderConfig
 
 from .base import (
@@ -40,9 +42,16 @@ class ProviderRegistry:
         self._factories[key] = factory
 
     def create(self, config: ProviderConfig | Mapping[str, Any]) -> Provider:
-        parsed = (
-            config if isinstance(config, ProviderConfig) else ProviderConfig.model_validate(config)
-        )
+        try:
+            parsed = (
+                config
+                if isinstance(config, ProviderConfig)
+                else ProviderConfig.model_validate(config)
+            )
+        except ValidationError as exc:
+            # 统一转成 ProviderConfigurationError：调用方只按该类型把
+            # 配置问题转 400，裸 ValidationError 会漏成 500。
+            raise ProviderConfigurationError(f"Provider 配置不合法：{exc}") from exc
         factory = self._factories.get((parsed.kind, parsed.adapter))
         if factory is None:
             raise ProviderConfigurationError(

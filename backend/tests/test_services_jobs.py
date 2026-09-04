@@ -21,7 +21,12 @@ from app.models.tables import (
     screenplay,
     video_version,
 )
-from app.schemas import ProviderSubmission, ShotQualityFixOutput
+from app.schemas import (
+    ProviderSubmission,
+    ShotImagePromptOutput,
+    ShotQualityFixOutput,
+    ShotVideoPromptOptimizeOutput,
+)
 from app.services.asset_service import AssetService
 from app.services.chapter_service import ChapterService
 from app.services.constants import MAX_IMAGE_SIZE, MAX_VIDEO_SIZE
@@ -491,6 +496,29 @@ def test_shot_prompt_batch_with_image_and_video_updates_both_prompts(
         chapter["id"],
         _shot_create(action="主角推开房门").model_dump(),
     )
+
+    class _BatchTextProvider:
+        async def generate_json(self, schema: Any, **values: Any) -> Any:
+            if schema is ShotImagePromptOutput:
+                return ShotImagePromptOutput(
+                    prompt="中景，主角位于画面中央。",
+                    negative_prompt="文字，水印",
+                )
+            return ShotVideoPromptOptimizeOutput(
+                prompt=(
+                    "以 @Image1 作为起始画面。主角先走到房门前，随后伸手推开房门。"
+                    "机位固定，画面变化由人物动作推动。"
+                )
+            )
+
+    monkeypatch.setattr(
+        shots.providers,
+        "resolve",
+        lambda **_kwargs: (
+            _BatchTextProvider(),
+            {"id": "mock-text", "model": "mock-text", "params": {}, "timeout_sec": 60},
+        ),
+    )
     monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
 
     batch = shots.queue_prompt_batch(
@@ -509,7 +537,8 @@ def test_shot_prompt_batch_with_image_and_video_updates_both_prompts(
 
     updated = shots.get(current["id"])
     assert updated["image_prompt"]
-    assert updated["video_prompt"]
+    # 视频提示词重新生成 = 基于当前提示词的自然语言优化，结果写入 override
+    assert updated["video_prompt_override"]
 
 
 def test_manual_shot_create_persists_prompt_overrides(
@@ -1084,7 +1113,7 @@ def test_grok_video_queue_rounds_fractional_duration_up_consistently(
 
     version = media.list_videos(current_shot["id"])[0]
     assert version["requested_duration_sec"] == 6
-    assert "6秒" in version["prompt_snapshot"]
+    assert "时长约 6 秒" in version["prompt_snapshot"]
     assert version["is_stale"] is False
 
 
@@ -1984,8 +2013,8 @@ def test_video_job_with_previous_end_frame_keeps_keyframe_first_and_anchor_order
     assert captured["paths"][0] == keyframe_path
     assert captured["paths"][1] == prev_frame_path
     snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
-    assert "@Image1：当前分镜关键帧" in snapshot
-    assert "@Image2：上一镜结束帧" in snapshot
+    assert "以 @Image1 作为这一镜的起始画面" in snapshot
+    assert "上一镜的结束画面（@Image2）仅用于衔接连贯" in snapshot
 
 
 def test_video_job_manual_continuous_puts_previous_end_frame_first(
@@ -2092,8 +2121,8 @@ def test_video_job_manual_continuous_puts_previous_end_frame_first(
     assert captured["paths"][0] == prev_frame_path
     assert captured["paths"][1] == keyframe_path
     snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
-    assert "@Image1：上一镜结束帧" in snapshot
-    assert "@Image2：当前分镜关键帧" in snapshot
+    assert "画面从 @Image1（上一镜的结束画面）自然进入" in snapshot
+    assert "向 @Image2 展示的目标画面发展" in snapshot
 
 
 def test_manual_continuous_preview_matches_actual_queue_video_prompt(
@@ -2180,12 +2209,12 @@ def test_manual_continuous_preview_matches_actual_queue_video_prompt(
     preview = shots.get(current_shot["id"])["compiled_video_prompt"]
     snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
 
-    assert "@Image1：上一镜结束帧" in preview
-    assert "@Image2：当前分镜关键帧" in preview
-    # 整数秒模型最短 6 秒：预览与实际提交都必须按 6 秒编译时间轴
-    assert "总时长：6秒" in preview
-    assert "总时长：5秒" not in preview
-    assert "总时长：6秒" in snapshot
+    assert "@Image1" in preview
+    assert "@Image2" in preview
+    # 整数秒模型最短 6 秒：预览与实际提交都必须按 6 秒编译
+    assert "时长约 6 秒" in preview
+    assert "时长约 5 秒" not in preview
+    assert "时长约 6 秒" in snapshot
     assert preview == snapshot
 
 
@@ -2422,7 +2451,7 @@ def test_video_queue_across_scene_change_omits_previous_end_frame(
     assert queued["input_data"]["prev_end_frame_path"] is None
     snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
     assert "上一镜结束帧" not in snapshot
-    assert "@Image1：当前分镜关键帧" in snapshot
+    assert "以 @Image1 作为这一镜的起始画面" in snapshot
 
 
 def test_video_queue_same_scene_cut_omits_previous_end_frame(
@@ -2497,7 +2526,7 @@ def test_video_queue_same_scene_cut_omits_previous_end_frame(
     # 末帧文件确实存在且同场景，但衔接类型不是 continuous，因此不引用
     assert queued["input_data"]["prev_end_frame_path"] is None
     snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
-    assert "@Image2：上一镜结束帧" not in snapshot
+    assert "@Image2" not in snapshot
     assert "独立机位" in snapshot
 
 
@@ -2677,7 +2706,7 @@ def test_video_prompt_with_single_image_provider_omits_extra_reference_anchors(
     media.queue_video(current_shot["id"], {})
     prompt_snapshot = media.list_videos(current_shot["id"])[0]["prompt_snapshot"]
 
-    assert "@Image1：当前分镜关键帧" in prompt_snapshot
+    assert "@Image1" in prompt_snapshot
     assert "@Image2" not in prompt_snapshot
 
 

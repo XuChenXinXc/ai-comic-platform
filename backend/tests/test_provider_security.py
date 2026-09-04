@@ -126,6 +126,29 @@ def test_provider_create_with_matching_kind_api_key_env_succeeds(
     assert provider["api_key_env"] == api_key_env
 
 
+def test_runtime_config_falls_back_to_api_key_env(
+    provider_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """仅配 api_key_env 的 Provider 运行时从环境变量取 Key。
+
+    回归：env 回退此前只存在于连接测试 _probe，实际运行（TTS 等）
+    拿到空 Key，导致「连接测试通过但生成 401/400」。
+    """
+    monkeypatch.setenv("TTS_API_KEY", "env-secret-value")
+    runtime = ProviderService._runtime_config(
+        {
+            "kind": "tts",
+            "adapter": "http_tts",
+            "base_url": "https://example.invalid/tts",
+            "api_key_env": "TTS_API_KEY",
+            "api_key": "",
+            "params": {},
+        }
+    )
+    assert runtime["api_key"] == "env-secret-value"
+
+
 def test_provider_create_with_direct_api_key_persists_only_configuration_status(
     provider_database: Database,
 ) -> None:

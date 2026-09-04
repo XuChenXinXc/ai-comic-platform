@@ -60,15 +60,24 @@ def _verify_referenced_rows() -> None:
     说明：defer_foreign_keys 在本环境 alembic SQLite 适配下不生效；
     foreign_keys 已在 env.py 关闭。下面仅做防御性的行数比对，避免在
     数据被并行改动时出现 FK 引用缺口。
+
+    只检查真实存在的引用列：历史上曾引用不存在的幽灵表
+    （character_provider/image_provider/video_provider/tts_provider）与
+    shot_audio.tts_provider_id（该列并不存在，SQLite 会把双引号未知列
+    当作字符串字面量导致预检恒真），此处修正为实际 schema。
     """
     if not _has_table("api_provider"):
         return
     referenced_tables = [
-        ("character_provider", "provider_id"),
-        ("image_provider", "provider_id"),
-        ("video_provider", "provider_id"),
-        ("tts_provider", "provider_id"),
-        ("shot_audio", "tts_provider_id"),
+        ("project", "default_text_provider_id"),
+        ("project", "default_image_provider_id"),
+        ("project", "default_video_provider_id"),
+        ("asset_image", "provider_id"),
+        ("keyframe_version", "provider_id"),
+        ("video_version", "provider_id"),
+        ("job", "provider_id"),
+        ("audio_config", "tts_provider_id"),
+        ("shot_audio", "provider_id"),
     ]
     connection = op.get_bind()
     provider_count = _count_rows("api_provider")

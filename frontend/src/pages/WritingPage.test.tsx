@@ -254,6 +254,90 @@ describe("文字工作台服务端版本冲突", () => {
   });
 });
 
+describe("文字工作台对白切分", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    projectContext.activeProject = {
+      id: "project-1",
+      name: "验收项目",
+      source_text: "测试小说原文",
+      style_prompt: "二维国风漫剧",
+      source_revision: 1,
+      source_signature: "source-1",
+    };
+    projectContext.activeProjectId = "chapter-1";
+    vi.spyOn(api.analysis, "get").mockRejectedValue(
+      new ApiError("分析不存在", 404),
+    );
+    vi.spyOn(api.screenplay, "get").mockResolvedValue({
+      ...screenplayRecord(1, "对白切分剧本"),
+      content_json: {
+        title: "对白切分剧本",
+        logline: "",
+        scenes: [
+          {
+            scene_no: 1,
+            scene_name: "门口",
+            characters: ["小明"],
+            dialogue: [],
+            narration: [],
+          },
+        ],
+      },
+    } as never);
+  });
+
+  test("test_dialogue_split_requires_short_punctuation_free_speaker_prefix", async () => {
+    const updateSpy = vi.spyOn(api.screenplay, "update").mockResolvedValue(
+      screenplayRecord(2, "对白切分剧本"),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    renderWritingPage(queryClient);
+
+    // 定位场次卡片中的对白 textarea（Label 未通过 htmlFor 关联）。
+    const dialogueLabel = await screen.findByText("对白（每行一条）");
+    const dialogueTextarea = dialogueLabel.parentElement!.querySelector(
+      "textarea",
+    ) as HTMLTextAreaElement;
+    fireEvent.change(dialogueTextarea, {
+      target: {
+        value: [
+          "小明：你终于来了。",
+          "这一整天从早到晚忙得他头昏脑涨：先开会再赶稿",
+          "他停顿了一下，说：你好",
+          "没有冒号的整句",
+          "一二三四五六七八九十一二：正文",
+        ].join("\n"),
+      },
+    });
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(updateSpy).toHaveBeenCalledTimes(1));
+    const payload = updateSpy.mock.calls[0][1];
+    // update 的 content_json 类型是 unknown，按 screenplay 结构断言解析结果。
+    const screenplay = payload.content_json as {
+      scenes: { dialogue: Array<{ speaker: string; text: string }> }[];
+    };
+    expect(screenplay.scenes[0].dialogue).toEqual([
+      // 短且无句末标点的冒号前缀识别为说话人。
+      { speaker: "小明", text: "你终于来了。" },
+      // 冒号前 15 个字符（>12）：整句作台词。
+      { speaker: "", text: "这一整天从早到晚忙得他头昏脑涨：先开会再赶稿" },
+      // 冒号前含句末标点（，）：整句作台词。
+      { speaker: "", text: "他停顿了一下，说：你好" },
+      // 无冒号：整句作台词。
+      { speaker: "", text: "没有冒号的整句" },
+      // 冒号前正好 12 个字符：仍视为说话人。
+      { speaker: "一二三四五六七八九十一二", text: "正文" },
+    ]);
+  });
+});
+
 describe("文字工作台延迟保存", () => {
   beforeEach(() => {
     vi.restoreAllMocks();

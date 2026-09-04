@@ -4,6 +4,7 @@
 """
 
 import logging
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from sqlalchemy import delete, insert, select
@@ -14,6 +15,42 @@ from app.services.errors import bad_request, not_found
 from app.services.utils import new_id, row_dict, utc_now
 
 logger = logging.getLogger(__name__)
+
+
+def effective_crossfade_seconds(
+    durations: Sequence[float],
+    crossfade_seconds: float,
+) -> float:
+    """实际使用的叠化时长：单段不叠化，且不能超过最短素材的一半。
+
+    该公式与合成服务的 xfade 链保持一致，字幕与音轨时间轴共用，
+    避免两边各自实现导致漂移。
+    """
+    if len(durations) < 2:
+        return 0.0
+    return max(0.1, min(float(crossfade_seconds), min(durations) / 2))
+
+
+def shot_start_offsets(
+    durations: Sequence[float],
+    crossfade_seconds: float | None,
+) -> list[float]:
+    """按真实视频时长计算每段素材在成片时间轴上的起始时间。
+
+    crossfade_seconds 为 None 表示无叠化（偏移即累计时长）；否则按
+    xfade 重叠公式扣减叠化时长。与合成服务的配音音轨偏移公式一致。
+    """
+    fade = (
+        effective_crossfade_seconds(durations, crossfade_seconds)
+        if crossfade_seconds is not None
+        else 0.0
+    )
+    offsets: list[float] = []
+    cursor = 0.0
+    for index, duration in enumerate(durations):
+        offsets.append(cursor)
+        cursor += duration - (fade if index < len(durations) - 1 else 0)
+    return offsets
 
 
 class SubtitleService:
@@ -104,8 +141,24 @@ class SubtitleService:
 
         return [row_dict(r) for r in records]
 
-    def export_chapter_srt(self, chapter_id: str) -> str:
-        """导出章节的 SRT 格式字幕文件"""
+    def export_chapter_srt(
+        self,
+        chapter_id: str,
+        *,
+        shot_video_durations: Mapping[str, float] | None = None,
+        crossfade_seconds: float | None = None,
+    ) -> str:
+        """导出章节的 SRT 格式字幕文件
+
+        Args:
+            chapter_id: 章节 ID。
+            shot_video_durations: 分镜 ID 到「当前完成视频实际时长」的映射。
+                提供时，只有映射中的分镜参与时间轴累计（与合成视频轨跳过
+                无视频分镜的行为一致），偏移按真实时长 + xfade 叠化计算，
+                与配音音轨公式一致；映射外分镜的字幕不导出。
+                未提供时保持旧行为：全部分镜按计划时长 duration_sec 累计。
+            crossfade_seconds: 叠化时长；None 表示无叠化。
+        """
         with self.database.engine.connect() as connection:
             # 获取章节所有分镜
             shot_records = connection.execute(
@@ -117,25 +170,44 @@ class SubtitleService:
             if not shot_records:
                 raise not_found(f"章节无分镜：{chapter_id}")
 
+            # 确定参与时间轴的分镜及其时长来源
+            if shot_video_durations is None:
+                # 旧行为：全部分镜按计划时长累计
+                participants = [
+                    (shot_record, float(shot_record.duration_sec or 6.0))
+                    for shot_record in shot_records
+                ]
+                fade_seconds = None
+            else:
+                # 新行为：只累计有当前视频的分镜的真实时长
+                participants = [
+                    (shot_record, float(shot_video_durations[shot_record.id]))
+                    for shot_record in shot_records
+                    if shot_record.id in shot_video_durations
+                ]
+                fade_seconds = crossfade_seconds
+            offsets = shot_start_offsets(
+                [duration for _, duration in participants],
+                fade_seconds,
+            )
+
             srt_content = []
             subtitle_index = 1
-            current_time = 0.0
 
-            for shot_record in shot_records:
-                shot_id = shot_record.id
-                shot_duration = shot_record.duration_sec or 6.0
-
+            for (shot_record, _shot_duration), shot_offset in zip(
+                participants, offsets, strict=True
+            ):
                 # 获取该分镜的字幕
                 subtitle_records = connection.execute(
                     select(shot_subtitle)
-                    .where(shot_subtitle.c.shot_id == shot_id)
+                    .where(shot_subtitle.c.shot_id == shot_record.id)
                     .order_by(shot_subtitle.c.start_time)
                 ).fetchall()
 
                 for subtitle_record in subtitle_records:
                     subtitle_dict = row_dict(subtitle_record)
-                    start = current_time + subtitle_dict["start_time"]
-                    end = current_time + subtitle_dict["end_time"]
+                    start = shot_offset + subtitle_dict["start_time"]
+                    end = shot_offset + subtitle_dict["end_time"]
                     text = subtitle_dict["text"]
 
                     # SRT 格式
@@ -147,8 +219,6 @@ class SubtitleService:
                     srt_content.append("")  # 空行
 
                     subtitle_index += 1
-
-                current_time += shot_duration
 
         return "\n".join(srt_content)
 

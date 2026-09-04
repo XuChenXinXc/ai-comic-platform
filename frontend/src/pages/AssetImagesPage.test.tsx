@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, test, vi } from "vitest";
-import { api } from "../api/client";
+import { api, queryKeys } from "../api/client";
 import type { Asset, MediaVersion } from "../types/api";
 import { AssetImagePanel } from "./AssetImagesPage";
 
@@ -39,11 +39,12 @@ function renderPanel(asset: Asset) {
       mutations: { retry: false },
     },
   });
-  return render(
+  const view = render(
     <QueryClientProvider client={queryClient}>
       <AssetImagePanel asset={asset} />
     </QueryClientProvider>,
   );
+  return { view, queryClient };
 }
 
 beforeEach(() => {
@@ -192,5 +193,114 @@ describe("素材图片提示词编辑", () => {
 
     expect(screen.getByText("已保存的图片提示词覆盖")).toBeTruthy();
     expect(screen.getByText("用户保存的白底提示词")).toBeTruthy();
+  });
+});
+
+describe("素材图片操作失效素材列表", () => {
+  test("test_upload_invalidates_asset_images_and_assets_queries", async () => {
+    const uploadSpy = vi
+      .spyOn(api.assets.images, "upload")
+      .mockResolvedValue({} as never);
+    const { view, queryClient } = renderPanel(baseAsset);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+    const fileInput = view.container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    await userEvent.upload(fileInput, new File(["x"], "ref.png", { type: "image/png" }));
+
+    await waitFor(() => expect(uploadSpy).toHaveBeenCalledWith("asset-1", expect.any(File)));
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: queryKeys.assetImages("asset-1"),
+      });
+    });
+    // 素材卡片主图来自 assets 查询，上传后必须同步失效。
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: queryKeys.assets("project-1"),
+      });
+    });
+  });
+
+  test("test_switch_current_invalidates_asset_images_and_assets_queries", async () => {
+    const user = userEvent.setup();
+    const completedVersion: MediaVersion = {
+      id: "image-current",
+      asset_id: baseAsset.id,
+      version_no: 1,
+      file_path: "character/小明.png",
+      prompt_snapshot: "成功提示词",
+      negative_prompt_snapshot: "",
+      model: "image-model",
+      status: "completed",
+      is_current: false,
+      source: "generated",
+      input_signature: "signature-1",
+      created_at: "2026-08-03T00:00:00Z",
+    };
+    vi.mocked(api.assets.images.list).mockResolvedValue([completedVersion]);
+    const currentSpy = vi
+      .spyOn(api.assets.images, "current")
+      .mockResolvedValue({} as never);
+    const { queryClient } = renderPanel(baseAsset);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+    await user.click(
+      await screen.findByRole("button", { name: "设为当前版本 1" }),
+    );
+
+    await waitFor(() => expect(currentSpy).toHaveBeenCalledWith("image-current"));
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: queryKeys.assetImages("asset-1"),
+      });
+    });
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: queryKeys.assets("project-1"),
+      });
+    });
+  });
+
+  test("test_delete_version_invalidates_asset_images_and_assets_queries", async () => {
+    const user = userEvent.setup();
+    const completedVersion: MediaVersion = {
+      id: "image-completed",
+      asset_id: baseAsset.id,
+      version_no: 1,
+      file_path: "character/小明.png",
+      prompt_snapshot: "成功提示词",
+      negative_prompt_snapshot: "",
+      model: "image-model",
+      status: "completed",
+      is_current: false,
+      source: "generated",
+      input_signature: "signature-1",
+      created_at: "2026-08-03T00:00:00Z",
+    };
+    vi.mocked(api.assets.images.list).mockResolvedValue([completedVersion]);
+    const removeSpy = vi
+      .spyOn(api.assets.images, "remove")
+      .mockResolvedValue(undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { queryClient } = renderPanel(baseAsset);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+    await user.click(
+      await screen.findByRole("button", { name: "删除版本 1" }),
+    );
+
+    await waitFor(() => expect(removeSpy).toHaveBeenCalledWith("image-completed"));
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: queryKeys.assetImages("asset-1"),
+      });
+    });
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: queryKeys.assets("project-1"),
+      });
+    });
   });
 });

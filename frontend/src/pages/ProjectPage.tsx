@@ -7,7 +7,7 @@ import {
   Save,
   Trash2,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import { api, queryKeys } from "../api/client";
@@ -15,7 +15,7 @@ import { ErrorState, PageHeader } from "../components/status";
 import { Button, Card, Input, Label, Select } from "../components/ui";
 import { useProject } from "../hooks/use-project";
 import { formatError } from "../lib/utils";
-import type { ProjectInput, ProviderKind } from "../types/api";
+import type { Project, ProjectInput, ProviderKind } from "../types/api";
 
 const emptyProject: ProjectInput = {
   name: "",
@@ -31,6 +31,21 @@ const emptyProject: ProjectInput = {
   default_video_provider_id: null,
 };
 
+function projectFormFromProject(project: Project): ProjectInput {
+  return {
+    name: project.name,
+    source_text: "",
+    style_prompt: project.style_prompt,
+    aspect_ratio: project.aspect_ratio || "16:9",
+    image_size: project.image_size || "2560x1440",
+    video_size: project.video_size || "16:9",
+    default_duration_sec: project.default_duration_sec ?? 6,
+    default_text_provider_id: project.default_text_provider_id,
+    default_image_provider_id: project.default_image_provider_id,
+    default_video_provider_id: project.default_video_provider_id,
+  };
+}
+
 export function ProjectPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -45,25 +60,33 @@ export function ProjectPage() {
   } = useProject();
   const creating = searchParams.get("create") === "1" || !activeProject;
   const [form, setForm] = useState<ProjectInput>(emptyProject);
+  // 用户修改过任一字段后置 true：后台任务终态刷新 projects 时不再自动回填表单，
+  // 避免正在编辑的值被服务器值静默覆盖（参照 WritingPage 的 dirty 保护模式）。
+  const formDirtyRef = useRef(false);
+  // 记录表单当前回填所属的项目/模式标识：切换项目或进出新建模式时重置 dirty。
+  const hydratedKeyRef = useRef("");
 
   useEffect(() => {
     if (creating) {
-      setForm(emptyProject);
+      // 仅在「进入创建模式」时重置一次：activeProject 对象随后台项目列表
+      // 刷新反复变化，若每次都重置会把用户正在输入的项目名清空。
+      if (hydratedKeyRef.current !== "create") {
+        setForm(emptyProject);
+        formDirtyRef.current = false;
+        hydratedKeyRef.current = "create";
+      }
       return;
     }
     if (activeProject) {
-      setForm({
-        name: activeProject.name,
-        source_text: "",
-        style_prompt: activeProject.style_prompt,
-        aspect_ratio: "16:9",
-        image_size: "3840x2160",
-        video_size: "16:9",
-        default_duration_sec: 6,
-        default_text_provider_id: activeProject.default_text_provider_id,
-        default_image_provider_id: activeProject.default_image_provider_id,
-        default_video_provider_id: activeProject.default_video_provider_id,
-      });
+      if (hydratedKeyRef.current !== activeProject.id) {
+        // 首次进入或切换项目：恢复自动回填并写入服务器值。
+        hydratedKeyRef.current = activeProject.id;
+        formDirtyRef.current = false;
+      }
+      // 用户修改过任一字段后保持本地值，等待用户保存或显式切换项目。
+      if (!formDirtyRef.current) {
+        setForm(projectFormFromProject(activeProject));
+      }
     }
   }, [activeProject, creating]);
 
@@ -87,11 +110,18 @@ export function ProjectPage() {
   }, [providersQuery.data]);
 
   const saveMutation = useMutation({
-    mutationFn: () =>
-      creating
-        ? api.projects.create(form)
-        : api.projects.update(activeProjectId, form),
+    mutationFn: () => {
+      if (creating) {
+        return api.projects.create(form);
+      }
+      // 编辑模式不携带 source_text：后端收到该字段会重算签名并清空存量正文。
+      const editable: Partial<ProjectInput> = { ...form };
+      delete editable.source_text;
+      return api.projects.update(activeProjectId, editable);
+    },
     onSuccess: async (project) => {
+      // 保存成功后恢复自动回填，后续任务（如自动画风识别）可同步表单。
+      formDirtyRef.current = false;
       await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
       selectProject(project.id);
       setSearchParams({}, { replace: true });
@@ -124,7 +154,11 @@ export function ProjectPage() {
   const setField = <K extends keyof ProjectInput>(
     key: K,
     value: ProjectInput[K],
-  ) => setForm((current) => ({ ...current, [key]: value }));
+  ) => {
+    // 用户修改过任一字段：停止后续自动回填。
+    formDirtyRef.current = true;
+    setForm((current) => ({ ...current, [key]: value }));
+  };
 
   const canSave = Boolean(form.name.trim());
 

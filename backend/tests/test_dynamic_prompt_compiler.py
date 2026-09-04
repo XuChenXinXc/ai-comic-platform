@@ -249,6 +249,66 @@ def test_video_compiler_splits_action_and_audio_cues_into_ordered_timeline() -> 
     assert "single action" not in result.prompt
 
 
+def test_video_compiler_warns_for_end_only_event_without_start_or_length() -> None:
+    result = compile_video_prompt(
+        style=_style(),
+        shot=_shot(
+            action_events=[
+                {"start_sec": 0, "end_sec": 2, "action": "抬起怀表"},
+                # 只有 end 没有 start/length，无法推导有效时间段，不能静默丢弃。
+                {"end_sec": 5, "action": "看向表盘"},
+            ],
+        ),
+        anchors=_anchors(),
+    )
+
+    dropped = [item for item in result.diagnostics if item.code == "timeline_event_dropped"]
+    assert dropped
+    assert dropped[0].level == "warning"
+    assert dropped[0].details["reason"] == "end_only_without_start_or_length"
+
+
+def test_video_compiler_warns_for_clamped_out_of_duration_events() -> None:
+    result = compile_video_prompt(
+        style=_style(),
+        shot=_shot(
+            action_events=[
+                # 起止时间超出 Provider 有效时长（6 秒），会被裁剪。
+                {"start_sec": 4, "end_sec": 9, "action": "走向站台尽头"},
+            ],
+        ),
+        anchors=_anchors(),
+    )
+
+    clamped = [item for item in result.diagnostics if item.code == "timeline_event_clamped"]
+    assert clamped
+    assert clamped[0].level == "warning"
+    assert clamped[0].details["raw_end"] == 9
+    assert clamped[0].details["clamped_end"] == 6
+    # 归一化后的时间轴仍保持 0 起点、末段对齐有效时长。
+    assert result.timeline[0].start == 0
+    assert result.timeline[-1].end == result.generation_duration_sec
+
+
+def test_compiled_bundle_registers_all_diagnostic_codes() -> None:
+    from app.dynamic_pipeline.diagnostics import (
+        PROMPT_DIAGNOSTIC_CODES,
+        unknown_prompt_diagnostic_codes,
+    )
+
+    result = compile_prompt_bundle(
+        style=_style(),
+        shot=_shot(),
+        anchors=_anchors(),
+    )
+
+    # 编译出口接线：bundle diagnostics 的 code 必须都在已注册诊断代码集合内。
+    assert unknown_prompt_diagnostic_codes(result.diagnostics) == []
+    assert "timeline_discontinuous" in PROMPT_DIAGNOSTIC_CODES
+    assert "timeline_event_dropped" in PROMPT_DIAGNOSTIC_CODES
+    assert "timeline_event_clamped" in PROMPT_DIAGNOSTIC_CODES
+
+
 def test_compiler_reports_missing_asset_action_end_and_continuous_previous_frame() -> None:
     missing = compile_prompt_bundle(
         style=_style(),

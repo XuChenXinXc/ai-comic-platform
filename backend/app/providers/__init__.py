@@ -3,6 +3,7 @@ from app.providers.base import (
     ProviderConfigurationError,
     ProviderError,
     TextProvider,
+    TTSProvider,
     VideoProvider,
 )
 from app.providers.mock import MockImageProvider, MockTextProvider, MockVideoProvider
@@ -17,6 +18,7 @@ __all__ = [
     "ProviderError",
     "ProviderRegistry",
     "TextProvider",
+    "TTSProvider",
     "VideoProvider",
     "provider_registry",
 ]

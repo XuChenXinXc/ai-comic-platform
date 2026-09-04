@@ -14,7 +14,6 @@ from app.dynamic_pipeline.reference_plan import (
 )
 from app.dynamic_pipeline.reference_resolver import (
     adapt_reference_bindings,
-    resolve_reference_inputs,
 )
 
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n"
@@ -63,10 +62,6 @@ def test_build_reference_plan_keeps_single_and_multiple_reference_order(tmp_path
     assert single.actual_urls == []
     assert list(single.text_mapping) == ["@Image1"]
     assert render_reference_text(single) == "@Image1[hero]"
-    assert resolve_reference_inputs(single) == (
-        single.actual_local_files,
-        single.actual_urls,
-    )
 
     url = "https://cdn.example.test/villain.jpg"
     slots = [
@@ -85,10 +80,6 @@ def test_build_reference_plan_keeps_single_and_multiple_reference_order(tmp_path
     assert plan.text_mapping["@Image2"]["index"] == 2
     assert plan.text_mapping["@Image2"]["value"] == plan.actual_urls[0]
     assert render_reference_text(plan) == "@Image1[hero]；@Image2[villain]"
-    assert resolve_reference_inputs(plan) == (
-        plan.actual_local_files,
-        plan.actual_urls,
-    )
 
     reordered_slots = [
         {key: value for key, value in reversed(list(slot.items()))} for slot in slots
@@ -179,7 +170,6 @@ def test_build_reference_plan_blocks_index_mismatch_without_reordering(
     assert plan.actual_urls == []
     assert plan.text_mapping == {}
     assert render_reference_text(plan) == ""
-    assert resolve_reference_inputs(plan) == ([], [])
 
 
 @pytest.mark.parametrize(

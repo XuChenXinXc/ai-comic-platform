@@ -56,6 +56,10 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
         )
     monkeypatch.setattr(file_service, "workspace_dir", tmp_path.resolve())
     monkeypatch.setattr(file_service, "projects_dir", (tmp_path / "projects").resolve())
+    # 服务层多数路径操作（media/asset/shot 等）直接使用全局 file_service 单例，
+    # 显式把它的 database 绑定到本测试库，与 test_audio_service_fix 的做法一致；
+    # 否则 _project_storage 会查询生产库，项目按 prefixed 布局生成路径。
+    monkeypatch.setattr(file_service, "database", database)
     file_service.projects_dir.mkdir(parents=True, exist_ok=True)
 
     repository = JobRepository(database)
@@ -271,8 +275,8 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     assert current_shots[0]["video_prompt"]
     assert current_shots[0]["negative_prompt"]
     assert "【参考】" in current_shots[0]["compiled_image_prompt"]
-    assert "【镜头】" in current_shots[0]["compiled_video_prompt"]
-    assert "【声音】" in current_shots[0]["compiled_video_prompt"]
+    assert "以 @Image1 作为这一镜的起始画面" in current_shots[0]["compiled_video_prompt"]
+    assert "这一镜发生在" in current_shots[0]["compiled_video_prompt"]
     assert current_shots[0]["reference_bindings"]
     keyframe_job = api_client.post(f"/api/shots/{shot_id}/keyframes/generate", json={})
     assert keyframe_job.status_code == 202
@@ -292,8 +296,8 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     videos = api_client.get(f"/api/shots/{shot_id}/videos").json()
     assert len(videos) == 1
     assert videos[0]["is_current"] is True
-    assert "【镜头】" in videos[0]["prompt_snapshot"]
-    assert "【声音】" in videos[0]["prompt_snapshot"]
+    assert "@Image1" in videos[0]["prompt_snapshot"]
+    assert "画面中不出现" in videos[0]["prompt_snapshot"]
     assert videos[0]["negative_prompt_snapshot"]  # 负面提示词存在
     assert videos[0]["file_path"].startswith("第01章-第一章/分镜视频/")
     assert api_client.get(f"/api/videos/{videos[0]['id']}/download").status_code == 200
@@ -615,6 +619,40 @@ def test_shot_update_rejects_duration_above_fifteen(api_client: TestClient) -> N
     )
 
     assert response.status_code == 422
+
+
+def test_shot_update_explicit_nulls_normalized_instead_of_500(
+    api_client: TestClient,
+) -> None:
+    """显式传 null 的文本/JSON/状态字段归一化，而不是写坏 NOT NULL 列。
+
+    回归：此前 {"action": null} 会触发 IntegrityError 500，
+    {"character_ids": null} 会写 "null" 进 JSON 列。
+    """
+    project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
+    created = api_client.post(
+        f"/api/chapters/{chapter['id']}/shots",
+        json={"action": "主角进入房间。", "duration_sec": 5},
+    )
+    assert created.status_code == 201
+
+    response = api_client.put(
+        f"/api/shots/{created.json()['id']}",
+        json={
+            "action": None,
+            "start_state": None,
+            "character_ids": None,
+            "status": None,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == ""
+    assert payload["start_state"] == ""
+    assert payload["character_ids"] == []
+    # status 显式 null 视为保持不变（新建分镜为 draft）
+    assert payload["status"] == "draft"
 
 
 def test_shot_split_rejects_duration_below_five(api_client: TestClient) -> None:

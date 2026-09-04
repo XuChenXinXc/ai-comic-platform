@@ -3,6 +3,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router";
+import { toast } from "sonner";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "../api/client";
 import type { Asset, Shot } from "../types/api";
@@ -186,13 +187,90 @@ describe("分镜视频统一页面", () => {
       screen.getByRole("button", { name: "生成全部视频" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /重新生成.*提示词/ }),
+      screen.getByRole("button", { name: /优化.*视频提示词/ }),
     ).toBeInTheDocument();
     expect(screen.queryByText("最终视频执行提示词")).not.toBeInTheDocument();
     expect(
       await screen.findByLabelText("分镜 1 关键帧区块"),
     ).toBeInTheDocument();
     expect(screen.getByLabelText("分镜 1 视频区块")).toBeInTheDocument();
+  });
+
+  test("test_shot_director_plan_section_shows_summary_and_issues", async () => {
+    vi.mocked(api.shots.list).mockResolvedValue([
+      {
+        ...shot,
+        director_plan: {
+          shotPurpose: "强调孤独",
+          audienceFocus: { first: "主角背影" },
+          composition: "negative-space",
+          cameraMotivation: "固定观察",
+          performance: "缓慢转身",
+          microPerformance: [
+            { trigger: "门开", action: "肩头轻偏", source: "环境刺激" },
+          ],
+          environmentMotion: "门缓缓滑开",
+          visualTone: ["低饱和自然光"],
+          timeline: [
+            { start: 0, end: 3, action: "站立" },
+            { start: 3, end: 6, action: "转身" },
+          ],
+          dialogueBindings: [
+            {
+              speaker: "主角",
+              text: "走吧",
+              startTime: 0.5,
+              endTime: 2,
+              requiresLipSync: true,
+              voiceSource: "character",
+            },
+          ],
+        },
+        consistency_issues: [
+          {
+            code: "continuity_mismatch",
+            severity: "warning",
+            message: "起始状态与上一镜结束状态缺少承接证据",
+            details: {},
+          },
+        ],
+      },
+    ]);
+    renderShotsPage();
+
+    await screen.findByRole("heading", { name: "分镜视频" });
+    expect(
+      await screen.findByRole("button", { name: "重新生成导演设计" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/叙事意图：强调孤独/)).toBeInTheDocument();
+    expect(screen.getByText(/构图：留白 \/ 负空间/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/唯一时间轴：0-3秒 站立；3-6秒 转身/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/对白绑定：0.5-2秒 主角：“走吧”/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/起始状态与上一镜结束状态缺少承接证据/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "重新生成导演设计" }),
+    ).toBeInTheDocument();
+  });
+
+  test("test_shot_director_plan_generate_calls_api", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api.shots, "generateDirectorPlan")
+      .mockResolvedValue({} as never);
+    renderShotsPage();
+
+    await screen.findByRole("heading", { name: "分镜视频" });
+    await user.click(
+      await screen.findByRole("button", { name: "生成导演设计" }),
+    );
+
+    await waitFor(() => expect(spy).toHaveBeenCalledWith("shot-1"));
   });
 
   test("test_shot_page_regenerate_prompts_uses_chapter_batch", async () => {
@@ -205,7 +283,7 @@ describe("分镜视频统一页面", () => {
 
     await screen.findByRole("heading", { name: "分镜视频" });
     await user.click(
-      screen.getByRole("button", { name: /重新生成.*提示词/ }),
+      screen.getByRole("button", { name: /优化.*视频提示词/ }),
     );
 
     expect(confirmSpy).toHaveBeenCalled();
@@ -217,6 +295,8 @@ describe("分镜视频统一页面", () => {
 
   test("test_shot_extraction_has_single_screenplay_source_without_selector", async () => {
     const user = userEvent.setup();
+    // 已有分镜时重新提取需先经确认
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     renderShotsPage();
 
     await screen.findByRole("heading", { name: "分镜视频" });
@@ -235,6 +315,83 @@ describe("分镜视频统一页面", () => {
         scope: "all",
       });
     });
+    confirmSpy.mockRestore();
+  });
+
+  test("test_shot_reextract_all_requires_confirmation_when_shots_exist", async () => {
+    const user = userEvent.setup();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderShotsPage();
+
+    // 等待 shots 加载完成，按钮变为「重新提取全部」
+    const reextractButton = await screen.findByRole("button", {
+      name: "重新提取全部",
+    });
+
+    // 取消确认时不执行覆盖性提取
+    await user.click(reextractButton);
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(api.shots.extract).not.toHaveBeenCalled();
+
+    // 确认后才执行提取
+    confirmSpy.mockReturnValue(true);
+    await user.click(reextractButton);
+    await waitFor(() => {
+      expect(api.shots.extract).toHaveBeenCalledWith("chapter-1", {
+        scope: "all",
+      });
+    });
+    confirmSpy.mockRestore();
+  });
+
+  test("test_shot_continuity_check_marks_session_and_confirms_rerun", async () => {
+    const user = userEvent.setup();
+    vi.mocked(toast.success).mockClear();
+    const checkSpy = vi
+      .spyOn(api.shots, "checkContinuity")
+      .mockResolvedValue({} as never);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderShotsPage();
+
+    await screen.findByRole("heading", { name: "分镜视频" });
+    // 本会话首次审校不弹确认
+    await user.click(screen.getByRole("button", { name: "剧情连贯审校" }));
+    // 等待 onSuccess 完成后再操作，确保会话级标记已写入
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+    expect(checkSpy).toHaveBeenCalledTimes(1);
+    expect(confirmSpy).not.toHaveBeenCalled();
+
+    // 同会话再次审校需确认会覆盖修正内容
+    await user.click(screen.getByRole("button", { name: "剧情连贯审校" }));
+    await waitFor(() => expect(checkSpy).toHaveBeenCalledTimes(2));
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    confirmSpy.mockRestore();
+  });
+
+  test("test_shot_continuity_check_state_resets_after_remount_without_localstorage", async () => {
+    const user = userEvent.setup();
+    vi.mocked(toast.success).mockClear();
+    const checkSpy = vi
+      .spyOn(api.shots, "checkContinuity")
+      .mockResolvedValue({} as never);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { unmount } = renderShotsPage();
+
+    await screen.findByRole("heading", { name: "分镜视频" });
+    await user.click(screen.getByRole("button", { name: "剧情连贯审校" }));
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+    unmount();
+
+    // 重新挂载（模拟刷新）后视为未审校，且不再写 localStorage
+    renderShotsPage();
+    await screen.findByRole("heading", { name: "分镜视频" });
+    await user.click(screen.getByRole("button", { name: "剧情连贯审校" }));
+    expect(checkSpy).toHaveBeenCalledTimes(2);
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(
+      localStorage.getItem("continuity-check-run-chapter-1"),
+    ).toBeNull();
+    confirmSpy.mockRestore();
   });
 
   test("test_shot_card_displays_dialogue_aliases_with_full_text", async () => {

@@ -1085,7 +1085,9 @@ def _duration_matches(left: float, right: float) -> bool:
 
 def _references_previous_frame(shot: StoryboardShot) -> bool:
     values: list[Any] = [shot.reference_bindings, shot.prompt_intent]
-    marker_keys = (
+    # 精确匹配的语义键：用于 role/type/kind 与映射键，避免 "prev" 命中
+    # "preview"/"previously"/"prev_scene_asset" 等无关文本导致误阻断。
+    exact_marker_keys = {
         "previous",
         "prev",
         "上一镜",
@@ -1096,16 +1098,37 @@ def _references_previous_frame(shot: StoryboardShot) -> bool:
         "inherit_previous",
         "last_frame",
         "end_frame_path",
+    }
+    # 字符串正文采用词边界匹配，避免子串误报；"上一镜" 等中文直接子串匹配。
+    word_markers = (
+        r"\bprev(?:ious)?\b",
+        r"\bprevious_frame\b",
+        r"\bprevious_keyframe\b",
+        r"\bprevious_end_frame\b",
+        r"\binherit_previous\b",
+        r"\blast_frame\b",
+        r"\bend_frame_path\b",
+        "上一镜",
     )
 
     def visit(value: Any) -> bool:
         if isinstance(value, Mapping):
             role = str(value.get("role", value.get("type", value.get("kind", "")))).casefold()
-            if any(marker in role for marker in marker_keys):
+            if role in exact_marker_keys:
                 return True
             for key, item in value.items():
                 key_text = str(key).casefold()
-                if any(marker in key_text for marker in marker_keys) and _usable(item):
+                # 语义组合键（previous_shot_id / previous_keyframe_id 等）按
+                # "标记_后缀" 命中；不带下划线的短标记（prev 等）保持精确匹配，
+                # 避免误伤 preview / prev_scene_asset 等无关键。
+                key_matches_marker = key_text in exact_marker_keys or (
+                    "_" in key_text
+                    and any(
+                        "_" in marker and key_text.startswith(f"{marker}_")
+                        for marker in exact_marker_keys
+                    )
+                )
+                if key_matches_marker and _usable(item):
                     return True
                 if visit(item):
                     return True
@@ -1113,10 +1136,19 @@ def _references_previous_frame(shot: StoryboardShot) -> bool:
         if isinstance(value, list | tuple):
             return any(visit(item) for item in value)
         if isinstance(value, str):
-            return any(marker in value.casefold() for marker in marker_keys)
+            text = value.casefold()
+            return any(_text_has_word(text, marker) for marker in word_markers)
         return False
 
     return any(visit(value) for value in values)
+
+
+def _text_has_word(text: str, marker: str) -> bool:
+    if not marker or not text:
+        return False
+    if marker in {"上一镜"}:
+        return marker in text
+    return re.search(marker, text) is not None
 
 
 def _has_frame_reference(shot: StoryboardShot) -> bool:
@@ -1134,15 +1166,22 @@ def _dialogue_text(value: Any) -> str:
 
 
 def _continuity_boundary(shot: StoryboardShot, side: str) -> dict[str, Any]:
+    """取 continuity_state 中指定侧（start/end）的边界；返回 (boundary, found)。
+
+    found=False 表示「字段存在但该侧边界缺失」（如 {"start": {...}} 取 end 侧），
+    与「完全无 state」（返回空 dict）语义不同，调用方据此产出 missing 诊断。
+    """
     state = shot.continuity_state
     if not isinstance(state, Mapping) or not state:
-        return {}
-    boundary = state.get(side)
-    if isinstance(boundary, Mapping):
-        return copy.deepcopy(dict(boundary))
+        return {}, False
     if "start" not in state and "end" not in state:
-        return copy.deepcopy(dict(state))
-    return {}
+        # 扁平结构：整个 state 即边界
+        return copy.deepcopy(dict(state)), True
+    boundary = state.get(side)
+    if isinstance(boundary, Mapping) and boundary:
+        return copy.deepcopy(dict(boundary)), True
+    # state 存在但目标侧缺失或为空：found=False，让调用方产出 missing 诊断
+    return {}, False
 
 
 def _continuity_differences(
@@ -2134,8 +2173,8 @@ def validate_storyboard_output(
                             },
                         )
                     )
-                previous_state = _continuity_boundary(previous, "end")
-                current_state = _continuity_boundary(shot, "start")
+                previous_state, previous_boundary_found = _continuity_boundary(previous, "end")
+                current_state, current_boundary_found = _continuity_boundary(shot, "start")
                 if previous_state and current_state:
                     differences = _continuity_differences(previous_state, current_state)
                     if differences:
@@ -2148,7 +2187,12 @@ def validate_storyboard_output(
                                 {"differences": differences},
                             )
                         )
-                elif not previous.continuity_state or not shot.continuity_state:
+                elif (
+                    not previous.continuity_state
+                    or not shot.continuity_state
+                    or not previous_boundary_found
+                    or not current_boundary_found
+                ):
                     diagnostics.append(
                         _diagnostic(
                             "blocking",
@@ -2158,6 +2202,8 @@ def validate_storyboard_output(
                             {
                                 "previous_has_state": bool(previous.continuity_state),
                                 "shot_has_state": bool(shot.continuity_state),
+                                "previous_boundary_found": previous_boundary_found,
+                                "current_boundary_found": current_boundary_found,
                             },
                         )
                     )
@@ -2680,7 +2726,7 @@ def build_storyboard_batch_payload(
             "action": previous.action,
             "end_state": previous.end_state,
             "transition_from_prev": previous.transition_from_prev,
-            "continuity_end": _continuity_boundary(previous, "end"),
+            "continuity_end": _continuity_boundary(previous, "end")[0],
         }
 
     return {
@@ -3134,8 +3180,8 @@ def validate_storyboard_batch(
                     },
                 )
             )
-        previous_state = _continuity_boundary(previous, "end")
-        current_state = _continuity_boundary(first, "start")
+        previous_state, previous_boundary_found = _continuity_boundary(previous, "end")
+        current_state, current_boundary_found = _continuity_boundary(first, "start")
         if previous_state and current_state:
             differences = _continuity_differences(previous_state, current_state)
             if differences:
@@ -3148,7 +3194,12 @@ def validate_storyboard_batch(
                         {"differences": differences},
                     )
                 )
-        elif not previous.continuity_state or not first.continuity_state:
+        elif (
+            not previous.continuity_state
+            or not first.continuity_state
+            or not previous_boundary_found
+            or not current_boundary_found
+        ):
             diagnostics.append(
                 _diagnostic(
                     "blocking",
@@ -3158,6 +3209,8 @@ def validate_storyboard_batch(
                     {
                         "previous_has_state": bool(previous.continuity_state),
                         "shot_has_state": bool(first.continuity_state),
+                        "previous_boundary_found": previous_boundary_found,
+                        "current_boundary_found": current_boundary_found,
                     },
                 )
             )

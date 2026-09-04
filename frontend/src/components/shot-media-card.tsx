@@ -94,7 +94,9 @@ export function ShotMediaCard({
     Promise.all([
       queryClient.invalidateQueries({ queryKey }),
       queryClient.invalidateQueries({
-        queryKey: queryKeys.shots(shot.project_id),
+        // 全站 shots 列表查询键是 chapterId 维度（ShotsPage/CustomShotsPage），
+        // 用 project_id 会失效错键导致分镜列表不刷新。
+        queryKey: queryKeys.shots(shot.chapter_id),
       }),
       ...(kind === "keyframe"
         ? [
@@ -121,7 +123,8 @@ export function ShotMediaCard({
     setPrompt((current) =>
       current === requestedPrompt ? savedPrompt : current,
     );
-    queryClient.setQueryData<Shot[]>(queryKeys.shots(shot.project_id), (shots) =>
+    // 与 invalidate 相同：shots 列表缓存按 chapterId 维度更新。
+    queryClient.setQueryData<Shot[]>(queryKeys.shots(shot.chapter_id), (shots) =>
       shots?.map((item) => (item.id === updatedShot.id ? updatedShot : item)),
     );
   };

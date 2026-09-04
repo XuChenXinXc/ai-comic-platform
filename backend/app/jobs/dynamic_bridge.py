@@ -9,7 +9,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.jobs.repository import JobRepository
-from app.models.tables import job, workflow_run, workflow_stage
+from app.models.tables import job
 from app.services.signature_service import calculate_signature
 from app.services.utils import json_dumps, new_id, utc_now
 
@@ -18,7 +18,6 @@ _DYNAMIC_TARGET_TYPE = "workflow_stage"
 _DYNAMIC_PROVIDER_KIND = "text"
 _REUSABLE_STATUSES = frozenset({"queued", "running", "waiting_provider", "downloading"})
 _RETRYABLE_STATUSES = frozenset({"failed", "interrupted"})
-_PROTECTED_RUN_STATUSES = frozenset({"blocked", "cancelled", "confirmed"})
 
 
 class DynamicJobBridgeError(RuntimeError):
@@ -310,98 +309,6 @@ class DynamicJobBridge:
                 pass
             raise
         return successful_ids
-
-    def reconcile_queued_stage_jobs(self) -> list[str]:
-        """为仍处于 queued 的动态阶段补建缺失顶层 Job。"""
-
-        try:
-            with self.repository.engine.connect() as connection:
-                candidates = connection.execute(
-                    select(
-                        workflow_run.c.id.label("run_id"),
-                        workflow_run.c.project_id.label("project_id"),
-                        workflow_run.c.chapter_id.label("chapter_id"),
-                        workflow_run.c.status.label("run_status"),
-                        workflow_stage.c.id.label("stage_id"),
-                        workflow_stage.c.stage_key.label("stage_key"),
-                        workflow_stage.c.input_signature.label("input_signature"),
-                        workflow_stage.c.status.label("stage_status"),
-                    )
-                    .select_from(
-                        workflow_run.join(
-                            workflow_stage,
-                            workflow_stage.c.workflow_run_id == workflow_run.c.id,
-                        )
-                    )
-                    .where(
-                        workflow_run.c.status.not_in(_PROTECTED_RUN_STATUSES),
-                        workflow_stage.c.status == "queued",
-                    )
-                    .order_by(workflow_run.c.id, workflow_stage.c.id)
-                ).all()
-
-            enqueue_ids: list[str] = []
-            seen_ids: set[str] = set()
-            for candidate in candidates:
-                values = _row_dict(candidate)
-                if values is None:
-                    continue
-                run_id = values.get("run_id")
-                stage_id = values.get("stage_id")
-                if not run_id or not stage_id:
-                    raise DynamicJobBridgeError("动态阶段候选记录缺少 run_id 或 stage_id")
-
-                with self.repository.engine.begin() as connection:
-                    run_record = _row_dict(
-                        connection.execute(
-                            select(workflow_run).where(workflow_run.c.id == run_id)
-                        ).first()
-                    )
-                    stage_record = _row_dict(
-                        connection.execute(
-                            select(workflow_stage).where(
-                                workflow_stage.c.id == stage_id,
-                                workflow_stage.c.workflow_run_id == run_id,
-                            )
-                        ).first()
-                    )
-                    if run_record is None or stage_record is None:
-                        continue
-                    if (
-                        run_record.get("status") in _PROTECTED_RUN_STATUSES
-                        or stage_record.get("status") != "queued"
-                    ):
-                        continue
-
-                    existing = self._find_by_stage_signature(
-                        connection,
-                        str(stage_record["id"]),
-                        str(stage_record.get("input_signature") or ""),
-                    )
-                    if existing is None:
-                        reference = self.ensure_stage_job_in_transaction(
-                            connection,
-                            run_record,
-                            stage_record,
-                        )
-                    else:
-                        reference = self._existing_reference(
-                            connection,
-                            existing,
-                            str(stage_record.get("status") or ""),
-                            retry_failed=False,
-                        )
-
-                if reference.status in _REUSABLE_STATUSES and reference.job_id not in seen_ids:
-                    seen_ids.add(reference.job_id)
-                    enqueue_ids.append(reference.job_id)
-            return enqueue_ids
-        except DynamicJobBridgeError:
-            raise
-        except SQLAlchemyError as error:
-            raise DynamicJobBridgeError(f"动态阶段 Job 对账失败：{error}") from error
-        except Exception as error:
-            raise DynamicJobBridgeError(f"动态阶段 Job 对账失败：{error}") from error
 
 
 __all__ = [

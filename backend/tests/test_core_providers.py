@@ -174,10 +174,14 @@ def test_http_provider_with_json_http_error_preserves_provider_message_without_u
     assert calls == 1
 
 
-def test_http_provider_retries_post_on_transient_status_and_preserves_message(
+def test_http_provider_post_gateway_failure_is_not_auto_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """瞬时性错误（503 过载）对 POST 也重试，且最终错误仍保留上游原始消息。"""
+    """C4：网关模糊失败（503 过载）对 POST 不自动重试，错误信息仍保留上游原始消息。
+
+    网关超时/过载时上游可能已建立计费任务，重发会重复计费；
+    失败直接返回，交由 Job 层 interrupted/失败恢复语义处理。
+    """
     provider = OpenAICompatibleTextProvider(
         ProviderConfig(
             id="text-real",
@@ -200,9 +204,7 @@ def test_http_provider_retries_post_on_transient_status_and_preserves_message(
     def fake_request(*_args: Any, **_kwargs: Any) -> requests.Response:
         nonlocal calls
         calls += 1
-        if calls <= 2:
-            return unavailable
-        raise requests.ConnectionError("connection reset")
+        return unavailable
 
     monkeypatch.setattr(requests, "request", fake_request)
 
@@ -216,7 +218,126 @@ def test_http_provider_retries_post_on_transient_status_and_preserves_message(
             options={},
         )
 
+    assert calls == 1
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+def test_http_provider_post_5xx_gateway_failures_are_not_auto_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    """C4：500/502/503/504 对 POST 一律不自动重试（网关模糊失败可能已建任务）。"""
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://provider.example/v1",
+            max_retries=2,
+        )
+    )
+    failure = requests.Response()
+    failure.status_code = status_code
+    failure.url = "https://provider.example/v1/chat/completions"
+    failure._content = b'{"error":{"message":"gateway failure"}}'
+    failure.headers["Content-Type"] = "application/json"
+    calls = 0
+
+    def fake_request(*_args: Any, **_kwargs: Any) -> requests.Response:
+        nonlocal calls
+        calls += 1
+        return failure
+
+    monkeypatch.setattr(requests, "request", fake_request)
+
+    with pytest.raises(ProviderError, match=f"HTTP {status_code}"):
+        provider._request(
+            "POST",
+            "https://provider.example/v1/chat/completions",
+            options={},
+        )
+
+    assert calls == 1
+
+
+def test_http_provider_post_429_rate_limit_is_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4：429 是明确限流（服务端未受理），对 POST 可安全重试。"""
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://provider.example/v1",
+            max_retries=1,
+        )
+    )
+    rate_limited = requests.Response()
+    rate_limited.status_code = 429
+    rate_limited.url = "https://provider.example/v1/chat/completions"
+    rate_limited._content = b'{"error":{"message":"rate limited"}}'
+    rate_limited.headers["Content-Type"] = "application/json"
+    ok = requests.Response()
+    ok.status_code = 200
+    ok._content = b"{}"
+    calls = 0
+
+    def fake_request(*_args: Any, **_kwargs: Any) -> requests.Response:
+        nonlocal calls
+        calls += 1
+        return rate_limited if calls == 1 else ok
+
+    monkeypatch.setattr(requests, "request", fake_request)
+
+    response = provider._request(
+        "POST",
+        "https://provider.example/v1/chat/completions",
+        options={},
+    )
+
     assert calls == 2
+    assert response.status_code == 200
+
+
+def test_http_provider_get_transient_5xx_keeps_retrying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4：GET 等安全方法幂等，瞬时 5xx 维持现状照常重试。"""
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://provider.example/v1",
+            max_retries=1,
+        )
+    )
+    failure = requests.Response()
+    failure.status_code = 503
+    failure.url = "https://provider.example/v1/tasks/task-1"
+    failure._content = b'{"error":{"message":"Service is too busy"}}'
+    failure.headers["Content-Type"] = "application/json"
+    ok = requests.Response()
+    ok.status_code = 200
+    ok._content = b"{}"
+    calls = 0
+
+    def fake_request(*_args: Any, **_kwargs: Any) -> requests.Response:
+        nonlocal calls
+        calls += 1
+        return failure if calls == 1 else ok
+
+    monkeypatch.setattr(requests, "request", fake_request)
+
+    response = provider._request(
+        "GET",
+        "https://provider.example/v1/tasks/task-1",
+        options={},
+    )
+
+    assert calls == 2
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize("header_name", ["Authorization", "X-Signature"])
@@ -1011,16 +1132,6 @@ def test_compress_reference_image_caps_long_side_and_preserves_aspect(
         assert original.size == (3840, 2160)
 
 
-def test_edge_tts_sync_wrapper_rejects_running_loop() -> None:
-    async def call() -> None:
-        from app.providers.tts.edge_tts import list_voices_sync
-
-        with pytest.raises(RuntimeError, match="事件循环"):
-            list_voices_sync()
-
-    asyncio.run(call())
-
-
 def test_gpt_image_2_x5_with_references_uses_multipart_edits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1780,7 +1891,12 @@ def test_grok_video_upload_retries_transient_status_with_complete_content(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """视频关键帧上传遇 503 重试时，两次发送的文件内容必须完整一致（不得发空文件）。"""
+    """视频关键帧上传遇 429（明确限流，POST 可安全重试）时，两次发送的文件内容必须完整一致。
+
+    C4 后 POST 对 500/502/503/504 网关模糊失败不再自动重试，可安全重试的
+    瞬时状态为 429（以及带错误体的 202）；本测试改用 429 验证重试路径
+    （重试时不得发空文件）。
+    """
     provider = HttpVideoProvider(
         ProviderConfig(
             id="video-grok",
@@ -1799,7 +1915,7 @@ def test_grok_video_upload_retries_transient_status_with_complete_content(
         sent_contents.append(value.read() if hasattr(value, "read") else value)
         if len(sent_contents) == 1:
             response = requests.Response()
-            response.status_code = 503
+            response.status_code = 429
             response._content = b""
             return response
         response = requests.Response()

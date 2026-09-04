@@ -17,8 +17,6 @@ from app.dynamic_pipeline.prompt_ir import (
     VisualStyleSpec,
     apply_human_override,
     canonical_prompt_json,
-    clear_human_override,
-    is_override_stale,
     prompt_input_hash,
 )
 
@@ -176,42 +174,6 @@ def test_human_override_applies_to_strict_nested_bundles() -> None:
     assert video.prompt == "人工视频"
     assert image.negative_prompt == "禁止 logo"
     assert video.end_state == {"pose": "finished"}
-
-
-def test_clear_human_override_restores_generated_and_marks_cleared() -> None:
-    generated = {"image_prompt": "自动稿"}
-    override = HumanOverrideSet(image_prompt="人工稿")
-    bundle = CompiledPromptBundle(
-        generated=generated,
-        human_override=override,
-        final=apply_human_override(generated, override),
-        input_hash="with-override",
-        base_compiler_hash="base-input",
-        override_status="active",
-    )
-
-    cleared = clear_human_override(bundle)
-
-    assert cleared.generated == generated
-    assert cleared.final == generated
-    assert cleared.human_override is not None
-    assert cleared.human_override.cleared is True
-    assert cleared.input_hash == "base-input"
-    assert cleared.override_status == "cleared"
-
-
-def test_override_stale_is_based_on_base_compiler_input_hash() -> None:
-    bundle = CompiledPromptBundle(
-        generated={"image_prompt": "自动稿"},
-        human_override=HumanOverrideSet(image_prompt="人工稿"),
-        base_compiler_hash="input-v1",
-        input_hash="compiled-with-override",
-        override_status="active",
-    )
-
-    assert is_override_stale(bundle, "input-v1") is False
-    assert is_override_stale(bundle, "input-v2") is True
-    assert is_override_stale(clear_human_override(bundle), "input-v2") is False
 
 
 def test_compiled_bundle_constructs_diagnostics_and_provider_capability_snapshot() -> None:

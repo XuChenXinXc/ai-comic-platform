@@ -226,6 +226,10 @@ def test_extract_assets_with_minor_screenplay_characters_saves_only_key_roles_on
     assert provider.calls[0]["user_prompt"] == (
         f"本章正文：\n{chapter['source_text']}\n\n"
         "已有素材目录（已存在，本章若出现同一对象请勿重复提取）：\n[]"
+        "\n\n本集已生成剧本的场次名（提取场景素材时：正文地点若与本集剧本"
+        "场次一致，`name` 必须逐字采用剧本场次名，或至少把剧本场次名收进"
+        " `aliases`，保证后续分镜按名称绑定场景素材）：\n"
+        f"{json_dumps(['法院大厅'])}"
     )
     assert {item["name"] for item in characters} == {"小明"}
     assert result["count"] == 1
@@ -352,7 +356,93 @@ def test_extract_warns_when_analysis_main_character_has_no_asset(
         service.handle_extract(_extract_job(str(chapter["id"]), str(project["id"])))
     )
 
-    assert result["warnings"] == ["核心角色「李四」尚未在素材库中"]
+    assert "核心角色「李四」尚未在素材库中" in result["warnings"]
+
+
+def test_complete_missing_creates_assets_from_missing_list(
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺失素材补全：只按缺失清单提取入库，清单为空时不调用模型。
+
+    分镜阶段报告 missing_assets 后，由 complete_missing 用专用提示词
+    asset_complete 补建素材，供重新提取分镜时按 ID 绑定。
+    """
+    _database, service, project, chapter = asset_extraction_services
+    missing = [
+        {
+            "asset_type": "scene",
+            "reason": "剧情进入办公楼大堂，素材库没有对应场景",
+            "source_ref": "第二场",
+            "suggested_name": "中关村科技公司一层大堂",
+            "suggested_aliases": ["公司大堂", "一楼大厅"],
+        }
+    ]
+    provider = SequencedAssetProvider(
+        [
+            {
+                "characters": [],
+                "scenes": [
+                    {
+                        "name": "中关村科技公司一层大堂",
+                        "aliases": ["公司大堂", "一楼大厅"],
+                        "layout": "旋转门正对前台，左右各一组闸机",
+                        "prompt": "办公楼一层大堂，旋转门与前台位置固定",
+                        "negative_prompt": "人物，人群，人影，文字，水印",
+                        "consistency_keywords": ["旋转门", "前台"],
+                        "composition": "主透视图、双向全景、俯视平面图",
+                        "importance": "core",
+                    }
+                ],
+                "props": [],
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_values: (provider, {"params": {}}),
+    )
+
+    result = asyncio.run(
+        service.complete_missing(str(chapter["id"]), missing, provider_id="mock-text")
+    )
+
+    assert result["count"] == 1
+    saved = service.get(result["asset_ids"][0])
+    assert saved["name"] == "中关村科技公司一层大堂"
+    assert saved["asset_type"] == "scene"
+    assert saved["profile"]["aliases"] == ["公司大堂", "一楼大厅"]
+    # 补素材提示词携带缺失清单与已有目录
+    assert "缺失素材清单" in provider.calls[0]["user_prompt"]
+    assert "已有素材目录" in provider.calls[0]["user_prompt"]
+
+
+def test_complete_missing_with_empty_list_does_not_call_model(
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺失清单为空时直接返回空结果，不调用模型。"""
+    _database, service, project, chapter = asset_extraction_services
+    called: list[str] = []
+
+    class UnexpectedProvider:
+        async def generate_json(self, **_values: Any) -> AssetExtractionOutput:
+            called.append("called")
+            return AssetExtractionOutput(
+                characters=[], scenes=[], props=[]
+            )
+
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_values: (UnexpectedProvider(), {"params": {}}),
+    )
+
+    result = asyncio.run(service.complete_missing(str(chapter["id"]), []))
+
+    assert result == {"asset_ids": [], "count": 0, "warnings": []}
+    assert called == []
 
 
 def test_extract_first_empty_retry_with_content_saves_asset(

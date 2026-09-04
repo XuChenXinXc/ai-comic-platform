@@ -373,9 +373,10 @@ def _insert_job(
     input_signature: str | None = "stage-signature",
     provider_id: str | None = None,
     params: dict[str, Any] | None = None,
+    job_suffix: str = "",
 ) -> dict[str, Any]:
     stage_id = f"stage-{DYNAMIC_STAGE_KEYS.index(stage_key)}"
-    job_id = f"job-{stage_key}"
+    job_id = f"job-{stage_key}{job_suffix}"
     now = utc_now()
     input_data = {"params": params or {}}
     with database.engine.begin() as connection:
@@ -1300,3 +1301,113 @@ def test_strict_script_schema_failure_marks_job_stage_and_run_failed(stage_conte
             .where(job.c.id == job_record["id"])
         ).one()
     assert statuses == ("failed", "failed", "failed")
+
+
+def test_storyboard_regenerate_with_new_attempt_bypasses_batch_cache(
+    stage_context,
+) -> None:
+    database = stage_context
+    service, provider_service = _phase34_service(database)
+    _confirm_phase34_upstream(database, include_script=True)
+    _set_run_stage(database, "4-storyboard")
+    first_job = _insert_job(database, "4-storyboard")
+
+    first_result = _run(service.execute_job(first_job))
+
+    assert first_result["stage_status"] == "ready"
+    # 30 秒单场景只拆出一个批次，首次执行恰好一次 Provider 调用。
+    assert len(provider_service.provider.calls) == 1
+
+    # 模拟 regenerate：同 run 同签名但 stage attempt 递增，重新入队执行。
+    _set_run_stage(database, "4-storyboard")
+    with database.engine.begin() as connection:
+        connection.execute(
+            update(workflow_stage)
+            .where(
+                workflow_stage.c.workflow_run_id == "run-stage-service",
+                workflow_stage.c.stage_key == "4-storyboard",
+            )
+            .values(attempt=2)
+        )
+    second_job = _insert_job(database, "4-storyboard", job_suffix="-retry")
+
+    second_result = _run(service.execute_job(second_job))
+
+    assert second_result["stage_status"] == "ready"
+    # 缓存键包含 attempt：新 attempt 不得命中旧缓存，Provider 必须再次被调用。
+    assert len(provider_service.provider.calls) == 2
+
+
+def test_storyboard_batch_cache_prunes_by_run_instead_of_global_clear(
+    stage_context,
+) -> None:
+    database = stage_context
+    service, provider_service = _phase34_service(database)
+    _confirm_phase34_upstream(database, include_script=True)
+    _set_run_stage(database, "4-storyboard")
+    job_record = _insert_job(database, "4-storyboard")
+
+    # 预填超过上限的其他 run 缓存条目（每个 run 一条）。
+    for index in range(service._STORYBOARD_CACHE_MAX_ENTRIES + 1):
+        service._storyboard_batch_cache[
+            (f"other-run-{index}", "other-signature", ((("scene-x",), 0.0, 30.0),), 1)
+        ] = []
+
+    _run(service.execute_job(job_record))
+
+    surviving_keys = list(service._storyboard_batch_cache)
+    surviving_runs = {key[0] for key in surviving_keys}
+    # 当前 run 的缓存条目保留，可继续复用。
+    assert "run-stage-service" in surviving_runs
+    # 超限后按 run 淘汰最旧运行（其他 run 各一条，淘汰两个后回到上限），
+    # 而不是 clear() 式全清导致所有 run 的缓存同时失效。
+    other_runs = {
+        key[0] for key in surviving_keys if key[0] != "run-stage-service"
+    }
+    assert len(other_runs) == service._STORYBOARD_CACHE_MAX_ENTRIES - 1
+    assert "other-run-0" not in other_runs
+    assert "other-run-1" not in other_runs
+    assert "other-run-2" in other_runs
+    assert len(surviving_keys) == service._STORYBOARD_CACHE_MAX_ENTRIES
+
+
+def test_mark_generation_failure_logs_persistence_exception(
+    stage_context,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    from app.dynamic_pipeline.stage_service import _ExecutionContext
+
+    database = stage_context
+    service, _ = _service(database)
+    context = _ExecutionContext(
+        job_record={"id": "job-logging"},
+        run_record={"id": "run-logging"},
+        stage_record={"id": "stage-logging", "stage_key": "0-source"},
+        upstream_outputs={},
+    )
+
+    class _BrokenEngine:
+        # 模拟落库阶段数据库引擎失效。
+        def begin(self) -> Any:
+            raise RuntimeError("database gone")
+
+        def dispose(self) -> None:
+            # fixture teardown 需要该方法，无需真实清理。
+            return
+
+    monkeypatch.setattr(service.database, "engine", _BrokenEngine())
+
+    with caplog.at_level(
+        logging.ERROR, logger="app.dynamic_pipeline.stage_service"
+    ):
+        # 落库失败不向上抛出（原始业务异常由调用方继续抛），但必须留下完整堆栈日志。
+        service._mark_generation_failure(context, RuntimeError("provider boom"))
+
+    failure_records = [
+        record for record in caplog.records if "动态阶段失败状态落库异常" in record.message
+    ]
+    assert failure_records, "阶段失败落库异常必须记录 logger.exception 而不是静默吞掉"
+    assert failure_records[0].exc_info is not None

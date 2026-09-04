@@ -34,4 +34,16 @@ describe("基础交互组件", () => {
     await user.keyboard("{Escape}");
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  test("test_modal_focuses_first_focusable_element_when_opened", () => {
+    render(
+      <Modal open onClose={() => {}} title="编辑素材">
+        <p>内容</p>
+      </Modal>,
+    );
+
+    // 打开后焦点应移入对话框内的第一个可聚焦元素（关闭按钮），而不是停留在背景页面
+    const closeButton = screen.getByRole("button", { name: "关闭" });
+    expect(document.activeElement).toBe(closeButton);
+  });
 });

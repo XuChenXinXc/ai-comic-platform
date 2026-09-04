@@ -434,8 +434,8 @@ class MockTextProvider:
         if schema is ShotVideoPromptOptimizeOutput:
             return {
                 "prompt": (
-                    "0-2秒：主角向前走；2-4秒：停下观察；4-5秒：视线转向画外。"
-                    "固定机位，画面变化由人物动作推动。"
+                    "主角先向前走，随后停下观察，接近结尾时视线转向画外。"
+                    "机位固定，画面变化由人物动作推动。"
                 ),
             }
         return self._generic_model_payload(schema)
@@ -602,7 +602,13 @@ class MockVideoProvider:
         local_file = result.data.get("local_file")
         if not local_file:
             raise ProviderError("Mock 视频结果缺少本地文件")
-        return await asyncio.to_thread(atomic_copy, local_file, target)
+        # 纵深防御：结果文件必须位于本 Provider 自己的任务目录内，
+        # 伪造结果指向任意本机文件时拒绝复制。
+        resolved_local = Path(str(local_file)).resolve()
+        task_root = Path(self.task_dir).resolve()
+        if not resolved_local.is_relative_to(task_root):
+            raise ProviderError("Provider 返回的本地文件超出任务目录范围")
+        return await asyncio.to_thread(atomic_copy, resolved_local, target)
 
     def _task_path(self, task_id: str) -> Path:
         if not task_id.startswith("mock-video-") or any(char in task_id for char in "\\/"):
@@ -717,8 +723,9 @@ class MockVideoProvider:
 class MockTTSProvider:
     """Mock TTS Provider for testing"""
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(self, config: ProviderConfig, api_key: str = "") -> None:
         self.config = config
+        self.api_key = api_key
 
     async def synthesize(
         self,

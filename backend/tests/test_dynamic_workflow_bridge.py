@@ -12,6 +12,7 @@ from app.jobs.dynamic_bridge import (
     DynamicJobBridgeError,
     build_dynamic_idempotency_key,
 )
+from app.jobs.dynamic_recovery import _reconcile_queued_stage_jobs
 from app.jobs.repository import JobRepository
 from app.models.tables import chapter, job, project, workflow_run, workflow_stage
 from app.services.signature_service import calculate_signature
@@ -312,15 +313,13 @@ def test_reconcile_queued_stage_builds_missing_job_without_enqueue(
     bridge_context: tuple[Database, JobRepository, dict, dict],
 ) -> None:
     database, repository, _run, _stage = bridge_context
-    called: list[str] = []
-    bridge = DynamicJobBridge(repository, enqueue=lambda job_id: called.append(job_id) or True)
-
-    first = bridge.reconcile_queued_stage_jobs()
-    second = bridge.reconcile_queued_stage_jobs()
+    # C3 收敛：DynamicJobBridge.reconcile_queued_stage_jobs 已删除，
+    # 对账统一走 dynamic_recovery._reconcile_queued_stage_jobs（生产恢复路径）。
+    first = _reconcile_queued_stage_jobs(repository)
+    second = _reconcile_queued_stage_jobs(repository)
 
     assert len(first) == 1
     assert second == first
-    assert called == []
     assert _count_jobs(database) == 1
 
 
@@ -344,5 +343,5 @@ def test_reconcile_skips_blocked_cancelled_confirmed_or_stale_stage(
             .values(status=stage_status)
         )
 
-    assert DynamicJobBridge(repository).reconcile_queued_stage_jobs() == []
+    assert _reconcile_queued_stage_jobs(repository) == []
     assert _count_jobs(database) == 0

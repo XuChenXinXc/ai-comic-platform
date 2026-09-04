@@ -23,6 +23,10 @@ Create Date: 2026-08-06
 
 如需保留数据，请在升级前设置环境变量：
   export SKIP_DATA_DELETION=1
+
+历史备注：本迁移是「迁移只增量」约定的显式例外（用户当时的明确决策）。
+迁移内的导出目录基于进程 CWD 相对路径 data_export/，且含 time.sleep(3)
+等待导出落盘；新迁移不得复制此模式。
 """
 
 import json
@@ -147,6 +151,9 @@ def upgrade() -> None:
     else:
         print("\n⚠️  跳过数据删除（SKIP_DATA_DELETION=1）")
         print("注意：这可能导致数据不一致，请手动处理数据迁移。\n")
+        # 逃生舱补强：跳过删除时也必须先把 novel_analysis/screenplay 导出
+        # 落盘，否则下面重建表会直接丢数据；导出目录见 export_data_before_deletion。
+        export_data_before_deletion()
 
     # novel_analysis / screenplay：主键换成 chapter_id
     for table_name in ("novel_analysis", "screenplay"):
@@ -196,12 +203,15 @@ def upgrade() -> None:
 
     if "shot" in existing_tables:
         with op.batch_alter_table("shot") as batch:
+            # 逃生舱（跳过删除）时存量 shot 行没有 chapter 归属：加列为可空，
+            # 否则 SQLite 重建表时 NOT NULL 无默认值必然失败；NULL 行对
+            # 新查询不可见（按 chapter_id 过滤），由用户手动迁移补齐。
             batch.add_column(
                 sa.Column(
                     "chapter_id",
                     sa.Text(),
                     sa.ForeignKey("chapter.id", ondelete="CASCADE"),
-                    nullable=False,
+                    nullable=skip_deletion,
                 )
             )
             batch.drop_constraint("uq_shot_project_no", type_="unique")

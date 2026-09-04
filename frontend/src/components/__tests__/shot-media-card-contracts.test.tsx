@@ -3,7 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, test, vi } from "vitest";
-import { api } from "../../api/client";
+import { api, queryKeys } from "../../api/client";
 import type { MediaVersion, ReferenceBinding, Shot } from "../../types/api";
 import { ShotMediaCard } from "../shot-media-card";
 
@@ -141,6 +141,32 @@ describe("分镜媒体显式提示词门禁", () => {
 
     expect(updateSpy).toHaveBeenCalledWith("shot-1", {
       image_prompt_override: "新的最终关键帧提示词",
+    });
+  });
+
+  test("test_save_prompt_invalidates_chapter_shots_query", async () => {
+    // 分镜列表查询键是 chapterId 维度：保存提示词后必须失效对应键。
+    const user = userEvent.setup();
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    vi.spyOn(api.shots, "update").mockResolvedValue(baseShot as never);
+
+    renderCard(baseShot, "keyframe", queryClient);
+
+    const textarea = screen.getByRole("textbox");
+    await user.clear(textarea);
+    await user.type(textarea, "新的最终关键帧提示词");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: queryKeys.shots("test-chapter"),
+      });
     });
   });
 

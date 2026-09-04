@@ -12,6 +12,8 @@ PROMPT_DIAGNOSTIC_CODES = frozenset(
         "reference_wrong_type",
         "reference_index_mismatch",
         "timeline_discontinuous",
+        "timeline_event_dropped",
+        "timeline_event_clamped",
         "continuous_previous_end_frame_missing",
         "provider_reference_limit",
         "provider_duration_unsupported",
@@ -26,6 +28,14 @@ PROMPT_DIAGNOSTIC_CODES = frozenset(
 )
 
 _ALLOWED_LEVELS = ("warning", "blocking")
+
+
+def unknown_prompt_diagnostic_codes(
+    diagnostics: Iterable[Diagnostic],
+) -> list[str]:
+    """返回不属于已注册诊断代码集合的 code，供编译出口断言使用。"""
+
+    return sorted({item.code for item in diagnostics} - PROMPT_DIAGNOSTIC_CODES)
 
 
 def diagnostic(
@@ -86,4 +96,5 @@ __all__ = [
     "diagnostic",
     "diagnostics_status",
     "sort_diagnostics",
+    "unknown_prompt_diagnostic_codes",
 ]

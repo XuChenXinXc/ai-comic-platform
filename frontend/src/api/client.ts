@@ -21,6 +21,7 @@ import type {
   ProjectStorageSelection,
   ProjectStorageSetting,
   ProviderInput,
+  SceneView,
   ScreenplayContent,
   Shot,
   ShotQualityReport,
@@ -165,6 +166,8 @@ function shotPayload(body: Partial<Shot>, includeCreateFields: boolean) {
     : rawSourceRef;
   const payload: Record<string, unknown> = {
     scene_asset_id: body.scene_asset_id,
+    // 后端 shot update 接收 scene_view_key（空字符串=默认母版）；scene_view_id 只读展示用，不提交
+    scene_view_key: body.scene_view_key,
     character_ids: body.character_ids_json ?? body.character_ids,
     prop_ids: body.prop_ids_json ?? body.prop_ids,
     positions: body.positions_json ?? body.positions,
@@ -223,8 +226,18 @@ export function mediaUrl(version?: MediaVersion | null) {
   const value = version?.media_url || version?.file_url || version?.file_path;
   if (!value) return "";
   if (/^https?:\/\//i.test(value) || value.startsWith("blob:")) return value;
-  if (value.startsWith("/media/")) return value;
-  return `/media/${value.replace(/^\/+/, "")}`;
+  if (value.startsWith("/media/")) {
+    // 服务端返回的路径理论上可信，仍清洗路径段防止拼出越界 URL；
+    // 必须补回前导斜杠，否则嵌套路由下会解析成相对路径导致 404。
+    const parts = value.split("/").filter((part) => part && part !== "..");
+    return `/${parts.join("/")}`;
+  }
+  const cleaned = value
+    .replace(/^\/+/, "")
+    .split("/")
+    .filter((part) => part && part !== "..")
+    .join("/");
+  return `/media/${cleaned}`;
 }
 
 export async function download(path: string, filename: string) {
@@ -262,7 +275,8 @@ async function downloadBlob(path: string, filename: string, init?: RequestInit) 
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(url);
+  // 延后 revoke：部分浏览器（Firefox/Safari）在 click 后立即回收会中断下载。
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
 function safeDownloadFilename(value: string) {
@@ -274,6 +288,7 @@ export const queryKeys = {
   project: (id: string) => ["projects", id] as const,
   analysis: (id: string) => ["analysis", id] as const,
   screenplay: (id: string) => ["screenplay", id] as const,
+  chapters: (projectId: string) => ["chapters", projectId] as const,
   assets: (id: string, type?: AssetType) => ["assets", id, type || "all"] as const,
   assetImages: (id: string) => ["asset-images", id] as const,
   shots: (id: string) => ["shots", id] as const,
@@ -409,10 +424,13 @@ export const api = {
         json("POST", body),
       ),
     images: {
-      list: async (assetId: string) =>
+      list: async (
+        assetId: string,
+        filters: { scene_view_id?: string } = {},
+      ) =>
         asList(
           await request<MediaVersion[] | { items: MediaVersion[] }>(
-            `/assets/${assetId}/images`,
+            `/assets/${assetId}/images${params(filters)}`,
           ),
         ),
       generate: (assetId: string, body: Record<string, unknown> = {}) =>
@@ -442,6 +460,25 @@ export const api = {
         request<MediaVersion>(`/asset-images/${id}/current`, json("PUT")),
       remove: (id: string) =>
         request<void>(`/asset-images/${id}`, json("DELETE")),
+    },
+    sceneViews: {
+      list: (assetId: string) =>
+        request<SceneView[]>(`/assets/${assetId}/scene-views`),
+      ensure: (assetId: string) =>
+        request<SceneView[]>(`/assets/${assetId}/scene-views/ensure`, json("POST")),
+      update: (viewId: string, body: { prompt: string }) =>
+        request<SceneView>(`/scene-views/${viewId}`, json("PUT", body)),
+      remove: (viewId: string) =>
+        request<void>(`/scene-views/${viewId}`, json("DELETE")),
+      generate: (
+        assetId: string,
+        viewKey: string,
+        body: { provider_id?: string } = {},
+      ) =>
+        request<Job>(
+          `/assets/${assetId}/scene-views/${viewKey}/generate`,
+          json("POST", body),
+        ),
     },
   },
   shots: {
@@ -488,6 +525,16 @@ export const api = {
       request<Job>(`/shots/${id}/image-prompt/generate`, json("POST", body)),
     generateVideoPrompt: (id: string, body: Record<string, unknown> = {}) =>
       request<Job>(`/shots/${id}/video-prompt/generate`, json("POST", body)),
+    generateDirectorPlan: (id: string, body: Record<string, unknown> = {}) =>
+      request<Job>(`/shots/${id}/director-plan/generate`, json("POST", body)),
+    batchDirectorPlans: (
+      chapterId: string,
+      body: { ids?: string[] } = {},
+    ) =>
+      request<BatchResponse>(
+        `/chapters/${chapterId}/shots/director-plans/batch`,
+        json("POST", body),
+      ),
     batchPrompts: (
       chapterId: string,
       body: { ids?: string[]; prompt_types?: Array<"image" | "video"> } = {},
@@ -763,6 +810,8 @@ export const api = {
         bgm_volume: number;
         dialogue_volume: number;
         sound_effect_volume: number;
+        // 角色→音色映射（服务端持久化；键为角色名，值为音色 ID）
+        voice_mapping: Record<string, string>;
       }>(`/audio/projects/${projectId}/config`),
 
     updateConfig: (projectId: string, config: {
@@ -770,6 +819,7 @@ export const api = {
       bgm_volume?: number;
       dialogue_volume?: number;
       sound_effect_volume?: number;
+      voice_mapping?: Record<string, string>;
     }) =>
       request<{
         project_id: string;
@@ -777,6 +827,7 @@ export const api = {
         bgm_volume: number;
         dialogue_volume: number;
         sound_effect_volume: number;
+        voice_mapping: Record<string, string>;
       }>(`/audio/projects/${projectId}/config`, json("PUT", config)),
 
     extractDialogues: (chapterId: string) =>

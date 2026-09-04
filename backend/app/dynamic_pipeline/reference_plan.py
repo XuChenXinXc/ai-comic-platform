@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import Field
 
@@ -571,6 +571,26 @@ def _text_mapping(
     return actual_local_files, actual_urls, mapping
 
 
+def _stable_url(value: Any) -> str:
+    """URL 稳定性投影：剔除 query 中的签名/Expires 参数。
+
+    provider_url 是带 Expires 的预签名 URL，重新签名会使 query 变化；
+    参与 snapshot hash 时只保留 scheme+host+path，保证同内容不同签名的
+    URL 得到相同 hash，避免不必要的重新生成（与 previous_end_frame 的
+    provider_url pop 处理保持一致口径）。
+    """
+    text = _text(value)
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+        if parsed.scheme not in {"http", "https"}:
+            return text
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    except ValueError:
+        return text
+
+
 def stable_reference_plan_payload(plan: ReferencePlan | Mapping[str, Any]) -> dict[str, Any]:
     """返回不包含工作目录绝对路径和输入 snapshot_hash 的计划投影。"""
 
@@ -594,6 +614,8 @@ def stable_reference_plan_payload(plan: ReferencePlan | Mapping[str, Any]) -> di
         stable = slot.model_dump(mode="json")
         if stable.get("relative_path"):
             stable["relative_path"] = _text(stable["relative_path"]).replace("\\", "/")
+        if stable.get("provider_url"):
+            stable["provider_url"] = _stable_url(stable["provider_url"])
         stable_slots.append(stable)
 
     raw_mapping = raw.get("text_mapping")
@@ -607,7 +629,7 @@ def stable_reference_plan_payload(plan: ReferencePlan | Mapping[str, Any]) -> di
         original = raw_mapping.get(token)
         original = original if isinstance(original, Mapping) else {}
         relative_path = _text(slot_payload.get("relative_path")).replace("\\", "/")
-        provider_url = _text(slot_payload.get("provider_url"))
+        provider_url = _stable_url(slot_payload.get("provider_url"))
         source = "local" if relative_path else "url" if provider_url else ""
         value = relative_path or provider_url
         try:

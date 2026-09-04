@@ -438,17 +438,35 @@ def _decode_row(
     return _redact(result)
 
 
-def _record_ready(record: Mapping[str, Any]) -> bool:
-    return _status(record.get("status")).casefold() in _READY_STATUSES
+def _record_ready(record: Mapping[str, Any], *, kind: str = "") -> bool:
+    status = _status(record.get("status")).casefold()
+    if status:
+        return status in _READY_STATUSES
+    # shot_subtitle 没有 status 列：用「存在有效文本 + 时间轴」作为完成判据，
+    # 避免交付清单里的字幕项无论是否生成都显示 missing。
+    if kind == "subtitle" or record.get("kind") == "subtitle":
+        text = str(record.get("text") or record.get("content") or "").strip()
+        start_time = record.get("start_time")
+        end_time = record.get("end_time")
+        return bool(
+            text
+            and isinstance(start_time, int | float)
+            and isinstance(end_time, int | float)
+            and float(end_time) > float(start_time)
+        )
+    return False
 
 
 def _checklist_media_item(
     key: str,
     label: str,
     records: Sequence[Mapping[str, Any]],
+    *,
+    kind: str = "",
 ) -> dict[str, Any]:
     total = len(records)
-    completed = sum(_record_ready(record) for record in records)
+    # 字幕行没有 status 列：按内容有效性判定完成，见 _record_ready。
+    completed = sum(_record_ready(record, kind=kind) for record in records)
     if total and completed == total:
         status = "completed"
         reason = ""
@@ -630,7 +648,9 @@ class DynamicDeliveryService:
             ("audio", "配音", "audio"),
             ("subtitle", "字幕", "subtitle"),
         ):
-            result.append(_checklist_media_item(key, label, current_media.get(kind, ())))
+            result.append(
+                _checklist_media_item(key, label, current_media.get(kind, ()), kind=kind)
+            )
 
         if selected_bgms:
             result.append(
@@ -1896,6 +1916,9 @@ class DynamicDeliveryJobService:
         if not dependencies:
             return
         try:
+            # 120 秒依赖等待只是 runner 层 depends_on 门控失效时的兜底防护，
+            # 主机制仍是 Job 调度器按 depends_on 依赖顺序入队执行；这里等待
+            # 到超时即抛错，避免交付任务在依赖缺失时无限挂起。
             async with asyncio.timeout(120):
                 while True:
                     pending = False
@@ -2304,9 +2327,16 @@ class DynamicDeliveryJobService:
                 "job_id": job_id,
                 "error": "子任务正在由共享 Runner 执行",
             }
-        result = handler(claimed)
-        if inspect.isawaitable(result):
-            result = await result
+        try:
+            result = handler(claimed)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:  # noqa: BLE001 — handler 异常必须落为子 Job 失败而非卡 running
+            error = sanitize_error_message(exc) or str(exc)
+            self.repository.fail(job_id, error)
+            raise DeliveryExecutionError(
+                f"{job_type} 子任务执行失败：{error}"
+            ) from exc
         result_mapping = dict(result) if isinstance(result, Mapping) else {}
         latest = self.repository.get(job_id)
         if latest is not None and latest.get("status") in NON_TERMINAL_STATUSES:

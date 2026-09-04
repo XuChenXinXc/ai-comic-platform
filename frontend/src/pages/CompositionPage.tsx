@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router";
-import { api } from "../api/client";
+import { toast } from "sonner";
+import { api, mediaUrl } from "../api/client";
+import { Modal } from "../components/ui";
 import { formatError } from "../lib/utils";
-import type { Chapter } from "../types/api";
+import type { Chapter, MediaVersion } from "../types/api";
 
 interface BGM {
   id: string;
@@ -41,6 +43,11 @@ export default function CompositionPage() {
   const [uploadingBGM, setUploadingBGM] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // BGM 名称内联输入（上传时使用；留空则回退文件名）
+  const [bgmName, setBgmName] = useState("");
+  // 待确认删除的 BGM ID（删除确认弹窗）
+  const [confirmDeleteBgmId, setConfirmDeleteBgmId] = useState<string | null>(null);
+  const confirmDeleteBgm = bgms.find(bgm => bgm.id === confirmDeleteBgmId) || null;
 
   useEffect(() => {
     return () => {
@@ -51,48 +58,69 @@ export default function CompositionPage() {
   useEffect(() => {
     if (!projectId) return;
     setLoadError(null);
-
+    // 项目直达切换（前进后退/URL 跳转）时，旧请求晚到会覆盖新项目数据：
+    // 响应落地前校验 projectId 未变。
+    let cancelled = false;
     Promise.all([
       api.chapters.list(projectId),
       api.audio.listBGMs(projectId),
-    ]).then(([chaptersData, bgmsData]) => {
+      api.audio.getConfig(projectId).catch(() => null),
+    ]).then(([chaptersData, bgmsData, audioConfig]) => {
+      if (cancelled) return;
       setChapters(chaptersData);
       setBgms(bgmsData);
+      // 加载已保存的项目音频配置（BGM 音量），避免每次进入都重置为默认值。
+      if (audioConfig && typeof audioConfig.bgm_volume === "number") {
+        setConfig(prev => ({
+          ...prev,
+          bgm_volume: audioConfig.bgm_volume,
+        }));
+      }
       if (chaptersData.length > 0) {
         setSelectedChapter(chaptersData[0].id);
+      } else {
+        setSelectedChapter("");
       }
     }).catch((error) => {
+      if (cancelled) return;
       console.error(error);
       setLoadError(formatError(error));
     });
+    return () => {
+      cancelled = true;
+    };
   }, [projectId]);
 
   useEffect(() => {
     if (!selectedChapter) return;
     setLoadError(null);
-
     // 切换章节后，上一个章节的轮询任务必须停止，避免状态互相覆盖。
     if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
-
+    let cancelled = false;
     // 查询当前章节的合成状态
     api.composition.getChapterComposition(selectedChapter).then(comp => {
+      if (cancelled) return;
       if (comp) {
         setCompositionStatus(comp);
       } else {
         setCompositionStatus(null);
       }
     }).catch((error) => {
+      if (cancelled) return;
       console.error(error);
       setLoadError(formatError(error));
     });
+    return () => {
+      cancelled = true;
+    };
   }, [selectedChapter]);
 
   const handleCompose = async () => {
     if (!selectedChapter) {
-      alert("请选择章节");
+      toast.error("请选择章节");
       return;
     }
 
@@ -108,7 +136,7 @@ export default function CompositionPage() {
       });
 
       setCompositionStatus(result);
-      alert("合成任务已创建，请在任务列表查看进度");
+      toast.success("合成任务已创建，请在任务列表查看进度");
 
       // 轮询任务状态
       if (result.job_id) {
@@ -116,7 +144,7 @@ export default function CompositionPage() {
       }
     } catch (error) {
       console.error(error);
-      alert(`合成失败：${error instanceof Error ? error.message : "未知错误"}`);
+      toast.error(`合成失败：${formatError(error)}`);
     } finally {
       setComposing(false);
     }
@@ -124,7 +152,15 @@ export default function CompositionPage() {
 
   const pollJobStatus = (jobId: string) => {
     if (pollRef.current) clearInterval(pollRef.current);
+    // 轮询上限：任务卡死时避免永久轮询；瞬时错误保留轮询不中断。
+    let remainingTicks = 200; // 200 * 3s = 10 分钟
     pollRef.current = setInterval(async () => {
+      if (remainingTicks <= 0) {
+        if (pollRef.current) clearInterval(pollRef.current);
+        pollRef.current = null;
+        return;
+      }
+      remainingTicks -= 1;
       try {
         const job = await api.jobs.get(jobId);
         setCompositionStatus(prev => prev ? { ...prev, status: job.status, job_id: jobId } : prev);
@@ -142,8 +178,7 @@ export default function CompositionPage() {
           }
         }
       } catch {
-        if (pollRef.current) clearInterval(pollRef.current);
-        pollRef.current = null;
+        // 瞬时错误（网络抖动）不停止轮询，下一轮继续。
       }
     }, 3000);
   };
@@ -156,18 +191,23 @@ export default function CompositionPage() {
       const file = (e.target as HTMLInputElement).files?.[0];
       if (!file || !projectId) return;
 
-      const name = prompt("请输入 BGM 名称", file.name.replace(/\.[^.]+$/, ""));
-      if (!name) return;
+      // 名称来自内联输入；留空回退为文件名（去掉扩展名）。
+      const name = bgmName.trim() || file.name.replace(/\.[^.]+$/, "");
+      if (!name) {
+        toast.error("请输入 BGM 名称");
+        return;
+      }
 
       setUploadingBGM(true);
 
       try {
         const bgm = await api.audio.uploadBGM(projectId, file, name, []);
         setBgms(prev => [bgm, ...prev]);
-        alert("BGM 上传成功");
+        setBgmName("");
+        toast.success("BGM 上传成功");
       } catch (error) {
         console.error(error);
-        alert(`上传失败：${error instanceof Error ? error.message : "未知错误"}`);
+        toast.error(`上传失败：${formatError(error)}`);
       } finally {
         setUploadingBGM(false);
       }
@@ -175,8 +215,14 @@ export default function CompositionPage() {
     input.click();
   };
 
-  const handleDeleteBGM = async (bgmId: string) => {
-    if (!confirm("确定删除该 BGM？")) return;
+  const handleDeleteBGM = (bgmId: string) => {
+    setConfirmDeleteBgmId(bgmId);
+  };
+
+  const handleConfirmDeleteBGM = async () => {
+    const bgmId = confirmDeleteBgmId;
+    if (!bgmId) return;
+    setConfirmDeleteBgmId(null);
 
     try {
       await api.audio.deleteBGM(bgmId);
@@ -184,9 +230,10 @@ export default function CompositionPage() {
       if (config.bgm_id === bgmId) {
         setConfig(prev => ({ ...prev, bgm_id: "" }));
       }
+      toast.success("BGM 已删除");
     } catch (error) {
       console.error(error);
-      alert(`删除失败：${error instanceof Error ? error.message : "未知错误"}`);
+      toast.error(`删除失败：${formatError(error)}`);
     }
   };
 
@@ -236,7 +283,7 @@ export default function CompositionPage() {
                     <input
                       type="radio"
                       checked={config.resolution === res}
-                      onChange={() => setConfig(prev => ({ ...prev, resolution: res as any }))}
+                      onChange={() => setConfig(prev => ({ ...prev, resolution: res as CompositionConfig["resolution"] }))}
                     />
                     <span>{res}</span>
                   </label>
@@ -273,6 +320,14 @@ export default function CompositionPage() {
                   {uploadingBGM ? "上传中..." : "+ 上传 BGM"}
                 </button>
               </div>
+              {/* BGM 名称内联输入：上传时使用，留空回退文件名 */}
+              <input
+                type="text"
+                value={bgmName}
+                onChange={(e) => setBgmName(e.target.value)}
+                placeholder="上传时使用的 BGM 名称（留空使用文件名）"
+                className="mb-2 w-full border rounded px-3 py-2 text-sm"
+              />
               <select
                 value={config.bgm_id}
                 onChange={(e) => setConfig(prev => ({ ...prev, bgm_id: e.target.value }))}
@@ -372,18 +427,28 @@ export default function CompositionPage() {
 
             {compositionStatus.file_path && compositionStatus.status === "completed" && (
               <div className="mt-4">
-                <video
-                  controls
-                  src={`/media/${projectId}/${compositionStatus.file_path}`}
-                  className="w-full max-w-2xl rounded border"
-                />
-                <a
-                  href={`/media/${projectId}/${compositionStatus.file_path}`}
-                  download
-                  className="inline-block bg-green-500 text-white px-6 py-2 rounded hover:bg-green-600"
-                >
-                  下载成品视频
-                </a>
+                {/* 项目内相对路径 → 清洗后的媒体 URL（复用 mediaUrl 的路径清洗，避免手工拼接越界） */}
+                {(() => {
+                  const compositionMediaUrl = mediaUrl({
+                    file_path: `${projectId}/${compositionStatus.file_path}`,
+                  } as MediaVersion);
+                  return (
+                    <>
+                      <video
+                        controls
+                        src={compositionMediaUrl}
+                        className="w-full max-w-2xl rounded border"
+                      />
+                      <a
+                        href={compositionMediaUrl}
+                        download
+                        className="inline-block bg-green-500 text-white px-6 py-2 rounded hover:bg-green-600"
+                      >
+                        下载成品视频
+                      </a>
+                    </>
+                  );
+                })()}
                 <p className="text-sm text-gray-500 mt-2">
                   文件路径: {compositionStatus.file_path}
                 </p>
@@ -398,6 +463,34 @@ export default function CompositionPage() {
           </div>
         </div>
       )}
+
+      {/* 删除 BGM 确认弹窗 */}
+      <Modal
+        open={confirmDeleteBgm !== null}
+        onClose={() => setConfirmDeleteBgmId(null)}
+        title="删除 BGM"
+        description={confirmDeleteBgm ? `确定删除「${confirmDeleteBgm.name}」？` : undefined}
+        footer={
+          <>
+            <button
+              type="button"
+              onClick={() => setConfirmDeleteBgmId(null)}
+              className="px-4 py-2 rounded border border-gray-300 bg-white text-sm hover:bg-gray-50"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleConfirmDeleteBGM()}
+              className="px-4 py-2 rounded bg-red-500 text-white text-sm hover:bg-red-600"
+            >
+              删除
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-gray-600">删除后无法恢复。</p>
+      </Modal>
     </div>
   );
 }

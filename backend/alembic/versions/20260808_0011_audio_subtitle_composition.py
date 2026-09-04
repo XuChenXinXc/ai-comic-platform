@@ -40,9 +40,10 @@ def _has_column(table: str, column: str) -> bool:
 
 def upgrade() -> None:
     # 1. 修改 api_provider.kind 约束，支持 tts
-    # SQLite 的 CHECK 约束在运行时检查，我们直接创建新表时会有正确的约束
-    # 对于已有数据库，只要不插入 tts 类型的 Provider，旧约束不会报错
-    # 当用户真正创建 TTS Provider 时，tables.py 中的新约束会生效
+    # 注意：SQLite 的 CHECK 约束在 INSERT 时对已存在的旧表立即生效，
+    # tables.py 的模型约束不会作用于已建成的表。因此在 0011~0016
+    # 区间的已有库上插入 tts Provider 会触发旧 CHECK 失败；
+    # 真正的约束修复由 0017 的表重建完成（含 kind CHECK 重建）。
 
     # 2. 创建 audio_config 表
     if not _has_table("audio_config"):

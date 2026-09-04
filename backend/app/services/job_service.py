@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from app.db import Database, db
 from app.jobs.repository import (
@@ -288,11 +289,10 @@ class JobService:
         Returns:
             删除的任务数量
         """
-        from datetime import datetime, timedelta
+        cutoff_date = (datetime.now(UTC) - timedelta(days=days)).isoformat()
 
-        cutoff_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
-
-        with self.database.engine.connect() as connection:
+        # count 与 delete 在同一事务中执行，保持 engine.begin() 统一事务风格
+        with self.repository.engine.begin() as connection:
             # 构建删除条件
             conditions = [
                 job.c.project_id == project_id,
@@ -308,15 +308,13 @@ class JobService:
                 conditions.append(job.c.status.in_(["completed", "failed", "cancelled"]))
 
             # 先查询要删除的任务数量
-            count_query = select(job.c.id).where(*conditions)
-            delete_count = len(list(connection.execute(count_query)))
+            delete_count = len(
+                connection.scalars(select(job.c.id).where(*conditions)).all()
+            )
 
             if delete_count > 0:
-                # 执行删除
-                from sqlalchemy import delete as sql_delete
-
-                connection.execute(sql_delete(job).where(*conditions))
-                connection.commit()
+                # 执行删除（同事务提交）
+                connection.execute(delete(job).where(*conditions))
 
         return delete_count
 
@@ -334,8 +332,10 @@ class JobService:
         from app.models.tables import project as project_table
 
         results = {}
-        with self.database.engine.connect() as connection:
-            project_ids = [row.id for row in connection.execute(select(project_table.c.id))]
+        with self.repository.engine.connect() as connection:
+            project_ids = [
+                row.id for row in connection.execute(select(project_table.c.id))
+            ]
 
         for project_id in project_ids:
             deleted = self.cleanup_old_jobs(project_id, days, keep_failed)

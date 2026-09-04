@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api } from "../api/client";
+import { api, queryKeys } from "../api/client";
 import type { Chapter } from "../types/api";
 import { useProject } from "./use-project";
 
@@ -58,7 +58,7 @@ export function ChapterProvider({ children }: { children: ReactNode }) {
   const [activeChapterId, setActiveChapterId] = useState("");
 
   const chaptersQuery = useQuery({
-    queryKey: ["chapters", activeProjectId],
+    queryKey: queryKeys.chapters(activeProjectId),
     queryFn: () => api.chapters.list(activeProjectId),
     enabled: Boolean(activeProjectId),
   });

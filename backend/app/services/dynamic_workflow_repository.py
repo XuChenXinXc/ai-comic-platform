@@ -549,7 +549,12 @@ class DynamicWorkflowRepository:
         statement = (
             select(workflow_stage.c.stage_key, workflow_stage.c.status, workflow_stage.c.attempt)
             .where(workflow_stage.c.workflow_run_id == run_id)
-            .order_by(workflow_stage.c.stage_key, workflow_stage.c.attempt.desc())
+            .order_by(
+                workflow_stage.c.stage_key,
+                workflow_stage.c.attempt.desc(),
+                workflow_stage.c.updated_at.desc(),
+                workflow_stage.c.id.desc(),
+            )
         )
         with self.engine.connect() as connection:
             rows = connection.execute(statement).all()
@@ -583,7 +588,12 @@ class DynamicWorkflowRepository:
                 workflow_stage.c.workflow_run_id == run_id,
                 workflow_stage.c.stage_key.in_(descendants),
             )
-            .order_by(workflow_stage.c.stage_key, workflow_stage.c.attempt.desc())
+            .order_by(
+                workflow_stage.c.stage_key,
+                workflow_stage.c.attempt.desc(),
+                workflow_stage.c.updated_at.desc(),
+                workflow_stage.c.id.desc(),
+            )
         ).all()
         latest: dict[str, dict[str, Any]] = {}
         for row in rows:

@@ -9,7 +9,6 @@ from sqlalchemy import insert, select, update
 
 from app.db import Database, migrate_schema, utc_now
 from app.jobs.dynamic_recovery import (
-    enqueue_recovered_dynamic_jobs,
     reconcile_dynamic_workflow_runs,
     recover_dynamic_jobs,
 )
@@ -177,7 +176,7 @@ def test_recovery_reconciles_missing_queued_stage_job_idempotently(
 
 @pytest.mark.parametrize(
     ("stage_status", "expected_job_status", "expected_report"),
-    [("stale", "interrupted", "interrupted"), ("blocked", "queued", "skipped")],
+    [("stale", "interrupted", "interrupted"), ("blocked", "interrupted", "interrupted")],
 )
 def test_stale_or_blocked_stage_is_not_recovered(
     recovery_context: tuple[Database, JobRepository],
@@ -224,6 +223,39 @@ def test_queued_job_with_running_stage_is_skipped_without_state_change(
     assert _workflow_status(repository, "run-recovery", "stage-recovery") == (
         "running",
         "running",
+    )
+    database.dispose()
+
+
+def test_running_job_with_ready_stage_is_interrupted_not_skipped_forever(
+    recovery_context: tuple[Database, JobRepository],
+) -> None:
+    """崩溃落在「stage 已写 ready、job 未写 completed」窗口时，Job 必须中断。
+
+    回归：此前状态组合不在允许集时仅静默 skip，Job 永久卡 running，
+    且 stage 不再 queued/running，reconcile 永远不再处理该 Job。
+    """
+    database, repository = recovery_context
+    record = repository.create_job(_job_data())
+    repository.update(record["id"], status="running")
+    _set_workflow_status(
+        database,
+        run_id="run-recovery",
+        stage_id="stage-recovery",
+        run_status="running",
+        stage_status="ready",
+    )
+
+    report = recover_dynamic_jobs(repository)
+
+    assert report.enqueue_ids == []
+    assert report.skipped_ids == []
+    assert report.interrupted_ids == [record["id"]]
+    assert repository.require(record["id"])["status"] == "interrupted"
+    # stage 自身状态由正常流程写好，恢复过程不再改动。
+    assert _workflow_status(repository, "run-recovery", "stage-recovery") == (
+        "running",
+        "ready",
     )
     database.dispose()
 
@@ -329,9 +361,12 @@ def test_blocked_or_cancelled_workflow_does_not_reactivate_dynamic_job(
 
     report = recover_dynamic_jobs(repository)
 
+    # B-M3：受保护 run 的非终态 Job 不再永久悬浮，统一标记 interrupted；
+    # 受保护的 run/stage 状态本身保持不变。
     assert report.enqueue_ids == []
-    assert report.skipped_ids == [record["id"]]
-    assert repository.require(record["id"])["status"] == "queued"
+    assert report.interrupted_ids == [record["id"]]
+    assert repository.require(record["id"])["status"] == "interrupted"
+    assert "受保护" in repository.require(record["id"])["error"]
     assert _workflow_status(repository, "run-recovery", "stage-recovery") == (
         run_status,
         stage_status,
@@ -432,9 +467,15 @@ def test_reconcile_does_not_overwrite_protected_stage(
     database.dispose()
 
 
-def test_enqueue_recovered_dynamic_jobs_only_calls_recovered_ids_and_keeps_false_job_queued(
+def test_recovery_report_only_contains_recoverable_ids_and_interrupts_lost_running_jobs(
     recovery_context: tuple[Database, JobRepository],
 ) -> None:
+    """enqueue_recovered_dynamic_jobs 已删除；恢复报告语义保持不变。
+
+    - 只有可安全恢复的 queued Job 进入 enqueue_ids；
+    - running 且无 task_id/结果的任务被标记 interrupted；
+    - 入队失败（enqueue 返回 False）由调用方处理，Job 保持 queued。
+    """
     database, repository = recovery_context
     with database.engine.begin() as connection:
         _insert_workflow(
@@ -453,21 +494,136 @@ def test_enqueue_recovered_dynamic_jobs_only_calls_recovered_ids_and_keeps_false
         )
     )
     repository.update(running["id"], status="running")
-    called: list[str] = []
 
-    def enqueue(job_id: str) -> bool:
-        called.append(job_id)
-        return False
+    report = recover_dynamic_jobs(repository)
 
-    report = enqueue_recovered_dynamic_jobs(repository, enqueue)
-
-    assert called == [queued["id"]]
-    assert report.enqueue_ids == []
-    assert report.skipped_ids == [queued["id"]]
+    assert report.enqueue_ids == [queued["id"]]
     assert report.interrupted_ids == [running["id"]]
     assert repository.require(queued["id"])["status"] == "queued"
     assert repository.require(running["id"])["status"] == "interrupted"
     database.dispose()
+
+
+def test_recovery_isolates_run_on_completed_job_with_queued_stage_invariant_violation(
+    recovery_context: tuple[Database, JobRepository],
+) -> None:
+    """C3：「Job completed 但 stage 仍 queued」时隔离该 run，不再抛异常。"""
+    database, repository = recovery_context
+    record = repository.create_job(_job_data())
+    repository.complete(record["id"], {"ok": True})
+    # 人为保持 stage 为 queued，制造不变量违反。
+
+    report = recover_dynamic_jobs(repository)
+
+    assert report.enqueue_ids == []
+    run_error = _run_error(repository, "run-recovery")
+    assert run_error is not None
+    assert "已隔离" in run_error
+    assert "stage-recovery" in run_error
+    assert _workflow_status(repository, "run-recovery", "stage-recovery") == (
+        "interrupted",
+        "queued",
+    )
+    database.dispose()
+
+
+def test_recovery_isolation_skips_bad_run_and_continues_other_runs(
+    recovery_context: tuple[Database, JobRepository],
+) -> None:
+    """C3：隔离坏 run 后，其余 run 的恢复不受影响。"""
+    database, repository = recovery_context
+    with database.engine.begin() as connection:
+        _insert_workflow(
+            connection,
+            run_id="run-broken",
+            stage_id="stage-broken",
+            run_status="running",
+            stage_status="queued",
+        )
+        _insert_workflow(
+            connection,
+            run_id="run-healthy",
+            stage_id="stage-healthy",
+            run_status="running",
+            stage_status="queued",
+        )
+    broken_job = repository.create_job(
+        _job_data(
+            workflow_run_id="run-broken",
+            workflow_stage_id="stage-broken",
+            idempotency_key="broken-job",
+        )
+    )
+    repository.complete(broken_job["id"], {"ok": True})
+    healthy_job = repository.create_job(
+        _job_data(
+            workflow_run_id="run-healthy",
+            workflow_stage_id="stage-healthy",
+            idempotency_key="healthy-job",
+        )
+    )
+
+    report = recover_dynamic_jobs(repository)
+
+    assert healthy_job["id"] in report.enqueue_ids
+    assert broken_job["id"] not in report.enqueue_ids
+    assert _run_error(repository, "run-broken") is not None
+    assert _run_error(repository, "run-healthy") == ""
+    database.dispose()
+
+
+def test_recovery_skips_run_when_record_processing_raises(
+    recovery_context: tuple[Database, JobRepository],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C3：单 run 处理异常时记录日志并跳过，不让整体恢复失败。"""
+    database, repository = recovery_context
+    with database.engine.begin() as connection:
+        _insert_workflow(
+            connection,
+            run_id="run-healthy",
+            stage_id="stage-healthy",
+            run_status="running",
+            stage_status="queued",
+        )
+    healthy_job = repository.create_job(
+        _job_data(
+            workflow_run_id="run-healthy",
+            workflow_stage_id="stage-healthy",
+            idempotency_key="healthy-job-2",
+        )
+    )
+    bad_job = repository.create_job(_job_data(idempotency_key="bad-job"))
+    original_load = __import__(
+        "app.jobs.dynamic_recovery", fromlist=["_load_workflow_records"]
+    )._load_workflow_records
+
+    def broken_load(repo: JobRepository, record: dict) -> tuple[None, None]:
+        if record.get("id") == bad_job["id"]:
+            raise RuntimeError("模拟恢复期数据库异常")
+        return original_load(repo, record)
+
+    monkeypatch.setattr(
+        "app.jobs.dynamic_recovery._load_workflow_records", broken_load
+    )
+
+    report = recover_dynamic_jobs(repository)
+
+    # 坏 run（run-recovery）被跳过：bad_job 保持 queued，未进入任何终态处理。
+    assert repository.require(bad_job["id"])["status"] == "queued"
+    # 健康 run 不受影响。
+    assert healthy_job["id"] in report.enqueue_ids
+    database.dispose()
+
+
+def _run_error(repository: JobRepository, run_id: str) -> str | None:
+    with repository.engine.connect() as connection:
+        value = connection.scalar(
+            workflow_run.select()
+            .with_only_columns(workflow_run.c.error)
+            .where(workflow_run.c.id == run_id)
+        )
+    return value
 
 
 def _workflow_status(repository: JobRepository, run_id: str, stage_id: str) -> tuple[str, str]:

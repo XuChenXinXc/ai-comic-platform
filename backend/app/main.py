@@ -1,5 +1,7 @@
+import logging
 import shutil
 import subprocess
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePath
@@ -29,10 +31,9 @@ from app.api import (
 from app.api import settings as settings_api
 from app.config import get_settings
 from app.db import Database, db, init_db
-from app.jobs.recovery_all import recover_all_once
-from app.jobs.repository import JobRepository
 from app.jobs.runner import job_runner
 from app.models.tables import project
+from app.providers.base import set_imgbb_api_key_override
 from app.services.errors import ServiceError
 from app.services.ffmpeg_utils import shutdown_ffmpeg_executor
 from app.services.file_service import file_service, is_reparse_point
@@ -60,6 +61,16 @@ class SPAStaticFiles(StaticFiles):
             return await super().get_response("index.html", scope)
 
 
+logger = logging.getLogger(__name__)
+
+# B-L10：project_id → 项目媒体根目录的进程内缓存（TTL + 容量上限）。
+# /media 每个请求都要按 project_id 查询数据库解析存储根目录，热门项目的
+# 图片/视频加载会放大为等量 DB 查询；缓存命中时跳过查询，命中后仍校验
+# 目录存在，项目删除（目录被移除）后自动失效回源重查。
+_MEDIA_ROOT_CACHE_TTL_SEC = 30.0
+_MEDIA_ROOT_CACHE_MAX_ENTRIES = 256
+
+
 class ProjectMediaStaticFiles(StaticFiles):
     def __init__(
         self,
@@ -69,7 +80,78 @@ class ProjectMediaStaticFiles(StaticFiles):
         check_dir: bool = True,
     ) -> None:
         self.database = database or db
+        # project_id -> (缓存时间戳, 已解析的项目根目录绝对路径)
+        self._root_cache: dict[str, tuple[float, Path]] = {}
+        # 已解析项目根目录 -> StaticFiles 实例：避免每个 /media 请求都新建实例。
+        self._files_cache: dict[Path, StaticFiles] = {}
         super().__init__(directory=directory, check_dir=check_dir)
+
+    def _files_app(self, project_root: Path) -> StaticFiles:
+        """按项目根目录复用 StaticFiles 实例（随根目录缓存容量一并清空）。"""
+        cached = self._files_cache.get(project_root)
+        if cached is not None:
+            return cached
+        if len(self._files_cache) >= _MEDIA_ROOT_CACHE_MAX_ENTRIES:
+            self._files_cache.clear()
+        app = StaticFiles(directory=project_root, check_dir=False)
+        self._files_cache[project_root] = app
+        return app
+
+    def _resolve_project_root(self, project_id: str) -> Path | None:
+        """解析并缓存项目媒体根目录；失败返回 ``None``（按 404 处理）。"""
+        now = time.monotonic()
+        cached = self._root_cache.get(project_id)
+        if cached is not None:
+            cached_at, cached_root = cached
+            # TTL 内且目录仍存在（项目删除会移除目录）才信任缓存。
+            if now - cached_at < _MEDIA_ROOT_CACHE_TTL_SEC and cached_root.is_dir():
+                return cached_root
+            self._root_cache.pop(project_id, None)
+
+        with self.database.engine.connect() as connection:
+            record = (
+                connection.execute(
+                    select(
+                        project.c.storage_root,
+                        project.c.storage_name,
+                        project.c.storage_layout,
+                    ).where(project.c.id == project_id)
+                )
+                .mappings()
+                .first()
+            )
+        if record is None:
+            return None
+
+        stored_root = str(record["storage_root"] or "")
+        storage_root = Path(stored_root) if stored_root else Path(self.directory)
+        if not storage_root.is_absolute():
+            return None
+        # 存储根目录本身不能是符号链接/目录联接（resolve 后再查会查不到）
+        if is_reparse_point(Path(stored_root)):
+            return None
+        storage_root = storage_root.resolve()
+        layout = str(record["storage_layout"] or "prefixed")
+        if layout == "categorized":
+            storage_name = str(record["storage_name"] or "")
+        elif layout == "prefixed":
+            storage_name = project_id
+        else:
+            return None
+        project_candidate = storage_root / storage_name
+        # 项目目录本身不能是符号链接/目录联接
+        if is_reparse_point(project_candidate):
+            return None
+        resolved_root = project_candidate.resolve()
+        # 使用 is_relative_to 检查路径包含关系，防止符号链接穿越
+        if not storage_name or not resolved_root.is_relative_to(storage_root):
+            return None
+
+        # 简单容量上限：超过容量时整体清空（构建成本远低于 LRU 复杂度）。
+        if len(self._root_cache) >= _MEDIA_ROOT_CACHE_MAX_ENTRIES:
+            self._root_cache.clear()
+        self._root_cache[project_id] = (now, resolved_root)
+        return resolved_root
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         normalized_path = PurePath(path).as_posix().strip("/")
@@ -84,50 +166,16 @@ class ProjectMediaStaticFiles(StaticFiles):
         relative_path = Path(*parts[1:])
         if relative_path.is_absolute():
             raise StarletteHTTPException(status_code=404)
-        with self.database.engine.connect() as connection:
-            record = (
-                connection.execute(
-                    select(
-                        project.c.storage_root,
-                        project.c.storage_name,
-                        project.c.storage_layout,
-                    ).where(project.c.id == project_id)
-                )
-                .mappings()
-                .first()
-            )
-        if record is None:
-            raise StarletteHTTPException(status_code=404)
 
-        stored_root = str(record["storage_root"] or "")
-        storage_root = Path(stored_root) if stored_root else Path(self.directory)
-        if not storage_root.is_absolute():
-            raise StarletteHTTPException(status_code=404)
-        # 存储根目录本身不能是符号链接/目录联接（resolve 后再查会查不到）
-        if is_reparse_point(Path(stored_root)):
-            raise StarletteHTTPException(status_code=404)
-        storage_root = storage_root.resolve()
-        layout = str(record["storage_layout"] or "prefixed")
-        if layout == "categorized":
-            storage_name = str(record["storage_name"] or "")
-        elif layout == "prefixed":
-            storage_name = project_id
-        else:
-            raise StarletteHTTPException(status_code=404)
-        project_candidate = storage_root / storage_name
-        # 项目目录本身不能是符号链接/目录联接
-        if is_reparse_point(project_candidate):
-            raise StarletteHTTPException(status_code=404)
-        project_root = project_candidate.resolve()
-        # 使用 is_relative_to 检查路径包含关系，防止符号链接穿越
-        if not storage_name or not project_root.is_relative_to(storage_root):
+        project_root = self._resolve_project_root(project_id)
+        if project_root is None:
             raise StarletteHTTPException(status_code=404)
         requested_path = (project_root / relative_path).resolve()
         try:
             requested_path.relative_to(project_root)
         except ValueError as exc:
             raise StarletteHTTPException(status_code=404) from exc
-        project_files = StaticFiles(directory=project_root, check_dir=False)
+        project_files = self._files_app(project_root)
         return await project_files.get_response(relative_path.as_posix(), scope)
 
 
@@ -136,15 +184,22 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     init_db(seed_mock_providers=True)
     # ImgBB 是平台级辅助密钥，优先从加密的 platform_setting 读取，
     # 避免明文密钥在 .env 中长期存在。空值时回退到 settings.imgbb_api_key（环境变量）。
+    # B-L10：写入独立的运行时覆盖变量，不再直接改写 lru_cache 单例 settings。
     override_key = get_imagbb_api_key_override(db)
     if override_key:
-        settings.imgbb_api_key = override_key
+        set_imgbb_api_key_override(override_key)
     file_service.migrate_categorized_media_layouts(strict=False)
     register_handlers()
-    job_runner.start(recover=False)
-    repository = JobRepository(db)
-    for job_id in recover_all_once(repository):
-        job_runner.enqueue(job_id)
+    # B-L10：恢复入口收敛为 start(recover=True)，由 runner.recover() 内部统一
+    # 走 recover_all_once（dynamic + 普通路径去重后统一 enqueue），不再手工
+    # 重复一遍等价逻辑。
+    # C3 兜底：单个 run 的恢复异常已在 dynamic_recovery 内按 run 隔离；
+    # 这里再整体兜底一次，确保任何恢复错误都不会让 lifespan 失败，
+    # 避免服务反复启动失败形成死循环。
+    try:
+        job_runner.start(recover=True)
+    except Exception:
+        logger.exception("启动期任务恢复失败，已跳过；不影响服务启动")
     try:
         yield
     finally:

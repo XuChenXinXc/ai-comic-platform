@@ -38,10 +38,16 @@ class JobRunner:
     ) -> None:
         self.repository = repository or job_repository
         limits = dict(worker_limits or get_settings().worker_limits)
-        for kind in ("text", "image", "video"):
+        # B-H2：合成 Job 使用独立 compose 池（并发 1），避免 FFmpeg 合成
+        # 与 Provider 任务互相争抢线程池；设置里未声明时默认 1。
+        limits.setdefault("compose", 1)
+        for kind in ("text", "image", "video", "compose"):
             if int(limits.get(kind, 0)) < 1:
                 raise ValueError(f"{kind} 线程数不能小于 1")
-        self.worker_limits = {kind: int(limits[kind]) for kind in ("text", "image", "video")}
+        self.worker_limits = {
+            kind: int(limits[kind])
+            for kind in ("text", "image", "video", "compose")
+        }
         self._executors = {
             kind: ThreadPoolExecutor(
                 max_workers=limit,
@@ -180,6 +186,18 @@ class JobRunner:
                 # "Event loop is closed"。这里用 new_event_loop 显式管理。
                 result = self._run_async(result)  # type: ignore[arg-type]
             current = self.repository.get(job_id)
+            if result is None:
+                # C3 根因修复：handler 未返回结果（如动态 handler 并发冲突回滚后
+                # 返回 None）时不能隐式 complete——那会制造「Job completed 但
+                # stage 仍 queued」的不变量违反，让启动恢复反复失败进入死循环。
+                # 这里统一按 failed 收口并写明原因；handler 已自行写入终态或
+                # 中间态（queued/waiting_provider/downloading）时保持其状态不覆盖。
+                if current is not None and current["status"] == "running":
+                    error = "处理器未返回结果，任务按失败处理"
+                    self.repository.fail(job_id, error)
+                    self._mark_dynamic_failure_state(record, error)
+                    self._propagate_dependency_failure(job_id, error)
+                return
             result_mapping = result if isinstance(result, Mapping) else {}
             result_status = result_mapping.get("status")
             if result_status in {"failed", "partial_failed", "blocked"}:
@@ -241,16 +259,6 @@ class JobRunner:
                 else []
             )
         return [str(value).strip() for value in dependencies if str(value).strip()]
-
-    def _dependencies_completed(self, record: Mapping[str, Any]) -> bool:
-        dependencies = self._dependency_ids(record)
-        if not dependencies:
-            return True
-        return all(
-            (dependency := self.repository.get(dependency_id)) is not None
-            and dependency.get("status") == "completed"
-            for dependency_id in dependencies
-        )
 
     def _dependency_state(
         self,
@@ -347,9 +355,6 @@ class JobRunner:
         except Exception:
             # 读取依赖失败时保持 queued，由恢复/下一次执行重新检查，避免误执行。
             return "pending", None
-
-    def _dependency_error(self, record: Mapping[str, Any]) -> str | None:
-        return self._dependency_state(record)[1]
 
     def _fail_dependency_blocked_job(
         self,
@@ -549,9 +554,13 @@ class JobRunner:
     @staticmethod
     def _provider_kind(record: Mapping[str, Any]) -> str:
         kind = str(record.get("provider_kind") or "")
-        if kind in {"text", "image", "video"}:
+        if kind in {"text", "image", "video", "compose"}:
             return kind
         job_type = str(record.get("job_type") or "")
+        # B-H2：合成 Job（provider_kind="compose"）使用独立线程池；
+        # 未显式声明 provider_kind 的历史合成 Job 按 job_type 兜底路由。
+        if "compose" in job_type:
+            return "compose"
         if "video" in job_type:
             return "video"
         if any(token in job_type for token in ("image", "keyframe")):

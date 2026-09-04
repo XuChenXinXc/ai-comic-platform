@@ -134,7 +134,7 @@ async def upload_bgm(
 
     mood_tags_list = json_loads(mood_tags, [])
 
-    return service.save_bgm(project_id, name, file_data, mood_tags_list)
+    return await service.save_bgm(project_id, name, file_data, mood_tags_list)
 
 
 @router.delete("/bgm/{bgm_id}")

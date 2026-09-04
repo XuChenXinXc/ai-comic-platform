@@ -59,11 +59,12 @@ def test_compile_video_prompt_normalizes_field_punctuation_joins() -> None:
     assert "。。" not in prompt
     assert "。，" not in prompt
     assert "。开始。" not in prompt
-    assert "从站在厨房操作台前，准备打开面前的玻璃罐开始。" in prompt
-    assert "已走到厨房操作台前停下。本镜动作直接承接该状态" in prompt
+    assert "这一镜开始时，站在厨房操作台前，准备打开面前的玻璃罐。" in prompt
+    assert "已走到厨房操作台前停下" in prompt
+    assert "这一镜直接接在上一镜之后" in prompt
     assert "只用了不到一小时" not in prompt
-    assert "画面不出现任何文字，景别和光线方向保持稳定。" in prompt
-    assert "场景：陈鑫的一楼公寓。" in prompt
+    assert "构图方面，画面不出现任何文字。" in prompt
+    assert "这一镜发生在陈鑫的一楼公寓。" in prompt
 
 
 def test_asset_extraction_prompt_requires_independent_key_props() -> None:
@@ -621,28 +622,32 @@ def test_compile_video_prompt_uses_v2_template_and_reference_order() -> None:
         },
     )
 
-    assert "【角色锁定】" in prompt
-    assert "@Image2：林雪，锁定角色身份与服装。" in prompt
-    assert "【物品锁定】" in prompt
-    assert "铜制罗盘" in prompt
-    assert "【场景锁定】" in prompt
-    assert "古寺偏殿" in prompt
-    assert "【本镜唯一开始状态】" in prompt
-    assert "@Image1：当前分镜关键帧" in prompt
-    assert "【核心动作】" in prompt
-    assert "林雪缓慢推开木门，门缝透出暖光。" in prompt
-    assert "【镜头】" in prompt
-    assert "【声音】" in prompt
-    assert "【结束状态】" in prompt
-    assert "木门打开一条缝，林雪停住。" in prompt
-    assert "【禁止项】" in prompt
-    assert "身份漂移、道具穿模、文字水印" in prompt
-    assert "画面比例：16:9，总时长：6秒。" in prompt
-    # 验证新模板的核心特征
-    assert "严格保持每位角色的身份、面部特征、发型、服装、体型、左右位置关系不变" in prompt
-    assert "重点道具的外观、尺寸、颜色和材质保持一致" in prompt
-    assert "枝叶可受风力影响产生幅度克制、方向一致的自然摆动" in prompt
-    assert "不得在动画中移动、旋转、重构或重新生成" in prompt
+    # 自然语言版不再出现 12 段【xxx】标题与规则说明书措辞
+    assert "【" not in prompt
+    assert "以 @Image1 作为这一镜的起始画面" in prompt
+    assert "林雪的外貌、发型和当天服装沿用 @Image2 的参考素材" in prompt
+    assert "本镜道具：铜制罗盘" in prompt
+    assert "这一镜发生在古寺偏殿" in prompt
+    assert "这一镜开始时，林雪右手按住木门。" in prompt
+    assert "林雪缓慢推开木门，门缝透出暖光" in prompt
+    assert "景别为中景" in prompt
+    assert "环境与动作声：木门摩擦声" in prompt
+    assert "接近结尾时，木门打开一条缝，林雪停住。" in prompt
+    assert "身份漂移" in prompt
+    assert "道具穿模" in prompt
+    assert "画面比例 16:9" in prompt
+    assert "时长约 6 秒" in prompt
+    # 旧模板特征词不得残留
+    for banned in (
+        "严格保持",
+        "全程保持",
+        "不得变化",
+        "锁定",
+        "唯一时间轴",
+        "连续覆盖",
+        "忽略其他描述",
+    ):
+        assert banned not in prompt
 
 
 def test_compile_video_prompt_includes_positions_and_expressions() -> None:
@@ -671,9 +676,9 @@ def test_compile_video_prompt_preserves_existing_timeline_without_nesting() -> N
         shot_context={},
     )
 
-    assert timeline in prompt
-    assert "0-2秒：0-2秒" not in prompt
-    assert prompt.count("0-2秒") == 1
+    assert "开头林雪推门，随后门缝扩大，接近结尾时林雪停住。" in prompt
+    assert "0-2秒" not in prompt
+    assert "2-4秒" not in prompt
 
 
 def test_compile_video_prompt_with_short_duration_omits_zero_length_segment() -> None:
@@ -686,14 +691,14 @@ def test_compile_video_prompt_with_short_duration_omits_zero_length_segment() ->
         shot_context={},
     )
 
-    assert "0-1秒：林雪眨眼。" in prompt
-    assert "1-1秒" not in prompt
+    assert "林雪眨眼" in prompt
+    assert "0-1秒" not in prompt
     # 双句号修复：非时间轴分支对白为空时不再追加多余句号
     assert "。。" not in prompt
 
 
 def test_compile_video_prompt_without_anchors_omits_reference_ruling() -> None:
-    """无参考图时省略冲突裁决句与道具锁定行；机位为空走固定默认。"""
+    """无参考图时省略参考句与道具锁定行；机位为空走固定机位默认。"""
     prompt = compile_video_prompt(
         style_prompt="东方奇幻二维动画",
         aspect_ratio="16:9",
@@ -703,9 +708,9 @@ def test_compile_video_prompt_without_anchors_omits_reference_ruling() -> None:
         shot_context={},
     )
 
-    assert "以参考图中的人物外观、服装、道具和空间关系为准" not in prompt
+    assert "@Image" not in prompt
     assert "重点道具" not in prompt
-    assert "固定机位，画面变化由人物动作推动，摄影机不移动。" in prompt
+    assert "机位固定，画面变化由人物动作推动。" in prompt
 
 
 def test_camera_line_treats_stable_move_as_moving() -> None:
@@ -719,12 +724,12 @@ def test_camera_line_treats_stable_move_as_moving() -> None:
         shot_context={"camera_move": "稳定横移"},
     )
 
-    assert "稳定横移；缓慢跟随人物运动" in prompt
-    assert "固定机位" not in prompt
+    assert "镜头稳定横移，并跟随人物的运动自然调整。" in prompt
+    assert "机位固定" not in prompt
 
 
 def test_compile_video_prompt_extends_short_timeline_to_generation_duration() -> None:
-    """时间轴末段不足生成时长时，模板补足稳定收尾段（供应商最低 6 秒场景）。"""
+    """时间轴末段不足生成时长时，补一段自然收尾（供应商最低 6 秒场景）。"""
     timeline = "0-2秒：林雪推门。"
 
     prompt = compile_video_prompt(
@@ -736,8 +741,9 @@ def test_compile_video_prompt_extends_short_timeline_to_generation_duration() ->
         shot_context={},
     )
 
-    assert timeline in prompt
-    assert "2-6秒：保持上一段结束状态稳定" in prompt
+    assert "林雪推门" in prompt
+    assert "自然收尾" in prompt
+    assert "0-2秒" not in prompt
 
 
 def test_compile_video_prompt_does_not_extend_complete_timeline() -> None:
@@ -752,8 +758,8 @@ def test_compile_video_prompt_does_not_extend_complete_timeline() -> None:
         shot_context={},
     )
 
-    assert "4-6秒：林雪停住。" in prompt
-    assert "保持上一段结束状态稳定" not in prompt
+    assert "接近结尾时林雪停住" in prompt
+    assert "自然收尾" not in prompt
 
 
 def test_compile_keyframe_prompt_uses_start_state_as_opening_frame() -> None:
@@ -825,9 +831,9 @@ def test_compile_video_prompt_keeps_voice_over_out_of_spoken_video_prompt() -> N
     )
 
     assert "本镜没有画内对白" in prompt
-    assert "所有人物全程闭口" in prompt
+    assert "人物全程不开口" in prompt
     assert "怀表留给你" not in prompt
-    assert "环境与动作声音" in prompt
+    assert "旁白与画外音由后期合成" in prompt
 
 
 def test_compile_video_prompt_binds_each_dialogue_to_structured_speaker() -> None:
@@ -857,12 +863,12 @@ def test_compile_video_prompt_binds_each_dialogue_to_structured_speaker() -> Non
         shot_context=context,
     )
 
-    assert "第1句：苏瑶说：“你只是送外卖的，也配进这里？”" in prompt
-    assert "第2句：顾沉舟说：“我是来送餐的。”" in prompt
-    assert "按第1句对白执行对应口型" in prompt
-    assert "按第2句对白执行对应口型" in prompt
-    assert "2-7秒：她开口说出台词" not in prompt
-    assert "7-10秒：顾沉舟平静地回答" not in prompt
+    assert "第1句，苏瑶说：“你只是送外卖的，也配进这里？”" in prompt
+    assert "第2句，顾沉舟说：“我是来送餐的。”" in prompt
+    assert "口型与第1句对白同步" in prompt
+    assert "口型与第2句对白同步" in prompt
+    assert "她开口说出台词" not in prompt
+    assert "顾沉舟平静地回答" not in prompt
 
 
 def test_compile_video_prompt_binds_quote_text_when_speaker_order_is_swapped() -> None:
@@ -894,10 +900,10 @@ def test_compile_video_prompt_binds_quote_text_when_speaker_order_is_swapped() -
     )
 
     # 口型编号必须出现在各自引号原文所在的时间段里（先“我是来送餐的”→第2句）
-    assert "按第2句对白执行对应口型" in prompt
-    assert "按第1句对白执行对应口型" in prompt
-    assert prompt.index("按第2句对白执行对应口型") < prompt.index(
-        "按第1句对白执行对应口型"
+    assert "口型与第2句对白同步" in prompt
+    assert "口型与第1句对白同步" in prompt
+    assert prompt.index("口型与第2句对白同步") < prompt.index(
+        "口型与第1句对白同步"
     )
 
 

@@ -402,12 +402,44 @@ def test_shot_with_blank_generation_prompt_is_rejected(field: str) -> None:
         ShotOutput.model_validate(payload)
 
 
-def test_shot_without_scene_asset_id_is_rejected() -> None:
+def test_shot_without_scene_asset_id_is_allowed_for_missing_scene() -> None:
+    """场景素材缺失时 scene_asset_id 允许省略：由 missing_assets 报告缺失，
+    后端补素材后重新绑定，不再强制模型编造或硬选近似素材。"""
     payload = _valid_shot()
     payload.pop("scene_asset_id")
+    payload["missing_assets"] = [
+        {
+            "asset_type": "scene",
+            "reason": "当前剧情发生在办公楼大堂，素材库没有对应场景",
+            "source_ref": "第一场",
+            "suggested_name": "中关村科技公司一层大堂",
+            "suggested_aliases": ["公司大堂", "一楼大厅"],
+        }
+    ]
 
-    with pytest.raises(ValidationError):
-        ShotOutput.model_validate(payload)
+    result = ShotOutput.model_validate(payload)
+
+    assert result.scene_asset_id == ""
+    assert result.missing_assets[0].suggested_name == "中关村科技公司一层大堂"
+
+
+@pytest.mark.parametrize("scene_asset_id", [None, "", "   "])
+def test_shot_with_empty_scene_asset_id_reports_missing(scene_asset_id: str | None) -> None:
+    """空场景素材 ID 表示该镜场景缺失，配合 missing_assets 使用，不再视为错误。"""
+    payload = _valid_shot()
+    payload["scene_asset_id"] = scene_asset_id
+    payload["missing_assets"] = [
+        {
+            "asset_type": "scene",
+            "reason": "素材库没有该场景",
+            "suggested_name": "旧剧院后台",
+        }
+    ]
+
+    result = ShotOutput.model_validate(payload)
+
+    assert result.scene_asset_id == ""
+    assert result.missing_assets[0].asset_type == "scene"
 
 
 def test_shot_duration_below_five_is_rejected() -> None:
@@ -421,15 +453,6 @@ def test_shot_duration_below_five_is_rejected() -> None:
 def test_shot_duration_above_fifteen_is_rejected() -> None:
     payload = _valid_shot()
     payload["duration_sec"] = 16
-
-    with pytest.raises(ValidationError):
-        ShotOutput.model_validate(payload)
-
-
-@pytest.mark.parametrize("scene_asset_id", [None, "", "   "])
-def test_shot_with_empty_scene_asset_id_is_rejected(scene_asset_id: str | None) -> None:
-    payload = _valid_shot()
-    payload["scene_asset_id"] = scene_asset_id
 
     with pytest.raises(ValidationError):
         ShotOutput.model_validate(payload)

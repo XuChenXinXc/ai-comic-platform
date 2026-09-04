@@ -283,6 +283,48 @@ def test_asset_plan_only_reuses_explicit_approved_existing_mapping() -> None:
     assert plan[0]["revision"] == 4
 
 
+def test_asset_plan_name_fallback_mapping_records_warning_diagnostic() -> None:
+    output = _bios()
+    # 只提供裸 character_key（非完整 workflow_asset_id），命中名称回退路径。
+    mapping = {
+        "workflow_asset_id": "hero",
+        "asset_id": "canonical-hero",
+        "reuse_mode": "approved_existing",
+        "locked_revision": 4,
+    }
+    plan = build_asset_materialization_plan(
+        output, project_id="project-1", run_id="run-1", reuse_mapping=(mapping,)
+    )
+
+    fallback_warnings = [
+        item for item in plan.diagnostics if item.code == "asset_mapping_name_fallback"
+    ]
+    assert fallback_warnings
+    assert fallback_warnings[0].level == "warning"
+    assert fallback_warnings[0].details["workflow_asset_id"] == "dynamic-asset:run-1:hero"
+    assert fallback_warnings[0].details["character_key"] == "hero"
+    # 回退仍然生效，但结果与显式完整 ID 匹配一致。
+    assert plan[0]["operation"] == "update"
+    assert plan[0]["asset_id"] == "canonical-hero"
+
+
+def test_asset_plan_full_workflow_id_mapping_has_no_fallback_warning() -> None:
+    output = _bios()
+    mapping = {
+        "workflow_asset_id": "dynamic-asset:run-1:hero",
+        "asset_id": "canonical-hero",
+        "reuse_mode": "approved_existing",
+        "locked_revision": 4,
+    }
+    plan = build_asset_materialization_plan(
+        output, project_id="project-1", run_id="run-1", reuse_mapping=(mapping,)
+    )
+
+    assert not [item for item in plan.diagnostics if item.code == "asset_mapping_name_fallback"]
+    assert plan[0]["operation"] == "update"
+    assert plan[0]["asset_id"] == "canonical-hero"
+
+
 def test_screenplay_projection_is_deterministic_and_contains_own_signature() -> None:
     script = {
         "artifact_meta": _meta("script-input-1"),

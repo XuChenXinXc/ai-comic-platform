@@ -1,0 +1,638 @@
+"""自然语言视频提示词生成器与素材绑定校验的测试。
+
+覆盖场景：
+
+- 单角色 + 场景；单角色 + 场景 + 道具；
+- 双角色；多角色左右位置变化但素材引用身份不变；
+- 同一道具跨镜头保持同一素材身份（asset_id 不变，编号可变）；
+- 场景切换；关键帧存在 / 不存在；
+- 用户手动修改 Prompt 后再次优化（引用集合一致）；
+- 素材顺序改变但 assetId 不变；@ImageN 编号不是固定语义顺序；
+- 优化前后素材 identity 完全一致；校验失败时拒绝返回。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from app.db import Database
+from app.schemas import ShotVideoPromptOptimizeOutput
+from app.services.chapter_service import ChapterService
+from app.services.errors import ServiceError
+from app.services.file_service import FileService
+from app.services.job_service import JobService
+from app.services.natural_video_prompt import (
+    _FORBIDDEN_TEMPLATE_WORDS,
+    parse_reference_anchors,
+    render_natural_video_prompt,
+    validate_natural_style,
+    validate_prompt_references,
+)
+from app.services.project_service import ProjectService
+from app.services.prompt_service import compile_video_prompt
+from app.services.shot_service import (
+    ShotService,
+    _collect_prompt_reference_tokens,
+    _validate_prompt_reference_identity,
+)
+
+_STYLE = "都市温情二维国漫"
+_CONTEXT = {
+    "transition_from_prev": "continuous",
+    "prev_end_state": "徐尘心站在工位前，双肩包还挂在肩上。",
+    "opening_frame": "徐尘心站在旋转门前。",
+    "ending_frame": "徐尘心侧身迈入门内。",
+    "characters": ["徐尘心"],
+    "scene_name": "中关村办公区一楼大厅",
+    "props": [],
+    "positions": "徐尘心：画面左侧，身体朝向旋转门",
+    "expressions": "徐尘心：平静专注",
+    "shot_type": "中景",
+    "camera_angle": "平视",
+    "camera_move": "固定",
+    "focus": "徐尘心走近旋转门推门进入",
+    "composition": "旋转门位于画面右侧",
+    "sound_effects": "旋转门转动的轻响",
+}
+
+
+def _render(
+    *,
+    anchors: list[Any] | None = None,
+    video_prompt: str = "0-3秒：走到门前；3-5秒：抬手；5-7秒：推门。",
+    style: str = _STYLE,
+    **overrides: Any,
+) -> str:
+    context = {**_CONTEXT, **overrides}
+    return compile_video_prompt(
+        style_prompt=style,
+        aspect_ratio="16:9",
+        video_prompt=video_prompt,
+        duration_sec=7,
+        anchors=anchors if anchors is not None else [],
+        shot_context=context,
+        negative_prompt="人物变形、穿模",
+    )
+
+
+def test_single_character_scene_keeps_reference_identity() -> None:
+    prompt = _render(
+        anchors=[
+            "@Image1：当前分镜关键帧，锁定构图、人物左右关系和起始站位。",
+            "@Image2：徐尘心，锁定角色身份与服装。",
+            "@Image3：中关村办公区，锁定场景空间结构和光线。",
+        ]
+    )
+
+    assert "以 @Image1 作为这一镜的起始画面" in prompt
+    assert "徐尘心的外貌、发型和当天服装沿用 @Image2 的参考素材" in prompt
+    assert "场景结构、陈设与光线沿用 @Image3 的参考素材" in prompt
+    tokens = validate_prompt_references(
+        prompt, parse_reference_anchors(
+            [
+                "@Image1：当前分镜关键帧。",
+                "@Image2：徐尘心，锁定角色身份与服装。",
+                "@Image3：中关村办公区，锁定场景空间结构和光线。",
+            ]
+        )
+    )
+    assert tokens.ok
+
+
+def test_single_character_scene_prop_embeds_prop_reference() -> None:
+    prompt = _render(
+        props=["工位仙人掌"],
+        anchors=[
+            "@Image1：当前分镜关键帧。",
+            "@Image2：徐尘心，锁定角色身份与服装。",
+            "@Image3：中关村办公区，锁定场景空间结构和光线。",
+            "@Image4：工位仙人掌，锁定物品外观、材质和结构。",
+        ],
+    )
+
+    assert "本镜道具：工位仙人掌" in prompt
+    assert "工位仙人掌沿用 @Image4 的外观与材质" in prompt
+    # 未绑定的引用不能凭空出现，也不能少
+    found = set()
+    for token in ("@Image1", "@Image2", "@Image3", "@Image4"):
+        assert token in prompt
+        found.add(token)
+    assert "@Image5" not in prompt
+
+
+def test_two_characters_bind_tokens_by_asset_name_not_order() -> None:
+    """角色 token 绑定按素材名匹配，不依赖角色在数组/画面中的顺序。"""
+    prompt = _render(
+        characters=["徐尘心", "林舟"],
+        positions="林舟：画面右侧，背对徐尘心；徐尘心：画面左侧，面向林舟",
+        anchors=[
+            "@Image1：当前分镜关键帧。",
+            "@Image2：林舟，锁定角色身份与服装。",
+            "@Image3：徐尘心，锁定角色身份与服装。",
+        ],
+    )
+
+    # 编号顺序（林舟先）与 characters 顺序（徐尘心先）相反，仍按名字绑定
+    assert "徐尘心的外貌、发型和当天服装沿用 @Image3 的参考素材" in prompt
+    assert "林舟的外貌、发型和当天服装沿用 @Image2 的参考素材" in prompt
+
+
+def test_swapped_positions_do_not_swap_reference_tokens() -> None:
+    """人物左右位置互换不得交换素材引用。"""
+    left_right = _render(
+        characters=["徐尘心", "林舟"],
+        positions="林舟：画面左侧；徐尘心：画面右侧",
+        anchors=[
+            "@Image1：当前分镜关键帧。",
+            "@Image2：徐尘心，锁定角色身份与服装。",
+            "@Image3：林舟，锁定角色身份与服装。",
+        ],
+    )
+    right_left = _render(
+        characters=["徐尘心", "林舟"],
+        positions="徐尘心：画面左侧；林舟：画面右侧",
+        anchors=[
+            "@Image1：当前分镜关键帧。",
+            "@Image2：徐尘心，锁定角色身份与服装。",
+            "@Image3：林舟，锁定角色身份与服装。",
+        ],
+    )
+
+    assert "徐尘心" in left_right and "徐尘心" in right_left
+    assert left_right.index("@Image2") < left_right.index("林舟的外貌")
+    assert right_left.index("@Image2") < right_left.index("林舟的外貌")
+    assert "林舟的外貌、发型和当天服装沿用 @Image3" in left_right
+    assert "林舟的外貌、发型和当天服装沿用 @Image3" in right_left
+
+
+def test_same_prop_across_shots_keeps_asset_id_when_numbering_changes() -> None:
+    """同一道具跨镜头：token 编号可以变，asset_id 必须保持同一素材身份。"""
+    shot_a_tokens = parse_reference_anchors(
+        [
+            {"token": "@Image1", "role": "keyframe", "label": "当前分镜关键帧"},
+            {
+                "token": "@Image2",
+                "role": "prop_identity",
+                "label": "工位仙人掌",
+                "asset_id": "prop-1",
+            },
+            {
+                "token": "@Image3",
+                "role": "scene_layout",
+                "label": "中关村办公区",
+                "asset_id": "scene-1",
+            },
+        ]
+    )
+    shot_b_tokens = parse_reference_anchors(
+        [
+            {"token": "@Image1", "role": "keyframe", "label": "当前分镜关键帧"},
+            {
+                "token": "@Image2",
+                "role": "scene_layout",
+                "label": "中关村办公区",
+                "asset_id": "scene-1",
+            },
+            {
+                "token": "@Image3",
+                "role": "prop_identity",
+                "label": "工位仙人掌",
+                "asset_id": "prop-1",
+            },
+        ]
+    )
+
+    prompt_a = render_natural_video_prompt(
+        style_prompt=_STYLE,
+        aspect_ratio="16:9",
+        duration_sec=5,
+        action_flow="徐尘心走向工位。",
+        shot_context={**_CONTEXT, "props": ["工位仙人掌"], "transition_from_prev": "scene_change"},
+        dialogue_entries=[],
+        tokens=shot_a_tokens,
+    )
+    prompt_b = render_natural_video_prompt(
+        style_prompt=_STYLE,
+        aspect_ratio="16:9",
+        duration_sec=5,
+        action_flow="徐尘心走向工位。",
+        shot_context={**_CONTEXT, "props": ["工位仙人掌"], "transition_from_prev": "scene_change"},
+        dialogue_entries=[],
+        tokens=shot_b_tokens,
+    )
+
+    assert "工位仙人掌沿用 @Image2 的外观与材质" in prompt_a
+    assert "工位仙人掌沿用 @Image3 的外观与材质" in prompt_b
+    # 两镜中仙人掌的 asset_id 都是 prop-1（编号不同但素材身份不变）
+    assert next(t for t in shot_a_tokens if t.role == "prop_identity").asset_id == "prop-1"
+    assert next(t for t in shot_b_tokens if t.role == "prop_identity").asset_id == "prop-1"
+    assert validate_prompt_references(prompt_a, shot_a_tokens).ok
+    assert validate_prompt_references(prompt_b, shot_b_tokens).ok
+
+
+def test_scene_change_transition_does_not_claim_continuity() -> None:
+    prompt = _render(
+        transition_from_prev="scene_change",
+        prev_end_state="上一场景的收尾状态",
+    )
+
+    assert "不承接上一镜的构图" in prompt
+    assert "直接接在上一镜之后" not in prompt
+
+
+def test_continuous_transition_natural_carry_over() -> None:
+    prompt = _render()
+
+    assert "这一镜直接接在上一镜之后" in prompt
+    assert "徐尘心站在工位前，双肩包还挂在肩上" in prompt
+
+
+def test_elliptical_transition_mentions_elision() -> None:
+    prompt = _render(transition_from_prev="elliptical")
+
+    assert "省略了一段过程" in prompt
+    assert "人物的服装与随身物品保持连续" in prompt
+
+
+def test_missing_keyframe_token_is_detected() -> None:
+    tokens = parse_reference_anchors(["@Image1：当前分镜关键帧。"])
+    prompt = "徐尘心推开旋转门。"
+
+    validation = validate_prompt_references(prompt, tokens, require_keyframe=True)
+    assert not validation.ok
+    assert any("关键帧" in issue for issue in validation.issues)
+
+
+def test_unknown_reference_token_is_detected() -> None:
+    tokens = parse_reference_anchors(["@Image1：当前分镜关键帧。"])
+    prompt = "以 @Image1 作为起始画面。角色参考 @Image2。"
+
+    validation = validate_prompt_references(prompt, tokens)
+    assert not validation.ok
+    assert any("@Image2" in issue for issue in validation.issues)
+
+
+def test_duplicate_token_binding_is_detected() -> None:
+    tokens = parse_reference_anchors(
+        [
+            "@Image1：徐尘心，锁定角色身份与服装。",
+            "@Image1：中关村办公区，锁定场景空间结构和光线。",
+        ]
+    )
+    prompt = "参考 @Image1。"
+
+    validation = validate_prompt_references(prompt, tokens)
+    assert not validation.ok
+    assert any("多个素材" in issue for issue in validation.issues)
+
+
+def test_reference_numbering_is_not_fixed_semantics() -> None:
+    """自由制作连续承接：@Image1 是上一镜结束帧、@Image2 才是关键帧。"""
+    prompt = _render(
+        anchors=[
+            "@Image1：上一镜结束帧，作为本镜第0秒起始帧（严格从该画面开始）。",
+            "@Image2：当前分镜关键帧，作为本镜动作结束的目标帧。",
+            "@Image3：徐尘心，锁定角色身份与服装。",
+        ]
+    )
+
+    assert "画面从 @Image1（上一镜的结束画面）自然进入" in prompt
+    assert "向 @Image2 展示的目标画面发展" in prompt
+    assert "徐尘心的外貌、发型和当天服装沿用 @Image3" in prompt
+    # 校验必须认 @Image1 为上一镜结束帧而不是关键帧
+    tokens = parse_reference_anchors(
+        [
+            "@Image1：上一镜结束帧。",
+            "@Image2：当前分镜关键帧。",
+            "@Image3：徐尘心，锁定角色身份与服装。",
+        ]
+    )
+    keyframe = next(t for t in tokens if t.role == "keyframe")
+    assert keyframe.token == "@Image2"
+    assert validate_prompt_references(prompt, tokens).ok
+
+
+def test_mechanical_timeline_is_naturalized() -> None:
+    prompt = _render()
+
+    assert "0-3秒" not in prompt
+    assert "3-5秒" not in prompt
+    assert "5-7秒" not in prompt
+    assert "开头走到门前，随后抬手，接近结尾时推门。" in prompt
+
+
+def test_output_avoids_template_style_and_banned_words() -> None:
+    prompt = _render(
+        props=["双肩包"],
+        anchors=[
+            "@Image1：当前分镜关键帧。",
+            "@Image2：徐尘心，锁定角色身份与服装。",
+            "@Image3：中关村办公区，锁定场景空间结构和光线。",
+            "@Image4：双肩包，锁定物品外观、材质和结构。",
+        ],
+    )
+
+    assert "【" not in prompt
+    for word in _FORBIDDEN_TEMPLATE_WORDS:
+        assert word not in prompt
+    # 不再出现「所有物体禁止移动」式场景冻结
+    assert "不得在动画中移动、旋转、重构或重新生成" not in prompt
+    assert "移动、旋转、重构" not in prompt
+
+
+def test_outdoor_scene_gets_wind_not_indoor_clutter() -> None:
+    outdoor = _render(scene_name="公司楼下街道")
+    indoor = _render(scene_name="中关村办公区一楼大厅")
+
+    assert "树叶、草叶等自然物受轻风影响" in outdoor
+    assert "室内光线与阴影允许细微的自然变化" in indoor
+    # 室内不要出现树叶，室外不要出现窗帘
+    assert "树叶" not in indoor
+    assert "窗帘" not in outdoor
+
+
+def test_dialogue_entries_keep_verbatim_text_and_speaker() -> None:
+    prompt = _render(
+        dialogue_entries=[
+            {"speaker": "徐尘心", "text": "让一下。"},
+            {"speaker": "林舟", "text": "请进。"},
+        ]
+    )
+
+    assert "第1句，徐尘心说：“让一下。”" in prompt
+    assert "第2句，林舟说：“请进。”" in prompt
+
+
+def test_timeline_marker_inside_clause_after_intro_is_naturalized() -> None:
+    """真实提取结果：机位/场景铺垫句在前，时间标记出现在句子中间。"""
+    video_prompt = (
+        "固定机位平视中近景。清晨，写字楼旋转门前，徐尘心背着双肩电脑包站在画面中央；"
+        "旋转门金属框与玻璃翼扇占据画面主体。徐尘心面部放松，目光平直落在门扇上。"
+        "0-2秒：他走完最后两步，在旋转门前略顿停步，随即抬臂，手掌靠近玻璃门扇；"
+        "2-5秒：手掌按实门扇向前发力，门扇绕轴转动打开，他顺势侧身迈步；"
+        "5-7秒：他半侧身站在旋转门隔间内，门扇继续带着他朝门厅内侧旋转。"
+    )
+    prompt = _render(video_prompt=video_prompt, scene_name="中关村科技公司办公楼外")
+
+    assert "0-2秒" not in prompt
+    assert "2-5秒" not in prompt
+    assert "5-7秒" not in prompt
+    # 动作顺序保持：略顿 → 按实门扇 → 半侧身进入
+    assert prompt.index("他走完最后两步") < prompt.index("手掌按实门扇")
+    assert prompt.index("手掌按实门扇") < prompt.index("他半侧身站在旋转门隔间内")
+    # 铺垫句里的场景描述保留，重复的机位句不再进入动作段
+    assert "旋转门金属框与玻璃翼扇占据画面主体" in prompt
+
+
+def test_opening_placeholder_is_not_repeated_as_start_sentence() -> None:
+    """start_state 为「承接上一镜结束状态」占位时，不再输出「开始时，承接…」。"""
+    prompt = _render(opening_frame="承接上一镜结束状态")
+
+    assert "这一镜开始时，承接上一镜结束状态" not in prompt
+
+
+def test_office_building_outdoor_scene_gets_wind_not_indoor_clutter() -> None:
+    prompt = _render(scene_name="中关村科技公司办公楼外（玉兰树下）")
+
+    assert "树叶、草叶等自然物受轻风影响" in prompt
+    assert "窗帘、纸张" not in prompt
+
+
+def test_style_prompt_with_trailing_period_has_no_double_suffix() -> None:
+    prompt = _render(
+        style="近未来科技职场题材，半写实 3D 国漫风，整体克制，带轻微黑色幽默与都市荒诞感。"
+    )
+
+    assert "荒诞感的风格。" in prompt
+    assert "。的风格" not in prompt
+
+
+def test_optimize_identity_validation_accepts_same_reference_set() -> None:
+    original = (
+        "以 @Image1 作为起始画面。徐尘心沿用 @Image2 的参考素材。"
+        "场景沿用 @Image3。0-2秒：推门；2-4秒：迈入。"
+    )
+    optimized = (
+        "画面以 @Image1 的构图与站位为基准，徐尘心的外貌与服装沿用 @Image2，"
+        "场景空间沿用 @Image3。他先推门，随后迈入门内。"
+    )
+    tokens = _collect_prompt_reference_tokens(original)
+    assert _validate_prompt_reference_identity(original, optimized, tokens) == []
+
+
+def test_optimize_identity_validation_rejects_missing_added_reordered() -> None:
+    original = "参考 @Image1 与 @Image2 与 @Image3。"
+    tokens = ["@Image1", "@Image2", "@Image3"]
+
+    missing = _validate_prompt_reference_identity(original, "参考 @Image1 与 @Image2。", tokens)
+    assert any("@Image3" in issue for issue in missing)
+
+    added = _validate_prompt_reference_identity(original, "参考 @Image4 与 @Image1。", tokens)
+    assert any("@Image4" in issue for issue in added)
+
+    reordered = _validate_prompt_reference_identity(
+        original, "参考 @Image2 与 @Image1 与 @Image3。", tokens
+    )
+    assert any("顺序" in issue for issue in reordered)
+
+
+def test_validate_natural_style_detects_template_output() -> None:
+    assert validate_natural_style("少年先向前走，随后停下观察。机位固定。") == []
+    issues = validate_natural_style(
+        "【核心动作】\n本镜只执行以下唯一一套时间轴，忽略其他时间描述；"
+        "0-2秒：少年向前走；2-5秒：停下观察。"
+    )
+    assert any("【】" in issue for issue in issues)
+    assert any("机械时间轴" in issue for issue in issues)
+    assert any("本镜只执行" in issue for issue in issues)
+
+
+def test_director_plan_render_is_natural_not_template() -> None:
+    """导演设计存在时，最终提示词也必须是自然语言而不是 10 段模板。"""
+    from app.services.director_plan import (
+        AudienceFocus,
+        DialogueBinding,
+        DirectorPlan,
+        DirectorTimelineSegment,
+        render_director_video_prompt,
+    )
+
+    prompt = render_director_video_prompt(
+        style_prompt="国漫3D写实",
+        aspect_ratio="9:16",
+        director_plan=DirectorPlan(
+            shot_purpose="强调孤独",
+            audience_focus=AudienceFocus(first="苏月背影"),
+            composition="negative-space",
+            performance="缓慢转身",
+            environment_motion="自动门滑开",
+            visual_tone=["低饱和自然光"],
+        ),
+        timeline=[
+            DirectorTimelineSegment(start=0, end=3, action="苏月背对镜头站立"),
+            DirectorTimelineSegment(start=3, end=6, action="转身望向自动门"),
+        ],
+        dialogue_bindings=[
+            DialogueBinding(
+                speaker="苏月", text="又要走了。", start_time=0.5, end_time=2.0
+            )
+        ],
+        initial_state="苏月背对镜头站在候车厅",
+        end_state="苏月侧身望门",
+        shot_type="中景",
+        anchors=["@Image1：当前分镜关键帧。"],
+    )
+
+    assert "【" not in prompt
+    assert validate_natural_style(prompt) == []
+    assert "以 @Image1 作为这一镜的起始画面" in prompt
+    assert "第1句，苏月说：“又要走了。”" in prompt
+    assert "先苏月背对镜头站立，随后转身望向自动门" in prompt
+    assert validate_prompt_references(
+        prompt, parse_reference_anchors(["@Image1：当前分镜关键帧。"])
+    ).ok
+
+
+class RecordingJobService(JobService):
+    def __init__(self) -> None:
+        super().__init__(Database("sqlite:///:memory:"))
+        self.created: dict[str, Any] = {}
+        self.progress: list[tuple[str, int, int, str]] = []
+
+    def create(self, **kwargs: Any) -> dict[str, Any]:
+        self.created = kwargs
+        return {"id": "job-record", "status": "queued", "project_id": kwargs["project_id"]}
+
+    def update_progress(
+        self,
+        job_id: str,
+        current: int,
+        total: int | None = None,
+        message: str = "",
+    ) -> None:
+        self.progress.append((job_id, current, total or 0, message))
+
+
+class StubTextProvider:
+    def __init__(self, prompt: str) -> None:
+        self.prompt = prompt
+        self.calls: list[dict[str, Any]] = []
+
+    async def generate_json(self, **values: Any) -> Any:
+        self.calls.append(values)
+        return ShotVideoPromptOptimizeOutput(prompt=self.prompt)
+
+
+@pytest.fixture
+def optimize_shot(tmp_path: Path) -> tuple[ShotService, dict[str, Any]]:
+    database = Database(f"sqlite:///{(tmp_path / 'natural-optimize.db').as_posix()}")
+    database.initialize(seed_mock_providers=True)
+    project = ProjectService(database, FileService(tmp_path)).create({"name": "自然语言化"})
+    chapter = ChapterService(database, FileService(tmp_path)).create(
+        project["id"], {"title": "第一章", "source_text": "徐尘心走进办公楼。"}
+    )
+    service = ShotService(database, jobs=RecordingJobService())  # type: ignore[arg-type]
+    shot = service.create(
+        chapter["id"],
+        {
+            "shot_no": 1,
+            "shot_order": 1,
+            "source_type": "screenplay",
+            "source_ref": "scene:1|中关村办公区",
+            "narration": "",
+            "shot_type": "中景",
+            "camera_angle": "平视",
+            "camera_move": "固定",
+            "duration_sec": 5,
+            "start_state": "徐尘心站在旋转门前。",
+            "action": "徐尘心推门进入。",
+            "end_state": "徐尘心迈入门内。",
+            "next_hook": "",
+            "frame_description": "徐尘心站在旋转门前。",
+            "video_prompt": "0-2秒：徐尘心走到门前；2-5秒：推门进入。",
+            "image_prompt": "徐尘心站在旋转门前。",
+            "negative_prompt": "人物变形。",
+            "status": "ready",
+        },
+    )
+    try:
+        yield service, shot
+    finally:
+        database.dispose()
+
+
+def test_optimize_once_rejects_broken_reference_set(
+    optimize_shot: tuple[ShotService, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """优化结果丢失/新增 @Image 引用时拒绝返回，不写入错误提示词。"""
+    service, shot = optimize_shot
+    current = service.get(shot["id"])
+    project = service._project(current["project_id"])
+    original = str(current["final_video_prompt"] or "")
+    assert "@Image1" in original
+    provider = StubTextProvider("优化后丢掉了关键帧引用的提示词。")
+
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **kwargs: (
+            provider,
+            {"id": "mock-text", "model": "mock-text", "params": {}, "timeout_sec": 120},
+        ),
+    )
+
+    with pytest.raises(ServiceError) as exc_info:
+        asyncio.run(
+            service._optimize_video_prompt_once(
+                current, project, original, provider_id=None, params=None
+            )
+        )
+
+    assert "素材引用关系" in exc_info.value.detail
+
+
+def test_handle_video_prompt_optimizes_and_preserves_user_edits(
+    optimize_shot: tuple[ShotService, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """「重新生成提示词」= 基于当前提示词的自然语言优化，写入 override 并保留引用。"""
+    service, shot = optimize_shot
+    current = service.get(shot["id"])
+    original = str(current["final_video_prompt"] or "")
+    assert "@Image1" in original
+    optimized_text = (
+        "以 @Image1 作为起始画面。徐尘心先走到旋转门前，随后抬手推门，"
+        "接近结尾时侧身迈入门内。机位固定。"
+    )
+    provider = StubTextProvider(optimized_text)
+
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **kwargs: (
+            provider,
+            {"id": "mock-text", "model": "mock-text", "params": {}, "timeout_sec": 120},
+        ),
+    )
+
+    input_data = service._prompt_job_input(current, "video", {})
+    job = {
+        "target_id": shot["id"],
+        "provider_id": None,
+        "input_json": json.dumps(input_data),
+    }
+    result = asyncio.run(service.handle_video_prompt(job))
+
+    assert result["shot_id"] == shot["id"]
+    refreshed = service.get(shot["id"])
+    assert refreshed["video_prompt_override"] == optimized_text
+    # 优化结果保留原引用集合
+    assert _collect_prompt_reference_tokens(optimized_text) == _collect_prompt_reference_tokens(
+        original
+    )

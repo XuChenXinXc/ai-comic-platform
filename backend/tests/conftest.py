@@ -46,6 +46,9 @@ def media_job_services(
     database.initialize(seed_mock_providers=True)
     monkeypatch.setattr(file_service, "workspace_dir", tmp_path.resolve())
     monkeypatch.setattr(file_service, "projects_dir", (tmp_path / "projects").resolve())
+    # 显式把全局 file_service 绑定到测试数据库：服务层不再隐式改写全局单例，
+    # MediaService 等依赖全局 file_service 的模块才能读到测试项目记录。
+    monkeypatch.setattr(file_service, "database", database)
     file_service.projects_dir.mkdir(parents=True, exist_ok=True)
     repository = JobRepository(database)
     runner = JobRunner(repository, {"text": 1, "image": 1, "video": 1})

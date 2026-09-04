@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.db import Database, db
@@ -26,11 +27,22 @@ from app.models.tables import (
     workflow_run,
     workflow_stage,
 )
-from app.services.errors import bad_request, not_found
-from app.services.file_service import file_service
+from app.services.errors import bad_request, conflict, not_found
+from app.services.file_service import chapter_folder_name, file_service
 from app.services.job_service import JobService
-from app.services.subtitle_service import SubtitleService
-from app.services.utils import json_dumps, json_loads, new_id, row_dict, utc_now
+from app.services.subtitle_service import (
+    SubtitleService,
+    effective_crossfade_seconds,
+    shot_start_offsets,
+)
+from app.services.utils import (
+    json_dumps,
+    json_loads,
+    new_id,
+    row_dict,
+    sanitize_error_message,
+    utc_now,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,37 +68,6 @@ def _ffmpeg_filter_path(value: str) -> str:
     """
     escaped = value.replace("'", "'\\''").replace(":", "\\:")
     return f"'{escaped}'"
-
-
-def _validate_file_path(file_path: Path, base_path: Path) -> Path:
-    """验证文件路径，防止路径遍历攻击
-
-    Args:
-        file_path: 要验证的文件路径
-        base_path: 允许的基础路径
-
-    Returns:
-        解析后的绝对路径
-
-    Raises:
-        bad_request: 如果路径不安全或不存在
-    """
-    try:
-        # 解析为绝对路径
-        resolved = file_path.resolve()
-        base_resolved = base_path.resolve()
-
-        # 检查是否在允许的基础路径内
-        if not str(resolved).startswith(str(base_resolved)):
-            raise bad_request(f"文件路径不在允许的目录内: {file_path}")
-
-        # 检查文件是否存在
-        if not resolved.exists():
-            raise bad_request(f"文件不存在: {file_path}")
-
-        return resolved
-    except (OSError, ValueError) as exc:
-        raise bad_request(f"无效的文件路径: {file_path}") from exc
 
 
 class CompositionService:
@@ -123,137 +104,151 @@ class CompositionService:
         Returns:
             合成任务信息
         """
-        with self.database.engine.begin() as connection:
-            # 整个 select + 失效旧记录 + insert 都必须跑在同一 IMMEDIATE 事务里，
-            # 避免并发请求同时通过 existing 检查后各自插入新行。
-            assert connection.in_transaction()
+        try:
+            with self.database.engine.begin() as connection:
+                # 整个 select + 失效旧记录 + insert 必须跑在同一事务里；
+                # 并发冲突由 ux_composition_chapter 部分唯一索引 + 下方
+                # IntegrityError 捕获兜底（SQLITE_BUSY 由 busy_timeout 兜底）。
+                assert connection.in_transaction()
 
-            # 检查章节是否存在
-            chapter_record = connection.execute(
-                select(chapter.c.id, chapter.c.project_id, chapter.c.title).where(
-                    chapter.c.id == chapter_id
-                )
-            ).first()
-            if chapter_record is None:
-                raise not_found(f"章节不存在：{chapter_id}")
-            assert chapter_record is not None
-
-            project_id = chapter_record.project_id
-            context = dict(workflow_context or {})
-            run_id = str(context.get("workflow_run_id") or "") or None
-            stage_id = str(context.get("workflow_stage_id") or "") or None
-            input_signature = str(context.get("input_signature") or "")
-            delivery_generation = str(context.get("delivery_generation") or "")
-
-            # 检查是否已有进行中的合成任务：只做幂等检测，不在循环里写 status。
-            # 失效旧记录交由 _invalidate_stale_compositions 统一批量处理。
-            if run_id:
-                existing_query = (
-                    select(chapter_composition)
-                    .select_from(
-                        chapter_composition.join(
-                            job,
-                            chapter_composition.c.job_id == job.c.id,
-                        )
-                    )
-                    .where(
-                        chapter_composition.c.chapter_id == chapter_id,
-                        chapter_composition.c.workflow_run_id == run_id,
-                        chapter_composition.c.input_signature == input_signature,
-                        chapter_composition.c.status.in_(("pending", "processing")),
-                    )
-                )
-                if stage_id:
-                    existing_query = existing_query.where(job.c.workflow_stage_id == stage_id)
-                existing = None
-                for existing_row in connection.execute(existing_query).all():
-                    existing_record = row_dict(existing_row) or {}
-                    provenance = json_loads(existing_record.get("provenance_json"), {})
-                    old_generation = (
-                        str(provenance.get("delivery_generation") or "")
-                        if isinstance(provenance, Mapping)
-                        else ""
-                    )
-                    if delivery_generation and old_generation != delivery_generation:
-                        # delivery_generation 不匹配：留给 _invalidate_stale_compositions
-                        # 统一走 JobRepository.batch_fail + chapter_composition 状态翻转。
-                        continue
-                    existing = existing_record
-                    break
-            else:
-                existing = connection.execute(
-                    select(chapter_composition).where(
-                        chapter_composition.c.chapter_id == chapter_id,
-                        chapter_composition.c.status.in_(["pending", "processing"]),
+                # 检查章节是否存在
+                chapter_record = connection.execute(
+                    select(chapter.c.id, chapter.c.project_id, chapter.c.title).where(
+                        chapter.c.id == chapter_id
                     )
                 ).first()
-            if existing:
-                raise bad_request("章节已有合成任务在进行中")
-            if run_id:
-                self._invalidate_stale_compositions(
-                    connection,
-                    chapter_id=chapter_id,
-                    run_id=run_id,
-                    stage_id=stage_id or "",
-                    input_signature=input_signature,
-                    delivery_generation=delivery_generation,
+                if chapter_record is None:
+                    raise not_found(f"章节不存在：{chapter_id}")
+                assert chapter_record is not None
+
+                project_id = chapter_record.project_id
+                context = dict(workflow_context or {})
+                run_id = str(context.get("workflow_run_id") or "") or None
+                stage_id = str(context.get("workflow_stage_id") or "") or None
+                input_signature = str(context.get("input_signature") or "")
+                delivery_generation = str(context.get("delivery_generation") or "")
+
+                # 检查是否已有进行中的合成任务：只做幂等检测，不在循环里写 status。
+                # 失效旧记录交由 _invalidate_stale_compositions 统一批量处理。
+                if run_id:
+                    existing_query = (
+                        select(chapter_composition)
+                        .select_from(
+                            chapter_composition.join(
+                                job,
+                                chapter_composition.c.job_id == job.c.id,
+                            )
+                        )
+                        .where(
+                            chapter_composition.c.chapter_id == chapter_id,
+                            chapter_composition.c.workflow_run_id == run_id,
+                            chapter_composition.c.input_signature == input_signature,
+                            chapter_composition.c.status.in_(("pending", "processing")),
+                        )
+                    )
+                    if stage_id:
+                        existing_query = existing_query.where(
+                            job.c.workflow_stage_id == stage_id
+                        )
+                    existing = None
+                    for existing_row in connection.execute(existing_query).all():
+                        existing_record = row_dict(existing_row) or {}
+                        provenance = json_loads(existing_record.get("provenance_json"), {})
+                        old_generation = (
+                            str(provenance.get("delivery_generation") or "")
+                            if isinstance(provenance, Mapping)
+                            else ""
+                        )
+                        if delivery_generation and old_generation != delivery_generation:
+                            # delivery_generation 不匹配：留给 _invalidate_stale_compositions
+                            # 统一走 JobRepository.batch_fail + chapter_composition 状态翻转。
+                            continue
+                        existing = existing_record
+                        break
+                else:
+                    existing = connection.execute(
+                        select(chapter_composition).where(
+                            chapter_composition.c.chapter_id == chapter_id,
+                            chapter_composition.c.status.in_(["pending", "processing"]),
+                        )
+                    ).first()
+                if existing:
+                    raise bad_request("章节已有合成任务在进行中")
+                if run_id:
+                    self._invalidate_stale_compositions(
+                        connection,
+                        chapter_id=chapter_id,
+                        run_id=run_id,
+                        stage_id=stage_id or "",
+                        input_signature=input_signature,
+                        delivery_generation=delivery_generation,
+                    )
+
+                # 创建 Job
+                job_id = new_id("job")
+                now = utc_now()
+                input_data = {**dict(config), **context}
+                dependency_ids = [str(value) for value in depends_on if str(value).strip()]
+                connection.execute(
+                    insert(job).values(
+                        id=job_id,
+                        project_id=project_id,
+                        chapter_id=chapter_id,
+                        workflow_run_id=run_id,
+                        workflow_stage_id=stage_id,
+                        job_type="compose_chapter",
+                        target_type="chapter",
+                        target_id=chapter_id,
+                        idempotency_key=context.get("idempotency_key"),
+                        # 合成是本地 FFmpeg 任务，不是文字 Provider 调用；
+                        # 标记为 compose 以免占用 text worker 池（runner 侧
+                        # 的 compose 池调度由独立改动提供，未识别前回退
+                        # job_type 推断）。
+                        provider_kind="compose",
+                        status="queued",
+                        input_json=json_dumps(input_data),
+                        input_signature=input_signature,
+                        depends_on_json=json_dumps(dependency_ids),
+                        result_json="{}",
+                        error="",
+                        retry_count=0,
+                        progress_current=0,
+                        progress_total=1,
+                        created_at=now,
+                        updated_at=now,
+                    )
                 )
 
-            # 创建 Job
-            job_id = new_id("job")
-            now = utc_now()
-            input_data = {**dict(config), **context}
-            dependency_ids = [str(value) for value in depends_on if str(value).strip()]
-            connection.execute(
-                insert(job).values(
-                    id=job_id,
-                    project_id=project_id,
-                    chapter_id=chapter_id,
-                    workflow_run_id=run_id,
-                    workflow_stage_id=stage_id,
-                    job_type="compose_chapter",
-                    target_type="chapter",
-                    target_id=chapter_id,
-                    idempotency_key=context.get("idempotency_key"),
-                    provider_kind="text",
-                    status="queued",
-                    input_json=json_dumps(input_data),
-                    input_signature=input_signature,
-                    depends_on_json=json_dumps(dependency_ids),
-                    result_json="{}",
-                    error="",
-                    retry_count=0,
-                    progress_current=0,
-                    progress_total=1,
-                    created_at=now,
-                    updated_at=now,
+                # 创建合成记录
+                composition_id = new_id("compose")
+                connection.execute(
+                    insert(chapter_composition).values(
+                        id=composition_id,
+                        chapter_id=chapter_id,
+                        job_id=job_id,
+                        workflow_run_id=run_id,
+                        input_signature=input_signature,
+                        preflight_json=json_dumps(context.get("preflight", {})),
+                        provenance_json=json_dumps(context.get("provenance", {})),
+                        resolution=config.get("resolution", "1080p"),
+                        include_audio=int(config.get("include_audio", True)),
+                        burn_subtitles=int(config.get("burn_subtitles", True)),
+                        bgm_id=config.get("bgm_id"),
+                        status="pending",
+                        created_at=now,
+                        updated_at=now,
+                    )
                 )
-            )
 
-            # 创建合成记录
-            composition_id = new_id("compose")
-            connection.execute(
-                insert(chapter_composition).values(
-                    id=composition_id,
-                    chapter_id=chapter_id,
-                    job_id=job_id,
-                    workflow_run_id=run_id,
-                    input_signature=input_signature,
-                    preflight_json=json_dumps(context.get("preflight", {})),
-                    provenance_json=json_dumps(context.get("provenance", {})),
-                    resolution=config.get("resolution", "1080p"),
-                    include_audio=int(config.get("include_audio", True)),
-                    burn_subtitles=int(config.get("burn_subtitles", True)),
-                    bgm_id=config.get("bgm_id"),
-                    status="pending",
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-
-            record = connection.execute(
-                select(chapter_composition).where(chapter_composition.c.id == composition_id)
-            ).first()
+                record = connection.execute(
+                    select(chapter_composition).where(
+                        chapter_composition.c.id == composition_id
+                    )
+                ).first()
+        except IntegrityError as exc:
+            # 并发 compose 撞 ux_composition_chapter 部分唯一索引时，
+            # 转成 409 语义，而不是裸 500。
+            raise conflict("章节合成任务已存在或正在创建，请稍后重试") from exc
 
         result = row_dict(record)
         if result is None:
@@ -529,12 +524,31 @@ class CompositionService:
                     .values(status="processing", updated_at=utc_now())
                 )
             else:
-                # legacy compose 保持原有章节级行为。
-                connection.execute(
-                    update(chapter_composition)
-                    .where(chapter_composition.c.chapter_id == chapter_id)
-                    .values(status="processing", updated_at=utc_now())
-                )
+                # legacy compose：只更新本次任务关联的合成记录（按 job_id），
+                # 避免把该章节历史已完成记录的状态/路径一并污染。
+                # 测试/直接调用场景下 job_record 可能缺 id，此时退化为
+                # 「该章节最新的 pending/processing 记录」而非全量覆盖。
+                job_id = job_record.get("id")
+                if job_id:
+                    legacy_update = connection.execute(
+                        update(chapter_composition)
+                        .where(
+                            chapter_composition.c.job_id == job_id,
+                            chapter_composition.c.chapter_id == chapter_id,
+                        )
+                        .values(status="processing", updated_at=utc_now())
+                    )
+                else:
+                    legacy_update = connection.execute(
+                        update(chapter_composition)
+                        .where(
+                            chapter_composition.c.chapter_id == chapter_id,
+                            chapter_composition.c.status.in_(("pending", "processing")),
+                        )
+                        .values(status="processing", updated_at=utc_now())
+                    )
+                if legacy_update.rowcount < 1 and job_id:
+                    raise RuntimeError("Legacy Composition 置为 processing 条件更新未命中")
 
         try:
             if dynamic_context:
@@ -583,9 +597,10 @@ class CompositionService:
             output_dir = project_path / "成片"
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            chapter_name = f"第{chapter_record.chapter_no:02d}章"
-            if chapter_record.title:
-                chapter_name += f"-{chapter_record.title}"
+            chapter_name = chapter_folder_name(
+                chapter_record.chapter_no,
+                str(chapter_record.title or ""),
+            )
 
             output_filename = f"{chapter_name}.mp4"
             output_path = output_dir / output_filename
@@ -600,7 +615,7 @@ class CompositionService:
                 # 5.1 拼接视频
                 concat_video = self._concat_videos(
                     shots_data,
-                    project_path,
+                    project_id,
                     temp_path,
                     crossfade=crossfade_enabled,
                     crossfade_seconds=crossfade_seconds,
@@ -611,7 +626,7 @@ class CompositionService:
                     concat_video = self._add_audio(
                         concat_video,
                         shots_data,
-                        project_path,
+                        project_id,
                         temp_path,
                         crossfade_seconds=(
                             crossfade_seconds if crossfade_enabled else None
@@ -623,14 +638,23 @@ class CompositionService:
                     concat_video = self._add_bgm(
                         concat_video,
                         config["bgm_id"],
-                        project_path,
+                        project_id,
                         temp_path,
                         volume=config.get("bgm_volume", 0.3),
                     )
 
                 # 5.4 烧录字幕（如果启用）
                 if config.get("burn_subtitles"):
-                    concat_video = self._burn_subtitles(concat_video, chapter_id, temp_path)
+                    concat_video = self._burn_subtitles(
+                        concat_video,
+                        chapter_id,
+                        temp_path,
+                        shots_data=shots_data,
+                        project_id=project_id,
+                        crossfade_seconds=(
+                            crossfade_seconds if crossfade_enabled else None
+                        ),
+                    )
 
                 # 5.5 最终输出
                 self._finalize_output(concat_video, output_path, config.get("resolution", "1080p"))
@@ -675,11 +699,23 @@ class CompositionService:
                         },
                     )
                 else:
-                    connection.execute(
-                        update(chapter_composition)
-                        .where(chapter_composition.c.chapter_id == chapter_id)
-                        .values(**values)
-                    )
+                    job_id = job_record.get("id")
+                    legacy_statement = update(chapter_composition)
+                    if job_id:
+                        legacy_statement = legacy_statement.where(
+                            chapter_composition.c.job_id == job_id,
+                            chapter_composition.c.chapter_id == chapter_id,
+                            chapter_composition.c.status == "processing",
+                        )
+                    else:
+                        # 直接调用场景（无 job id）：只更新该章节最新 processing 记录。
+                        legacy_statement = legacy_statement.where(
+                            chapter_composition.c.chapter_id == chapter_id,
+                            chapter_composition.c.status == "processing",
+                        )
+                    legacy_update = connection.execute(legacy_statement.values(**values))
+                    if legacy_update.rowcount < 1 and job_id:
+                        raise RuntimeError("Legacy Composition 完成条件更新未命中")
 
             logger.info(f"章节 {chapter_id} 合成完成：{output_path}")
 
@@ -689,7 +725,10 @@ class CompositionService:
             }
 
         except Exception as exc:
-            logger.error(f"章节 {chapter_id} 合成失败：{exc}")
+            # 入库前统一脱敏：避免 ffmpeg stderr、绝对路径或敏感凭据
+            # 直接写入 composition.error 并经 API 返回给前端
+            error_text = sanitize_error_message(str(exc))
+            logger.error(f"章节 {chapter_id} 合成失败：{error_text}")
             with self.database.engine.begin() as connection:
                 if dynamic_context:
                     self._assert_dynamic_current(connection, job_record)
@@ -705,7 +744,7 @@ class CompositionService:
                                 ("pending", "processing", "failed")
                             ),
                         )
-                        .values(status="failed", error=str(exc), updated_at=utc_now())
+                        .values(status="failed", error=error_text, updated_at=utc_now())
                     )
                     if failed_update.rowcount != 1:
                         raise RuntimeError("动态 Composition 失败状态条件更新未命中") from exc
@@ -713,19 +752,34 @@ class CompositionService:
                         connection,
                         job_record,
                         stage_status="partial_failed",
-                        error=str(exc),
+                        error=error_text,
                         job_status="failed",
                         result={
                             "status": "partial_failed",
-                            "error": str(exc),
+                            "error": error_text,
                         },
                     )
                 else:
-                    connection.execute(
-                        update(chapter_composition)
-                        .where(chapter_composition.c.chapter_id == chapter_id)
-                        .values(status="failed", error=str(exc), updated_at=utc_now())
+                    job_id = job_record.get("id")
+                    legacy_failed_statement = update(chapter_composition)
+                    if job_id:
+                        legacy_failed_statement = legacy_failed_statement.where(
+                            chapter_composition.c.job_id == job_id,
+                            chapter_composition.c.chapter_id == chapter_id,
+                            chapter_composition.c.status.in_(("pending", "processing", "failed")),
+                        )
+                    else:
+                        legacy_failed_statement = legacy_failed_statement.where(
+                            chapter_composition.c.chapter_id == chapter_id,
+                            chapter_composition.c.status.in_(("pending", "processing", "failed")),
+                        )
+                    legacy_failed_update = connection.execute(
+                        legacy_failed_statement.values(
+                            status="failed", error=error_text, updated_at=utc_now()
+                        )
                     )
+                    if legacy_failed_update.rowcount < 1 and job_id:
+                        raise RuntimeError("Legacy Composition 失败条件更新未命中") from exc
             raise
 
     @staticmethod
@@ -872,7 +926,7 @@ class CompositionService:
     def _concat_videos(
         self,
         shots_data: list[dict[str, Any]],
-        project_path: Path,
+        project_id: str,
         temp_path: Path,
         *,
         crossfade: bool = False,
@@ -882,7 +936,7 @@ class CompositionService:
         if crossfade:
             return self._concat_videos_with_crossfade(
                 shots_data,
-                project_path,
+                project_id,
                 temp_path,
                 crossfade_seconds,
             )
@@ -890,7 +944,10 @@ class CompositionService:
         concat_file = temp_path / "concat.txt"
         with concat_file.open("w", encoding="utf-8") as f:
             for shot in shots_data:
-                video_full_path = project_path / shot["video_path"]
+                # 数据库相对路径必须经项目路径校验，防止路径穿越
+                video_full_path = file_service.resolve_project_path(
+                    project_id, shot["video_path"]
+                )
                 # FFmpeg concat 需要绝对路径或用单引号包裹
                 f.write(f"file '{_ffconcat_escape(video_full_path.as_posix())}'\n")
 
@@ -939,31 +996,20 @@ class CompositionService:
         durations: list[float],
         crossfade_seconds: float,
     ) -> float:
-        """实际使用的叠化时长：单段不叠化，且不能超过最短素材的一半。"""
-        if len(durations) < 2:
-            return 0.0
-        return max(0.1, min(float(crossfade_seconds), min(durations) / 2))
+        """实际使用的叠化时长（委托共用纯函数，见 subtitle_service）。"""
+        return effective_crossfade_seconds(durations, crossfade_seconds)
 
     @staticmethod
     def _audio_offsets(
         durations: list[float],
         crossfade_seconds: float | None,
     ) -> list[float]:
-        """按真实视频时长计算每段素材在成片时间轴上的起始时间。"""
-        fade = (
-            CompositionService._effective_crossfade_seconds(
-                durations,
-                crossfade_seconds,
-            )
-            if crossfade_seconds is not None
-            else 0.0
-        )
-        offsets: list[float] = []
-        cursor = 0.0
-        for index, duration in enumerate(durations):
-            offsets.append(cursor)
-            cursor += duration - (fade if index < len(durations) - 1 else 0)
-        return offsets
+        """按真实视频时长计算每段素材在成片时间轴上的起始时间。
+
+        委托共用纯函数（见 subtitle_service），字幕与音轨共用同一公式，
+        避免 xfade 偏移在两个服务里各自实现产生漂移。
+        """
+        return shot_start_offsets(durations, crossfade_seconds)
 
     @staticmethod
     def _get_video_stream_info(path: Path) -> dict[str, Any]:
@@ -1001,18 +1047,19 @@ class CompositionService:
     def _concat_videos_with_crossfade(
         self,
         shots_data: list[dict[str, Any]],
-        project_path: Path,
+        project_id: str,
         temp_path: Path,
         crossfade_seconds: float,
     ) -> Path:
         """用 xfade 叠化拼接分镜视频（每个转场 0.5s）。"""
+        # 数据库相对路径必须经项目路径校验，防止路径穿越
         video_paths = [
-            project_path / shot["video_path"]
+            file_service.resolve_project_path(project_id, shot["video_path"])
             for shot in shots_data
             if shot.get("video_path")
         ]
         if len(video_paths) < 2:
-            return self._concat_videos(shots_data, project_path, temp_path)
+            return self._concat_videos(shots_data, project_id, temp_path)
 
         durations = [self._get_video_duration(path) for path in video_paths]
         first = self._get_video_stream_info(video_paths[0])
@@ -1109,7 +1156,7 @@ class CompositionService:
         self,
         video_path: Path,
         shots_data: list[dict[str, Any]],
-        project_path: Path,
+        project_id: str,
         temp_path: Path,
         *,
         crossfade_seconds: float | None = None,
@@ -1121,13 +1168,20 @@ class CompositionService:
         for item in shots_data:
             if item.get("video_path"):
                 video_durations.append(
-                    self._get_video_duration(project_path / item["video_path"])
+                    self._get_video_duration(
+                        file_service.resolve_project_path(
+                            project_id, item["video_path"]
+                        )
+                    )
                 )
             else:
                 video_durations.append(float(item.get("duration_sec") or 0))
         starts = self._audio_offsets(video_durations, crossfade_seconds)
         audio_files = [
-            (offset, project_path / item["audio_path"])
+            (
+                offset,
+                file_service.resolve_project_path(project_id, item["audio_path"]),
+            )
             for offset, item in zip(starts, shots_data, strict=True)
             if item.get("audio_path")
         ]
@@ -1203,19 +1257,32 @@ class CompositionService:
         return output
 
     def _add_bgm(
-        self, video_path: Path, bgm_id: str, project_path: Path, temp_path: Path, volume: float
+        self,
+        video_path: Path,
+        bgm_id: str,
+        project_id: str,
+        temp_path: Path,
+        volume: float,
     ) -> Path:
         """添加 BGM 音轨"""
         with self.database.engine.connect() as connection:
+            # BGM 必须属于当前项目，防止跨项目引用其他项目的音频文件
             bgm_record = connection.execute(
-                select(project_bgm.c.file_path).where(project_bgm.c.id == bgm_id)
+                select(project_bgm.c.file_path).where(
+                    project_bgm.c.id == bgm_id,
+                    project_bgm.c.project_id == project_id,
+                )
             ).first()
 
         if bgm_record is None:
-            logger.warning(f"BGM 不存在：{bgm_id}，跳过")
-            return video_path
+            # 不再静默跳过：BGM 缺失或跨项目引用都让合成任务显式失败，
+            # 错误消息不包含任何路径信息
+            raise bad_request("BGM 不存在或不属于当前项目")
 
-        bgm_full_path = project_path / bgm_record.file_path
+        # 数据库相对路径必须经项目路径校验，防止路径穿越
+        bgm_full_path = file_service.resolve_project_path(
+            project_id, bgm_record.file_path
+        )
         output = temp_path / "with_bgm.mp4"
 
         # 获取视频时长
@@ -1272,10 +1339,41 @@ class CompositionService:
 
         return output
 
-    def _burn_subtitles(self, video_path: Path, chapter_id: str, temp_path: Path) -> Path:
-        """烧录字幕"""
+    def _burn_subtitles(
+        self,
+        video_path: Path,
+        chapter_id: str,
+        temp_path: Path,
+        *,
+        shots_data: list[dict[str, Any]] | None = None,
+        project_id: str = "",
+        crossfade_seconds: float | None = None,
+    ) -> Path:
+        """烧录字幕
+
+        Args:
+            shots_data: 参与本次合成的分镜列表（已过滤出有当前视频的分镜）。
+                提供且 project_id 非空时，字幕时间轴与视频轨/音轨保持一致：
+                只累计这些分镜的真实视频时长并应用 xfade 偏移，
+                无视频分镜的字幕不烧录。未提供时保持旧行为。
+            project_id: 项目 ID，用于把数据库相对路径解析为安全的绝对路径。
+            crossfade_seconds: 叠化时长；None 表示无叠化。
+        """
         # 导出 SRT 文件
-        srt_content = self.subtitle_service.export_chapter_srt(chapter_id)
+        shot_video_durations: Mapping[str, float] | None = None
+        if shots_data is not None and project_id:
+            shot_video_durations = {
+                item["shot_id"]: self._get_video_duration(
+                    file_service.resolve_project_path(project_id, item["video_path"])
+                )
+                for item in shots_data
+                if item.get("video_path")
+            }
+        srt_content = self.subtitle_service.export_chapter_srt(
+            chapter_id,
+            shot_video_durations=shot_video_durations,
+            crossfade_seconds=crossfade_seconds,
+        )
         if not srt_content.strip():
             logger.info(f"章节 {chapter_id} 无字幕，跳过烧录")
             return video_path
@@ -1316,15 +1414,22 @@ class CompositionService:
         return output
 
     def _finalize_output(self, video_path: Path, output_path: Path, resolution: str) -> None:
-        """最终输出（可选：调整分辨率）"""
-        if resolution == "720p":
-            scale = "scale=1280:720"
-        elif resolution == "4k":
-            scale = "scale=3840:2160"
-        else:  # 1080p 或其他
-            scale = None
+        """最终输出（可选：调整分辨率）
 
-        if scale:
+        使用等比缩放 + pad，保持竖屏/异形比内容不被强行拉伸变形。
+        """
+        if resolution == "720p":
+            width, height = 1280, 720
+        elif resolution == "4k":
+            width, height = 3840, 2160
+        else:  # 1080p 或其他
+            width, height = 1920, 1080
+
+        if resolution in {"720p", "4k"}:
+            scale = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+            )
             subprocess.run(
                 [
                     settings.ffmpeg_path,
@@ -1387,8 +1492,9 @@ class CompositionService:
             error_msg = exc.stderr if exc.stderr else "未知错误"
             raise bad_request(f"获取视频时长失败: {error_msg[:200]}") from exc
         except ValueError as exc:
-            logger.warning(f"无法获取视频时长：{exc}")
-            return 0.0
+            # 时长解析失败不能静默当 0 秒：0 时长会污染成片记录与时间轴，
+            # 与音频侧「探测失败抛明确错误」的口径一致。
+            raise bad_request(f"获取视频时长失败：{exc}") from exc
 
     def get_chapter_composition(self, chapter_id: str) -> dict[str, Any] | None:
         """获取章节合成记录"""
@@ -1402,4 +1508,10 @@ class CompositionService:
         if record is None:
             return None
 
-        return row_dict(record)
+        result = row_dict(record)
+        if result is None:
+            return None
+        # 对外返回前统一脱敏，避免历史 error 中的绝对路径或敏感信息
+        # 经 /composition/chapters/{id}/composition 接口泄露
+        result["error"] = sanitize_error_message(result.get("error", ""))
+        return result

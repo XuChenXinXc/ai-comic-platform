@@ -1,8 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router";
-import { api } from "../api/client";
+import { toast } from "sonner";
+import { api, mediaUrl } from "../api/client";
+import { Modal } from "../components/ui";
 import { formatError } from "../lib/utils";
-import type { Chapter, ApiProvider } from "../types/api";
+import type { Chapter, ApiProvider, MediaVersion } from "../types/api";
 
 interface Dialogue {
   shot_no: number;
@@ -36,8 +38,27 @@ const OPENAI_VOICES = [
   { id: "shimmer", name: "Shimmer（柔和女性）" },
 ];
 
+// 过滤映射中的空键/空值/非字符串项，保证写入服务端的键值均为非空字符串。
+function sanitizeVoiceMapping(mapping: Record<string, string>): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const [speaker, voice] of Object.entries(mapping)) {
+    if (speaker && typeof voice === "string" && voice) {
+      next[speaker] = voice;
+    }
+  }
+  return next;
+}
+
 export default function AudioWorkbenchPage() {
   const { projectId, chapterId } = useParams<{ projectId: string; chapterId: string }>();
+  // 组件挂载状态：卸载后停止批量生成循环与状态更新，避免对已卸载组件 setState。
+  const mountedRef = useRef(true);
+  // 章节实时镜像：在途生成/删除响应落地前校验章节未变，
+  // 防止切换到新章节后把旧章节结果写入同名分镜。
+  const chapterIdRef = useRef(chapterId);
+  chapterIdRef.current = chapterId;
+  // 响应落地守卫：组件仍挂载且章节未切换时才允许写入状态。
+  const canCommit = () => mountedRef.current && chapterIdRef.current === chapterId;
   const [chapter, setChapter] = useState<Chapter | null>(null);
   const [dialogues, setDialogues] = useState<Dialogue[]>([]);
   const [ttsProviders, setTtsProviders] = useState<ApiProvider[]>([]);
@@ -50,9 +71,63 @@ export default function AudioWorkbenchPage() {
   const [audioStatus, setAudioStatus] = useState<Record<number, ShotAudio>>({});
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // 待确认删除的对话（配音删除确认弹窗）
+  const [confirmDeleteDialogue, setConfirmDeleteDialogue] = useState<Dialogue | null>(null);
+  // 批量生成结果面板（失败/跳过明细较长时用 Modal 展示）
+  const [batchResult, setBatchResult] = useState<{ summary: string; details: string[] } | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // 存在非终态配音（排队/生成中）时每 2s 轮询章节配音状态，
+  // 避免异步产出后状态徽标停留在「生成中」。
+  const hasPendingAudio = Object.values(audioStatus).some(
+    audio => !!audio && !["completed", "failed"].includes(audio.status),
+  );
+  useEffect(() => {
+    if (!hasPendingAudio || !chapterId) return;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      api.audio
+        .getChapterAudios(chapterId)
+        .then(items => {
+          if (cancelled || !mountedRef.current) return;
+          setAudioStatus(prev => {
+            const updates: Record<number, ShotAudio> = {};
+            for (const item of items) {
+              if (!item.audio) continue;
+              const prevAudio = prev[item.shot_no];
+              const unchanged =
+                prevAudio &&
+                prevAudio.status === item.audio.status &&
+                prevAudio.file_path === item.audio.file_path &&
+                prevAudio.duration_sec === item.audio.duration_sec;
+              if (!unchanged) {
+                updates[item.shot_no] = item.audio as ShotAudio;
+              }
+            }
+            if (Object.keys(updates).length === 0) return prev;
+            return { ...prev, ...updates };
+          });
+        })
+        .catch(() => {
+          // 轮询失败静默忽略，下一轮重试
+        });
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [chapterId, hasPendingAudio]);
 
   useEffect(() => {
     if (!projectId || !chapterId) return;
+    // 竞态防护：切换章节/卸载后丢弃旧响应，避免旧章节数据覆盖新章节。
+    let cancelled = false;
     setLoadError(null);
     Promise.all([
       api.chapters.get(chapterId),
@@ -62,6 +137,7 @@ export default function AudioWorkbenchPage() {
       api.audio.getEdgeTTSVoices(),
       api.audio.getChapterAudios(chapterId),
     ]).then(([chapterData, dialoguesData, providersData, configData, edgeVoicesData, chapterAudiosData]) => {
+      if (cancelled) return;
       setChapter(chapterData);
       setDialogues(dialoguesData);
       setTtsProviders(providersData);
@@ -97,51 +173,94 @@ export default function AudioWorkbenchPage() {
         });
       }
 
-      // 恢复本机保存的音色映射（覆盖默认值）
-      const savedMapping = localStorage.getItem(`audio-voice-mapping-${projectId}`);
-      if (savedMapping) {
+      // 恢复服务端持久化的音色映射（覆盖默认值）
+      for (const [speaker, voice] of Object.entries(configData.voice_mapping || {})) {
+        if (typeof voice === "string" && voice) {
+          defaultMapping[speaker] = voice;
+        }
+      }
+
+      // 一次性迁移旧版 localStorage 音色映射：服务端映射为空且本地有值时写入服务端，成功后删除本地键。
+      const legacyMappingRaw = localStorage.getItem(`audio-voice-mapping-${projectId}`);
+      if (legacyMappingRaw && Object.keys(configData.voice_mapping || {}).length === 0) {
+        let hasLegacyValues = false;
         try {
-          const parsed = JSON.parse(savedMapping) as unknown;
+          const parsed = JSON.parse(legacyMappingRaw) as unknown;
           if (parsed && typeof parsed === "object") {
             for (const [speaker, voice] of Object.entries(
               parsed as Record<string, unknown>,
             )) {
-              if (typeof voice === "string") {
+              if (typeof voice === "string" && voice) {
                 defaultMapping[speaker] = voice;
+                hasLegacyValues = true;
               }
             }
           }
         } catch {
           // 忽略损坏的本地缓存
         }
+        if (hasLegacyValues) {
+          void api.audio
+            .updateConfig(projectId, { voice_mapping: sanitizeVoiceMapping(defaultMapping) })
+            .then(() => {
+              // 迁移成功后移除旧本地键；失败时保留，下次进入页面重试。
+              localStorage.removeItem(`audio-voice-mapping-${projectId}`);
+            })
+            .catch(() => {
+              // 迁移失败静默保留本地键，避免提示打断正常使用
+            });
+        }
       }
       setVoiceMapping(defaultMapping);
     }).catch((error) => {
+      if (cancelled) return;
       console.error(error);
       setLoadError(formatError(error));
     });
+    return () => {
+      cancelled = true;
+    };
   }, [projectId, chapterId]);
 
+  // 更新本地映射并持久化到服务端；保存失败仅提示，不回滚本地即时状态。
   const persistVoiceMapping = (next: Record<string, string>) => {
     setVoiceMapping(next);
-    localStorage.setItem(`audio-voice-mapping-${projectId}`, JSON.stringify(next));
+    if (!projectId) return;
+    api.audio
+      .updateConfig(projectId, { voice_mapping: sanitizeVoiceMapping(next) })
+      .catch((error) => {
+        if (!canCommit()) return;
+        console.error(error);
+        toast.error(`音色映射保存失败：${formatError(error)}`);
+      });
   };
 
-  const handleDeleteAudio = async (dialogue: Dialogue) => {
+  const handleDeleteAudio = (dialogue: Dialogue) => {
     const audio = audioStatus[dialogue.shot_no];
     if (!audio?.id) return;
-    if (!confirm(`确定删除分镜 ${dialogue.shot_no} 的配音？`)) return;
+    setConfirmDeleteDialogue(dialogue);
+  };
+
+  const handleConfirmDeleteAudio = async () => {
+    const dialogue = confirmDeleteDialogue;
+    if (!dialogue) return;
+    const audio = audioStatus[dialogue.shot_no];
+    setConfirmDeleteDialogue(null);
+    if (!audio?.id) return;
 
     try {
       await api.audio.deleteShotAudio(audio.id);
+      if (!canCommit()) return;
       setAudioStatus(prev => {
         const next = { ...prev };
         delete next[dialogue.shot_no];
         return next;
       });
+      toast.success(`分镜 ${dialogue.shot_no} 配音已删除`);
     } catch (error) {
+      if (!canCommit()) return;
       console.error(error);
-      alert(`删除失败：${error instanceof Error ? error.message : "未知错误"}`);
+      toast.error(`删除失败：${formatError(error)}`);
     }
   };
 
@@ -149,14 +268,14 @@ export default function AudioWorkbenchPage() {
     const voiceId = voiceMapping[dialogue.speaker];
 
     if (!voiceId) {
-      alert("请为该角色选择音色");
+      toast.error("请为该角色选择音色");
       return;
     }
 
     // 检查是否需要 Provider
     const isEdgeTTS = voiceId.startsWith("edge-tts:");
     if (!isEdgeTTS && !selectedProvider) {
-      alert("请先选择 TTS Provider");
+      toast.error("请先选择 TTS Provider");
       return;
     }
 
@@ -165,9 +284,10 @@ export default function AudioWorkbenchPage() {
     try {
       // 查询 shot_id
       const shots = await api.shots.list(chapterId!);
+      if (!canCommit()) return;
       const shot = shots.find(s => s.shot_no === dialogue.shot_no);
       if (!shot) {
-        alert(`未找到分镜 ${dialogue.shot_no}`);
+        toast.error(`未找到分镜 ${dialogue.shot_no}`);
         return;
       }
 
@@ -177,21 +297,25 @@ export default function AudioWorkbenchPage() {
         tts_provider_id: isEdgeTTS ? undefined : selectedProvider,
       });
 
+      if (!canCommit()) return;
       setAudioStatus(prev => ({
         ...prev,
         [dialogue.shot_no]: result,
       }));
 
-      alert(`分镜 ${dialogue.shot_no} 配音生成成功`);
+      toast.success(`分镜 ${dialogue.shot_no} 配音生成成功`);
     } catch (error) {
+      if (!canCommit()) return;
       console.error(error);
-      alert(`生成失败：${error instanceof Error ? error.message : "未知错误"}`);
+      toast.error(`生成失败：${formatError(error)}`);
     } finally {
-      setGenerating(prev => {
-        const newSet = new Set(prev);
-        newSet.delete(dialogue.shot_no);
-        return newSet;
-      });
+      if (canCommit()) {
+        setGenerating(prev => {
+          const newSet = new Set(prev);
+          newSet.delete(dialogue.shot_no);
+          return newSet;
+        });
+      }
     }
   };
 
@@ -201,11 +325,13 @@ export default function AudioWorkbenchPage() {
 
     try {
       const shots = await api.shots.list(chapterId!);
+      if (!canCommit()) return;
       const failures: string[] = [];
       const skipped: string[] = [];
       let done = 0;
 
       for (const dialogue of dialogues) {
+        if (!canCommit()) return; // 用户已离开页面：停止批量生成
         const shot = shots.find(s => s.shot_no === dialogue.shot_no);
         if (!shot) {
           skipped.push(`分镜 ${dialogue.shot_no}：找不到分镜`);
@@ -239,6 +365,7 @@ export default function AudioWorkbenchPage() {
             tts_provider_id: isEdgeTTS ? undefined : selectedProvider,
           });
 
+          if (!canCommit()) return;
           setAudioStatus(prev => ({
             ...prev,
             [dialogue.shot_no]: result,
@@ -251,6 +378,7 @@ export default function AudioWorkbenchPage() {
         setBatchProgress({ done, total: dialogues.length });
       }
 
+      if (!canCommit()) return;
       const summary =
         `批量生成完成：成功 ${done - failures.length} 条，失败 ${failures.length} 条` +
         (skipped.length ? `，跳过 ${skipped.length} 条` : "");
@@ -258,36 +386,38 @@ export default function AudioWorkbenchPage() {
         ...failures.map(item => `失败：${item}`),
         ...skipped.map(item => `跳过：${item}`),
       ];
-      alert(
-        details.length === 0
-          ? `批量生成完成：成功 ${done} 条`
-          : `${summary}\n\n${details.join("\n")}`,
-      );
+      if (details.length === 0) {
+        toast.success(`批量生成完成：成功 ${done} 条`);
+      } else {
+        // 失败/跳过明细较长，用结果面板展示而不是 alert。
+        setBatchResult({ summary, details });
+      }
     } catch (error) {
+      if (!canCommit()) return;
       console.error(error);
-      alert(`批量生成失败：${error instanceof Error ? error.message : "未知错误"}`);
+      toast.error(`批量生成失败：${formatError(error)}`);
     } finally {
-      setLoading(false);
-      setBatchProgress(null);
+      if (canCommit()) {
+        setLoading(false);
+        setBatchProgress(null);
+      }
     }
   };
 
   const switchTtsMode = (mode: "edge" | "provider") => {
     setTtsMode(mode);
-    setVoiceMapping(prev => {
-      const next: Record<string, string> = {};
-      const fallbackEdgeVoice = edgeTTSVoices[0]?.name;
-      for (const [speaker, current] of Object.entries(prev)) {
-        const isEdge = current.startsWith("edge-tts:");
-        if (mode === "edge") {
-          next[speaker] = isEdge ? current : fallbackEdgeVoice ? `edge-tts:${fallbackEdgeVoice}` : current;
-        } else {
-          next[speaker] = isEdge ? OPENAI_VOICES[0].id : current;
-        }
+    // 切换模式时换算音色体系（Edge ↔ OpenAI），结果同步保存到服务端。
+    const next: Record<string, string> = {};
+    const fallbackEdgeVoice = edgeTTSVoices[0]?.name;
+    for (const [speaker, current] of Object.entries(voiceMapping)) {
+      const isEdge = current.startsWith("edge-tts:");
+      if (mode === "edge") {
+        next[speaker] = isEdge ? current : fallbackEdgeVoice ? `edge-tts:${fallbackEdgeVoice}` : current;
+      } else {
+        next[speaker] = isEdge ? OPENAI_VOICES[0].id : current;
       }
-      localStorage.setItem(`audio-voice-mapping-${projectId}`, JSON.stringify(next));
-      return next;
-    });
+    }
+    persistVoiceMapping(next);
   };
 
   const uniqueSpeakers = Array.from(new Set(dialogues.map(d => d.speaker)));
@@ -479,7 +609,9 @@ export default function AudioWorkbenchPage() {
                           <audio
                             controls
                             preload="none"
-                            src={`/media/${projectId}/${audioStatus[dialogue.shot_no].file_path}`}
+                            src={mediaUrl({
+                              file_path: `${projectId}/${audioStatus[dialogue.shot_no].file_path}`,
+                            } as MediaVersion)}
                             className="mt-2 h-8 w-full max-w-md"
                           />
                         )}
@@ -521,6 +653,56 @@ export default function AudioWorkbenchPage() {
           )}
         </div>
       </div>
+
+      {/* 删除配音确认弹窗 */}
+      <Modal
+        open={confirmDeleteDialogue !== null}
+        onClose={() => setConfirmDeleteDialogue(null)}
+        title="删除配音"
+        description={
+          confirmDeleteDialogue
+            ? `确定删除分镜 ${confirmDeleteDialogue.shot_no} 的配音？`
+            : undefined
+        }
+        footer={
+          <>
+            <button
+              type="button"
+              onClick={() => setConfirmDeleteDialogue(null)}
+              className="px-4 py-2 rounded border border-gray-300 bg-white text-sm hover:bg-gray-50"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleConfirmDeleteAudio()}
+              className="px-4 py-2 rounded bg-red-500 text-white text-sm hover:bg-red-600"
+            >
+              删除
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-gray-600">删除后需要重新生成配音。</p>
+      </Modal>
+
+      {/* 批量生成结果面板 */}
+      <Modal
+        open={batchResult !== null}
+        onClose={() => setBatchResult(null)}
+        title="批量生成结果"
+      >
+        {batchResult ? (
+          <div>
+            <p className="text-sm font-medium mb-3">{batchResult.summary}</p>
+            <ul className="text-sm text-gray-600 space-y-1 max-h-80 overflow-y-auto">
+              {batchResult.details.map((item, idx) => (
+                <li key={idx}>{item}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </Modal>
     </div>
   );
 }

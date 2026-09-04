@@ -69,11 +69,11 @@ def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def test_migration_script_has_single_0017_head_and_expected_revision() -> None:
     script_directory = ScriptDirectory.from_config(_alembic_config())
 
-    assert script_directory.get_heads() == ["20260818_0017_dynamic_audio_current"]
-    revision = script_directory.get_revision("20260818_0017_dynamic_audio_current")
+    assert script_directory.get_heads() == ["20260901_0020_shot_director_plan"]
+    revision = script_directory.get_revision("20260901_0020_shot_director_plan")
     assert revision is not None
-    assert revision.revision == "20260818_0017_dynamic_audio_current"
-    assert revision.down_revision == "20260816_0016_dynamic_job_idempotency"
+    assert revision.revision == "20260901_0020_shot_director_plan"
+    assert revision.down_revision == "20260901_0019_audio_config_voice_mapping"
 
 
 def test_fresh_migration_creates_workflow_tables_with_constraints(
@@ -353,7 +353,7 @@ def test_database_initialize_and_repeated_migrate_schema_are_idempotent(
         assert first_migration_snapshot == second_migration_snapshot
         with migrated_database.engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "20260818_0017_dynamic_audio_current"
+                "20260901_0020_shot_director_plan"
             )
     finally:
         migrated_database.dispose()
@@ -505,7 +505,7 @@ def test_migrate_schema_from_minimal_0003_database_preserves_project_data_and_ad
                 == legacy_row[1]
             )
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "20260818_0017_dynamic_audio_current"
+                "20260901_0020_shot_director_plan"
             )
     finally:
         database.dispose()
@@ -713,7 +713,7 @@ def test_0017_upgrade_cleans_stale_sqlite_batch_table_and_can_retry(
 
         with database.engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "20260818_0017_dynamic_audio_current"
+                "20260901_0020_shot_director_plan"
             )
             assert connection.scalar(
                 text(

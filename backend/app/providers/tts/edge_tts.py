@@ -7,12 +7,7 @@ Edge TTS Provider
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from app.providers.base import TTSParams
 
 try:
     import edge_tts
@@ -25,46 +20,6 @@ async def _generate_tts(text: str, voice: str, output_path: Path) -> None:
     """异步生成 TTS 音频"""
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(str(output_path))
-
-
-def _ensure_no_running_loop() -> None:
-    """已有运行事件循环时给出明确报错，避免误用同步包装。"""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    raise RuntimeError("当前已在事件循环内运行，请直接 await 对应的异步函数")
-
-
-def generate(params: TTSParams) -> Path:
-    """
-    生成 TTS 音频
-
-    Args:
-        params: TTS 参数，包含 text（文本）和 voice（声音 ID）
-
-    Returns:
-        生成的音频文件路径
-    """
-    if not EDGE_TTS_AVAILABLE:
-        raise RuntimeError(
-            "Edge TTS 未安装。请运行: pip install edge-tts"
-        )
-
-    text = params.get("text", "")
-    voice = params.get("voice", "zh-CN-XiaoxiaoNeural")
-    output_path = params.get("output_path")
-
-    if not text:
-        raise ValueError("text 参数不能为空")
-    if not output_path:
-        raise ValueError("output_path 参数不能为空")
-
-    # 使用 asyncio 运行异步函数
-    _ensure_no_running_loop()
-    asyncio.run(_generate_tts(text, voice, output_path))
-
-    return output_path
 
 
 async def list_voices() -> list[dict[str, str]]:
@@ -89,17 +44,6 @@ async def list_voices() -> list[dict[str, str]]:
         for v in voices
         if v["Locale"].startswith("zh-")
     ]
-
-
-def list_voices_sync() -> list[dict[str, str]]:
-    """
-    同步版本：获取所有可用的中文声音列表
-
-    Returns:
-        声音列表
-    """
-    _ensure_no_running_loop()
-    return asyncio.run(list_voices())
 
 
 # 预定义的常用中文声音

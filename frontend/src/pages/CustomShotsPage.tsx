@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { api, mediaUrl, queryKeys } from "../api/client";
 import {
   EmptyState,
+  ErrorState,
   LoadingState,
   PageHeader,
   StatusBadge,
@@ -108,6 +109,19 @@ export function isTianyueVideoProvider(
   );
 }
 
+/**
+ * 校验自由制作分镜位时长是否合法。
+ * NaN、Infinity 等非法数值与小于 5 秒统一视为非法：
+ * 批量生成跳过该槽，单槽保存与生成按钮禁用，保证两处判定一致。
+ * 天岳固定 15 秒模式由调用方先行豁免，本函数只判断数值本身。
+ */
+export function isSlotDurationValid(duration: number): boolean {
+  return Number.isFinite(duration) && duration >= 5;
+}
+
+// 任务状态轮询连续失败达到该次数后停止轮询，等待用户手动重试
+const POLL_FAILURE_LIMIT = 3;
+
 function freeProjectPayload(name: string) {
   return {
     name,
@@ -119,6 +133,70 @@ function freeProjectPayload(name: string) {
     default_duration_sec: 6,
     is_free_create: true,
   };
+}
+
+type FreeProjectBootstrap = {
+  projects: Project[];
+  projectId: string;
+  chapterId: string;
+};
+
+async function bootstrapFreeProjects(): Promise<FreeProjectBootstrap> {
+  // 兼容旧数据：早期自由制作项目只靠名称或本地存储识别。
+  // 这里一次性把尚未打标的旧项目转成自由制作项目，之后统一按标记区分。
+  const savedIds = readFreeProjectIds();
+  const allProjects = await api.projects.list();
+  const pendingConversion = allProjects.filter(
+    (project) =>
+      !project.is_free_create &&
+      (legacyFreeNames.has(project.name) ||
+        project.name.startsWith("自由制作") ||
+        savedIds.includes(project.id)),
+  );
+  for (const project of pendingConversion) {
+    await api.projects.update(project.id, { is_free_create: true });
+  }
+
+  let list = await api.projects.list({ kind: "free" });
+  const usedNames = new Set(list.map((project) => project.name.trim()));
+  for (const project of list.filter((item) =>
+    legacyFreeNames.has(item.name),
+  )) {
+    const nextName = nextFreeProjectName([...usedNames]);
+    usedNames.add(nextName);
+    await api.projects.update(project.id, { name: nextName });
+    project.name = nextName;
+  }
+
+  if (!list.length) {
+    const created = await api.projects.create(
+      freeProjectPayload(nextFreeProjectName(list.map((p) => p.name))),
+    );
+    list = [created];
+  }
+
+  const storedId = localStorage.getItem(FREE_PROJECT_ID_KEY);
+  const project = list.find((item) => item.id === storedId) ?? list[0];
+  const chapters = await api.chapters.list(project.id);
+  let chapter = chapters[0] ?? null;
+  if (!chapter) {
+    chapter = await api.chapters.create(project.id, { title: "第1章" });
+  }
+  return { projects: list, projectId: project.id, chapterId: chapter.id };
+}
+
+// 模块级 in-flight promise：保证迁移/初始化写操作单飞。
+// StrictMode 双挂载或快速进出页面时复用同一次执行，避免并发重复创建
+// 「自由制作」项目；执行结束后清空，后续挂载仍按原语义重新读取。
+let freeProjectBootstrapInFlight: Promise<FreeProjectBootstrap> | null = null;
+
+export function runFreeProjectBootstrap(): Promise<FreeProjectBootstrap> {
+  if (!freeProjectBootstrapInFlight) {
+    freeProjectBootstrapInFlight = bootstrapFreeProjects().finally(() => {
+      freeProjectBootstrapInFlight = null;
+    });
+  }
+  return freeProjectBootstrapInFlight;
 }
 
 export function selectedAssetContext(
@@ -275,6 +353,10 @@ function CustomShotsInner() {
   const [manualProjectId, setManualProjectId] = useState("");
   const [manualChapterId, setManualChapterId] = useState("");
   const [workspaceError, setWorkspaceError] = useState("");
+  // 分镜位初始化失败原因（初始化成功后自动清除）
+  const [slotInitError, setSlotInitError] = useState("");
+  // 自建轮询连续失败后的错误状态（可手动重试）
+  const [pollError, setPollError] = useState("");
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
   const [assetType, setAssetType] = useState<AssetType>("character");
@@ -320,63 +402,22 @@ function CustomShotsInner() {
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        // 兼容旧数据：早期自由制作项目只靠名称或本地存储识别。
-        // 这里一次性把尚未打标的旧项目转成自由制作项目，之后统一按标记区分。
-        const savedIds = readFreeProjectIds();
-        const allProjects = await api.projects.list();
-        const pendingConversion = allProjects.filter(
-          (project) =>
-            !project.is_free_create &&
-            (legacyFreeNames.has(project.name) ||
-              project.name.startsWith("自由制作") ||
-              savedIds.includes(project.id)),
+    // 迁移/初始化逻辑通过模块级单飞执行，
+    // 并发挂载时复用同一次请求，避免重复创建自由制作项目。
+    runFreeProjectBootstrap()
+      .then(({ projects, projectId, chapterId }) => {
+        if (cancelled) return;
+        setProjects(projects);
+        setManualProjectId(projectId);
+        setManualChapterId(chapterId);
+        localStorage.setItem(FREE_PROJECT_ID_KEY, projectId);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setWorkspaceError(
+          error instanceof Error ? error.message : "创建自由制作项目失败",
         );
-        for (const project of pendingConversion) {
-          await api.projects.update(project.id, { is_free_create: true });
-        }
-
-        let list = await api.projects.list({ kind: "free" });
-        const usedNames = new Set(list.map((project) => project.name.trim()));
-        for (const project of list.filter((item) =>
-          legacyFreeNames.has(item.name),
-        )) {
-          const nextName = nextFreeProjectName([...usedNames]);
-          usedNames.add(nextName);
-          await api.projects.update(project.id, { name: nextName });
-          project.name = nextName;
-        }
-
-        if (!list.length) {
-          const created = await api.projects.create(
-            freeProjectPayload(nextFreeProjectName(list.map((p) => p.name))),
-          );
-          list = [created];
-        }
-
-        const storedId = localStorage.getItem(FREE_PROJECT_ID_KEY);
-        const project =
-          list.find((item) => item.id === storedId) ?? list[0];
-        const chapters = await api.chapters.list(project.id);
-        let chapter = chapters[0] ?? null;
-        if (!chapter) {
-          chapter = await api.chapters.create(project.id, { title: "第1章" });
-        }
-        if (!cancelled) {
-          setProjects(list);
-          setManualProjectId(project.id);
-          setManualChapterId(chapter.id);
-          localStorage.setItem(FREE_PROJECT_ID_KEY, project.id);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setWorkspaceError(
-            error instanceof Error ? error.message : "创建自由制作项目失败",
-          );
-        }
-      }
-    })();
+      });
     return () => {
       cancelled = true;
     };
@@ -394,11 +435,14 @@ function CustomShotsInner() {
   useEffect(() => {
     if (!manualChapterId) return;
     let cancelled = false;
+    setSlotInitError("");
     (async () => {
       try {
         let list = await api.shots.list(manualChapterId);
         const manual = list.filter((shot) => shot.source_ref === "manual");
         for (let no = 1; no <= FREE_SHOT_SLOT_COUNT; no += 1) {
+          // 卸载或章节切换后立即停止后续创建，避免向已离开的章节继续写入
+          if (cancelled) return;
           if (manual.some((shot) => shot.shot_no === no)) continue;
           await api.shots.create(
             manualChapterId,
@@ -446,8 +490,12 @@ function CustomShotsInner() {
         await queryClient.invalidateQueries({
           queryKey: queryKeys.shots(manualChapterId),
         });
-      } catch {
-        // 保留现有草稿，用户仍可继续编辑
+      } catch (error) {
+        // 不再静默吞错：明确提示初始化失败及原因，草稿保留，用户可重试
+        if (cancelled) return;
+        setSlotInitError(
+          error instanceof Error ? error.message : "未知错误",
+        );
       }
     })();
     return () => {
@@ -550,10 +598,24 @@ function CustomShotsInner() {
 
   useEffect(() => {
     if (!manualChapterId) return;
+    // 切换章节/项目后旧响应不得落地，否则会把上一章合成记录（含旧项目
+    // file_path）显示到新章节，拼出错误媒体 URL。
+    let cancelled = false;
+    setComposition(null);
     api.composition
       .getChapterComposition(manualChapterId)
-      .then((record) => setComposition(record))
-      .catch(() => setComposition(null));
+      .then((record) => {
+        if (!cancelled) setComposition(record);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setComposition(null);
+        // 查询失败要明确提示，避免用户误以为「无合成记录」。
+        toast.warning(`合成记录读取失败：${formatError(error)}`);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [manualChapterId]);
 
   const stopTimers = () => {
@@ -571,6 +633,7 @@ function CustomShotsInner() {
     }
     assetJobsRef.current = new Set();
     setGeneratingAssetIds(new Set());
+    setPollError("");
   };
 
   const resetWorkspaceState = () => {
@@ -585,6 +648,8 @@ function CustomShotsInner() {
 
   const startPolling = () => {
     if (pollRef.current) return;
+    // 连续失败计数：达到阈值后停止轮询并显示错误，允许用户手动重试
+    let failures = 0;
     pollRef.current = setInterval(async () => {
       let running = true;
       try {
@@ -597,7 +662,23 @@ function CustomShotsInner() {
             ["generate_keyframe", "generate_video"].includes(job.job_type) &&
             RUNNING.has(job.status),
         );
-      } catch {
+        failures = 0;
+        setPollError("");
+      } catch (error) {
+        failures += 1;
+        if (failures >= POLL_FAILURE_LIMIT) {
+          // 连续失败达到阈值：停止轮询并显示错误状态，不再无限重试
+          if (pollRef.current) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
+          setPollError(
+            `已连续 ${failures} 次无法获取任务状态：${
+              error instanceof Error ? error.message : "未知错误"
+            }`,
+          );
+          return;
+        }
         running = true;
       }
       if (!running && pollRef.current) {
@@ -639,6 +720,20 @@ function CustomShotsInner() {
 
   const switchProject = async (projectId: string) => {
     if (!projectId || projectId === manualProjectId) return;
+    // 切换前先保存已填写的分镜位草稿，避免未保存内容被 resetWorkspaceState 静默丢弃
+    const hasFilledDrafts = slotDrafts.some(
+      (draft) => draft.imagePrompt.trim() || draft.videoPrompt.trim(),
+    );
+    if (hasFilledDrafts) {
+      const saved = await saveFilledDrafts();
+      if (!saved) {
+        // 保存失败时明确告知将丢弃未保存草稿，由用户决定是否继续
+        const discardConfirmed = window.confirm(
+          "部分分镜草稿保存失败，切换项目将丢弃未保存的草稿。确定继续切换吗？",
+        );
+        if (!discardConfirmed) return;
+      }
+    }
     try {
       const chapters = await api.chapters.list(projectId);
       let chapter = chapters[0] ?? null;
@@ -813,27 +908,40 @@ function CustomShotsInner() {
     return { ...payload, scene_asset_id: draft.sceneAssetId || null };
   };
 
-  const saveSlot = async (index: number) => {
+  const saveSlot = async (index: number): Promise<boolean> => {
     const shot = slotShot(index);
     const payload = buildSlotPayload(index);
-    if (!shot || !payload) return;
+    // 无对应分镜位记录（初始化失败等）时视为保存失败，无法持久化
+    if (!shot || !payload) return false;
     setSavingSlotIndex(index);
     try {
       await api.shots.update(shot.id, payload);
       await invalidateShots();
+      return true;
+    } catch (error) {
+      // 明确反馈保存失败，避免用户误以为已保存。
+      toast.error(`分镜 ${index + 1} 保存失败：${formatError(error)}`);
+      return false;
     } finally {
       setSavingSlotIndex(null);
     }
   };
 
-  const saveFilledDrafts = async () => {
-    const tasks: Promise<void>[] = [];
+  // 批量保存已填写的分镜位草稿；返回是否全部保存成功。
+  // 已填写但没有对应分镜位记录的槽位无法持久化，同样计入失败。
+  const saveFilledDrafts = async (): Promise<boolean> => {
+    const tasks: Promise<boolean>[] = [];
+    let skippedFilled = false;
     slotDrafts.forEach((draft, index) => {
       if (!draft.imagePrompt.trim() && !draft.videoPrompt.trim()) return;
-      if (!slotShot(index)) return;
+      if (!slotShot(index)) {
+        skippedFilled = true;
+        return;
+      }
       tasks.push(saveSlot(index));
     });
-    await Promise.all(tasks);
+    const results = await Promise.all(tasks);
+    return !skippedFilled && results.every((result) => result);
   };
 
   const mediaMutation = useMutation({
@@ -861,7 +969,9 @@ function CustomShotsInner() {
   ) => {
     const shot = slotShot(index);
     if (!shot) return;
-    await saveSlot(index);
+    // 保存失败则不再入队生成，避免用未保存的内容触发生成。
+    const saved = await saveSlot(index);
+    if (!saved) return;
     mediaMutation.mutate({ id: shot.id, kind });
   };
 
@@ -872,6 +982,10 @@ function CustomShotsInner() {
         .map((draft, index) => ({ draft, shot: slotShot(index) }))
         .filter(({ draft, shot }) => {
           if (!shot) return false;
+          // 时长非法（含 NaN）的槽位不参与批量生成，与单槽校验口径一致
+          if (!tianyueFixedVideo && !isSlotDurationValid(draft.duration)) {
+            return false;
+          }
           if (kind === "keyframe") return Boolean(draft.imagePrompt.trim());
           return (
             Boolean(draft.videoPrompt.trim()) &&
@@ -929,7 +1043,12 @@ function CustomShotsInner() {
     if (!manualChapterId) return;
     setComposing(true);
     try {
-      await saveFilledDrafts();
+      // 草稿保存失败（含无对应分镜位记录的槽位）时停止合成，避免成片缺失最新草稿。
+      const saved = await saveFilledDrafts();
+      if (!saved) {
+        toast.error("部分分镜草稿保存失败，请修正后重新合成");
+        return;
+      }
       const result = await api.composition.composeChapter(manualChapterId, {
         resolution,
         include_audio: false,
@@ -988,7 +1107,7 @@ function CustomShotsInner() {
     (draft) =>
       (draft.imagePrompt.trim() || draft.videoPrompt.trim()) &&
       !tianyueFixedVideo &&
-      draft.duration < 5,
+      !isSlotDurationValid(draft.duration),
   );
 
   if (workspaceError) {
@@ -1247,6 +1366,22 @@ function CustomShotsInner() {
         )}
       </Card>
 
+      {/* 分镜位初始化失败时明确提示原因，不再静默吞错 */}
+      {slotInitError ? (
+        <ErrorState title="分镜位初始化失败" message={slotInitError} />
+      ) : null}
+      {/* 轮询连续失败后停止并显示错误，可手动重试 */}
+      {pollError ? (
+        <ErrorState
+          title="任务状态更新失败"
+          message={pollError}
+          onRetry={() => {
+            setPollError("");
+            startPolling();
+          }}
+        />
+      ) : null}
+
       <Card className="p-5">
         <div className="mb-4 flex flex-col justify-between gap-3 lg:flex-row lg:items-center">
           <div>
@@ -1288,7 +1423,8 @@ function CustomShotsInner() {
             const keyframeRunning = RUNNING.has(keyframe?.status ?? "");
             const videoRunning = RUNNING.has(video?.status ?? "");
             const keyframeReady = keyframe?.status === "completed";
-            const durationValid = tianyueFixedVideo || draft.duration >= 5;
+            const durationValid =
+              tianyueFixedVideo || isSlotDurationValid(draft.duration);
             const slotBoundAssets = assets.filter((asset) =>
               [draft.sceneAssetId, ...draft.characterIds, ...draft.propIds].includes(
                 asset.id,

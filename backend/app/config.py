@@ -75,7 +75,7 @@ class Settings(BaseSettings):
         ge=1,
         validation_alias=AliasChoices("VIDEO_WORKERS", "APP_VIDEO_WORKERS"),
     )
-    provider_poll_interval_sec: float = Field(default=0.25, gt=0)
+    provider_poll_interval_sec: float = Field(default=2.0, gt=0)
     ffmpeg_path: str = Field(
         default="ffmpeg",
         validation_alias=AliasChoices("APP_FFMPEG_PATH", "FFMPEG_PATH"),

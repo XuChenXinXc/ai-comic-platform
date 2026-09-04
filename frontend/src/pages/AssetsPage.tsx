@@ -17,6 +17,7 @@ import { ChapterSelector } from "../components/chapter-selector";
 import { ImagePreview } from "../components/image-preview";
 import { JsonEditor } from "../components/json-editor";
 import { ProjectRequired } from "../components/project-required";
+import { SceneViewPanel } from "../components/scene-view-panel";
 import {
   EmptyState,
   ErrorState,
@@ -418,6 +419,9 @@ export function AssetsPage() {
                   </div>
                 </div>
                 <AssetImagePanel asset={asset} />
+                {asset.asset_type === "scene" ? (
+                  <SceneViewPanel asset={asset} />
+                ) : null}
               </Card>
             );
           })}

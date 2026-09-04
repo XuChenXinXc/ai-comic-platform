@@ -199,3 +199,24 @@ def test_validator_flags_cut_time_beyond_duration() -> None:
     )
     errors = validate_ref2va_sections(injected, expected_duration_sec=14)
     assert any("exceeds requested duration" in item for item in errors)
+
+
+def test_validator_allows_cut_time_exactly_at_duration_boundary() -> None:
+    injected = _VALID_REF2VA.replace(
+        "Golden dusk.",
+        "Golden dusk. At 00:14.000, the camera cuts to a wider view.",
+    )
+    # 切点正好等于视频时长是合法边界，不算越界。
+    errors = validate_ref2va_sections(injected, expected_duration_sec=14)
+    assert not any("exceeds requested duration" in item for item in errors)
+
+
+def test_ref2va_speaker_ids_number_by_first_appearance_not_line_number() -> None:
+    request = build_ref2va_rewrite_request(
+        _SOURCE,
+        dialogue_lines=[("林风", "第一句"), ("苏月", "第二句"), ("林风", "第三句")],
+    )
+    payload = json.loads(request.user_payload)
+    # 首个出场的说话人固定拿到 S1，与其出现在第几行无关。
+    assert payload["speakers"] == {"林风": "S1", "苏月": "S2"}
+    assert [item["speaker_tag"] for item in payload["dialogue_lines"]] == ["S1", "S2", "S1"]

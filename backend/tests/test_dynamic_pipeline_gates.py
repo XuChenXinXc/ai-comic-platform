@@ -19,6 +19,7 @@ from app.dynamic_pipeline.stage_gates import (
     evaluate_rhythm_gate,
     evaluate_source_gate,
     evaluate_stage_gate,
+    server_bound_rhythm_content,
 )
 
 
@@ -606,3 +607,49 @@ def test_rhythm_non_positive_target_is_blocked() -> None:
     assert "rhythm_invalid_target_duration" in {
         diagnostic.code for diagnostic in result.diagnostics
     }
+
+
+def test_server_bound_rhythm_signature_matches_normalizer_json_mode() -> None:
+    from app.dynamic_pipeline import normalizers
+    from app.services.signature_service import calculate_signature
+
+    normalized = normalizers.normalize_rhythm_output(
+        _rhythm_payload(),
+        input_signature="input-1",
+        target_duration_sec=30.0,
+    )
+
+    # 服务端上限与产物 max_events 一致时内容不变，签名必须与
+    # normalizers._build_output（json 模式 dump）计算出的完全一致。
+    bounded = server_bound_rhythm_content(normalized, {"strong_dynamic_max_events": 1})
+
+    json_dump = normalized.model_dump(mode="json", exclude={"artifact_meta"})
+    assert bounded["artifact_meta"]["content_signature"] == calculate_signature(
+        json_dump, "input-1"
+    )
+    assert (
+        bounded["artifact_meta"]["content_signature"]
+        == normalized.artifact_meta.content_signature
+    )
+
+
+def test_server_bound_rhythm_signature_tolerates_non_json_native_values() -> None:
+    from datetime import datetime
+
+    from app.services.signature_service import calculate_signature
+
+    # Mapping 输入携带非 JSON 原生值（datetime）时，签名基准应先归一为
+    # JSON 类型（default=str 兜底）再计算，而不是直接序列化导致失败。
+    payload = _rhythm_payload()
+    stamped = datetime(2026, 1, 1, 12, 0, 0)
+    payload["generated_at"] = stamped
+
+    bounded = server_bound_rhythm_content(payload, {"strong_dynamic_max_events": 1})
+
+    expected_content = {
+        key: value for key, value in payload.items() if key != "artifact_meta"
+    }
+    expected_content["generated_at"] = str(stamped)
+    assert bounded["artifact_meta"]["content_signature"] == calculate_signature(
+        expected_content, "input-1"
+    )

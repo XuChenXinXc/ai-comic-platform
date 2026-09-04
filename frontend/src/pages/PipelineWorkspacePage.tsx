@@ -763,6 +763,9 @@ export function PipelineWorkspacePage() {
     syncDraftWithServer(selectedStage);
   }, [selectedStage, syncDraftWithServer]);
 
+  // 交付清单只在进入交付阶段或 run revision 变化时拉取；轮询 refresh 会
+  // 频繁更新 workspace 对象引用，若依赖整个对象会造成每 1.5s 重复请求。
+  const workspaceRevision = workspace?.run?.revision ?? null;
   useEffect(() => {
     if (!runId || hasInvalidStageKey || selectedStageKey !== "6-delivery" || !workspace) return;
     let cancelled = false;
@@ -785,7 +788,7 @@ export function PipelineWorkspacePage() {
     return () => {
       cancelled = true;
     };
-  }, [hasInvalidStageKey, runId, selectedStageKey, workspace]);
+  }, [hasInvalidStageKey, runId, selectedStageKey, workspaceRevision]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleOperationError = (error: unknown) => {
     if (!mountedRef.current) return;
@@ -913,37 +916,6 @@ export function PipelineWorkspacePage() {
     }
   };
 
-  const handleConfirm = async () => {
-    if (hasDirtyDraft) {
-      setActionError("请先保存未保存的草稿，再确认当前阶段。");
-      return;
-    }
-    if (!workspace || !selectedStage || !canConfirmCurrentStage) {
-      if (workspace && selectedStage) {
-        setActionError(`${confirmDisabledReason}，无法确认。`);
-      }
-      return;
-    }
-    await runOperation("confirm", (revision) =>
-      api.dynamicRuns.confirmStage(workspace.run.id, selectedStageKey, revision),
-    );
-  };
-
-  const handleRegenerate = async () => {
-    if (
-      !workspace ||
-      !selectedStage ||
-      isLocked ||
-      !canRegenerate ||
-      selectedStage.status === "cancelled"
-    ) {
-      return;
-    }
-    await runOperation("regenerate", (revision) =>
-      api.dynamicRuns.regenerateStage(workspace.run.id, selectedStageKey, revision),
-    );
-  };
-
   const handlePreflight = async () => {
     if (!runId) return;
     setDeliveryLoading(true);
@@ -1039,6 +1011,39 @@ export function PipelineWorkspacePage() {
     : ["stale", "failed", "partial_failed", "interrupted"].includes(runStatus)
       ? `运行状态为${statusLabels[runStatus] || runStatus}，请先恢复运行`
       : "当前阶段尚未通过门禁";
+
+  // 声明在 confirmDisabledReason / canRegenerate 之后，避免闭包引用未初始化变量（TDZ）。
+  const handleConfirm = async () => {
+    if (hasDirtyDraft) {
+      setActionError("请先保存未保存的草稿，再确认当前阶段。");
+      return;
+    }
+    if (!workspace || !selectedStage || !canConfirmCurrentStage) {
+      if (workspace && selectedStage) {
+        setActionError(`${confirmDisabledReason}，无法确认。`);
+      }
+      return;
+    }
+    await runOperation("confirm", (revision) =>
+      api.dynamicRuns.confirmStage(workspace.run.id, selectedStageKey, revision),
+    );
+  };
+
+  const handleRegenerate = async () => {
+    if (
+      !workspace ||
+      !selectedStage ||
+      isLocked ||
+      !canRegenerate ||
+      selectedStage.status === "cancelled"
+    ) {
+      return;
+    }
+    await runOperation("regenerate", (revision) =>
+      api.dynamicRuns.regenerateStage(workspace.run.id, selectedStageKey, revision),
+    );
+  };
+
   const artifactValue =
     artifactTab === "raw"
       ? selectedStage.raw_output
@@ -1179,6 +1184,14 @@ export function PipelineWorkspacePage() {
               </div>
 
               <div className="p-5 sm:p-6">
+                {selectedStageKey === "5a-image-prompts" || selectedStageKey === "5b-video-prompts" ? (
+                  <p
+                    role="status"
+                    className="mb-4 rounded-md border border-[#dfb98f] bg-[#fff9f0] px-3 py-2 text-xs leading-5 text-[#7b4b22]"
+                  >
+                    三层提示词（生成稿 / 用户修改 / 最终发送稿）、@图片N 参考图映射与 Provider 请求快照视图尚未实现，当前阶段为原始 JSON 编辑。
+                  </p>
+                ) : null}
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h3 className="text-sm font-bold">产物预览</h3>

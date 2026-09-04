@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import os
 import re
@@ -9,7 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from threading import RLock
 from typing import BinaryIO
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 from uuid import uuid4
 
 import requests
@@ -70,6 +71,13 @@ def _truncate_utf16(value: str, max_units: int) -> str:
         if units > max_units:
             return value[:index]
     return value
+
+
+def _media_view_token(view_key: str) -> str:
+    """Scene View 目录 token：view_key 转安全目录名，超长截断。"""
+    safe = _INVALID_WINDOWS_NAME.sub("_", str(view_key or "")).strip().rstrip(". ")
+    safe = _truncate_utf16(safe, 40)
+    return safe or "view"
 
 
 def chapter_folder_name(chapter_no: int, title: str = "") -> str:
@@ -188,6 +196,24 @@ def atomic_copy(
     return target_path
 
 
+def _reject_private_download_host(url: str) -> None:
+    """拒绝直接指向内网/保留地址的下载，防止恶意 Provider result_url 触发 SSRF。
+
+    仅拦截 IP 字面量（私网/链路本地/保留地址，含 169.254.169.254 云元数据端点
+    与 127.0.0.1）；主机名不做 DNS 解析预检：代理/离线环境下解析结果不可靠，
+    且逐解析仍有 TOCTOU，DNS 重绑定与 30x 跳转到内网属残余风险。
+    """
+    parsed = urlparse(str(url))
+    hostname = (parsed.hostname or "").strip("[]")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        # 非 IP 字面量（普通主机名）：不做 DNS 预检
+        return
+    if address.is_loopback or address.is_link_local or address.is_private or address.is_reserved:
+        raise FileServiceError(f"下载地址指向内网或保留地址，已拒绝：{hostname}")
+
+
 def download_url_atomic(
     url: str,
     target: str | Path,
@@ -197,20 +223,47 @@ def download_url_atomic(
     temp_dir: str | Path | None = None,
     max_bytes: int = MAX_DOWNLOAD_SIZE,
 ) -> Path:
+    # 下载协议白名单：只允许 http/https，拒绝 file:// 等任意协议读取本地文件
+    scheme = urlparse(str(url)).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise FileServiceError(f"不支持的下载协议：{scheme or '空'}")
     target_path = Path(target)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temp_root = Path(temp_dir) if temp_dir else target_path.parent
     temporary = _temp_path(temp_root, target_path)
+    request_headers = dict(headers or {})
     try:
-        with requests.get(
-            url,
-            headers=dict(headers or {}),
-            timeout=timeout,
-            stream=True,
-        ) as response:
+        # 手动逐跳跟随重定向：每一跳都重新校验协议与主机，
+        # 阻止公网 30x 跳转到内网/元数据地址的 SSRF 变体。
+        current_url = str(url)
+        response = None
+        for _redirects in range(10):
+            if urlparse(current_url).scheme.lower() not in ("http", "https"):
+                raise FileServiceError(
+                    f"下载重定向到不支持的协议：{urlparse(current_url).scheme or '空'}"
+                )
+            _reject_private_download_host(current_url)
+            response = requests.get(
+                current_url,
+                headers=request_headers,
+                timeout=timeout,
+                stream=True,
+                allow_redirects=False,
+            )
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    raise FileServiceError("下载重定向缺少 Location 头")
+                current_url = urljoin(current_url, location)
+                continue
+            break
+        else:
+            raise FileServiceError("下载重定向次数过多")
+        assert response is not None
+        with response:
             response.raise_for_status()
-            headers = getattr(response, "headers", {}) or {}
-            _validate_content_length(headers.get("Content-Length"), max_bytes)
+            response_headers = getattr(response, "headers", {}) or {}
+            _validate_content_length(response_headers.get("Content-Length"), max_bytes)
             # stream 模式复制 response.raw 不会自动解压 gzip，需要显式开启解码
             response.raw.decode_content = True
             with temporary.open("wb") as output:
@@ -525,15 +578,22 @@ class FileService:
         asset_name: str | None = None,
         current: bool = False,
         storage_name: str | None = None,
+        view_key: str | None = None,
     ) -> Path:
         folders = {"character": "characters", "scene": "scenes", "prop": "props"}
         if asset_type not in folders:
             raise FileServiceError(f"未知素材类型：{asset_type}")
+        # Scene View 分区目录：MASTER / 各视角各有独立子目录，
+        # 避免不同视图的 v001 互相覆盖（视图各自独立编号）。
+        view_suffix = ""
+        if asset_type == "scene" and view_key:
+            safe_view = _media_view_token(view_key)
+            view_suffix = f"/views/{safe_view}"
         layout, persisted_storage_name = self._project_storage(project_id)
         if layout == "categorized":
             named_folders = {"character": "角色", "scene": "场景", "prop": "物品"}
             folder = named_folders[asset_type]
-            relative = Path(folder) / _media_filename(
+            relative = Path(folder) / f"{view_suffix.lstrip('/')}" / _media_filename(
                 folder,
                 asset_name or asset_id,
                 version_no,
@@ -550,10 +610,22 @@ class FileService:
             named_folders = {"character": "角色", "scene": "场景", "prop": "物品"}
             safe_name = sanitize_project_storage_name(storage_name or persisted_storage_name or "")
             folder = f"{safe_name}-{named_folders[asset_type]}"
-            relative = Path(folder) / asset_id / f"v{version_no:03d}{suffix}"
-        else:
+            view_token = f"{view_suffix.lstrip('/')}" if view_suffix else ""
             relative = (
-                Path("assets") / folders[asset_type] / asset_id / f"v{version_no:03d}{suffix}"
+                Path(folder)
+                / asset_id
+                / view_token
+                / f"v{version_no:03d}{suffix}"
+            )
+        else:
+            folders_by_type = folders[asset_type]
+            view_token = f"{view_suffix.lstrip('/')}" if view_suffix else ""
+            relative = (
+                Path("assets")
+                / folders_by_type
+                / asset_id
+                / view_token
+                / f"v{version_no:03d}{suffix}"
             )
         return self.resolve_project_path(project_id, relative)
 
@@ -1025,3 +1097,15 @@ class FileService:
 
 
 file_service = FileService(database=db)
+
+
+def derive_file_service(database: Database) -> FileService:
+    """基于全局 file_service 当前配置派生绑定指定数据库的独立实例。
+
+    供服务层默认注入使用：继承全局实例的 workspace/projects 目录（含测试
+    monkeypatch 后的值），但不反向改写全局单例的 database，避免跨实例污染。
+    """
+    storage = FileService(database=database)
+    storage.workspace_dir = file_service.workspace_dir
+    storage.projects_dir = file_service.projects_dir
+    return storage

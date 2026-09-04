@@ -27,6 +27,13 @@ class SecretBackend(ABC):
     def decrypt(self, ciphertext: str) -> str:
         """解密数据库中的密文/引用，返回明文。"""
 
+    def delete(self, ciphertext: str) -> None:  # noqa: B027 — 默认空实现是有意设计
+        """删除密文对应的存储条目；后端不支持删除时静默跳过。
+
+        默认实现为空操作（DPAPI 密文不产生独立存储条目），
+        因此不作为抽象方法强制子类实现。
+        """
+
 
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
 # DPAPI 附加熵：同一 Windows 用户下的无关进程拿到密文也无法直接解密。
@@ -198,6 +205,22 @@ class MacOSKeychainBackend(SecretBackend):
             raise SecretServiceError(f"macOS Keychain 中未找到密钥：{account}")
         return password
 
+    def delete(self, ciphertext: str) -> None:
+        """B-L8：删除 Keychain 中的 account 条目，避免替换密钥后留下孤儿。
+
+        仅处理 ``keychain:`` 引用；条目不存在视为已删除，失败只记录日志
+        （清理失败不应阻塞新密钥的写入）。
+        """
+        if not ciphertext.startswith(self.REFERENCE_PREFIX):
+            return
+        account = ciphertext.removeprefix(self.REFERENCE_PREFIX)
+        import keyring
+
+        try:
+            keyring.delete_password(self.SERVICE_NAME, account)
+        except keyring.errors.KeyringError:
+            logger.warning("macOS Keychain 条目删除失败（可能已不存在）：%s", account)
+
 
 def _get_backend() -> SecretBackend:
     """按当前平台选择密钥存储后端。"""
@@ -226,13 +249,34 @@ def get_backend() -> SecretBackend:
     return _backend
 
 
-def encrypt_secret(value: str) -> str:
+def encrypt_secret(value: str, *, replaces: str = "") -> str:
+    """加密明文；``replaces`` 为被替换的旧密文时同步清理其存储条目。
+
+    B-L8：替换密钥时删除旧 account 条目（Keychain 后端），避免孤儿残留。
+    旧条目清理失败只记录日志，不影响新密钥写入；空值与不支持删除的
+    后端（DPAPI）为无操作。
+    """
     if not value:
+        delete_secret(replaces)
         return ""
-    return get_backend().encrypt(value)
+    encrypted = get_backend().encrypt(value)
+    if replaces:
+        delete_secret(replaces)
+    return encrypted
 
 
 def decrypt_secret(ciphertext: str) -> str:
     if not ciphertext:
         return ""
     return get_backend().decrypt(ciphertext)
+
+
+def delete_secret(ciphertext: str) -> None:
+    """删除密文对应的存储条目；空值或不支持的后端为无操作。"""
+    if not ciphertext:
+        return
+    try:
+        get_backend().delete(ciphertext)
+    except SecretServiceError:
+        # 非本后端格式的密文（如 macOS 上遇到 DPAPI 密文）无需清理，静默跳过。
+        return

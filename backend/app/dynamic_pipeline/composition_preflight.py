@@ -946,6 +946,8 @@ def _evaluate(
     requires_path = kind in {"keyframe", "video", "audio", "bgm"}
     if kind == "composition":
         requires_path = raw_status in _READY_STATUSES
+    # 字幕（shot_subtitle）无 status 列且由合成阶段生成，路径仅作提示：
+    # 有路径时不强制校验存在性（与既有测试契约一致）。
     if kind == "subtitle" and path_value is None:
         text = _text(copied.get("text"))
         try:

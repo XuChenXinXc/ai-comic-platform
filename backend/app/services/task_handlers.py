@@ -47,6 +47,7 @@ def register_handlers(
         "extract_shots": shots.handle_extract,
         "generate_shot_image_prompt": shots.handle_image_prompt,
         "generate_shot_video_prompt": shots.handle_video_prompt,
+        "generate_shot_director_plan": shots.handle_director_plan,
         "optimize_shot_video_prompts": shots.handle_optimize_video_prompts,
         "check_shot_continuity": shots.handle_continuity_check,
         "fix_shot_quality": shots.handle_quality_fix,

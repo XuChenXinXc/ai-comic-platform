@@ -3071,6 +3071,9 @@ class DynamicWorkflowService:
                             candidate["id"],
                             {"status": "blocked", "updated_at": utc_now()},
                         )
+                    # 同时中断在途 Job：暂停/取消后后台不应继续消耗 Provider 配额并写文件。
+                    # Job 在 runner/handler 的执行循环中会按 interrupted 状态尽快停止。
+                    self._interrupt_active_stage_jobs(connection, candidate["id"], utc_now())
         except Exception as exc:
             self._raise_service_error(exc)
         return self._get_action_record(run_id)
@@ -3102,6 +3105,22 @@ class DynamicWorkflowService:
                         workflow_stage.c.status.in_(_CANCELLABLE_STAGE_STATUSES),
                     )
                     .values(status="cancelled", updated_at=now, finished_at=now)
+                )
+                # 取消语义应真正停止后台执行：中断该 run 下所有在途 Job，
+                # 避免已发出的 Provider 调用与文件写出继续消耗资源。
+                connection.execute(
+                    update(job)
+                    .where(
+                        job.c.workflow_run_id == run_id,
+                        job.c.status.in_(_ACTIVE_JOB_STATUSES),
+                    )
+                    .values(
+                        status="interrupted",
+                        message="任务因运行取消而中断",
+                        error="运行已取消，任务停止执行",
+                        finished_at=now,
+                        updated_at=now,
+                    )
                 )
         except Exception as exc:
             self._raise_service_error(exc)
@@ -3242,6 +3261,12 @@ class DynamicWorkflowService:
                     raise not_found("阶段")
                 if stage["status"] == "cancelled":
                     raise conflict("已取消的阶段不能保存草稿")
+                if stage["status"] in {"queued", "running"}:
+                    # 阶段正在生成：保存草稿意味着用户放弃在途生成结果。
+                    # 显式中断该阶段的在途 Job（而非静默让 stage_service 在下次
+                    # 执行时因状态变为 ready/blocked 丢弃结果），并同步 run/stage
+                    # 状态，保证「保存草稿 → 在途生成停止」语义明确、可观测。
+                    self._interrupt_active_stage_jobs(connection, stage["id"], utc_now())
                 stages = self._stages_from_connection(connection, run_id)
                 draft_output = self._model_dump(payload.draft_output)
                 if stage_key == "2-rhythm":
@@ -3771,9 +3796,10 @@ class DynamicWorkflowService:
                 self.repository.mark_descendants_stale(connection, run_id, stage_key)
                 now = utc_now()
                 target_run_status = run.get("status")
+                # ready 不能直接转 queued，必须落入下方分支经
+                # ready→stale→queued 两步合法转移（见 _queue_status）。
                 if target_run_status in {
                     "pending",
-                    "ready",
                     "blocked",
                     "stale",
                     "failed",

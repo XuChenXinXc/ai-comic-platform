@@ -3,7 +3,19 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
-STYLE_ANCHOR = "[STYLE_ANCHOR]"
+from pydantic import ValidationError
+
+from app.services.director_plan import (
+    director_bundle_from_llm,
+    render_director_video_prompt,
+)
+from app.services.natural_video_prompt import (
+    ReferenceToken,
+    parse_reference_anchors,
+    render_natural_video_prompt,
+)
+
+STYLE_ANCHOR = "统一画风锚定（最高优先级）：全片所有画面严格采用下列画风要求"
 VISUAL_PROMPT_TEMPLATE_VERSION = "visual-prompt-v3.1"
 _FIXED_VISUAL_ASPECT_RATIOS = {
     "character": "3:2",
@@ -12,11 +24,6 @@ _FIXED_VISUAL_ASPECT_RATIOS = {
     "keyframe": "16:9",
     "video": "16:9",
 }
-_TIMELINE_PATTERN = re.compile(
-    # 前置分隔符需包含。，否则「0-1秒：…。1-2秒：…」只能匹配首段，
-    # 导致末段补尾用错 last_end 生成与已有分段重叠的时间轴
-    r"(?:^|[。；;，,\n])\s*(\d+(?:\.\d+)?)\s*[-–—~－至]\s*(\d+(?:\.\d+)?)\s*秒"
-)
 _NARRATION_CUE_PATTERN = re.compile(
     r"(?:画外旁白|画外音|旁白|内心独白|OS)"
     r"(?:低声)?(?:声音?|声)?(?:开始|起|响起|声中|中|收尾|同期收尾)?"
@@ -108,7 +115,7 @@ def style_anchor(
     return join_non_empty(
         [
             "画面美术风格：",
-            f"{STYLE_ANCHOR} 核心主题: {style_prompt.strip() or '项目既定动画风格'}",
+            f"{STYLE_ANCHOR} 核心主题：{style_prompt.strip() or '项目既定动画风格'}",
             "统一画风锁定：角色图、场景图、物品图、分镜图与视频画面使用同一动画/"
             "插画管线，不是真人摄影、产品摄影或3D建模渲染。",
             f"小说风格桥接：{novel_style_bridge.strip()}。" if novel_style_bridge.strip() else "",
@@ -790,10 +797,27 @@ def compile_asset_prompt(
     composition: str,
     reference_mode: bool = False,
     use_template: bool = True,
+    master_mode: bool = False,
 ) -> str:
     effective_negative_prompt = resolve_asset_negative_prompt(asset_type, negative_prompt)
     effective_aspect_ratio = resolve_visual_aspect_ratio(asset_type, aspect_ratio)
     detail = _asset_detail(prompt, profile)
+    if master_mode and asset_type == "scene":
+        # Scene MASTER 母版：单张完整空间透视图（scene_master.md），
+        # 供 Scene Views 以图生图派生，也作为分镜空间锚点。
+        from app.services.prompt_template_renderer import render_scene_master_body
+
+        body = render_scene_master_body(
+            asset_name=asset_name,
+            profile=profile,
+            prompt=prompt,
+            negative_prompt=effective_negative_prompt,
+            consistency_keywords=consistency_keywords,
+            composition=composition,
+        )
+        return apply_content_safety(
+            join_non_empty([style_anchor(style_prompt, effective_aspect_ratio), body])
+        )
     if reference_mode:
         reference_template = {
             "character": _character_clean_reference,
@@ -1064,28 +1088,6 @@ def shot_template_context(
     }
 
 
-def _camera_line(camera_move: Any) -> str:
-    """机位描述二选一：固定机位与连续调度不共存。
-
-    仅以「固定/不动/静止」等机位语义词判定固定机位；
-    「稳定」多为防抖描述（如"稳定横移"），不视为固定。
-    """
-    raw = str(camera_move or "").strip()
-    fixed_markers = ("固定", "不动", "静止", "机位不动", "无运镜")
-    move_markers = ("推近", "推进", "横移", "摇镜", "跟随", "缓推", "移动", "升降", "环绕")
-    is_fixed = any(marker in raw for marker in fixed_markers) or not raw
-    has_move = any(marker in raw for marker in move_markers)
-    if is_fixed and has_move:
-        move_word = next(
-            (marker for marker in move_markers if marker in raw),
-            "缓推",
-        )
-        return f"固定机位，不切换机位，仅做轻微{move_word}（镜头移动幅度很小）。"
-    if is_fixed:
-        return "固定机位，画面变化由人物动作推动，摄影机不移动。"
-    return f"{raw or '缓慢跟随'}；缓慢跟随人物运动，不切换机位。"
-
-
 def _clean_speech_prefix(prefix: str, dialogue_speakers: set[str]) -> str:
     """保留说话片段中的可视动作，去掉会把代词误当说话人的前缀。"""
     cleaned = prefix.strip(" ，,；;")
@@ -1250,6 +1252,50 @@ def effective_video_duration(model: str, duration_sec: float) -> float | int:
     return duration_sec
 
 
+def _render_with_director_plan(
+    *,
+    style_prompt: str,
+    aspect_ratio: str,
+    director_plan: dict[str, Any],
+    shot_context: dict[str, Any],
+    anchors: list[str],
+    negative_prompt: str,
+) -> str:
+    """用导演计划渲染 10 段最终提示词；时间轴为空或结构非法时返回空串由调用方回退。"""
+
+    try:
+        bundle = director_bundle_from_llm(director_plan)
+    except (ValidationError, ValueError, TypeError):
+        # 存储中的导演计划若结构非法（如时间轴段 end<=start、时间值不可解析），
+        # 回退旧版渲染而不是让分镜列表整体 500。
+        return ""
+    if not bundle.timeline:
+        return ""
+    initial_state = _value(shot_context.get("opening_frame"), "")
+    end_state = _value(shot_context.get("ending_frame"), "")
+    shot_type = _value(shot_context.get("shot_type"), "中景")
+    hard_constraints: list[str] = []
+    cleaned_negative = re.sub(
+        r"^禁止出现\s*[:：]\s*",
+        "",
+        (negative_prompt or "").strip(),
+    ).rstrip("。")
+    if cleaned_negative:
+        hard_constraints.append(cleaned_negative)
+    return render_director_video_prompt(
+        style_prompt=style_prompt,
+        aspect_ratio=aspect_ratio,
+        director_plan=bundle.director_plan,
+        timeline=bundle.timeline,
+        dialogue_bindings=bundle.dialogue_bindings,
+        initial_state=initial_state,
+        end_state=end_state,
+        shot_type=shot_type,
+        anchors=anchors,
+        hard_constraints=hard_constraints,
+    )
+
+
 def compile_video_prompt(
     *,
     style_prompt: str,
@@ -1259,302 +1305,50 @@ def compile_video_prompt(
     anchors: list[str],
     shot_context: dict[str, Any],
     negative_prompt: str = "",
+    director_plan: dict[str, Any] | None = None,
+    reference_tokens: list[dict[str, Any]] | None = None,
 ) -> str:
-    """生成视频提示词，采用新的段落式结构"""
+    """生成视频提示词。
+
+    有导演计划时渲染导演设计层结构；否则用自然语言生成器把结构化分镜事实
+    渲染成导演口吻的自然语言提示词（不再拼接旧版 12 段【xxx】模板）。
+    素材引用由调用方通过 anchors / reference_tokens 先行确定编号，
+    生成器只把既有引用自然嵌入句子，不新增、不删除、不重排。
+    """
     effective_aspect_ratio = resolve_visual_aspect_ratio("video", aspect_ratio)
-    opening_frame = _value(shot_context.get("opening_frame"), "当前关键帧画面")
-    ending_frame = _value(shot_context.get("ending_frame"), "为下一镜衔接的稳定状态")
-    characters = _value(shot_context.get("characters"), "当前分镜角色")
-    props = _value(shot_context.get("props"), "当前分镜物品")
-    scene_name = _value(shot_context.get("scene_name"), "当前场景")
-    focus = _value(shot_context.get("focus"), "当前主要动作")
-    composition = _value(shot_context.get("composition"), "构图保持稳定")
-    lighting = _value(shot_context.get("lighting"), "符合场景设定的光线")
-    color_tone = _value(shot_context.get("color_tone"), "统一色调")
-    environment_details = _value(shot_context.get("environment_details"), "场景固定环境细节")
-    prev_ending = shot_context.get("prev_end_state", "")
-    positions = _value(shot_context.get("positions"), "")
-    expressions = _value(shot_context.get("expressions"), "")
-    sound_effects = _normalize_sentence_end(
-        _value(shot_context.get("sound_effects"), "符合场景的环境声")
+
+    if director_plan:
+        rendered = _render_with_director_plan(
+            style_prompt=style_prompt,
+            aspect_ratio=effective_aspect_ratio,
+            director_plan=director_plan,
+            shot_context=shot_context,
+            anchors=anchors,
+            negative_prompt=negative_prompt,
+        )
+        if rendered:
+            return apply_content_safety(rendered)
+
+    tokens: list[ReferenceToken] = parse_reference_anchors(
+        reference_tokens if reference_tokens is not None else anchors
     )
     dialogue_entries = [
         item
         for item in shot_context.get("dialogue_entries", [])
         if isinstance(item, dict) and item.get("speaker") and item.get("text")
     ]
+    focus = _value(shot_context.get("focus"), "当前主要动作")
     sanitized_video_prompt = _sanitize_video_prompt_speech(video_prompt, dialogue_entries)
     if not sanitized_video_prompt:
         sanitized_video_prompt = focus
-
-    # 时间分段：检查 video_prompt 是否已包含时间轴
-    timeline_matches = list(_TIMELINE_PATTERN.finditer(sanitized_video_prompt))
-    if timeline_matches:
-        # 已有时间轴，检查是否需要补充稳定段
-        last_match = timeline_matches[-1]
-        last_end = float(last_match.group(2))
-        if last_end < duration_sec - 0.1:
-            # 时间轴不足总时长，补充稳定段
-            # 格式化末尾时间：整数时去掉小数点
-            last_end_str = f"{int(last_end)}" if last_end == int(last_end) else f"{last_end:.1f}"
-            duration_str = (
-                f"{int(duration_sec)}"
-                if duration_sec == int(duration_sec)
-                else f"{duration_sec:.1f}"
-            )
-            action_timeline = (
-                f"{sanitized_video_prompt.rstrip('；')}；{last_end_str}-{duration_str}秒："
-                "保持上一段结束状态稳定"
-            )
-        else:
-            action_timeline = sanitized_video_prompt
-    else:
-        # 没有时间轴，根据时长决定是否分段
-        if duration_sec <= 2:
-            # 短视频（≤2秒）：单段式
-            action_timeline = f"0-{duration_sec}秒：{sanitized_video_prompt}"
-        else:
-            # 长视频：三段式
-            t1 = duration_sec / 3
-            t2 = duration_sec * 2 / 3
-            action_timeline = (
-                f"0-{t1:.1f}秒：{focus}的起始状态明确展开；"
-                f"{t1:.1f}-{t2:.1f}秒：{sanitized_video_prompt}；"
-                f"{t2:.1f}-{duration_sec}秒：动作收尾，为下一镜衔接保留清楚状态"
-            )
-
-    # 智能分配 anchors 到各段落
-    prev_frame_anchor = None
-    current_frame_anchor = None
-    character_anchors = []
-    prop_anchors = []
-    scene_anchors = []
-
-    for anchor in anchors:
-        lower = anchor.lower()
-        if "上一镜" in anchor or "结束帧" in anchor:
-            prev_frame_anchor = anchor
-        elif "当前分镜关键帧" in anchor or "锁定构图" in anchor:
-            current_frame_anchor = anchor
-        elif any(kw in lower for kw in ["角色", "人物", "身份", "服装"]):
-            character_anchors.append(anchor)
-        elif any(kw in lower for kw in ["道具", "物品"]):
-            prop_anchors.append(anchor)
-        elif any(kw in lower for kw in ["场景", "背景", "环境"]):
-            scene_anchors.append(anchor)
-        else:
-            # 默认归入角色
-            character_anchors.append(anchor)
-
-    sections = [
-        "【全局风格】",
-        _normalize_sentence_end(style_prompt),
-        f"画面比例：{effective_aspect_ratio}，总时长：{duration_sec}秒。",
-    ]
-    sections.append("")
-
-    # 角色锁定
-    sections.append("【角色锁定】")
-    if character_anchors:
-        sections.extend(character_anchors)
-    sections.extend(
-        [
-            f"本镜角色：{_normalize_sentence_end(characters)}",
-            "严格保持每位角色的身份、面部特征、发型、服装、体型、左右位置关系不变。",
-            "人物不得变形、消失、新增或互换位置。",
-        ]
+    compiled = render_natural_video_prompt(
+        style_prompt=style_prompt,
+        aspect_ratio=effective_aspect_ratio,
+        duration_sec=duration_sec,
+        action_flow=sanitized_video_prompt,
+        shot_context=shot_context,
+        dialogue_entries=dialogue_entries,
+        tokens=tokens,
+        negative_prompt=negative_prompt,
     )
-    sections.append("")
-
-    # 物品锁定
-    if props and props != "当前分镜物品":
-        sections.append("【物品锁定】")
-        if prop_anchors:
-            sections.extend(prop_anchors)
-        sections.append(f"本镜道具：{_normalize_sentence_end(props)}")
-        sections.append(
-            "重点道具的外观、尺寸、颜色和材质保持一致；"
-            "若剧情要求道具被拿取、移动或放下，位置随人物动作自然变化，"
-            "不得复制、消失、变形、穿模或瞬移。"
-        )
-        sections.append(
-            "若道具以「隐约」「一角」「不清晰」形式出现，必须保持该可见度，"
-            "不得提前清晰展示、放大或特写。"
-        )
-        sections.append("")
-
-    # 场景锁定
-    sections.append("【场景锁定】")
-    if scene_anchors:
-        sections.extend(scene_anchors)
-    sections.extend(
-        [
-            f"场景：{_normalize_sentence_end(scene_name)}",
-            "本镜及相邻镜统一使用该场景名称，不得改用其他叫法或另造地点。",
-            (
-                f"视觉风格：{_strip_sentence_end(lighting)}，"
-                f"{_strip_sentence_end(color_tone)}，"
-                f"{_normalize_sentence_end(environment_details)}"
-            ),
-            "背景建筑、道路布局、光源方向、天气状态全程保持一致；"
-            "雨势、灯光、昼夜不得突变，场景结构与主要陈设保持稳定。",
-        ]
-    )
-    sections.append("")
-
-    # 上一镜结束状态：按衔接类型给出不同措辞，避免模型把独立机位/新场景
-    # 误当成需要承接的画面
-    transition = str(shot_context.get("transition_from_prev") or "scene_change")
-    sections.append("【上一镜结束状态】")
-    if prev_frame_anchor:
-        sections.append(prev_frame_anchor)
-    if transition == "continuous":
-        sections.append(
-            f"{_normalize_sentence_end(prev_ending)}本镜动作直接承接该状态，人物位置、姿态与朝向保持连续。"
-            if prev_ending
-            else "本镜动作直接承接上一镜结束状态，人物位置、姿态与朝向保持连续。"
-        )
-        sections.append(
-            "必须完整继承上一镜结束时的人物姿态与手持道具；"
-            "视线目标变化需在时间轴中明确交代，不得无承接跳变。"
-        )
-        sections.append(
-            "人物朝向与机位关系保持承接，不得为了展示角色突然转向镜头。"
-        )
-    elif transition == "elliptical":
-        sections.append(
-            f"{_normalize_sentence_end(prev_ending)}本镜在此之后，中间省略了一段过程："
-            "人物衣着与持有物保持一致，但画面不承接上一镜构图。"
-            if prev_ending
-            else "本镜承接上一镜之后的时间点，中间省略了一段过程，画面不承接上一镜构图。"
-        )
-    elif transition == "same_scene_cut":
-        sections.append(
-            "本镜与上一镜同处一个场景，属于独立机位（对切/反打/景别切换）；"
-            "不承接上一镜画面构图，但必须承接人物在场景中的空间位置、朝向、"
-            "持有物与剧情状态，并以本镜关键帧作为新的画面构图基准。"
-        )
-    else:
-        sections.append("场景已切换，本镜为全新画面，不承接上一镜的任何构图元素。")
-    sections.append("")
-
-    # 本镜唯一开始状态
-    sections.append("【本镜唯一开始状态】")
-    if current_frame_anchor:
-        sections.append(current_frame_anchor)
-    sections.append(f"从{_strip_sentence_end(opening_frame)}开始。")
-    if positions and positions != "当前分镜位置":
-        sections.append(f"人物站位：{_normalize_sentence_end(positions)}")
-    if expressions and expressions != "当前分镜表情":
-        sections.append(f"表情状态：{_normalize_sentence_end(expressions)}")
-    sections.append(
-        "人物站位必须与起始姿态一致：若起始为蜷缩/躺姿，站位不得写成坐姿；"
-        "动作起点从该姿态自然展开。"
-    )
-    sections.append(
-        "起始朝向不得写成「面向镜头」；应与上一镜保持一致，"
-        "除非动作明确交代转身。"
-    )
-    static_objects_rule = (
-        "初始帧画面内固定场景结构、岩石、地面与主要陈设的位置、姿态、光影已经固定；"
-        "树木主体位置和结构保持固定，但枝叶可受风力影响产生幅度克制、方向一致的自然摆动；"
-    )
-    if props and props != "当前分镜物品":
-        static_objects_rule += f"除本镜剧情明确由人物拿取/移动的{props}外，"
-    static_objects_rule += (
-        "除可随风摆动的树木枝叶外，"
-        "其余物体不得在动画中移动、旋转、重构或重新生成。"
-    )
-    sections.append(static_objects_rule)
-    sections.append("")
-
-    # 对白只从结构化 dialogue_json 进入视频提示词，避免动作/旁白文本被模型当成台词。
-    sections.append("【对白与口型】")
-    if dialogue_entries:
-        sections.append(
-            "本镜只允许以下画内对白，角色名与台词严格一一对应，禁止交换、代说或新增："
-        )
-        for index, item in enumerate(dialogue_entries, start=1):
-            sections.append(f"第{index}句：{item['speaker']}说：“{item['text']}”")
-        sections.append(
-            "对白按时间轴中出现的对白时段依次执行；只有对应说话人开口，"
-            "其他角色在该时段保持闭口，不抢话、不代说。"
-        )
-    else:
-        sections.append(
-            "本镜没有画内对白。所有人物全程闭口，不生成角色台词、旁白、画外音或可辨识语音。"
-        )
-    sections.append(
-        "时间轴中的动作、表情、旁白、画外音、内心独白和环境声只用于画面或声音效果，"
-        "不得被人物念出；不得用“他/她”替代明确说话人。"
-    )
-    sections.append("")
-
-    # 核心动作
-    sections.extend(
-        [
-            "【核心动作】",
-            (
-                f"本镜只执行以下唯一一套时间轴，忽略其他时间描述；"
-                f"时间轴须连续覆盖 0 到 {duration_sec:g} 秒。"
-            ),
-            "时间轴内不要重复描述机位；机位以【镜头】段落为准，两者冲突时以【镜头】段落为准。",
-            action_timeline,
-        ]
-    )
-    sections.append("")
-
-    # 镜头
-    sections.extend(
-        [
-            "【镜头】",
-            f"{_value(shot_context.get('shot_type'), '中景')}，"
-            f"{_value(shot_context.get('camera_angle'), '平视')}视角，"
-            f"{_camera_line(shot_context.get('camera_move'))}",
-            (
-                f"焦点围绕{focus}进行平缓、连续的调度；"
-                f"{_strip_sentence_end(composition)}，景别和光线方向保持稳定。"
-            ),
-        ]
-    )
-    sections.append("")
-
-    # 声音
-    sections.append("【声音】")
-    sections.append(f"环境与动作声音：{sound_effects}")
-    sections.append("")
-
-    # 结束状态
-    sections.extend(
-        [
-            "【结束状态】",
-            _normalize_sentence_end(ending_frame),
-            "结束状态必须明确所有已持有道具的最终位置；"
-            "若某道具不再持有，必须交代已放下或离开画面，不得凭空消失。",
-        ]
-    )
-    sections.append("")
-
-    # 禁止项：把分镜 negative_prompt 并入同一句“禁止出现”，避免重复出现两个前缀
-    forbidden_line = "禁止出现：人物变形、服装变化、新增人物、字幕文字、物体瞬移。"
-    extra_negative = re.sub(
-        r"^禁止出现\s*[:：]\s*",
-        "",
-        negative_prompt.strip(),
-    )
-    if extra_negative:
-        forbidden_line = (
-            forbidden_line.rstrip("。") + "；" + extra_negative.rstrip("。") + "。"
-        )
-    sections.extend(
-        [
-            "【禁止项】",
-            forbidden_line,
-            "缴费单、笔记、招牌等画面文字由后期叠加，生成画面本身不绘制任何文字。",
-        ]
-    )
-
-    compiled = "\n".join(part for part in sections if part.strip())
-    # 段落内部单换行，只在【段落标题】前保留一个空行，减少无意义空行
-    compiled = re.sub(r"\n(?=【)", "\n\n", compiled)
     return apply_content_safety(compiled)

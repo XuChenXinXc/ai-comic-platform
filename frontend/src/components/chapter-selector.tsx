@@ -6,7 +6,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { BookOpen, ChevronDown, ChevronUp, Plus, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
-import { api } from "../api/client";
+import { api, queryKeys } from "../api/client";
 import { useChapter } from "../hooks/use-chapter";
 import { useProject } from "../hooks/use-project";
 import { formatError } from "../lib/utils";
@@ -31,7 +31,7 @@ export function ChapterSelector() {
       }),
     onSuccess: async (chapter) => {
       await queryClient.invalidateQueries({
-        queryKey: ["chapters", activeProjectId],
+        queryKey: queryKeys.chapters(activeProjectId),
       });
       selectChapter(chapter.id);
       setOpen(false);
@@ -45,7 +45,7 @@ export function ChapterSelector() {
       api.chapters.reorder(activeProjectId, ids),
     onSuccess: async () => {
       await queryClient.invalidateQueries({
-        queryKey: ["chapters", activeProjectId],
+        queryKey: queryKeys.chapters(activeProjectId),
       });
     },
     onError: (error) => toast.error(formatError(error)),
@@ -66,7 +66,7 @@ export function ChapterSelector() {
     onSuccess: async (result) => {
       if (!result.deleted) return;
       await queryClient.invalidateQueries({
-        queryKey: ["chapters", activeProjectId],
+        queryKey: queryKeys.chapters(activeProjectId),
       });
       refetch();
       toast.success("章节已删除");
@@ -102,6 +102,8 @@ export function ChapterSelector() {
       <button
         type="button"
         className="border-border bg-card hover:bg-accent flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium transition-colors"
+        aria-haspopup="listbox"
+        aria-expanded={open}
         onClick={() => setOpen(!open)}
       >
         <BookOpen className="text-muted-foreground h-3.5 w-3.5" />
@@ -157,6 +159,7 @@ export function ChapterSelector() {
                       disabled={index === 0 || reorderMutation.isPending}
                       className="rounded p-0.5 hover:bg-accent disabled:opacity-30"
                       title="上移"
+                      aria-label={`上移第${item.chapter_no}章`}
                       onClick={() => moveChapter(index, -1)}
                     >
                       <ChevronUp className="h-3.5 w-3.5" />
@@ -169,6 +172,7 @@ export function ChapterSelector() {
                       }
                       className="rounded p-0.5 hover:bg-accent disabled:opacity-30"
                       title="下移"
+                      aria-label={`下移第${item.chapter_no}章`}
                       onClick={() => moveChapter(index, 1)}
                     >
                       <ChevronDown className="h-3.5 w-3.5" />
@@ -178,6 +182,7 @@ export function ChapterSelector() {
                       disabled={deleteMutation.isPending}
                       className="rounded p-0.5 text-[#9b342c] hover:bg-accent disabled:opacity-30"
                       title="删除章节"
+                      aria-label={`删除第${item.chapter_no}章`}
                       onClick={() => deleteMutation.mutate(item.id)}
                     >
                       <Trash2 className="h-3.5 w-3.5" />

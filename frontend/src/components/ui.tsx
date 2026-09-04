@@ -3,6 +3,7 @@ import { LoaderCircle, X } from "lucide-react";
 import {
   forwardRef,
   useEffect,
+  useRef,
   type ButtonHTMLAttributes,
   type HTMLAttributes,
   type InputHTMLAttributes,
@@ -209,14 +210,34 @@ export function Modal({
   footer,
   wide,
 }: ModalProps) {
+  const dialogRef = useRef<HTMLElement | null>(null);
+  // 焦点只依赖 open：onClose 常为内联函数（每次渲染引用都会变化），
+  // 若放入依赖会导致输入时重渲染反复抢回焦点。
+  useEffect(() => {
+    if (!open) return;
+    // 打开后将焦点移入对话框内的第一个可聚焦元素，避免焦点滞留背景页面导致 Tab 游离。
+    const focusable = dialogRef.current?.querySelector<HTMLElement>(
+      "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+    );
+    focusable?.focus();
+  }, [open]);
+  // 使用 ref 读取最新 onClose，避免内联 onClose 导致键盘监听 effect 频繁重建。
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") onCloseRef.current();
     };
     document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose, open]);
+    // 打开时锁定背景滚动，关闭时恢复。
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [open]);
 
   if (!open) return null;
   return createPortal(
@@ -228,6 +249,7 @@ export function Modal({
       }}
     >
       <section
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="modal-title"

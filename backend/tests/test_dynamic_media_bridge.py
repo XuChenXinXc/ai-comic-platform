@@ -4,12 +4,10 @@ from copy import deepcopy
 from typing import Any
 
 from app.dynamic_pipeline.media_bridge import (
-    build_dynamic_media_bridge_plan,
     build_keyframe_media_plan,
     build_video_media_plan,
     to_job_payload,
     to_media_version_payload,
-    to_shot_pipeline_metadata,
 )
 from app.dynamic_pipeline.prompt_ir import CompiledPromptBundle, ImagePromptBundle
 
@@ -22,6 +20,7 @@ def _compiled(
     transition: str = "scene_change",
     status: str = "ready",
     diagnostics: list[dict[str, object]] | None = None,
+    timeline: list[dict[str, object]] | None = None,
 ) -> CompiledPromptBundle:
     return CompiledPromptBundle.model_validate(
         {
@@ -38,7 +37,9 @@ def _compiled(
                 "negative_prompt": "no text",
                 "edit_duration_sec": duration,
                 "generation_duration_sec": 6,
-                "timeline": [{"start": 0, "end": 6, "action": "walk"}],
+                "timeline": timeline
+                if timeline is not None
+                else [{"start": 0, "end": 6, "action": "walk"}],
                 "end_state": "stop",
                 "reference_slots": [],
                 "semantic_plan": {
@@ -224,60 +225,101 @@ def test_image_motion_diagnostic_blocks_enqueue_state() -> None:
     assert to_job_payload(plan)["status"] == "blocked"
 
 
-def test_dynamic_plan_is_stable_and_orders_image_video_with_dag_dependencies() -> None:
-    bundles = {
-        "external-2": _compiled(transition="continuous"),
-        "external-1": _compiled(),
-    }
-    plan = build_dynamic_media_bridge_plan(
-        bundles,
-        workflow_run_id="run-1",
-        workflow_stage_id="stage-5",
-        input_signature="stage-input-1",
-        provider_id="provider-1",
-        provider_model="model-1",
-        previous_end_frames={"external-2": "shots/end-1.png"},
-    )
-    repeated = build_dynamic_media_bridge_plan(
-        dict(reversed(list(bundles.items()))),
-        workflow_run_id="run-1",
-        workflow_stage_id="stage-5",
-        input_signature="stage-input-1",
-        provider_id="provider-1",
-        provider_model="model-1",
-        previous_end_frames={"external-2": "shots/end-1.png"},
-    )
-
-    assert [item.kind for item in plan.targets] == ["image", "video", "image", "video"]
-    assert [item.external_key for item in plan.targets] == [
-        "external-1",
-        "external-1",
-        "external-2",
-        "external-2",
-    ]
-    assert plan.targets[1].depends_on == [plan.targets[0].idempotency_key]
-    assert plan.targets[3].depends_on == [
-        plan.targets[2].idempotency_key,
-        plan.targets[1].idempotency_key,
-    ]
-    assert plan.status == "ready"
-    assert plan.model_dump(mode="json") == repeated.model_dump(mode="json")
-
-
-def test_dynamic_blocked_bundle_aggregates_diagnostics_without_provider_or_db() -> None:
-    plan = build_dynamic_media_bridge_plan(
-        {"external-1": _compiled(status="blocked")},
-        workflow_run_id="run-1",
-        workflow_stage_id="stage-5",
-        input_signature="stage-input-1",
-        provider_id="provider-1",
-        provider_model="model-1",
+def test_video_empty_timeline_is_blocked_with_explicit_diagnostic() -> None:
+    plan = build_video_media_plan(
+        _compiled(timeline=[]),
+        **_kwargs(),
+        keyframe_job_id="job-keyframe-1",
     )
 
     assert plan.status == "blocked"
-    assert plan.targets
-    assert all(item.status == "blocked" for item in plan.targets)
-    assert any(item.code == "compiled_bundle_blocked" for item in plan.diagnostics)
+    empty = [item for item in plan.diagnostics if item.code == "timeline_discontinuous"]
+    assert empty and empty[0].details.get("reason") == "empty_timeline"
+    assert to_job_payload(plan)["queueable"] is False
+
+
+def test_video_timeline_with_gap_between_segments_is_blocked() -> None:
+    plan = build_video_media_plan(
+        _compiled(
+            timeline=[
+                {"start": 0, "end": 2, "action": "walk"},
+                {"start": 3, "end": 6, "action": "stop"},
+            ]
+        ),
+        **_kwargs(),
+        keyframe_job_id="job-keyframe-1",
+    )
+
+    assert plan.status == "blocked"
+    gap = [item for item in plan.diagnostics if item.code == "timeline_discontinuous"]
+    assert gap and gap[0].details.get("reason") == "segment_gap_or_overlap"
+
+
+def test_video_timeline_with_overlapping_segments_is_blocked() -> None:
+    plan = build_video_media_plan(
+        _compiled(
+            timeline=[
+                {"start": 0, "end": 4, "action": "walk"},
+                {"start": 2, "end": 6, "action": "stop"},
+            ]
+        ),
+        **_kwargs(),
+        keyframe_job_id="job-keyframe-1",
+    )
+
+    assert plan.status == "blocked"
+    overlap = [item for item in plan.diagnostics if item.code == "timeline_discontinuous"]
+    assert overlap and overlap[0].details.get("reason") == "segment_gap_or_overlap"
+
+
+def test_video_timeline_last_segment_end_mismatch_is_blocked() -> None:
+    plan = build_video_media_plan(
+        _compiled(
+            timeline=[
+                {"start": 0, "end": 2, "action": "walk"},
+                {"start": 2, "end": 5, "action": "stop"},
+            ]
+        ),
+        **_kwargs(),
+        keyframe_job_id="job-keyframe-1",
+    )
+
+    assert plan.status == "blocked"
+    mismatch = [item for item in plan.diagnostics if item.code == "timeline_discontinuous"]
+    assert mismatch and mismatch[0].details.get("reason") == "last_segment_end_mismatch"
+    assert mismatch[0].details.get("generation_duration_sec") == 6
+
+
+def test_video_timeline_first_segment_not_from_zero_is_blocked() -> None:
+    plan = build_video_media_plan(
+        _compiled(
+            timeline=[
+                {"start": 1, "end": 6, "action": "walk"},
+            ]
+        ),
+        **_kwargs(),
+        keyframe_job_id="job-keyframe-1",
+    )
+
+    assert plan.status == "blocked"
+    nonzero = [item for item in plan.diagnostics if item.code == "timeline_discontinuous"]
+    assert nonzero and nonzero[0].details.get("reason") == "first_segment_start_nonzero"
+
+
+def test_video_continuous_legal_timeline_stays_ready() -> None:
+    plan = build_video_media_plan(
+        _compiled(
+            timeline=[
+                {"start": 0, "end": 2, "action": "walk"},
+                {"start": 2, "end": 6, "action": "stop"},
+            ]
+        ),
+        **_kwargs(),
+        keyframe_job_id="job-keyframe-1",
+    )
+
+    assert plan.status == "ready"
+    assert not any(item.code == "timeline_discontinuous" for item in plan.diagnostics)
 
 
 def test_payload_projections_include_prompt_ir_provenance_and_dependencies() -> None:
@@ -290,12 +332,9 @@ def test_payload_projections_include_prompt_ir_provenance_and_dependencies() -> 
         previous_end_frame_path="shots/end-0.png",
     )
 
-    shot_metadata = to_shot_pipeline_metadata(video)
     media_payload = to_media_version_payload(video)
     job_payload = to_job_payload(video)
 
-    assert shot_metadata["prompt_ir_json"] == video.prompt_ir_json
-    assert shot_metadata["provenance_json"] == video.provenance_json
     assert media_payload["prompt_ir_json"]
     assert media_payload["provenance_json"]
     assert media_payload["requested_duration_sec"] == 6

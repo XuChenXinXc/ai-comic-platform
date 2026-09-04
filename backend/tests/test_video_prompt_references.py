@@ -52,5 +52,7 @@ def test_video_prompt_compilation_includes_scene_and_prop_images_when_bindings_a
         "character_identity",
         "prop_identity",
     ]
-    assert "@Image2：" in prompt and "场景空间结构和光线" in prompt
-    assert "@Image4：" in prompt and "物品外观、材质和结构" in prompt
+    # @Image 编号语义按真实绑定：@Image2 场景、@Image3 角色、@Image4 道具
+    assert "场景结构、陈设与光线沿用 @Image2 的参考素材" in prompt
+    assert "林雪的外貌、发型和当天服装沿用 @Image3 的参考素材" in prompt
+    assert "铜制罗盘沿用 @Image4 的外观与材质" in prompt

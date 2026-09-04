@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections import Counter
 from collections.abc import Mapping
 from math import isfinite
@@ -145,6 +146,22 @@ def resolve_strong_dynamic_max_events(
     return DEFAULT_STRONG_DYNAMIC_MAX_EVENTS
 
 
+def _json_mode_content(content: Mapping[str, Any]) -> dict[str, Any]:
+    """把签名计算基准统一为纯 JSON 类型。
+
+    与 normalizers._build_output 的 ``model_dump(mode="json")`` 对齐：
+    先走 json 序列化往返（``default=str`` 兜底非 JSON 原生值），
+    保证两处对同一节奏产物计算出的 content_signature 一致。
+    序列化失败时保留原值，交由 calculate_signature 自行抛错。
+    """
+
+    try:
+        normalized = json.loads(json.dumps(content, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return dict(content)
+    return dict(normalized) if isinstance(normalized, dict) else dict(content)
+
+
 def server_bound_rhythm_content(
     content: Any,
     config_snapshot: Mapping[str, Any] | None = None,
@@ -152,22 +169,23 @@ def server_bound_rhythm_content(
     """复制节奏输入并写入服务端预算，调用方可将副本持久化。"""
 
     if isinstance(content, BaseModel):
-        content = content.model_dump(mode="python")
+        # 统一使用 json 模式 dump，与 normalizers._build_output 的签名基准一致。
+        content = content.model_dump(mode="json")
     if not isinstance(content, Mapping):
         return content
     payload = copy.deepcopy(dict(content))
     budget = payload.get("strong_dynamic_budget")
     if isinstance(budget, BaseModel):
-        budget = budget.model_dump(mode="python")
+        budget = budget.model_dump(mode="json")
     if isinstance(budget, Mapping):
         bounded_budget = dict(budget)
         bounded_budget["max_events"] = resolve_strong_dynamic_max_events(config_snapshot)
         payload["strong_dynamic_budget"] = bounded_budget
         artifact_meta = payload.get("artifact_meta")
         if isinstance(artifact_meta, Mapping):
-            canonical_content = {
-                key: value for key, value in payload.items() if key != "artifact_meta"
-            }
+            canonical_content = _json_mode_content(
+                {key: value for key, value in payload.items() if key != "artifact_meta"}
+            )
             rebuilt_meta = dict(artifact_meta)
             rebuilt_meta["content_signature"] = calculate_signature(
                 canonical_content,
@@ -194,8 +212,6 @@ def _small_beats_minimum(
         return 0
     if target_duration_sec <= 30:
         return 0
-    if profile in {"long", "feature", "长片", "长视频"}:
-        return max(1, int(target_duration_sec // 30))
     return max(1, int(target_duration_sec // 30))
 
 

@@ -1,4 +1,3 @@
-import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -9,12 +8,16 @@ from app.schemas import (
     ScreenplayDialogue,
     ShotTransitionFromPrev,
 )
+from app.services.provider_service import ProviderService
 
 AssetType = Literal["character", "scene", "prop"]
 ContentStatus = Literal["draft", "ready", "confirmed", "failed"]
 ProviderKind = Literal["text", "image", "video", "tts"]
 ShotSourceType = Literal["novel", "screenplay"]
 ProjectStorageSource = Literal["database", "environment", "default"]
+
+# 批量请求 ids 数量上限：防止一次性排队海量任务造成异常负载。
+_MAX_BATCH_IDS = 200
 
 # 项目默认画风：仅作为新建项目的初始值，之后只允许用户手动修改
 DEFAULT_STYLE_PROMPT = (
@@ -28,36 +31,10 @@ DEFAULT_STYLE_PROMPT = (
 def _sensitive_param_path(value: Any, path: str = "params") -> str | None:
     if isinstance(value, dict):
         for key, item in value.items():
-            normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
-            parts = {part for part in re.split(r"[^a-z0-9]+", normalized.lower()) if part}
-            collapsed = re.sub(r"[^a-z0-9]", "", normalized.lower())
             current = f"{path}.{key}"
-            if parts & {
-                "auth",
-                "authorization",
-                "credential",
-                "credentials",
-                "token",
-                "key",
-                "secret",
-                "password",
-                "passwd",
-                "cookie",
-                "sig",
-                "signature",
-            } or collapsed in {
-                "apikey",
-                "xapikey",
-                "accesstoken",
-                "accesskey",
-                "authtoken",
-                "bearertoken",
-                "clientsecret",
-                "privatekey",
-                "proxyauthorization",
-                "secretkey",
-                "setcookie",
-            }:
+            # 与 provider_service 共用同一套敏感键检测（含超长输入保护），
+            # 避免两份实现各自演化导致脱敏/拦截口径分叉。
+            if ProviderService._is_sensitive_name(key):
                 return current
             nested = _sensitive_param_path(item, current)
             if nested:
@@ -201,10 +178,22 @@ class AssetMergeRequest(ApiModel):
         return self
 
 
+class SceneViewUpdate(ApiModel):
+    """更新 Scene View 的视角附加提示词。"""
+
+    prompt: str = Field(default="", max_length=4000)
+
+
 class AssetBatchRequest(GenerateRequest):
     ids: list[str] | None = None
     asset_type: AssetType | None = None
     only_missing: bool = False
+
+    @model_validator(mode="after")
+    def limit_batch_ids(self) -> "AssetBatchRequest":
+        if self.ids and len(self.ids) > _MAX_BATCH_IDS:
+            raise ValueError(f"批量请求 ids 数量不能超过 {_MAX_BATCH_IDS}")
+        return self
 
 
 class ShotExtractRequest(GenerateRequest):
@@ -307,6 +296,9 @@ class ShotFields(ApiModel):
     source_type: ShotSourceType = "screenplay"
     source_ref: str = ""
     scene_asset_id: str | None = None
+    # 分镜使用的 Scene View：空字符串 / null 表示默认（MASTER）。
+    # 兼容两种写法：view id 或 view_key（front/reverse/left45/right45/master）。
+    scene_view_key: str | None = None
     character_ids: list[str] = Field(default_factory=list)
     prop_ids: list[str] = Field(default_factory=list)
     positions: list[ShotPositionInput] = Field(default_factory=list)
@@ -340,6 +332,9 @@ class ShotCreate(ShotFields):
 class ShotUpdate(ApiModel):
     source_ref: str | None = None
     scene_asset_id: str | None = None
+    # 分镜使用的 Scene View：空字符串 / null 表示默认（MASTER）；
+    # 兼容 view id 或 view_key 两种写法。
+    scene_view_key: str | None = None
     character_ids: list[str] | None = None
     prop_ids: list[str] | None = None
     positions: list[ShotPositionInput] | None = None
@@ -440,6 +435,18 @@ class ShotPromptBatchRequest(GenerateRequest):
             raise ValueError("prompt_types 不能为空")
         if len(set(self.prompt_types)) != len(self.prompt_types):
             raise ValueError("prompt_types 不能重复")
+        if self.ids and len(self.ids) > _MAX_BATCH_IDS:
+            raise ValueError(f"批量请求 ids 数量不能超过 {_MAX_BATCH_IDS}")
+        return self
+
+
+class ShotDirectorPlanBatchRequest(GenerateRequest):
+    ids: list[str] | None = None
+
+    @model_validator(mode="after")
+    def limit_batch_ids(self) -> "ShotDirectorPlanBatchRequest":
+        if self.ids and len(self.ids) > _MAX_BATCH_IDS:
+            raise ValueError(f"批量请求 ids 数量不能超过 {_MAX_BATCH_IDS}")
         return self
 
 
@@ -447,6 +454,12 @@ class ContinuityCheckRequest(GenerateRequest):
     ids: list[str] | None = None
     apply_fixes: bool = True
     insert_transitions: bool = False
+
+    @model_validator(mode="after")
+    def limit_batch_ids(self) -> "ContinuityCheckRequest":
+        if self.ids and len(self.ids) > _MAX_BATCH_IDS:
+            raise ValueError(f"批量请求 ids 数量不能超过 {_MAX_BATCH_IDS}")
+        return self
 
 
 class RefinePromptsRequest(GenerateRequest):
@@ -465,11 +478,23 @@ class RefinePromptsRequest(GenerateRequest):
 class QualityFixRequest(GenerateRequest):
     ids: list[str] | None = None
 
+    @model_validator(mode="after")
+    def limit_batch_ids(self) -> "QualityFixRequest":
+        if self.ids and len(self.ids) > _MAX_BATCH_IDS:
+            raise ValueError(f"批量请求 ids 数量不能超过 {_MAX_BATCH_IDS}")
+        return self
+
 
 class MediaBatchRequest(GenerateRequest):
     ids: list[str] | None = None
     scene_no: int | None = Field(default=None, ge=1)
     only_missing: bool = False
+
+    @model_validator(mode="after")
+    def limit_batch_ids(self) -> "MediaBatchRequest":
+        if self.ids and len(self.ids) > _MAX_BATCH_IDS:
+            raise ValueError(f"批量请求 ids 数量不能超过 {_MAX_BATCH_IDS}")
+        return self
 
 
 class ProviderCreate(ApiModel):

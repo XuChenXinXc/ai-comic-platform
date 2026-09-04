@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -8,9 +9,11 @@ from sqlalchemy import select, update
 
 from app.db import utc_now
 from app.dynamic_pipeline.stage_catalog import get_stage_prerequisites
-from app.jobs.dynamic_bridge import DynamicJobBridge
+from app.jobs.dynamic_bridge import DynamicJobBridge, DynamicJobBridgeError
 from app.jobs.repository import JobRepository, has_download_source
 from app.models.tables import job, workflow_run, workflow_stage
+
+logger = logging.getLogger(__name__)
 
 _PROTECTED_WORKFLOW_STATUSES = {"blocked", "cancelled", "stale", "confirmed"}
 _PROTECTED_STAGE_STATUSES = {"blocked", "cancelled", "stale", "confirmed"}
@@ -397,6 +400,38 @@ def _stage_dependency_state(
     return ("pending", None) if pending else ("ready", None)
 
 
+def _isolate_inconsistent_run(
+    repository: JobRepository,
+    *,
+    run_id: str,
+    stage_id: str,
+    detail: str,
+) -> None:
+    """C3：恢复对账发现状态不一致时隔离该 run，避免启动恢复死循环。
+
+    只把仍可执行（queued/running）的 run 标记为 ``interrupted`` 并写入诊断
+    信息；受保护状态（cancelled/confirmed 等）保持原样。隔离动作本身失败
+    只记录日志，不阻塞其余 run 的恢复。
+    """
+    error = f"恢复对账发现动态工作流状态不一致，已隔离该运行：{detail}"
+    try:
+        _update_workflow_state(
+            repository,
+            run_id=run_id,
+            run_target="interrupted",
+            run_error=error,
+            run_allowed_statuses=_SAFE_INTERRUPTED_RUN_STATUSES,
+        )
+    except Exception:
+        logger.exception("隔离不一致的动态 run 失败：%s", run_id)
+    logger.error(
+        "动态 run 恢复对账不一致，已隔离：run=%s stage=%s：%s",
+        run_id,
+        stage_id,
+        detail,
+    )
+
+
 def _reconcile_queued_stage_jobs(repository: JobRepository) -> list[str]:
     """只为当前 attempt 且前置阶段已确认的 queued stage 补建 Job。"""
     bridge = DynamicJobBridge(repository)
@@ -452,55 +487,73 @@ def _reconcile_queued_stage_jobs(repository: JobRepository) -> list[str]:
             continue
         if dependency_state != "ready":
             continue
-        with repository.engine.begin() as connection:
-            run_record = _row_dict(
-                connection.execute(select(workflow_run).where(workflow_run.c.id == run_id)).first()
-            )
-            stage_record = _row_dict(
-                connection.execute(
-                    select(workflow_stage).where(
-                        workflow_stage.c.id == stage_id,
-                        workflow_stage.c.workflow_run_id == run_id,
-                        workflow_stage.c.status == "queued",
+        reference: Any = None
+        bridge_error: str | None = None
+        try:
+            with repository.engine.begin() as connection:
+                run_record = _row_dict(
+                    connection.execute(
+                        select(workflow_run).where(workflow_run.c.id == run_id)
+                    ).first()
+                )
+                stage_record = _row_dict(
+                    connection.execute(
+                        select(workflow_stage).where(
+                            workflow_stage.c.id == stage_id,
+                            workflow_stage.c.workflow_run_id == run_id,
+                            workflow_stage.c.status == "queued",
+                        )
+                    ).first()
+                )
+                if run_record is None or stage_record is None:
+                    continue
+                existing = bridge._find_by_stage_signature(
+                    connection,
+                    stage_id,
+                    str(stage_record.get("input_signature") or ""),
+                )
+                if existing is not None:
+                    reference = bridge._existing_reference(
+                        connection,
+                        existing,
+                        str(stage_record.get("status") or ""),
+                        retry_failed=False,
                     )
-                ).first()
+                else:
+                    reference = bridge.ensure_stage_job_in_transaction(
+                        connection,
+                        run_record,
+                        stage_record,
+                    )
+        except DynamicJobBridgeError as error:
+            # C3：对账遇到不变量违反（如「Job completed 但 stage 仍 queued」）时，
+            # 事务已回滚；不再让异常向上传播导致 lifespan 启动失败/死循环，
+            # 而是隔离该 run 后继续恢复其余 run。
+            bridge_error = str(error)
+        if bridge_error is not None:
+            _isolate_inconsistent_run(
+                repository,
+                run_id=run_id,
+                stage_id=stage_id,
+                detail=bridge_error,
             )
-            if run_record is None or stage_record is None:
-                continue
-            existing = bridge._find_by_stage_signature(
-                connection,
-                stage_id,
-                str(stage_record.get("input_signature") or ""),
-            )
-            if existing is not None:
-                reference = bridge._existing_reference(
-                    connection,
-                    existing,
-                    str(stage_record.get("status") or ""),
-                    retry_failed=False,
-                )
-            else:
-                reference = bridge.ensure_stage_job_in_transaction(
-                    connection,
-                    run_record,
-                    stage_record,
-                )
-            if reference.status == "queued" and reference.job_id not in enqueue_ids:
-                enqueue_ids.append(reference.job_id)
+            continue
+        if (
+            reference is not None
+            and reference.status == "queued"
+            and reference.job_id not in enqueue_ids
+        ):
+            enqueue_ids.append(reference.job_id)
     return enqueue_ids
 
 
-def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
-    report = DynamicRecoveryReport()
-    reconciled_ids = _reconcile_queued_stage_jobs(repository)
-    for job_id in reconciled_ids:
-        _add_enqueue_id(report, job_id)
-
-    for record in repository.list_non_terminal(include_dynamic=True):
-        run_id = record.get("workflow_run_id")
-        if not run_id:
-            continue
-
+def _recover_run_records(
+    repository: JobRepository,
+    report: DynamicRecoveryReport,
+    records: list[dict[str, Any]],
+) -> None:
+    """恢复单个 run 关联的一批非终态 Job（原 recover_dynamic_jobs 逐条逻辑）。"""
+    for record in records:
         run_record, stage_record = _load_workflow_records(repository, record)
         job_id = record["id"]
         if run_record is None:
@@ -511,7 +564,17 @@ def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
             continue
 
         if run_record["status"] in _PROTECTED_WORKFLOW_STATUSES:
-            _add_skipped_id(report, job_id)
+            # B-M3：受保护 run（cancelled/confirmed 等）的非终态 Job 不能永久
+            # 悬浮在非终态，统一标记 interrupted 并注明原因；受保护的
+            # run/stage 状态本身保持不变。
+            _mark_interrupted(
+                repository,
+                report,
+                record,
+                f"动态任务所属运行已受保护（{run_record['status']}），任务按中断处理",
+                stage_target=None,
+                run_target=None,
+            )
             continue
 
         if stage_record is None:
@@ -527,7 +590,7 @@ def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
 
         latest_stage = _latest_stage_record(
             repository,
-            str(run_id),
+            str(record.get("workflow_run_id") or ""),
             str(stage_record.get("stage_key") or ""),
         )
         if latest_stage is None or latest_stage.get("id") != stage_record.get("id"):
@@ -552,7 +615,17 @@ def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
                     stage_target=None,
                 )
             else:
-                _add_skipped_id(report, job_id)
+                # B-M3：blocked/cancelled/confirmed 阶段的非终态 Job 同样不再
+                # 永久悬浮，标记 interrupted 并注明原因；不改动受保护的
+                # stage 状态与 run 状态。
+                _mark_interrupted(
+                    repository,
+                    report,
+                    record,
+                    f"动态任务关联的工作流阶段已受保护（{stage_status}），任务按中断处理",
+                    stage_target=None,
+                    run_target=None,
+                )
             continue
 
         stage_dependency_state, stage_dependency_error = _stage_dependency_state(
@@ -599,7 +672,26 @@ def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
 
         status = record["status"]
         if stage_status not in _ALLOWED_STAGE_STATUSES_BY_JOB.get(status, frozenset()):
-            _add_skipped_id(report, job_id)
+            if status == "queued":
+                # 排队 Job 保持跳过：与阶段状态的时序差异可能短暂存在，
+                # 由依赖完成/重新入队路径继续推进，不做破坏性中断。
+                _add_skipped_id(report, job_id)
+                continue
+            # stage 已落到 Job 尚未到达的终态（如崩溃发生在「stage 已写 ready、
+            # job 未写 completed」窗口）：该 Job 的结果已无法与 stage 对账，
+            # 不能静默跳过（否则永久卡 running），按中断处理并保留诊断原因；
+            # stage 自身状态已由正常流程写好，不再改动。
+            _mark_interrupted(
+                repository,
+                report,
+                record,
+                (
+                    f"动态任务状态（{status}）与阶段状态（{stage_status}）无法对账，"
+                    "任务按中断处理，请重新运行该阶段"
+                ),
+                stage_target=None,
+                run_target=None,
+            )
             continue
 
         if status == "queued":
@@ -638,6 +730,29 @@ def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
             else:
                 error = "下载中的动态任务缺少已保存结果地址，无法恢复"
                 _mark_failed(repository, report, record, error)
+
+
+def recover_dynamic_jobs(repository: JobRepository) -> DynamicRecoveryReport:
+    report = DynamicRecoveryReport()
+    reconciled_ids = _reconcile_queued_stage_jobs(repository)
+    for job_id in reconciled_ids:
+        _add_enqueue_id(report, job_id)
+
+    # C3：按 run 分组处理非终态 Job；单个 run 的恢复异常只记录日志并跳过
+    # 该 run，绝不让启动期恢复（lifespan）因单个坏 run 失败而形成死循环。
+    records_by_run: dict[str, list[dict[str, Any]]] = {}
+    for record in repository.list_non_terminal(include_dynamic=True):
+        run_id = record.get("workflow_run_id")
+        if not run_id:
+            # 没有关联 run 的任务由 legacy recover_jobs 路径处理。
+            continue
+        records_by_run.setdefault(str(run_id), []).append(record)
+
+    for run_id, records in records_by_run.items():
+        try:
+            _recover_run_records(repository, report, records)
+        except Exception:
+            logger.exception("恢复动态工作流 run 失败，跳过该 run：%s", run_id)
 
     report.partial_failed_stage_ids.extend(
         stage_id
@@ -713,24 +828,8 @@ def reconcile_dynamic_workflow_runs(repository: JobRepository) -> list[str]:
     return partial_failed_stage_ids
 
 
-def enqueue_recovered_dynamic_jobs(
-    repository: JobRepository,
-    enqueue: Callable[[str], bool],
-) -> DynamicRecoveryReport:
-    report = recover_dynamic_jobs(repository)
-    successful_ids: list[str] = []
-    for job_id in report.enqueue_ids:
-        if enqueue(job_id):
-            successful_ids.append(job_id)
-        else:
-            report.skipped_ids.append(job_id)
-    report.enqueue_ids = successful_ids
-    return report
-
-
 __all__ = [
     "DynamicRecoveryReport",
-    "enqueue_recovered_dynamic_jobs",
     "reconcile_dynamic_workflow_runs",
     "recover_dynamic_jobs",
 ]

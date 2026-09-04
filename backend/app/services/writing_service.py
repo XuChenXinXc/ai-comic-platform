@@ -224,6 +224,34 @@ class WritingService:
             connection.execute(insert(table).values(**values))
             return current_revision
 
+    def _revert_generating_status(self, table: Any, chapter_id: str) -> None:
+        """建任务失败时把 generating 状态回退为 ready（有内容）或 draft（空行）。
+
+        queue_analysis/queue_screenplay 在 jobs.create 抛异常时调用，
+        避免内容行永久停在 generating 导致前端一直显示「生成中」。
+        """
+        now = utc_now()
+        with self.database.engine.begin() as connection:
+            existing = row_dict(
+                connection.execute(
+                    select(table.c.chapter_id, table.c.status, table.c.content_json).where(
+                        table.c.chapter_id == chapter_id
+                    )
+                ).first()
+            )
+            if existing is None or existing["status"] != "generating":
+                return
+            fallback = (
+                "ready"
+                if (existing.get("content_json") or "") not in ("", "{}")
+                else "draft"
+            )
+            connection.execute(
+                update(table)
+                .where(table.c.chapter_id == chapter_id, table.c.status == "generating")
+                .values(status=fallback, updated_at=now)
+            )
+
     @staticmethod
     def _expected_revision(
         input_data: dict[str, Any],
@@ -289,19 +317,25 @@ class WritingService:
         project_record = self._project(chapter_record["project_id"])
         expected_revision = self._set_status(novel_analysis, chapter_id, "generating")
         assert expected_revision is not None
-        return self.jobs.create(
-            project_id=chapter_record["project_id"],
-            chapter_id=chapter_id,
-            job_type="analyze_novel",
-            target_type="analysis",
-            target_id=chapter_id,
-            provider_kind="text",
-            provider_id=options.get("provider_id") or project_record["default_text_provider_id"],
-            input_data={
-                "expected_revision": expected_revision,
-                "params": options.get("params", {}),
-            },
-        )
+        try:
+            return self.jobs.create(
+                project_id=chapter_record["project_id"],
+                chapter_id=chapter_id,
+                job_type="analyze_novel",
+                target_type="analysis",
+                target_id=chapter_id,
+                provider_kind="text",
+                provider_id=options.get("provider_id")
+                or project_record["default_text_provider_id"],
+                input_data={
+                    "expected_revision": expected_revision,
+                    "params": options.get("params", {}),
+                },
+            )
+        except Exception:
+            # 建任务失败时回置状态，避免内容行永久停在 generating。
+            self._revert_generating_status(novel_analysis, chapter_id)
+            raise
 
     def queue_screenplay(self, chapter_id: str, options: dict[str, Any]) -> dict[str, Any]:
         chapter_record = self._chapter(chapter_id)
@@ -314,20 +348,27 @@ class WritingService:
         assert expected_analysis_revision is not None
         expected_revision = self._set_status(screenplay, chapter_id, "generating")
         assert expected_revision is not None
-        return self.jobs.create(
-            project_id=chapter_record["project_id"],
-            chapter_id=chapter_id,
-            job_type="generate_screenplay",
-            target_type="screenplay",
-            target_id=chapter_id,
-            provider_kind="text",
-            provider_id=options.get("provider_id") or project_record["default_text_provider_id"],
-            input_data={
-                "expected_analysis_revision": expected_analysis_revision,
-                "expected_revision": expected_revision,
-                "params": options.get("params", {}),
-            },
-        )
+        try:
+            return self.jobs.create(
+                project_id=chapter_record["project_id"],
+                chapter_id=chapter_id,
+                job_type="generate_screenplay",
+                target_type="screenplay",
+                target_id=chapter_id,
+                provider_kind="text",
+                provider_id=options.get("provider_id")
+                or project_record["default_text_provider_id"],
+                input_data={
+                    "expected_analysis_revision": expected_analysis_revision,
+                    "expected_revision": expected_revision,
+                    "params": options.get("params", {}),
+                },
+            )
+        except Exception:
+            # 建任务失败时回置状态，避免内容行永久停在 generating。
+            self._revert_generating_status(novel_analysis, chapter_id)
+            self._revert_generating_status(screenplay, chapter_id)
+            raise
 
     def queue_screenplay_scene(self, chapter_id: str, options: dict[str, Any]) -> dict[str, Any]:
         chapter_record = self._chapter(chapter_id)
@@ -339,21 +380,27 @@ class WritingService:
             raise not_found("剧本场次")
         expected_revision = self._set_status(screenplay, chapter_id, "generating")
         assert expected_revision is not None
-        return self.jobs.create(
-            project_id=chapter_record["project_id"],
-            chapter_id=chapter_id,
-            job_type="generate_screenplay_scene",
-            target_type="screenplay_scene",
-            target_id=f"{chapter_id}:{scene_no}",
-            provider_kind="text",
-            provider_id=options.get("provider_id") or project_record["default_text_provider_id"],
-            input_data={
-                "expected_revision": expected_revision,
-                "scene_no": scene_no,
-                "instructions": options.get("instructions", ""),
-                "params": options.get("params", {}),
-            },
-        )
+        try:
+            return self.jobs.create(
+                project_id=chapter_record["project_id"],
+                chapter_id=chapter_id,
+                job_type="generate_screenplay_scene",
+                target_type="screenplay_scene",
+                target_id=f"{chapter_id}:{scene_no}",
+                provider_kind="text",
+                provider_id=options.get("provider_id")
+                or project_record["default_text_provider_id"],
+                input_data={
+                    "expected_revision": expected_revision,
+                    "scene_no": scene_no,
+                    "instructions": options.get("instructions", ""),
+                    "params": options.get("params", {}),
+                },
+            )
+        except Exception:
+            # 建任务失败时回置状态，避免内容行永久停在 generating。
+            self._revert_generating_status(screenplay, chapter_id)
+            raise
 
     def _provider(self, provider_id: str | None) -> tuple[Any, dict[str, Any]]:
         return self.providers.resolve(kind="text", provider_id=provider_id)

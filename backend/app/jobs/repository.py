@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import uuid4
@@ -15,6 +16,10 @@ from app.services.utils import sanitize_error_message
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 NON_TERMINAL_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+# 非终态任务扫描的防御上限：本地平台正常不会达到，达到时必须告警而非静默截断。
+_LIST_NON_TERMINAL_LIMIT = 100_000
+
+logger = logging.getLogger(__name__)
 
 
 class JobRepositoryError(RuntimeError):
@@ -424,26 +429,68 @@ class JobRepository:
             "progress_current": current["progress_total"],
             "message": "任务完成",
             "error": "",
-            "finished_at": utc_now(),
         }
         if result_data is not None:
-            values["result_data"] = dict(result_data)
-        return self.update(job_id, **values)
+            # 表列为 result_json；原实现经由 update() 完成该转换。
+            values["result_json"] = _json_dumps(dict(result_data))
+        # 仅从非终态转换：防止迟到的 complete 覆盖 cancelled/failed/completed。
+        if current["status"] not in NON_TERMINAL_STATUSES:
+            return current
+        # B-M4：读取与写入之间任务可能被并发置为终态（如取消）。
+        # UPDATE 限定仅在非终态上生效并校验 rowcount（与 claim 的条件更新
+        # 模式一致）；未命中说明并发已进入终态，此时不覆盖写，
+        # 返回数据库中的当前记录。
+        now = utc_now()
+        values["finished_at"] = now
+        values["updated_at"] = now
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(job)
+                .where(
+                    job.c.id == job_id,
+                    job.c.status.in_(NON_TERMINAL_STATUSES),
+                )
+                .values(**values)
+            )
+        if result.rowcount != 1:
+            # rowcount == 0：并发已进入终态，条件更新未命中，不覆盖写。
+            return self.require(job_id)
+        return self.require(job_id)
 
     mark_completed = complete
 
     def fail(self, job_id: str, error: str) -> dict[str, Any]:
-        return self.update(
-            job_id,
-            status="failed",
-            error=error,
-            message="任务失败",
-            finished_at=utc_now(),
-        )
+        current = self.require(job_id)
+        if current["status"] not in NON_TERMINAL_STATUSES:
+            return current
+        # B-M4：同 complete——UPDATE 限定非终态并校验 rowcount，
+        # 防止迟到的 fail 覆盖并发写入的 cancelled 等终态。
+        now = utc_now()
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(job)
+                .where(
+                    job.c.id == job_id,
+                    job.c.status.in_(NON_TERMINAL_STATUSES),
+                )
+                .values(
+                    status="failed",
+                    error=sanitize_error_message(error),
+                    message="任务失败",
+                    finished_at=now,
+                    updated_at=now,
+                )
+            )
+        if result.rowcount != 1:
+            return self.require(job_id)
+        return self.require(job_id)
 
     mark_failed = fail
 
     def interrupt(self, job_id: str, message: str) -> dict[str, Any]:
+        current = self.require(job_id)
+        if current["status"] not in NON_TERMINAL_STATUSES:
+            return current
         return self.update(
             job_id,
             status="interrupted",
@@ -561,9 +608,15 @@ class JobRepository:
             statement = statement.where(job.c.workflow_run_id == workflow_run_id)
         elif not include_dynamic:
             statement = statement.where(job.c.workflow_run_id.is_(None))
-        statement = statement.order_by(job.c.created_at.desc()).limit(100_000)
+        statement = statement.order_by(job.c.created_at.desc()).limit(_LIST_NON_TERMINAL_LIMIT)
         with self.engine.connect() as connection:
             rows = connection.execute(statement).all()
+        # 防御上限被击穿时必须显式告警：静默截断会让恢复/依赖传播漏掉任务。
+        if len(rows) >= _LIST_NON_TERMINAL_LIMIT:
+            logger.warning(
+                "非终态任务数量达到防御上限 %d，可能存在未处理的截断任务",
+                _LIST_NON_TERMINAL_LIMIT,
+            )
         return [record for row in rows if (record := self._decode(row)) is not None]
 
 

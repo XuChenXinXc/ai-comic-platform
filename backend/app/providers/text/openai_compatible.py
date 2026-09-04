@@ -94,8 +94,13 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
         headers = self._headers(options)
         headers.setdefault("Content-Type", "application/json")
         response_format = options.pop("response_format", {"type": "json_object"})
-        for internal_key in ("headers", "verify_ssl"):
-            options.pop(internal_key, None)
+        # 请求行为控制键不进请求体，但要保留给 _request：
+        # verify_ssl=False 必须继续生效（此前被 pop 后恒 True，自签证书渠道
+        # 无法关闭校验）；retry_unsafe_methods 同理。
+        control_options: dict[str, Any] = {}
+        for control_key in ("headers", "verify_ssl", "retry_unsafe_methods"):
+            if control_key in options:
+                control_options[control_key] = options.pop(control_key)
         payload: dict[str, Any] = {"model": model, "messages": messages, **options}
         if json_response and response_format:
             payload["response_format"] = response_format
@@ -108,7 +113,7 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
             response = await self._request_json(
                 "POST",
                 chat_path,
-                options=options,
+                options=control_options,
                 headers=headers,
                 json=payload,
             )

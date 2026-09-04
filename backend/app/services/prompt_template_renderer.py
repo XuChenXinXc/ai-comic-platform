@@ -361,3 +361,32 @@ def render_asset_body(
     template_path = TEMPLATE_DIR / f"{asset_type}_sheet.md"
     template_text = template_path.read_text(encoding="utf-8")
     return render_template(template_text, context)
+
+
+def render_scene_master_body(
+    *,
+    asset_name: str,
+    profile: dict[str, Any],
+    prompt: str,
+    negative_prompt: str,
+    consistency_keywords: list[str],
+    composition: str,
+) -> str:
+    """渲染 Scene MASTER 母版提示词正文（scene_master.md 模板）。
+
+    与 scene_sheet.md（多视图拼板展板）不同：MASTER 是一张完整空间
+    全景透视图，供 Scene Views 以图生图派生，也作为分镜空间锚点。
+    ``negative_prompt`` 应为已合并默认负向的最终值。
+    """
+    detail = _asset_detail(prompt, profile)
+    context = _scene_context(
+        name=asset_name,
+        profile=profile,
+        detail=detail,
+        consistency_keywords=consistency_keywords,
+        composition=composition,
+        negative_prompt=negative_prompt,
+    )
+    template_path = TEMPLATE_DIR / "scene_master.md"
+    template_text = template_path.read_text(encoding="utf-8")
+    return render_template(template_text, context)

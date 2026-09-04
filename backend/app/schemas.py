@@ -281,6 +281,7 @@ class CharacterAssetOutput(AssetVisualPromptFields):
 
 class SceneAssetOutput(AssetVisualPromptFields):
     name: NonEmptyText
+    aliases: list[str] = Field(default_factory=list)
     concept: str = ""
     worldview: str = ""
     indoor_outdoor: str = ""
@@ -366,6 +367,7 @@ class SceneAssetOutput(AssetVisualPromptFields):
 
 class PropAssetOutput(AssetVisualPromptFields):
     name: NonEmptyText
+    aliases: list[str] = Field(default_factory=list)
     description: str
     concept: str = ""
     worldview: str = ""
@@ -454,6 +456,16 @@ class AssetExtractionOutput(OutputModel):
     props: list[PropAssetOutput]
 
 
+class MissingAsset(OutputModel):
+    """分镜提取时发现素材库中不存在的角色/场景/道具，交由补素材流程处理。"""
+
+    asset_type: Literal["scene", "character", "prop"]
+    reason: str = ""
+    source_ref: str = ""
+    suggested_name: NonEmptyText
+    suggested_aliases: list[str] = Field(default_factory=list)
+
+
 class AssetPromptOutput(AssetVisualPromptFields):
     pass
 
@@ -520,11 +532,18 @@ class ShotOutput(OutputModel):
     scene_no: int | None = None
     source_ref: str = ""
     scene_name: NonEmptyText
-    scene_asset_id: NonEmptyText
+    # 允许为空：剧情发生地无法对应素材库中任何场景时留空，并通过
+    # missing_assets 报告缺失，由后端补素材后重新绑定，禁止强行绑定近似素材。
+    scene_asset_id: str = ""
+    # 场景视角（Scene View）：只能从素材目录中该场景已有的视图里选择；
+    # 空串表示默认（MASTER）。禁止为视角新建场景素材或编造不存在的视图 key。
+    scene_view_key: str = ""
     character_names: list[NonEmptyText]
     character_asset_ids: list[NonEmptyText]
     prop_names: list[NonEmptyText]
     prop_asset_ids: list[NonEmptyText]
+    # 素材库中不存在的角色/场景/道具：不得静默错误绑定，必须列出供补素材流程使用。
+    missing_assets: list[MissingAsset] = Field(default_factory=list)
     positions: list[ShotPosition]
     start_state: str
     action: str
@@ -550,6 +569,17 @@ class ShotOutput(OutputModel):
     def validate_unique_asset_ids(cls, value: list[str]) -> list[str]:
         if len(value) != len(set(value)):
             raise ValueError("素材 ID 不能重复")
+        return value
+
+    @field_validator("scene_asset_id", mode="before")
+    @classmethod
+    def normalize_empty_scene_asset_id(cls, value: Any) -> Any:
+        """None/空白场景 ID 归一化为空字符串：表示该镜场景缺失，
+        由 missing_assets 报告，而不是解析失败。"""
+        if isinstance(value, str):
+            return value.strip()
+        if not value:
+            return ""
         return value
 
     # 以下两项为「质量警告」而非硬校验：提取整批生成，若抛异常会导致
@@ -778,6 +808,84 @@ class ShotVideoPromptOptimizeOutput(OutputModel):
     plain_text_output_field: ClassVar[str] = "prompt"
 
     prompt: NonEmptyText
+
+
+DirectorComposition = Literal[
+    "centered",
+    "left-weighted",
+    "right-weighted",
+    "environment-dominant",
+    "negative-space",
+    "foreground-obstructed",
+    "layered-depth",
+]
+
+
+class DirectorAudienceFocusOutput(OutputModel):
+    """观众第一 / 第二 / 第三视觉注意落点。"""
+
+    first: NonEmptyText
+    second: str = ""
+    third: str = ""
+
+
+class DirectorMicroPerformanceOutput(OutputModel):
+    """单个自然微动作：触发时机 + 具体动作 + 来源。"""
+
+    trigger: str = ""
+    action: NonEmptyText
+    source: str = ""
+
+
+class DirectorDialogueBindingOutput(OutputModel):
+    """结构化对白绑定；真人角色 requiresLipSync=true，设备/广播/电话等为 false。"""
+
+    speaker: NonEmptyText
+    text: NonEmptyText
+    startTime: float = Field(ge=0)
+    endTime: float = Field(gt=0)
+    requiresLipSync: bool = True
+    voiceSource: Literal["character", "device", "broadcast", "phone", "offscreen"] = "character"
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> DirectorDialogueBindingOutput:
+        if self.endTime <= self.startTime:
+            raise ValueError("endTime 必须大于 startTime")
+        return self
+
+
+class DirectorTimelineSegmentOutput(OutputModel):
+    """唯一绝对时间轴的一段。"""
+
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    action: NonEmptyText
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> DirectorTimelineSegmentOutput:
+        if self.end <= self.start:
+            raise ValueError("end 必须大于 start")
+        return self
+
+
+class ShotDirectorPlanOutput(OutputModel):
+    """导演设计层输出：只决定「如何呈现」，不修改剧情 / 连续性 / 资产等既有事实。"""
+
+    shotPurpose: NonEmptyText
+    audienceFocus: DirectorAudienceFocusOutput
+    composition: DirectorComposition
+    foreground: str = ""
+    midground: str = ""
+    background: str = ""
+    cameraMotivation: str = ""
+    performance: str = ""
+    microPerformance: list[DirectorMicroPerformanceOutput] = Field(
+        default_factory=list, max_length=2
+    )
+    environmentMotion: str = ""
+    visualTone: list[str] = Field(default_factory=list)
+    timeline: list[DirectorTimelineSegmentOutput]
+    dialogueBindings: list[DirectorDialogueBindingOutput] = Field(default_factory=list)
 
 
 class AssetReferenceBinding(OutputModel):

@@ -12,7 +12,6 @@ from urllib.parse import urlsplit
 
 import requests
 
-from app.config import settings
 from app.schemas import ProviderConfig, ProviderPollResult, ProviderSubmission
 
 from ..base import (
@@ -21,6 +20,7 @@ from ..base import (
     ProviderError,
     compress_reference_image,
     extract_path,
+    get_imgbb_api_key,
     normalize_provider_status,
     reference_jpeg_part,
 )
@@ -447,14 +447,11 @@ class HttpVideoProvider(HttpProviderBase):
 
     async def poll(self, task_id: str) -> ProviderPollResult:
         options = self._options()
-        is_multipart = str(options.get("submit_transport", "")) == "multipart"
         poll_template = str(options.get("poll_path", "tasks/{task_id}"))
-        if is_multipart:
-            # 任务 ID 来自服务端字符串：拼进 URL 前做字符白名单过滤，
-            # 杜绝 "../"、查询串等被带进同源请求路径（相对路径同样处理）
-            path = poll_template.format(task_id=self._safe_task_segment(task_id))
-        else:
-            path = poll_template.format(task_id=task_id)
+        # B-L5：任务 ID 来自服务端字符串，拼进 URL 前统一做字符白名单过滤，
+        # 杜绝 "../"、查询串等被带进同源请求路径；JSON 协议路径与 multipart
+        # 路径同样处理，不再只覆盖 multipart 协议。
+        path = poll_template.format(task_id=self._safe_task_segment(task_id))
         method = str(options.get("poll_method", "GET"))
         kwargs: dict[str, Any] = {"headers": self._headers(options)}
         if method.upper() != "GET":
@@ -530,7 +527,9 @@ class HttpVideoProvider(HttpProviderBase):
 
     async def _upload_input_image_public(self, local_file: Path) -> dict[str, Any]:
         """把本地参考图上传到 ImgBB，返回公网 HTTPS URL（天悦火山接口需要）。"""
-        if not settings.imgbb_api_key:
+        # B-L10：ImgBB Key 优先读运行时覆盖（数据库加密值），不改写 settings 单例。
+        imgbb_api_key = get_imgbb_api_key()
+        if not imgbb_api_key:
             raise ProviderConfigurationError(
                 "未配置 ImgBB API Key（APP_IMGBB_API_KEY），无法生成公网参考图 URL"
             )
@@ -540,7 +539,7 @@ class HttpVideoProvider(HttpProviderBase):
             encoded = base64.b64encode(content).decode("ascii")
             response = requests.post(
                 "https://api.imgbb.com/1/upload",
-                params={"key": settings.imgbb_api_key, "expiration": 600},
+                params={"key": imgbb_api_key, "expiration": 600},
                 files={"image": (None, encoded)},
                 timeout=60,
             )

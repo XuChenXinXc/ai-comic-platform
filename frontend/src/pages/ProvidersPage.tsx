@@ -15,7 +15,6 @@ import {
   ErrorState,
   LoadingState,
   PageHeader,
-  StatusBadge,
 } from "../components/status";
 import {
   Badge,
@@ -242,7 +241,12 @@ export function ProvidersPage() {
                       默认
                     </Badge>
                   ) : null}
-                  {!provider.enabled ? <StatusBadge status="已停用" /> : null}
+                  {/* 用 Badge 展示停用状态，不再向 StatusBadge 传入非任务状态的枚举值 */}
+                  {!provider.enabled ? (
+                    <Badge className="border-[#b9bcb4] bg-[#f3f2ec] text-[#6f726b]">
+                      已停用
+                    </Badge>
+                  ) : null}
                 </div>
                 <p className="mt-1 font-mono text-xs text-muted">
                   {provider.adapter} · {provider.model || "未指定模型"}
@@ -366,6 +370,8 @@ export function ProvidersPage() {
             <Select
               id="provider-kind"
               value={form.kind}
+              // 更新接口不提交 kind，编辑模式禁用选择，避免界面与实际不一致
+              disabled={editing !== "new"}
               onChange={(event) => {
                 const kind = event.target.value as ProviderKind;
                 setForm((current) => ({

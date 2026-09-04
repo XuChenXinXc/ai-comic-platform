@@ -27,6 +27,11 @@ from app.dynamic_pipeline.prompt_ir import (
 from app.dynamic_pipeline.prompt_stage import PromptStageOutput, stage_output_to_stage_json
 from app.dynamic_pipeline.schemas import ArtifactMeta
 from app.dynamic_pipeline.stage_catalog import STAGE_KEYS
+from app.dynamic_pipeline.state_machine import (
+    InvalidWorkflowTransition,
+    can_transition_status,
+    transition_status,
+)
 from app.main import app as main_app
 from app.models.tables import chapter, project, workflow_run, workflow_stage
 from app.services.chapter_service import ChapterService
@@ -582,13 +587,62 @@ def test_regenerate_stage_creates_new_attempt_stales_descendants_and_rejects_rep
         json={"expected_revision": 2},
     )
     assert repeated_response.status_code == 409
-    assert repeated_response.json() == {"detail": "阶段 0-source 正在处理中，不能重复生成"}
+    assert repeated_response.json()["detail"] == "阶段 0-source 正在处理中，不能重复生成"
 
     invalid_stage_response = api_context.client.post(
         f"/api/dynamic-runs/{run_id}/stages/9-invalid/regenerate",
         json={"expected_revision": 2},
     )
     _assert_invalid_stage(invalid_stage_response)
+
+
+def test_queue_status_ready_routes_through_stale_two_step_transition() -> None:
+    # ready 不能直接转 queued：必须经 ready→stale→queued 两步合法转移，
+    # _queue_status 负责按状态机校验该路径。
+    assert DynamicWorkflowService._queue_status("ready") == "queued"
+
+    assert can_transition_status("ready", "stale") is True
+    assert transition_status("ready", "stale") == "stale"
+    assert transition_status("stale", "queued") == "queued"
+    with pytest.raises(InvalidWorkflowTransition):
+        transition_status("ready", "queued")
+
+
+def test_regenerate_stage_from_ready_run_moves_run_to_queued(
+    api_context: ApiContext,
+) -> None:
+    created = _create_free_run(api_context)
+    run_id = created["run"]["id"]
+
+    # 模拟阶段 0 已生成待确认：run 与 stage 均处于 ready。
+    with api_context.database.engine.begin() as connection:
+        connection.execute(
+            update(workflow_run)
+            .where(workflow_run.c.id == run_id)
+            .values(status="ready")
+        )
+        connection.execute(
+            update(workflow_stage)
+            .where(
+                workflow_stage.c.workflow_run_id == run_id,
+                workflow_stage.c.stage_key == "0-source",
+            )
+            .values(status="ready")
+        )
+
+    response = api_context.client.post(
+        f"/api/dynamic-runs/{run_id}/stages/0-source/regenerate",
+        json={"expected_revision": 1},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    # ready 状态的 run 重新生成后，经 ready→stale→queued 两步转移回到 queued。
+    assert body["run"]["status"] == "queued"
+    assert body["run"]["revision"] == 2
+    assert body["stages"][0]["attempt"] == 2
+    assert body["stages"][0]["status"] == "queued"
+    assert [stage["status"] for stage in body["stages"][1:]] == ["stale"] * 7
 
 
 def test_main_app_registers_dynamic_routes_and_legacy_project_chapter_smoke_stays_available(

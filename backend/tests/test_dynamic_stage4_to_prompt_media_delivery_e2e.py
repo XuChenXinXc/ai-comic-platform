@@ -464,7 +464,11 @@ def test_dynamic_stage4_to_delivery_real_runner_emits_binary_zip(
         "_add_audio",
         lambda self, video, *_args, **_kwargs: video,
     )
-    monkeypatch.setattr(CompositionService, "_burn_subtitles", lambda self, video, *_args: video)
+    monkeypatch.setattr(
+        CompositionService,
+        "_burn_subtitles",
+        lambda self, video, *_args, **_kwargs: video,
+    )
     monkeypatch.setattr(
         CompositionService,
         "_add_bgm",

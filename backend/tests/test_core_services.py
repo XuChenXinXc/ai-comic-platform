@@ -390,6 +390,9 @@ def test_download_url_atomic_with_signed_http_error_hides_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FailingResponse:
+        is_redirect = False
+        is_permanent_redirect = False
+
         def __enter__(self) -> FailingResponse:
             return self
 
@@ -437,6 +440,8 @@ def test_download_url_atomic_decodes_gzip_content(
 
     class GzipResponse:
         raw = Raw()
+        is_redirect = False
+        is_permanent_redirect = False
 
         def __enter__(self) -> GzipResponse:
             return self
@@ -458,3 +463,24 @@ def test_download_url_atomic_decodes_gzip_content(
 
     assert GzipResponse.raw.decode_content is True
     assert target.read_bytes() == payload
+
+
+def test_first_chapter_inherits_project_source_text(tmp_path: Path) -> None:
+    """首章自动继承项目创建时录入的正文，避免分章模型下小说正文丢失。"""
+    from app.db import Database
+    from app.services.chapter_service import ChapterService
+
+    database = Database(f"sqlite:///{(tmp_path / 'chapter-inherit.db').as_posix()}")
+    database.initialize(seed_mock_providers=True)
+    try:
+        project = ProjectService(database).create(
+            {"name": "继承测试", "source_text": "雨落在旧城巷口。"}
+        )
+        chapter = ChapterService(database).create(project["id"], {"title": "第1章"})
+        assert chapter["source_text"] == "雨落在旧城巷口。"
+        assert chapter["source_signature"] == source_signature("雨落在旧城巷口。")
+        # 第二章节不继承（分章录入）
+        second = ChapterService(database).create(project["id"], {"title": "第2章"})
+        assert second["source_text"] == ""
+    finally:
+        database.dispose()

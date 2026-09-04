@@ -3,13 +3,32 @@
 支持 OpenAI TTS API 和兼容接口（如 deepseek、volcengine 等）。
 """
 
+import asyncio
 from typing import Any
 
 import requests
 
-from app.providers.base import ProviderError, validate_custom_headers
+from app.providers.base import ProviderError, validate_custom_headers, validate_provider_base_url
 from app.schemas import ProviderConfig
+from app.services.constants import MAX_AUDIO_SIZE
 from app.services.utils import sanitize_error_message
+
+
+def _error_message(payload: Any, fallback: str) -> str:
+    """从 Provider 错误体提取文本；错误体可能是任意结构，逐层防御。"""
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return str(error.get("message") or error.get("detail") or error)
+        if isinstance(error, str) and error:
+            return error
+        message = payload.get("message") or payload.get("detail")
+        if isinstance(message, str) and message:
+            return message
+        return str(payload)
+    if isinstance(payload, str) and payload:
+        return payload
+    return fallback
 
 
 class OpenAITTSProvider:
@@ -18,6 +37,9 @@ class OpenAITTSProvider:
     def __init__(self, config: ProviderConfig, api_key: str) -> None:
         self.config = config
         self.api_key = api_key
+        # B-H/TTS：构造时校验 base_url，与 HttpProviderBase 一致，
+        # 拒绝 userinfo / 敏感查询参数等不安全配置。
+        validate_provider_base_url(config.base_url)
         self.base_url = config.base_url.rstrip("/") if config.base_url else "https://api.openai.com/v1"
         self.model = config.model or "tts-1"
         self.timeout = config.timeout_sec or 120
@@ -60,10 +82,16 @@ class OpenAITTSProvider:
 
         # 可选参数
         if "speed" in params:
-            payload["speed"] = float(params["speed"])
+            try:
+                payload["speed"] = float(params["speed"])
+            except (TypeError, ValueError) as exc:
+                raise ProviderError("TTS speed 参数必须是数字") from exc
 
         try:
-            response = requests.post(
+            # B-H/TTS：synthesize 是 async 函数，同步 requests.post 会阻塞事件
+            # 循环；移入线程执行，保持函数签名与返回契约不变。
+            response = await asyncio.to_thread(
+                requests.post,
                 url,
                 headers=headers,
                 json=payload,
@@ -77,25 +105,39 @@ class OpenAITTSProvider:
                 # 可能是 JSON 错误响应
                 try:
                     error_data = response.json()
-                    error_msg = error_data.get("error", {}).get("message", str(error_data))
-                    raise ProviderError(f"TTS 生成失败：{error_msg}")
                 except (ValueError, KeyError):
-                    raise ProviderError(f"TTS 返回非音频数据：{content_type}") from None
+                    error_data = None
+                raise ProviderError(
+                    f"TTS 生成失败：{_error_message(error_data, f'非音频数据（{content_type}）')}"
+                )
 
-            return response.content
+            content = response.content
+            if len(content) > MAX_AUDIO_SIZE:
+                raise ProviderError(
+                    f"TTS 返回音频超过大小上限（{len(content)} > {MAX_AUDIO_SIZE} 字节）"
+                )
+            return content
 
         except requests.HTTPError as exc:
             try:
-                error_data = exc.response.json()
-                error_msg = error_data.get("error", {}).get("message", str(error_data))
+                error_payload = exc.response.json() if exc.response is not None else None
             except (ValueError, KeyError):
-                error_msg = exc.response.text[:200]
-            raise ProviderError(f"TTS API 请求失败：{error_msg}") from exc
+                error_payload = None
+            fallback = (
+                exc.response.text[:200]
+                if exc.response is not None and exc.response.text
+                else str(exc)
+            )
+            raise ProviderError(
+                f"TTS API 请求失败：{_error_message(error_payload, fallback)}"
+            ) from exc
         except requests.RequestException as exc:
             raise ProviderError(f"TTS 网络请求失败：{sanitize_error_message(exc)}") from exc
 
     def supports_voice(self, voice_id: str) -> bool:
-        """检查是否支持指定音色"""
-        # OpenAI 官方音色
-        official_voices = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
-        return voice_id in official_voices
+        """是否支持指定音色。
+
+        兼容接口（deepseek/volcengine 等）的音色由渠道决定，无法在本地枚举，
+        因此只拒绝空音色；具体可用性由渠道返回错误说明。
+        """
+        return bool(str(voice_id or "").strip())

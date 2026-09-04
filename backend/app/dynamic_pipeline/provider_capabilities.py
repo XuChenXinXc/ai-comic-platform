@@ -95,11 +95,14 @@ def normalize_capabilities(
         )
     }
     duration_value = _read_capability(raw, "supported_durations")
-    payload["supported_durations"] = (
-        list(_DEFAULT_DURATIONS)
-        if duration_value is _MISSING or duration_value is None
-        else duration_value
-    )
+    if duration_value is _MISSING or duration_value is None:
+        payload["supported_durations"] = list(_DEFAULT_DURATIONS)
+    elif isinstance(duration_value, int | float):
+        # 标量 supported_durations 是常见写法：包成单元素列表。
+        payload["supported_durations"] = [float(duration_value)]
+    else:
+        payload["supported_durations"] = duration_value
+    # max_reference_images=0 由 Schema 的 ge=1 校验拒绝（保持既有契约）。
     return ProviderCapabilitiesSnapshot.model_validate(payload)
 
 

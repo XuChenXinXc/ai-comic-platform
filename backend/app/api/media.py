@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import FileResponse
 
 from app.api.schemas import AssetBatchRequest, GenerateRequest, MediaBatchRequest
@@ -9,8 +9,10 @@ from app.services.media_service import MediaService
 router = APIRouter(tags=["media"])
 
 
-async def _read_upload(file: UploadFile, max_bytes: int) -> tuple[str, str, bytes]:
-    data = await file.read(max_bytes + 1)
+def _read_upload(file: UploadFile, max_bytes: int) -> tuple[str, str, bytes]:
+    # 同步读取（FastAPI 的 UploadFile.read 在事件循环外调用）：
+    # 上传处理器用普通 def 由 FastAPI 线程池执行，避免阻塞事件循环。
+    data = file.file.read(max_bytes + 1) if file.file is not None else b""
     if len(data) > max_bytes:
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
@@ -22,9 +24,10 @@ async def _read_upload(file: UploadFile, max_bytes: int) -> tuple[str, str, byte
 @router.get("/assets/{asset_id}/images")
 def list_asset_images(
     asset_id: str,
+    scene_view_id: str | None = Query(default=None),
     service: MediaService = Depends(get_media_service),
 ) -> list[dict]:
-    return service.list_asset_images(asset_id)
+    return service.list_asset_images(asset_id, scene_view_id=scene_view_id)
 
 
 @router.post("/assets/{asset_id}/images/generate", status_code=status.HTTP_202_ACCEPTED)
@@ -49,12 +52,12 @@ def generate_asset_images_batch(
 
 
 @router.post("/assets/{asset_id}/images/upload", status_code=status.HTTP_201_CREATED)
-async def upload_asset_image(
+def upload_asset_image(
     asset_id: str,
     file: UploadFile = File(...),
     service: MediaService = Depends(get_media_service),
 ) -> dict:
-    return service.upload_asset_image(asset_id, *(await _read_upload(file, MAX_IMAGE_SIZE)))
+    return service.upload_asset_image(asset_id, *_read_upload(file, MAX_IMAGE_SIZE))
 
 
 @router.put("/asset-images/{image_id}/current")
@@ -124,12 +127,12 @@ def generate_keyframes_batch_chapter(
 
 
 @router.post("/shots/{shot_id}/keyframes/upload", status_code=status.HTTP_201_CREATED)
-async def upload_keyframe(
+def upload_keyframe(
     shot_id: str,
     file: UploadFile = File(...),
     service: MediaService = Depends(get_media_service),
 ) -> dict:
-    return service.upload_keyframe(shot_id, *(await _read_upload(file, MAX_IMAGE_SIZE)))
+    return service.upload_keyframe(shot_id, *_read_upload(file, MAX_IMAGE_SIZE))
 
 
 @router.put("/keyframes/{keyframe_id}/current")
@@ -199,12 +202,14 @@ def generate_videos_batch_chapter(
 
 
 @router.post("/shots/{shot_id}/videos/upload", status_code=status.HTTP_201_CREATED)
-async def upload_video(
+def upload_video(
     shot_id: str,
     file: UploadFile = File(...),
     service: MediaService = Depends(get_media_service),
 ) -> dict:
-    return service.upload_video(shot_id, *(await _read_upload(file, MAX_VIDEO_SIZE)))
+    # 普通同步路由由 FastAPI 放入线程池执行：其中的 ffprobe/ffmpeg
+    # 校验不会阻塞事件循环（与素材图/关键帧上传保持同一路由形态）。
+    return service.upload_video(shot_id, *_read_upload(file, MAX_VIDEO_SIZE))
 
 
 @router.put("/videos/{video_id}/current")

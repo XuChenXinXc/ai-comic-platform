@@ -162,6 +162,8 @@ export function AppShell() {
                 key={item.to}
                 to={linkTo}
                 aria-label={item.label}
+                aria-disabled={isDisabled || undefined}
+                tabIndex={isDisabled ? -1 : undefined}
                 className={({ isActive }) =>
                   [
                     "group flex min-w-max items-center gap-3 rounded-md border px-3 py-2.5 text-sm font-semibold transition lg:w-full",

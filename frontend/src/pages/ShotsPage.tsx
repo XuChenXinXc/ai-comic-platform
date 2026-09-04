@@ -20,7 +20,7 @@ import {
   WandSparkles,
   Wrench,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router";
 import { toast } from "sonner";
 import { api, mediaUrl, queryKeys } from "../api/client";
@@ -55,6 +55,7 @@ import { formatError, makeDownloadName, parseJson } from "../lib/utils";
 import type {
   BatchResponse,
   DialogueLine,
+  DirectorPlan,
   ReferenceBinding,
   Shot,
   ShotExpression,
@@ -156,6 +157,52 @@ function formatExpression(item: ShotExpression) {
   return character ? `${character}：${expression}` : expression;
 }
 
+const compositionLabels: Record<string, string> = {
+  centered: "人物居中",
+  "left-weighted": "画面重心偏左",
+  "right-weighted": "画面重心偏右",
+  "environment-dominant": "环境占主导",
+  "negative-space": "留白 / 负空间",
+  "foreground-obstructed": "前景遮挡",
+  "layered-depth": "前中后景递进",
+};
+
+function directorPlanSummary(plan: DirectorPlan): string[] {
+  const lines = [
+    `叙事意图：${plan.shotPurpose || ""}`,
+    `视觉主次：${[plan.audienceFocus?.first, plan.audienceFocus?.second, plan.audienceFocus?.third].filter(Boolean).join(" → ") || "—"}`,
+    `构图：${(compositionLabels[plan.composition] ?? plan.composition) || "—"}`,
+  ];
+  if (plan.cameraMotivation) lines.push(`运镜动机：${plan.cameraMotivation}`);
+  const layers = [plan.foreground, plan.midground, plan.background].filter(
+    Boolean,
+  );
+  if (layers.length) lines.push(`景深：${layers.join(" / ")}`);
+  if (plan.performance) lines.push(`表演：${plan.performance}`);
+  for (const item of plan.microPerformance ?? []) {
+    if (!item?.action) continue;
+    lines.push(
+      `微动作：${item.trigger ? `${item.trigger}时 ` : ""}${item.action}`,
+    );
+  }
+  if (plan.environmentMotion) lines.push(`环境动态：${plan.environmentMotion}`);
+  if (plan.visualTone?.length) lines.push(`影像规则：${plan.visualTone.join("；")}`);
+  const timeline = (plan.timeline ?? [])
+    .map((segment) => `${segment.start}-${segment.end}秒 ${segment.action}`)
+    .join("；");
+  if (timeline) lines.push(`唯一时间轴：${timeline}`);
+  const dialogue = (plan.dialogueBindings ?? [])
+    .map(
+      (item) =>
+        `${item.startTime}-${item.endTime}秒 ${item.speaker}：“${item.text}”${
+          item.requiresLipSync ? "" : "（闭口/外部发声）"
+        }`,
+    )
+    .join("；");
+  if (dialogue) lines.push(`对白绑定：${dialogue}`);
+  return lines;
+}
+
 export function ShotsPage() {
   const queryClient = useQueryClient();
   const location = useLocation();
@@ -172,6 +219,9 @@ export function ShotsPage() {
   );
   const [jsonValidity, setJsonValidity] = useState<Record<string, boolean>>({});
   const [draggedId, setDraggedId] = useState("");
+  // 会话级审校标记：不落 localStorage。
+  // 分镜列表重新加载或提取后视为未审校（见下方 query.data 监听）。
+  const continuityCheckedRef = useRef(false);
 
   const query = useQuery({
     queryKey: queryKeys.shots(activeChapterId),
@@ -210,6 +260,12 @@ export function ShotsPage() {
     setSelected(new Set());
     setSceneNo("");
   }, [activeChapterId]);
+
+  // 分镜列表重新加载（提取、编辑保存、章节或项目切换）后，
+  // 此前的审校结论不再适用，重置会话级审校标记。
+  useEffect(() => {
+    continuityCheckedRef.current = false;
+  }, [query.data]);
 
   useEffect(() => {
     const stage = new URLSearchParams(location.search).get("stage");
@@ -273,9 +329,23 @@ export function ShotsPage() {
     onError: (error) => toast.error(formatError(error)),
   });
 
-  const handleContinuityCheck = () => {
+  // 已有分镜时重新提取会覆盖全部分镜及其提示词，先经用户确认
+  const handleExtractAll = () => {
     if (
-      localStorage.getItem(`continuity-check-run-${activeProjectId}`) &&
+      shots.length &&
+      !window.confirm(
+        "重新提取将覆盖现有的全部分镜及其提示词（含已编辑内容），确定继续吗？",
+      )
+    ) {
+      return;
+    }
+    taskMutation.mutate({ action: "extract" });
+  };
+
+  const handleContinuityCheck = () => {
+    // 本会话已审校过当前分镜列表时，再次审校前先确认会覆盖修正内容
+    if (
+      continuityCheckedRef.current &&
       !window.confirm(
         "再次执行剧情连贯审校会重新生成并覆盖修正内容，确定继续吗？",
       )
@@ -300,7 +370,7 @@ export function ShotsPage() {
   });
 
   // 剧情连贯审校：把相邻分镜的起止状态与旁白交给文字模型逐对检查，
-  // 修正直接写回源字段。改完需要重新生成提示词才会生效。
+  // 修正直接写回源字段；视频提示词在生成视频时会按最新源字段自动重新编译。
   const continuityFixMutation = useMutation({
     mutationFn: () =>
       api.shots.checkContinuity(activeProjectId, {
@@ -309,19 +379,20 @@ export function ShotsPage() {
         insert_transitions: false,
       }),
     onSuccess: async () => {
-      localStorage.setItem(`continuity-check-run-${activeProjectId}`, "1");
+      // 会话级标记（不写 localStorage）：同会话再次审校前需确认
+      continuityCheckedRef.current = true;
       await queryClient.invalidateQueries({
         queryKey: queryKeys.jobs(activeProjectId),
       });
       toast.success("剧情连贯审校已入队", {
-        description: "完成后请重新生成提示词，修正才会写入提示词",
+        description: "修正写回源字段后，生成视频时会自动进入新的视频提示词",
       });
     },
     onError: (error) => toast.error(formatError(error)),
   });
 
-  // 重新生成提示词：只把当前源字段重新编译为视频提示词，不动图片提示词。
-  // 审校修正写回源字段后必须执行这一步，否则旧提示词仍会被使用。
+  // 优化视频提示词：基于当前提示词（含手工编辑内容）做自然语言优化，
+  // 素材引用与剧情事实保持不变；无提示词的分镜会先从源字段重新生成。
   const promptBatchMutation = useMutation({
     mutationFn: () =>
       api.shots.batchPrompts(activeChapterId, {
@@ -333,7 +404,7 @@ export function ShotsPage() {
         queryKey: queryKeys.jobs(activeProjectId),
       });
       toast.success(`已入队 ${result.jobs.length} 个提示词任务`, {
-        description: "完成后请重新生成视频，修正才会进入画面",
+        description: "完成后请重新生成视频，优化才会进入画面",
       });
     },
     onError: (error) => toast.error(formatError(error)),
@@ -342,13 +413,44 @@ export function ShotsPage() {
   const handlePromptBatch = () => {
     if (
       !window.confirm(
-        "将重新生成视频提示词并覆盖现有视频提示词（含手工覆盖的版本），确定继续吗？",
+        "将对当前视频提示词做自然语言优化，保留手工编辑的内容与素材引用，确定继续吗？",
       )
     ) {
       return;
     }
     promptBatchMutation.mutate();
   };
+
+  // 导演设计层：按分镜事实与相邻镜关系生成叙事意图/构图/运镜动机/
+  // 微表演/唯一时间轴/对白绑定，完成后分镜列表由任务轮询自动刷新。
+  const directorPlanMutation = useMutation({
+    mutationFn: (shotId: string) => api.shots.generateDirectorPlan(shotId),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      toast.success("导演设计已入队", {
+        description: "完成后本镜视频提示词将按导演设计渲染，可通过重新生成修正",
+      });
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+
+  // 批量导演设计：按批量范围（所选 / 当前场次 / 全部）入队。
+  const directorPlanBatchMutation = useMutation({
+    mutationFn: () =>
+      api.shots.batchDirectorPlans(activeChapterId, { ids: batchIds }),
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      toast.success(`已入队 ${result.jobs.length} 个导演设计任务`, {
+        description:
+          "完成后视频提示词将切换为「叙事意图 + 镜头构图 + 人物表演 + 唯一时间轴」新结构",
+      });
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
 
   // 分镜质量报告：提取阶段的警告不阻断保存，这里主动扫描存量分镜。
   const qualityQuery = useQuery({
@@ -474,7 +576,7 @@ export function ShotsPage() {
 
   const openNew = () => {
     setForm({
-      ...blankShot(activeProjectId),
+      ...blankShot(activeChapterId),
       shot_no: shots.length + 1,
       shot_order: shots.length + 1,
     });
@@ -522,7 +624,7 @@ export function ShotsPage() {
                   taskMutation.isPending &&
                   taskMutation.variables?.action === "extract"
                 }
-                onClick={() => taskMutation.mutate({ action: "extract" })}
+                onClick={handleExtractAll}
               >
                 <WandSparkles className="h-4 w-4" />
                 {shots.length ? "重新提取全部" : "提取分镜"}
@@ -531,7 +633,7 @@ export function ShotsPage() {
                 variant="secondary"
                 busy={continuityFixMutation.isPending}
                 disabled={!shots.length}
-                title="把相邻分镜的起止状态与旁白交给文字模型逐对审校并自动修正源字段；完成后需重新生成提示词才会生效"
+                title="把相邻分镜的起止状态与旁白交给文字模型逐对审校并自动修正源字段；生成视频时会按最新源字段自动重写视频提示词"
                 onClick={handleContinuityCheck}
               >
                 <Link2 className="h-4 w-4" />
@@ -539,17 +641,31 @@ export function ShotsPage() {
               </Button>
               <Button
                 variant="secondary"
+                busy={directorPlanBatchMutation.isPending}
+                disabled={!shots.length}
+                title="按分镜事实与相邻镜关系生成导演设计（叙事意图 / 构图 / 运镜动机 / 微表演 / 唯一时间轴 / 对白绑定）；完成后视频提示词切换为新结构"
+                onClick={() => directorPlanBatchMutation.mutate()}
+              >
+                <WandSparkles className="h-4 w-4" />
+                {selected.size
+                  ? `生成所选导演设计（${selected.size}）`
+                  : scope === "scene"
+                    ? "生成当前场次导演设计"
+                    : "生成全部导演设计"}
+              </Button>
+              <Button
+                variant="secondary"
                 busy={promptBatchMutation.isPending}
                 disabled={!shots.length}
-                title="把所选（或全部）分镜的最新字段重新编译为视频提示词；会覆盖现有视频提示词与手工覆盖，不影响图片提示词"
+                title="对当前视频提示词做自然语言优化：保留手工编辑内容与素材引用，去除机械化表述；没有提示词的分镜会先从源字段生成"
                 onClick={handlePromptBatch}
               >
                 <RefreshCw className="h-4 w-4" />
                 {selected.size
-                  ? `重新生成所选视频提示词（${selected.size}）`
+                  ? `优化所选视频提示词（${selected.size}）`
                   : scope === "scene"
-                    ? "重新生成当前场次视频提示词"
-                    : "重新生成全部视频提示词"}
+                    ? "优化当前场次视频提示词"
+                    : "优化全部视频提示词"}
               </Button>
               <Button
                 variant="secondary"
@@ -1010,7 +1126,9 @@ export function ShotsPage() {
                                 <p className="mt-2 truncate text-xs font-semibold text-[#3f423d]" title={assetName}>
                                   {assetName}
                                 </p>
-                                <p className="mt-0.5 text-[10px] text-muted">{typeLabel}</p>
+                                <p className="mt-0.5 text-[10px] text-muted">
+                                  {typeLabel}
+                                </p>
                               </div>
                             );
                             },
@@ -1066,6 +1184,68 @@ export function ShotsPage() {
                               shot.narration ||
                               "本镜无对白"}
                           </p>
+                        </div>
+                        <div>
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
+                              导演设计
+                            </p>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              busy={
+                                directorPlanMutation.isPending &&
+                                directorPlanMutation.variables === shot.id
+                              }
+                              title="按分镜事实与相邻镜关系生成导演设计（叙事意图 / 构图 / 运镜动机 / 微表演 / 唯一时间轴 / 对白绑定）"
+                              onClick={() =>
+                                directorPlanMutation.mutate(shot.id)
+                              }
+                            >
+                              <WandSparkles className="h-4 w-4" />
+                              {shot.director_plan
+                                ? "重新生成导演设计"
+                                : "生成导演设计"}
+                            </Button>
+                          </div>
+                          {shot.director_plan ? (
+                            <div className="mt-2 space-y-1 text-xs leading-5 text-[#454842]">
+                              {directorPlanSummary(shot.director_plan).map(
+                                (line, lineIndex) => (
+                                  <p key={lineIndex} className="break-words">
+                                    {line}
+                                  </p>
+                                ),
+                              )}
+                            </div>
+                          ) : (
+                            <p className="mt-2 text-xs text-muted">
+                              尚未生成导演设计，视频提示词使用旧模板渲染；生成后将切换为
+                              「叙事意图 + 镜头构图 + 人物表演 + 唯一时间轴」的新结构。
+                            </p>
+                          )}
+                          {shot.consistency_issues?.length ? (
+                            <ul className="mt-2 space-y-1">
+                              {shot.consistency_issues.map((issue, issueIndex) => (
+                                <li
+                                  key={`${issue.code}-${issueIndex}`}
+                                  className={`flex items-start gap-1 text-xs leading-5 ${
+                                    issue.severity === "blocking"
+                                      ? "text-red-700"
+                                      : "text-amber-700"
+                                  }`}
+                                >
+                                  <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                                  <span>
+                                    {issue.severity === "blocking"
+                                      ? "阻断："
+                                      : ""}
+                                    {issue.message}
+                                  </span>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : null}
                         </div>
                       </div>
                     </div>
@@ -1269,12 +1449,13 @@ export function ShotsPage() {
                 <Label>场景素材</Label>
                 <Select
                   value={form.scene_asset_id || ""}
-                  onChange={(event) =>
+                  onChange={(event) => {
+                    const nextId = event.target.value || null;
                     setForm((current) => ({
                       ...current,
-                      scene_asset_id: event.target.value || null,
-                    }))
-                  }
+                      scene_asset_id: nextId,
+                    }));
+                  }}
                 >
                   <option value="">未绑定</option>
                   {assets

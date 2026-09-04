@@ -67,6 +67,42 @@ _SECTION_ORDER = (
     "禁止项",
 )
 
+# 导演设计层重构后的 10 段最终提示词（v2）。
+_SECTION_ORDER_V2 = (
+    "画面风格",
+    "本镜叙事意图",
+    "初始状态",
+    "镜头与构图",
+    "人物表演",
+    "唯一时间轴",
+    "环境动态",
+    "对白与声音",
+    "结束状态",
+    "硬约束",
+)
+
+
+# v2 中与 v1 不同的段落标题，用于判定 10 段格式（「结束状态」是两版共享，不能作为判据）。
+_SECTION_ORDER_V2_UNIQUE = (
+    "画面风格",
+    "本镜叙事意图",
+    "初始状态",
+    "镜头与构图",
+    "人物表演",
+    "唯一时间轴",
+    "环境动态",
+    "对白与声音",
+    "硬约束",
+)
+
+
+def _active_section_order(sections: Mapping[str, str]) -> tuple[str, ...]:
+    """按实际存在的段落标题选择 v1（12 段）或 v2（10 段）顺序。"""
+
+    if any(name in sections for name in _SECTION_ORDER_V2_UNIQUE):
+        return _SECTION_ORDER_V2
+    return _SECTION_ORDER
+
 # 起草者约束类整行剔除（这些话约束的是提取 Agent，不是视频模型）
 _DRAFTER_LINE_PREFIXES = (
     "人物站位必须",
@@ -111,8 +147,8 @@ def detect_preflight_warnings(source: str) -> list[PreflightWarning]:
     """扫描完整规范版的核心动作与禁止项，返回词面互斥类预检告警。"""
 
     sections = _split_sections(source)
-    action = sections.get("核心动作", "")
-    forbidden = sections.get("禁止项", "")
+    action = sections.get("核心动作") or sections.get("唯一时间轴", "")
+    forbidden = sections.get("禁止项") or sections.get("硬约束", "")
     if not action or not forbidden:
         return []
 
@@ -228,7 +264,10 @@ def _compact_forbidden(body: str) -> str:
     clauses_in = [item.strip() for item in re.split(r"[；;\n]", body) if item.strip()]
     kept: list[str] = []
     seen: set[str] = set()
+    had_text_family = False
     for item in clauses_in:
+        if _TEXT_FAMILY_MARK.search(item):
+            had_text_family = True
         if any(token in item for token in _LOWVALUE_NEGATIVE_TOKENS):
             continue
         if _TEXT_FAMILY_MARK.search(item):
@@ -237,15 +276,32 @@ def _compact_forbidden(body: str) -> str:
             continue
         seen.add(item)
         kept.append(item)
-    kept.append(_CONSOLIDATED_TEXT_RULE)
+    if had_text_family:
+        # 仅当源存在文字/字幕/水印约束时才追加合并规则，避免向源注入
+        # 未声明的「全片无文字」硬约束（如场景本就要求出现招牌等文字）。
+        kept.append(_CONSOLIDATED_TEXT_RULE)
     return "；".join(kept) + "。"
 
 
 def compact_chinese_prompt(source: str) -> CompactResult:
-    """把完整规范版压缩为精简执行版；纯文本变换，不依赖任何模型调用。"""
+    """把完整规范版压缩为精简执行版；纯文本变换，不依赖任何模型调用。
+
+    自然语言版提示词（无【】段落标题）已经是导演口吻的精简执行文本，
+    原样透传，不做任何截断或改写。
+    """
 
     sections = _split_sections(source)
     warnings = detect_preflight_warnings(source)
+
+    if not sections:
+        return CompactResult(text=source.strip(), original_length=len(source), warnings=warnings)
+
+    # v2（导演设计层 10 段）已经是渲染好的结果，直接透传，不再做起草者约束压缩。
+    if _active_section_order(sections) is _SECTION_ORDER_V2:
+        parts = [f"【{name}】\n{sections[name]}" for name in _SECTION_ORDER_V2 if name in sections]
+        text = "\n\n".join(parts)
+        return CompactResult(text=text, original_length=len(source), warnings=warnings)
+
     total_match = _TOTAL_RE.search(sections.get("全局风格", ""))
     fallback_duration = float(total_match.group(1)) if total_match else None
 
@@ -324,7 +380,7 @@ class Ref2VATextOutput(BaseModel):
 
 
 _DIALOGUE_ENTRY_RE = re.compile(
-    r"^第\d+句[：:]\s*(.+?)说[：:]\s*[“\"](.+?)[”\"]\s*$",
+    r"^第\d+句(?:对白)?[，,：:]\s*(.+?)说[：:]\s*[“\"](.+?)[”\"]\s*$",
     re.MULTILINE,
 )
 
@@ -369,10 +425,13 @@ def build_ref2va_rewrite_request(
     }
     speakers: dict[str, str] = {}
     dialogue_payload: list[dict[str, Any]] = []
-    for index, item in enumerate(dialogue_lines, 1):
+    for item in dialogue_lines:
         speaker, text = item[0], item[1]
         time_range = item[2] if len(item) > 2 else None
-        speakers.setdefault(speaker, f"S{index}")
+        # 说话人 ID 按出场顺序连续编号（S1, S2, ...）：首个出现的说话人固定
+        # 拿到 S1，与它出现在第几行无关。
+        if speaker not in speakers:
+            speakers[speaker] = f"S{len(speakers) + 1}"
         dialogue_payload.append(
             {
                 "speaker": speaker,
@@ -390,7 +449,9 @@ def build_ref2va_rewrite_request(
         "reference_labels": labels,
         "speakers": speakers,
         "source_text": source,
-        "source_sections_zh": {key: sections[key] for key in _SECTION_ORDER if key in sections},
+        "source_sections_zh": {
+            key: sections[key] for key in _active_section_order(sections) if key in sections
+        },
         "dialogue_lines": dialogue_payload,
         "requirements": [
             "exactly six sections, official order, English prose",
@@ -488,7 +549,8 @@ def validate_ref2va_sections(
             seconds = (
                 int(match.group(1)) * 60 + int(match.group(2)) + int(match.group(3)) / 1000
             )
-            if seconds >= expected_duration_sec:
+            # 等于视频末尾的切点属于合法边界，只有严格超过时长才算越界。
+            if seconds > expected_duration_sec:
                 errors.append(
                     f"cut time {match.group(0)} exceeds requested duration "
                     f"{expected_duration_sec:g}s"

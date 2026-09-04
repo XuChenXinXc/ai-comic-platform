@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -54,6 +55,8 @@ _PROMPT_NAMES = {
 
 # 分镜单批最大生成尝试次数；批间衔接与覆盖校验失败只重试本批
 _STORYBOARD_BATCH_MAX_ATTEMPTS = 3
+
+logger = logging.getLogger(__name__)
 
 
 class StageExecutionError(RuntimeError):
@@ -164,10 +167,11 @@ class DynamicStageService:
         self.provider_service = (
             provider_service if provider_service is not None else ProviderService(database)
         )
-        # 分镜批次结果内存缓存：同一 run+签名+批次规划的后续 attempt 复用已成功批，
+        # 分镜批次结果内存缓存：同一 run+签名+批次规划+attempt 的后续执行复用已成功批，
         # 避免「某批反复失败 → 整章重跑」的全量浪费。仅进程内有效，重启即失。
+        # 键中包含 attempt，regenerate 产生新 attempt 后不会命中旧缓存。
         self._storyboard_batch_cache: dict[
-            tuple[str, str, tuple[tuple[tuple[str, ...], float, float], ...]],
+            tuple[str, str, tuple[tuple[tuple[str, ...], float, float], ...], int],
             list[storyboard_stage.StoryboardOutput | None],
         ] = {}
 
@@ -947,6 +951,34 @@ class DynamicStageService:
             raise TypeError(f"阶段 {context.stage_key} 未生成合法结果")
         return normalized, config, gate, raw_payload
 
+    # 分镜批缓存条目上限：超过后按 run 淘汰最旧运行，而不是粗暴全清。
+    _STORYBOARD_CACHE_MAX_ENTRIES = 16
+
+    def _prune_storyboard_batch_cache(self, current_run_id: str) -> None:
+        """缓存超限时按 run 淘汰最早写入的运行条目。
+
+        只原地删除键，不重建字典，保证执行中的批缓存引用继续有效；
+        当前 run 排在最后清理，优先淘汰其他旧运行。
+        """
+
+        if len(self._storyboard_batch_cache) <= self._STORYBOARD_CACHE_MAX_ENTRIES:
+            return
+        runs_in_order: list[str] = []
+        for key in self._storyboard_batch_cache:
+            key_run_id = key[0]
+            if key_run_id not in runs_in_order:
+                runs_in_order.append(key_run_id)
+        runs_in_order = [item for item in runs_in_order if item != current_run_id] + [
+            item for item in runs_in_order if item == current_run_id
+        ]
+        for oldest_run in runs_in_order:
+            if len(self._storyboard_batch_cache) <= self._STORYBOARD_CACHE_MAX_ENTRIES:
+                break
+            for key in [
+                item for item in self._storyboard_batch_cache if item[0] == oldest_run
+            ]:
+                del self._storyboard_batch_cache[key]
+
     async def _generate_storyboard_batches(
         self,
         context: _ExecutionContext,
@@ -998,7 +1030,7 @@ class DynamicStageService:
         plan_fingerprint = tuple(
             (tuple(plan.scene_ids), plan.start_sec, plan.end_sec) for plan in plans
         )
-        cache_key = (context.run_id, input_signature, plan_fingerprint)
+        cache_key = (context.run_id, input_signature, plan_fingerprint, attempt)
         cached_batches = self._storyboard_batch_cache.get(cache_key)
         for plan_index, plan in enumerate(plans):
             cached = (
@@ -1088,8 +1120,7 @@ class DynamicStageService:
                 previous_shot = batch_output.shots[-1]
             batch_cache = self._storyboard_batch_cache.setdefault(cache_key, [None] * len(plans))
             batch_cache[plan_index] = batch_output
-            if len(self._storyboard_batch_cache) > 16:
-                self._storyboard_batch_cache.clear()
+            self._prune_storyboard_batch_cache(context.run_id)
 
         return storyboard_stage.merge_storyboard_batches(
             collected,
@@ -1184,7 +1215,14 @@ class DynamicStageService:
                     )
                 )
         except Exception:
-            # 原始 Provider/归一化/门禁异常必须继续向调用方抛出。
+            # 原始 Provider/归一化/门禁异常必须继续向调用方抛出；
+            # 落库失败只记录完整堆栈，便于排查任务状态残留问题。
+            logger.exception(
+                "动态阶段失败状态落库异常：job_id=%s run_id=%s stage_id=%s",
+                context.job_id,
+                context.run_id,
+                context.stage_id,
+            )
             return
 
     @staticmethod

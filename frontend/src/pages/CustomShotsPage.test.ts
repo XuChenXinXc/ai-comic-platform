@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import type { ApiProvider, Asset, Shot } from "../types/api";
 import {
   customShotPayload,
@@ -7,10 +7,40 @@ import {
   emptyFreeShotDraft,
   isTianyueVideoProvider,
   firstSceneAssetId,
+  isSlotDurationValid,
   nextFreeProjectName,
   nextShotTransition,
+  runFreeProjectBootstrap,
   selectedAssetContext,
 } from "./CustomShotsPage";
+
+// 仅 mock 自由项目迁移单飞用到的接口；其余测试不触发 api 调用
+const freeBootstrapMocks = vi.hoisted(() => ({
+  projectsList: vi.fn(),
+  projectsUpdate: vi.fn(),
+  projectsCreate: vi.fn(),
+  chaptersList: vi.fn(),
+  chaptersCreate: vi.fn(),
+}));
+
+vi.mock("../api/client", () => ({
+  api: {
+    projects: {
+      list: freeBootstrapMocks.projectsList,
+      update: freeBootstrapMocks.projectsUpdate,
+      create: freeBootstrapMocks.projectsCreate,
+    },
+    chapters: {
+      list: freeBootstrapMocks.chaptersList,
+      create: freeBootstrapMocks.chaptersCreate,
+    },
+  },
+  mediaUrl: vi.fn(),
+  queryKeys: {
+    shots: (id: string) => ["shots", id],
+    assets: (id: string) => ["assets", id],
+  },
+}));
 
 function makeAsset(
   id: string,
@@ -220,4 +250,64 @@ test("test_free_create_project_name_is_unique", () => {
   expect(nextFreeProjectName([])).toBe("自由制作");
   expect(nextFreeProjectName(["自由制作"])).toBe("自由制作 2");
   expect(nextFreeProjectName(["自由制作", "自由制作 2"])).toBe("自由制作 3");
+});
+
+describe("自由制作分镜位时长校验统一", () => {
+  test("test_free_create_slot_duration_valid_accepts_valid_values", () => {
+    expect(isSlotDurationValid(5)).toBe(true);
+    expect(isSlotDurationValid(6)).toBe(true);
+    expect(isSlotDurationValid(12.5)).toBe(true);
+  });
+
+  test("test_free_create_slot_duration_valid_rejects_invalid_values", () => {
+    // NaN 等非法数值与过短时长统一视为非法：批量跳过该槽且保存禁用
+    expect(isSlotDurationValid(NaN)).toBe(false);
+    expect(isSlotDurationValid(Infinity)).toBe(false);
+    expect(isSlotDurationValid(-Infinity)).toBe(false);
+    expect(isSlotDurationValid(4)).toBe(false);
+    expect(isSlotDurationValid(0)).toBe(false);
+  });
+});
+
+describe("自由项目迁移单飞", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.removeItem("free-create-project-id");
+    localStorage.removeItem("free-create-project-ids");
+  });
+
+  test("test_free_project_bootstrap_concurrent_calls_share_one_execution", async () => {
+    // 存在待打标旧项目且没有自由项目，迁移后会触发一次创建
+    freeBootstrapMocks.projectsList.mockImplementation(
+      async (options?: { kind?: string }) =>
+        options?.kind === "free"
+          ? []
+          : [{ id: "legacy-1", name: "手动分镜", is_free_create: false }],
+    );
+    freeBootstrapMocks.projectsUpdate.mockResolvedValue(undefined);
+    freeBootstrapMocks.projectsCreate.mockResolvedValue({
+      id: "free-new",
+      name: "自由制作",
+      is_free_create: true,
+    });
+    freeBootstrapMocks.chaptersList.mockResolvedValue([]);
+    freeBootstrapMocks.chaptersCreate.mockResolvedValue({ id: "chap-new" });
+
+    const first = runFreeProjectBootstrap();
+    const second = runFreeProjectBootstrap();
+    // 并发调用复用同一次执行，避免重复创建「自由制作」项目
+    expect(second).toBe(first);
+
+    const result = await first;
+    expect(result.projectId).toBe("free-new");
+    expect(result.chapterId).toBe("chap-new");
+    expect(freeBootstrapMocks.projectsCreate).toHaveBeenCalledTimes(1);
+
+    // 执行结束后清空 in-flight，后续挂载仍按原语义重新执行
+    const third = runFreeProjectBootstrap();
+    expect(third).not.toBe(first);
+    await third;
+    // 重新执行时创建接口再次被调用（各自独立执行）
+    expect(freeBootstrapMocks.projectsCreate).toHaveBeenCalledTimes(2);
+  });
 });

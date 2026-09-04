@@ -8,7 +8,7 @@ from sqlalchemy import delete, insert, select, update
 from app.db import Database, db
 from app.models.tables import api_provider, job, project
 from app.services.errors import ServiceError, bad_request, conflict, not_found
-from app.services.file_service import FileService, FileServiceError, file_service
+from app.services.file_service import FileService, FileServiceError, derive_file_service
 from app.services.signature_service import source_signature
 from app.services.utils import new_id, row_dict, utc_now
 
@@ -20,8 +20,16 @@ class ProjectService:
         storage: FileService | None = None,
     ) -> None:
         self.database = database or db
-        self.storage = storage or file_service
-        self.storage.database = self.database
+        if storage is not None:
+            # 不改写已绑定数据库的实例（如全局 file_service 单例），
+            # 避免跨实例污染；未绑定 database 的注入实例仍绑定当前数据库，
+            # 保持既有调用方（自建 FileService(workspace)）的兼容行为。
+            if storage.database is None:
+                storage.database = self.database
+            self.storage = storage
+        else:
+            # 默认派生绑定当前 database 的独立实例，不改写全局单例
+            self.storage = derive_file_service(self.database)
 
     def _public_record(self, record: dict[str, Any]) -> dict[str, Any]:
         result = dict(record)
@@ -123,7 +131,18 @@ class ProjectService:
 
     def update(self, project_id: str, values: dict[str, Any]) -> dict[str, Any]:
         current = self.get(project_id)
-        changes = dict(values)
+        # 显式传 null 的非 Provider 字段视为「保持不变」：这些列 NOT NULL，
+        # 裸写 None 会触发 IntegrityError 500；Provider 默认字段 null 合法（清除默认）。
+        provider_default_fields = {
+            "default_text_provider_id",
+            "default_image_provider_id",
+            "default_video_provider_id",
+        }
+        changes = {
+            key: value
+            for key, value in values.items()
+            if value is not None or key in provider_default_fields
+        }
         if "source_text" in changes:
             signature = source_signature(changes["source_text"])
             changes["source_signature"] = signature

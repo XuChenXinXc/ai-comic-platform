@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from typing import Any
@@ -18,8 +19,10 @@ from app.models.tables import (
     job,
     keyframe_version,
     project,
+    scene_view,
     screenplay,
     shot,
+    shot_audio,
     video_version,
 )
 from app.prompts import load_prompt
@@ -29,6 +32,7 @@ from app.schemas import (
     BatchRefinedPromptsOutput,
     ScreenplayDialogue,
     ShotContinuityPairOutput,
+    ShotDirectorPlanOutput,
     ShotExtractionOutput,
     ShotImagePromptOutput,
     ShotOutput,
@@ -36,9 +40,15 @@ from app.schemas import (
     ShotVideoPromptOptimizeOutput,
     ShotVideoPromptOutput,
 )
+from app.services.asset_service import AssetService
+from app.services.director_plan import (
+    director_bundle_from_llm,
+    validate_shot_consistency,
+)
 from app.services.errors import ServiceError, bad_request, conflict, not_found
-from app.services.file_service import file_service, project_media_url
+from app.services.file_service import FileServiceError, file_service, project_media_url
 from app.services.job_service import JobService
+from app.services.natural_video_prompt import validate_natural_style
 from app.services.prompt_service import (
     compile_keyframe_prompt,
     compile_video_prompt,
@@ -58,6 +68,8 @@ from app.services.utils import (
     utc_now,
 )
 
+logger = logging.getLogger(__name__)
+
 _JSON_FIELDS = {
     "character_ids": "character_ids_json",
     "prop_ids": "prop_ids_json",
@@ -67,10 +79,32 @@ _JSON_FIELDS = {
     "reference_bindings": "reference_bindings_json",
 }
 
+# update 允许写入且为 NOT NULL 的纯文本列：显式传 null 时归一化为空串，
+# 避免把 None 写进 NOT NULL 列触发 IntegrityError 500。
+_NOT_NULL_TEXT_FIELDS = (
+    "source_ref",
+    "start_state",
+    "action",
+    "narration",
+    "shot_type",
+    "camera_angle",
+    "camera_move",
+    "end_state",
+    "next_hook",
+    "transition_from_prev",
+    "frame_description",
+    "image_prompt",
+    "image_prompt_override",
+    "video_prompt",
+    "video_prompt_override",
+    "negative_prompt",
+)
+
 _SIGNATURE_FIELDS = (
     "source_type",
     "source_ref",
     "scene_asset_id",
+    "scene_view_id",
     "character_ids",
     "prop_ids",
     "positions",
@@ -96,6 +130,10 @@ _SIGNATURE_FIELDS = (
 )
 
 _ACTIVE_JOB_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+# 分镜提取「缺失素材 → 补素材 → 重新提取」的最大补建轮数：每轮调用一次素材补全
+# 模型，补建后必然再调用一次分镜模型重新提取验证；超过轮数后按最后一次提取
+# 结果报缺失清单，交由用户决定补建。
+_MAX_MISSING_REFILL_ROUNDS = 2
 _PROMPT_GENERATED_FIELDS = {
     "image_prompt",
     "image_prompt_override",
@@ -106,6 +144,73 @@ _PROMPT_GENERATED_FIELDS = {
 _PROMPT_GUARD_FIELDS = tuple(
     field for field in _SIGNATURE_FIELDS if field not in _PROMPT_GENERATED_FIELDS
 )
+
+_IMAGE_TOKEN_RE = re.compile(r"@Image(\d+)")
+
+
+def _collect_prompt_reference_tokens(prompt: str) -> list[str]:
+    """按出现顺序收集提示词中的 @ImageN 引用（该编号由入队时的参考图数组决定）。"""
+    seen: list[str] = []
+    for number in _IMAGE_TOKEN_RE.findall(prompt or ""):
+        token = f"@Image{number}"
+        if token not in seen:
+            seen.append(token)
+    return seen
+
+
+def _reference_token_sentences(prompt: str, tokens: list[str]) -> str:
+    """提取每个 @ImageN 所在的整句，作为优化时的只读引用说明。"""
+    lines: list[str] = []
+    for token in tokens:
+        pattern = re.compile(re.escape(token))
+        for match in pattern.finditer(prompt):
+            start = prompt.rfind("。", 0, match.start()) + 1
+            end = prompt.find("。", match.end())
+            if end < 0:
+                end = len(prompt)
+            sentence = prompt[start : end + 1].strip()
+            if sentence:
+                lines.append(sentence)
+            break
+    return "\n".join(lines)
+
+
+def _validate_prompt_reference_identity(
+    original: str,
+    optimized: str,
+    reference_tokens: list[str],
+) -> list[str]:
+    """确定性校验优化前后的素材引用集合一致，返回问题列表。
+
+    优化只允许调整引用在句子中的表达位置，不允许新增、删除或改号。
+    """
+    issues: list[str] = []
+    original_set = _collect_prompt_reference_tokens(original)
+    optimized_set = _collect_prompt_reference_tokens(optimized)
+    missing = [token for token in original_set if token not in optimized_set]
+    added = [token for token in optimized_set if token not in original_set]
+    if missing:
+        issues.append(f"丢失引用：{'、'.join(missing)}")
+    if added:
+        issues.append(f"凭空新增引用：{'、'.join(added)}")
+    # 编号顺序含义由参考图数组决定，优化不得改变原有出现顺序的相对关系；
+    # 按两份文本中的真实出现顺序比较（只比较原提示词中已存在的引用）。
+    original_ordered = _collect_prompt_reference_tokens(original)
+    optimized_ordered = _collect_prompt_reference_tokens(optimized)
+    shared_original = [token for token in original_ordered if token in optimized_set]
+    shared_optimized = [token for token in optimized_ordered if token in original_set]
+    if (
+        not issues
+        and len(shared_original) > 1
+        and shared_optimized != shared_original
+    ):
+        issues.append(
+            "引用出现顺序被改变："
+            + "→".join(shared_original)
+            + " 变为 "
+            + "→".join(shared_optimized)
+        )
+    return issues
 
 
 class ShotService:
@@ -177,7 +282,12 @@ class ShotService:
             value = json_loads(result[column], [])
             result[column] = value
             result[alias] = value
+        # 导演计划是对象结构（{} 为空），不能套用上面的列表默认值。
+        result["director_plan"] = json_loads(result.get("director_plan_json") or "{}", {})
         result["scene_no"] = cls._scene_no(result["source_ref"])
+        result.setdefault("scene_view_id", None)
+        result["scene_view_key"] = None
+        result["scene_view_name"] = None
         return result
 
     @staticmethod
@@ -222,6 +332,30 @@ class ShotService:
             )
         }
 
+    @classmethod
+    def _fill_scene_view_info(cls, connection: Any, record: dict[str, Any]) -> dict[str, Any]:
+        """回填分镜的 scene_view_key / scene_view_name 展示字段。
+
+        只读展示用；分镜提交用 scene_view_key（view id 或 key），
+        后端按 scene_view_id 稳定绑定。视图被删除后置空回退 MASTER。
+        """
+        view_id = record.get("scene_view_id")
+        if not view_id:
+            record["scene_view_key"] = None
+            record["scene_view_name"] = None
+            return record
+        row = connection.execute(
+            select(scene_view.c.view_key, scene_view.c.name).where(scene_view.c.id == view_id)
+        ).first()
+        if row:
+            record["scene_view_key"] = row.view_key
+            record["scene_view_name"] = row.name
+        else:
+            record["scene_view_id"] = None
+            record["scene_view_key"] = None
+            record["scene_view_name"] = None
+        return record
+
     @staticmethod
     def _reference_labels(
         connection: Any,
@@ -230,6 +364,7 @@ class ShotService:
         labels = {
             "character_identity": "锁定角色身份与服装",
             "scene_layout": "锁定场景空间结构和光线",
+            "scene_master": "锁定场景母版空间结构",
             "prop_identity": "锁定物品外观、材质和结构",
             "previous_keyframe": "锁定上一镜构图与连续性",
         }
@@ -418,10 +553,33 @@ class ShotService:
             anchors=video_anchors,
             shot_context=context,
             negative_prompt=current["negative_prompt"],
+            director_plan=current.get("director_plan") or None,
         )
         current["final_video_prompt"] = (
             str(current["video_prompt_override"] or "").strip() or current["compiled_video_prompt"]
         )
+        # 最终一致性校验：把问题以只读方式暴露给前端，不在此处阻断。
+        current["consistency_issues"] = []
+        director_plan_value = current.get("director_plan") or None
+        if director_plan_value:
+            bundle = director_bundle_from_llm(director_plan_value)
+            current["consistency_issues"] = [
+                {
+                    "code": issue.code,
+                    "severity": issue.severity,
+                    "message": issue.message,
+                    "details": issue.details,
+                }
+                for issue in validate_shot_consistency(
+                    shot={**current, "prop_names": context.get("props") or []},
+                    timeline=bundle.timeline,
+                    dialogue_bindings=bundle.dialogue_bindings,
+                    duration_sec=self._preview_video_duration(
+                        current_project, current["duration_sec"]
+                    ),
+                    prev_end_state=prev_end_state,
+                )
+            ]
 
     def list(self, chapter_id: str) -> list[dict[str, Any]]:
         current_chapter = self._chapter(chapter_id)
@@ -438,6 +596,7 @@ class ShotService:
             raw_records = []
             for row in connection.execute(statement):
                 record = self._decode(dict(row._mapping))
+                self._fill_scene_view_info(connection, record)
                 source_now = self._current_source_signature(
                     connection, current_chapter, record["source_type"]
                 )
@@ -468,9 +627,19 @@ class ShotService:
         with self.database.engine.connect() as connection:
             # 一次性查询所有章节信息
             chapter_map = {
-                row.id: {"chapter_no": row.chapter_no, "title": row.title}
+                row.id: {
+                    "id": row.id,
+                    "chapter_no": row.chapter_no,
+                    "title": row.title,
+                    "source_signature": row.source_signature,
+                }
                 for row in connection.execute(
-                    select(chapter.c.id, chapter.c.chapter_no, chapter.c.title)
+                    select(
+                        chapter.c.id,
+                        chapter.c.chapter_no,
+                        chapter.c.title,
+                        chapter.c.source_signature,
+                    )
                     .where(chapter.c.project_id == project_id)
                     .order_by(chapter.c.chapter_no)
                 )
@@ -492,11 +661,14 @@ class ShotService:
                 record = self._decode(dict(row._mapping))
                 chapter_id = record["chapter_id"]
                 chapter_info = chapter_map[chapter_id]
+                self._fill_scene_view_info(connection, record)
 
-                # 获取源签名（需要当前章节信息）
-                current_chapter = self._chapter(chapter_id)
-                source_now = self._current_source_signature(
-                    connection, current_chapter, record["source_type"]
+                # 获取源签名：复用已加载的 chapter_map，避免每行再开一次
+                # 连接回查 chapter 表（原实现注释声称避免 N+1 却仍在循环内查询）。
+                source_now = self._current_source_signature_for_chapter(
+                    connection,
+                    chapter_info,
+                    record["source_type"],
                 )
                 record["is_stale"] = bool(
                     record["source_signature"] and record["source_signature"] != source_now
@@ -529,6 +701,7 @@ class ShotService:
             if record is None:
                 raise not_found("分镜")
             result = self._decode(record)
+            self._fill_scene_view_info(connection, result)
             # 取上一镜轻量数据参与编译，保证单镜详情与列表/入队的
             # 衔接锚点（@Image 编号）口径一致。
             prev_row = connection.execute(
@@ -608,6 +781,26 @@ class ShotService:
             or ""
         )
 
+    @staticmethod
+    def _current_source_signature_for_chapter(
+        connection: Any,
+        chapter_info: dict[str, Any],
+        source_type: str,
+    ) -> str:
+        """list_project 内部复用：chapter_info 来自一次查询的 chapter_map，
+        避免逐行回查 chapter 表（screenplay 签名仍需查询，但不再重复读 chapter）。
+        """
+        if source_type == "novel":
+            return str(chapter_info.get("source_signature") or "")
+        return (
+            connection.execute(
+                select(screenplay.c.own_signature).where(
+                    screenplay.c.chapter_id == chapter_info.get("id")
+                )
+            ).scalar()
+            or ""
+        )
+
     def _source_signature(self, chapter_record: dict[str, Any], source_type: str) -> str:
         with self.database.engine.connect() as connection:
             signature = self._current_source_signature(connection, chapter_record, source_type)
@@ -638,6 +831,40 @@ class ShotService:
             "expected_status": current["status"],
             "params": params,
         }
+
+    def _resolve_scene_view_id(
+        self,
+        project_id: str,
+        scene_asset_id: str | None,
+        scene_view_ref: Any,
+    ) -> str | None:
+        """把分镜提交的 scene_view_key 解析为 scene_view.id。
+
+        兼容两种写法：view id（前端 Select 的 option value）或
+        view_key（master/front/reverse/left45/right45）。找不到返回 None，
+        分镜回退 MASTER/旧图，不阻断场景绑定。
+        """
+        if not scene_asset_id or not scene_view_ref:
+            return None
+        ref = str(scene_view_ref or "").strip()
+        if not ref:
+            return None
+        with self.database.engine.connect() as connection:
+            row = connection.execute(
+                select(scene_view.c.id).where(
+                    scene_view.c.asset_id == scene_asset_id,
+                    scene_view.c.view_key == ref,
+                )
+            ).first()
+            if row:
+                return str(row[0])
+            row_id = connection.execute(
+                select(scene_view.c.id).where(
+                    scene_view.c.asset_id == scene_asset_id,
+                    scene_view.c.id == ref,
+                )
+            ).first()
+            return str(row_id[0]) if row_id else None
 
     def _validate_asset_ids(
         self,
@@ -674,6 +901,7 @@ class ShotService:
         allowed_asset_roles = {
             "character_identity": "character",
             "scene_layout": "scene",
+            "scene_master": "scene",
             "prop_identity": "prop",
         }
         with self.database.engine.connect() as connection:
@@ -751,6 +979,9 @@ class ShotService:
         semantic = {key: values.get(key) for key in _SIGNATURE_FIELDS if key in values}
         semantic["source_type"] = source_type
         semantic["duration_sec"] = values["duration_sec"]
+        # 已移除多视角场景（Scene Pack）：分镜不再绑定视角，
+        # scene_view_id 恒为 NULL，场景参考图回退旧版单图。
+        semantic["scene_view_id"] = None
         semantic.setdefault("image_prompt_override", "")
         semantic.setdefault("video_prompt_override", "")
         # 这些列 NOT NULL 且无 server_default，未传入时补空串，
@@ -779,6 +1010,7 @@ class ShotService:
                 {
                     "project_id": project_id,
                     "scene_asset_id": semantic.get("scene_asset_id"),
+                    "scene_view_id": semantic.get("scene_view_id"),
                     "character_ids": semantic.get("character_ids", []),
                     "prop_ids": semantic.get("prop_ids", []),
                 }
@@ -810,7 +1042,15 @@ class ShotService:
         return self.get(record["id"])
 
     def sync_asset_image_binding(self, asset_id: str, asset_image_id: str) -> None:
-        """素材图切换为当前版本后，回写所有引用该素材的分镜。"""
+        """素材图切换为当前版本后，回写所有引用该素材的分镜。
+
+        场景素材按 Scene Pack 分区（MASTER / 各 View / 旧图各有一张 current），
+        这里按新图的 scene_view_id 匹配分镜：
+        - 新图属于某 View → 只更新 scene_view_id 相同的分镜；
+        - 新图是旧图（NULL）→ 只更新未选视图（scene_view_id IS NULL）的分镜。
+        角色/道具保持原全量替换行为。分镜生成关键帧时仍会按
+        _resolve_shot_reference_bindings 重新解析，此处只保证静态绑定展示正确。
+        """
         with self.database.engine.begin() as connection:
             asset_record = connection.execute(
                 select(asset.c.project_id, asset.c.asset_type).where(asset.c.id == asset_id)
@@ -824,6 +1064,10 @@ class ShotService:
             }.get(asset_record.asset_type)
             if role is None:
                 return
+            new_image = connection.execute(
+                select(asset_image.c.scene_view_id).where(asset_image.c.id == asset_image_id)
+            ).first()
+            new_view_id = new_image.scene_view_id if new_image else None
             rows = connection.execute(
                 select(shot).where(shot.c.project_id == asset_record.project_id)
             ).all()
@@ -834,13 +1078,16 @@ class ShotService:
             }
             for row in rows:
                 current = self._decode(dict(row._mapping))
-                referenced = asset_id in {
+                if asset_id not in {
                     current.get("scene_asset_id"),
                     *current.get("character_ids", []),
                     *current.get("prop_ids", []),
-                }
-                if not referenced:
+                }:
                     continue
+                if role == "scene_layout":
+                    # 场景按视图匹配：新图所属 View 与分镜选中的 View 一致才回写
+                    if current.get("scene_view_id") != new_view_id:
+                        continue
                 bindings = current["reference_bindings"]
                 next_bindings: list[dict[str, Any]] = []
                 replaced = False
@@ -881,6 +1128,19 @@ class ShotService:
         current = self.get(shot_id)
         if expected_revision is not None and current["revision"] != expected_revision:
             raise conflict("分镜已被其他请求更新，请重试")
+        # 显式传 null 的 JSON 列表字段归一化为空列表，与 create/_save_extracted 一致，
+        # 避免把 "null" 写进 JSON 列或在校验阶段对 None 迭代抛 TypeError。
+        for key in _JSON_FIELDS:
+            if key in values and values[key] is None:
+                values[key] = []
+        # 显式传 null 的 NOT NULL 文本列归一化为空串：客户端把 null 当「清空」用，
+        # 裸写 None 会触发 IntegrityError 500（scene_asset_id 可为 NULL，保持原样）。
+        for key in _NOT_NULL_TEXT_FIELDS:
+            if key in values and values[key] is None:
+                values[key] = ""
+        # status 显式传 null 视为「保持不变」，而不是写入 NOT NULL 列触发 500。
+        if "status" in values and values["status"] is None:
+            values["status"] = current["status"]
         duration = values.get("duration_sec", current["duration_sec"])
         action = values.get("action", current.get("action", ""))
         dialogue = values.get("dialogue", current.get("dialogue", []))
@@ -898,10 +1158,24 @@ class ShotService:
         )
         changes: dict[str, Any] = {}
         for key, value in values.items():
+            if key == "scene_view_key":
+                # 已移除多视角场景（Scene Pack）：分镜不再绑定视角，
+                # scene_view_id 恒为 NULL，场景参考图回退旧版单图。
+                changes["scene_view_id"] = None
+                continue
+            if key == "director_plan":
+                # 导演计划是对象结构，单独序列化，空值落成 {} 而非 []。
+                changes["director_plan_json"] = json_dumps(
+                    value if isinstance(value, dict) else {}
+                )
+                continue
             column = _JSON_FIELDS.get(key, key)
-            changes[column] = json_dumps(value) if column.endswith("_json") else value
+            changes[column] = json_dumps(value or []) if column.endswith("_json") else value
         if values:
             semantic = {key: values.get(key, current.get(key)) for key in _SIGNATURE_FIELDS}
+            semantic["scene_view_id"] = changes.get(
+                "scene_view_id", current.get("scene_view_id")
+            )
             changes["own_signature"] = self._signature(semantic)
             changes["revision"] = current["revision"] + 1
             if "status" not in changes:
@@ -914,8 +1188,21 @@ class ShotService:
                 result = connection.execute(statement.values(**changes))
                 if expected_revision is not None and result.rowcount != 1:
                     raise conflict("分镜已被其他请求更新，请重试")
-                if any(key in _SIGNATURE_FIELDS for key in values):
+                # 语义字段变化或场景视图切换都会使旧关键帧/视频失效
+                scene_view_changed = (
+                    "scene_view_id" in changes
+                    and changes["scene_view_id"] != current.get("scene_view_id")
+                )
+                if (
+                    any(key in _SIGNATURE_FIELDS for key in values)
+                    or scene_view_changed
+                ):
                     self._invalidate_media_for_shots(connection, {shot_id})
+                elif "director_plan" in values:
+                    # 导演计划只影响视频提示词渲染，仅失效视频，不误伤关键帧。
+                    self._invalidate_media_for_shots(
+                        connection, {shot_id}, video_only=True
+                    )
         return self.get(shot_id)
 
     @staticmethod
@@ -968,12 +1255,17 @@ class ShotService:
         cls,
         connection: Any,
         shot_ids: set[str],
+        *,
+        video_only: bool = False,
     ) -> None:
-        """分镜语义变化后阻止旧媒体继续成为当前结果或完成激活。"""
+        """分镜语义变化后阻止旧媒体继续成为当前结果或完成激活。
+
+        video_only=True 时只失效视频（如导演计划只影响视频提示词渲染）。
+        """
         if not shot_ids:
             return
         keyframe_ids, video_ids = cls._related_media_ids(connection, shot_ids)
-        media_ids = keyframe_ids | video_ids
+        media_ids = video_ids if video_only else keyframe_ids | video_ids
         now = utc_now()
         if media_ids:
             connection.execute(
@@ -1004,18 +1296,19 @@ class ShotService:
                 ),
             )
 
-        connection.execute(
-            update(keyframe_version)
-            .where(
-                keyframe_version.c.shot_id.in_(shot_ids),
-                _legacy_only_where(keyframe_version),
+        if not video_only:
+            connection.execute(
+                update(keyframe_version)
+                .where(
+                    keyframe_version.c.shot_id.in_(shot_ids),
+                    _legacy_only_where(keyframe_version),
+                )
+                .values(
+                    is_current=False,
+                    status="failed",
+                    error="分镜内容已变更，关键帧已失效",
+                )
             )
-            .values(
-                is_current=False,
-                status="failed",
-                error="分镜内容已变更，关键帧已失效",
-            )
-        )
         connection.execute(
             update(video_version)
             .where(
@@ -1139,15 +1432,28 @@ class ShotService:
                 ).scalars()
             )
             self._renumber(connection, current["chapter_id"], remaining)
+        # 文件删除失败只记录日志继续清理，不让单个失败中断后续删除或导致 500
+        failed_paths: list[str] = []
         for path in media_paths:
-            file_service.delete_file(current["project_id"], path)
+            try:
+                file_service.delete_file(current["project_id"], path)
+            except (FileServiceError, OSError) as exc:
+                logger.warning("删除分镜媒体文件失败：%s（%s）", path, exc)
+                failed_paths.append(path)
+        if failed_paths:
+            logger.warning(
+                "分镜删除完成，但有 %d 个媒体文件删除失败：%s",
+                len(failed_paths),
+                failed_paths,
+            )
 
     @staticmethod
     def _media_paths(connection: Any, shot_ids: list[str]) -> list[str]:
         if not shot_ids:
             return []
         paths: list[str] = []
-        for table in (keyframe_version, video_version):
+        # 配音文件随分镜删除一并清理（分镜行 CASCADE 之前收集）
+        for table in (keyframe_version, video_version, shot_audio):
             paths.extend(
                 connection.execute(
                     select(table.c.file_path).where(
@@ -1461,6 +1767,63 @@ class ShotService:
             ),
         )
 
+    def queue_director_plan(
+        self,
+        shot_id: str,
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        current = self.get(shot_id)
+        current_project = self._project(current["project_id"])
+        return self.jobs.create(
+            project_id=current["project_id"],
+            chapter_id=current["chapter_id"],
+            job_type="generate_shot_director_plan",
+            target_type="shot",
+            target_id=shot_id,
+            provider_kind="text",
+            provider_id=options.get("provider_id") or current_project["default_text_provider_id"],
+            input_data={
+                "expected_revision": current["revision"],
+                "params": options.get("params", {}),
+            },
+        )
+
+    def queue_director_plan_batch(
+        self,
+        chapter_id: str,
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        current_chapter = self._chapter(chapter_id)
+        project_id = current_chapter["project_id"]
+        current_project = self._project(project_id)
+        statement = select(shot).where(shot.c.chapter_id == chapter_id)
+        if options.get("ids"):
+            statement = statement.where(shot.c.id.in_(options["ids"]))
+        with self.database.engine.connect() as connection:
+            records = [
+                self._decode(dict(row._mapping)) for row in connection.execute(statement)
+            ]
+        if not records:
+            raise bad_request("没有可生成导演设计的分镜")
+        items = [
+            {
+                "project_id": project_id,
+                "chapter_id": chapter_id,
+                "job_type": "generate_shot_director_plan",
+                "target_type": "shot",
+                "target_id": record["id"],
+                "provider_kind": "text",
+                "provider_id": options.get("provider_id")
+                or current_project["default_text_provider_id"],
+                "input_data": {
+                    "expected_revision": record["revision"],
+                    "params": options.get("params", {}),
+                },
+            }
+            for record in records
+        ]
+        return self.jobs.create_batch(items)
+
     def queue_prompt_batch(self, chapter_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current_chapter = self._chapter(chapter_id)
         project_id = current_chapter["project_id"]
@@ -1498,6 +1861,12 @@ class ShotService:
         return self.jobs.create_batch(items)
 
     async def handle_extract(self, job: dict[str, Any]) -> dict[str, Any]:
+        """整章/单场分镜提取入口。
+
+        工作流：单轮生成分镜 → 汇总 missing_assets → 自动补建素材 →
+        重新生成 → 保存。剧情完整性优先：缺素材时补素材重试，而不是
+        强制绑定近似素材或删改剧情。
+        """
         current_chapter = self._chapter(job["chapter_id"])
         current_project = self._project(current_chapter["project_id"])
         input_data = json_loads(job.get("input_json"), {})
@@ -1516,16 +1885,144 @@ class ShotService:
             if isinstance(screenplay_content, dict)
             else None
         )
+        all_shots: list[dict[str, Any]] = []
+        all_warnings: list[dict[str, Any]] = []
+        missing_assets: list[dict[str, Any]] = []
+        all_shots, round_warnings = await self._extract_shots_payload(
+            job=job,
+            current_project=current_project,
+            source_type=source_type,
+            input_data=input_data,
+            screenplay_content=screenplay_content,
+            scenes=scenes,
+            content_raw=content_raw,
+        )
+        missing_assets = self._collect_missing_assets(all_shots)
+        # 跨轮保留：前一轮的质量警告与补素材警告不能被子轮覆盖
+        all_warnings = [*all_warnings, *round_warnings]
+        for _round in range(_MAX_MISSING_REFILL_ROUNDS):
+            if not missing_assets:
+                break
+            detail = "、".join(
+                f"{item['asset_type']}「{item['suggested_name']}」"
+                for item in missing_assets
+            )
+            all_warnings.append({
+                "scene_no": 0,
+                "message": (
+                    f"检测到素材缺失（{detail}），已自动补建素材并重新提取分镜；"
+                    "未强行绑定近似素材，剧情完整性优先。"
+                ),
+            })
+            await self._refill_missing_assets(
+                current_chapter["id"],
+                job.get("provider_id"),
+                missing_assets,
+            )
+            # 补建后立即重新提取验证：只有重新提取仍报告缺失才允许报错，
+            # 避免最后一轮补建成功后仍按补建前的缺失清单误报失败。
+            all_shots, round_warnings = await self._extract_shots_payload(
+                job=job,
+                current_project=current_project,
+                source_type=source_type,
+                input_data=input_data,
+                screenplay_content=screenplay_content,
+                scenes=scenes,
+                content_raw=content_raw,
+            )
+            missing_assets = self._collect_missing_assets(all_shots)
+            all_warnings = [*all_warnings, *round_warnings]
+        if missing_assets:
+            # 自动补素材已重试多轮仍无法覆盖：明确报缺失清单，禁止把缺素材的分镜
+            # 静默保存（既不强行绑定近似素材，也不得删改剧情）。
+            detail = "、".join(
+                f"{item['asset_type']}「{item['suggested_name']}」"
+                for item in missing_assets
+            )
+            raise bad_request(
+                f"分镜素材缺失：{detail}。已自动尝试补建素材仍无法覆盖，"
+                "请先补齐对应素材后重新提取分镜，或在分镜中修正素材绑定。"
+            )
+        return self._save_extracted(
+            current_chapter,
+            source_type,
+            input_data,
+            all_shots,
+            all_warnings,
+        )
+
+    async def _refill_missing_assets(
+        self,
+        chapter_id: str,
+        provider_id: str | None,
+        missing_assets: list[dict[str, Any]],
+    ) -> None:
+        """调用素材补全流程，把缺失素材写入 asset 表（供下一轮分镜提取使用）。"""
+        await AssetService(self.database, self.jobs).complete_missing(
+            chapter_id,
+            missing_assets,
+            provider_id=provider_id,
+        )
+
+    @staticmethod
+    def _collect_missing_assets(
+        shots: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """汇总整批分镜报告的缺失素材，按（类型+建议名）去重。
+
+        返回项的 asset_type / suggested_name / suggested_aliases 供补素材流程使用。
+        """
+        seen: set[tuple[str, str]] = set()
+        result: list[dict[str, Any]] = []
+        # 循环变量不能叫 shot：会遮蔽模块顶部导入的 shot 表对象（ruff F402）
+        for shot_data in shots:
+            for item in shot_data.get("missing_assets", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                asset_type = str(item.get("asset_type") or "")
+                name = str(item.get("suggested_name") or "").strip()
+                if asset_type not in {"scene", "character", "prop"} or not name:
+                    continue
+                key = (asset_type, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(
+                    {
+                        "asset_type": asset_type,
+                        "reason": str(item.get("reason") or ""),
+                        "source_ref": str(item.get("source_ref") or ""),
+                        "suggested_name": name,
+                        "suggested_aliases": item.get("suggested_aliases", [])
+                        if isinstance(item.get("suggested_aliases"), list)
+                        else [],
+                    }
+                )
+        return result
+
+    async def _extract_shots_payload(
+        self,
+        *,
+        job: dict[str, Any],
+        current_project: dict[str, Any],
+        source_type: str,
+        input_data: dict[str, Any],
+        screenplay_content: Any,
+        scenes: Any,
+        content_raw: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """单轮分镜生成：读取最新素材目录，注入缺失提示，按模式生成全部分镜。"""
         asset_catalog = self._asset_catalog(current_project["id"])
         if not any(item["asset_type"] == "scene" for item in asset_catalog):
             raise conflict("请先提取场景素材，再提取分镜")
-        # 前置校验：剧本场次名必须在场景素材库中可解析。分镜提示词要求
-        # scene_name 逐字沿用剧本，后端按名称绑定素材；剧本名若带桥段标题
-        # （如「坐错桌」）或与素材名不一致，模型无论如何输出都会整批绑定
-        # 失败。这里在调用模型前拦截并给出可操作提示，避免白跑一遍提取。
+        # 剧本场次名不匹配场景素材库时不再硬拦截整批提取：新绑定协议以 ID 为准，
+        # 模型可对这些场次输出空 scene_asset_id 并在 missing_assets 中报告缺失
+        # 场景，由补素材流程兜底，避免「为了迁就素材而删改剧情」。
+        # 这里只把不匹配信息注入 user_prompt 提醒模型，防止它强行绑定近似素材。
+        unmatched_note = ""
         if isinstance(scenes, list) and scenes:
-            # 只校验本次提取实际会处理的场次：整章模式校验全部，
-            # 单场模式只校验目标场次，避免其他场次的旧名误拦单场重试。
+            # 只提示本次提取实际会处理的场次：整章模式提示全部，
+            # 单场模式只提示目标场次，避免其他场次的旧名误扰单场重试。
             if input_data.get("scope") == "scene":
                 target_scene_no = input_data.get("scene_no")
                 scenes_to_check = [
@@ -1540,31 +2037,19 @@ class ShotService:
                 self._asset_lookup(current_project["id"]),
             )
             if unmatched_scenes:
-                available = "、".join(
-                    sorted(
-                        {
-                            str(item["name"])
-                            for item in asset_catalog
-                            if item["asset_type"] == "scene"
-                        }
-                    )
-                )
                 detail = "；".join(
                     f"场次 {scene_no}「{scene_name}」"
                     for scene_no, scene_name in unmatched_scenes
                 )
-                raise bad_request(
-                    "分镜素材绑定前置校验失败：剧本场次名无法匹配到任何场景素材："
-                    f"{detail}。"
-                    f"当前场景素材：{available or '无'}。"
-                    "请先修正剧本场次名（与素材库同名），或补齐对应场景素材后重试。"
+                unmatched_note = (
+                    "\n\n注意：以下剧本场次名无法匹配到任何场景素材："
+                    f"{detail}。这些场次的镜头必须输出空的 scene_asset_id，"
+                    "并在 missing_assets 中报告缺失场景（suggested_name 用剧本场次名）；"
+                    "不得强行绑定近似素材，也不得因此删减剧情。"
                 )
         provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
         all_shots: list[dict[str, Any]] = []
         all_warnings: list[dict[str, Any]] = []
-
-        # 默认整章只调用一次，模型同时看到全部场次，才能建立跨场次连续性。
-        # 仅在用户明确指定 scope=scene 时走单场提取，避免无谓的逐场网络往返。
         if isinstance(scenes, list) and scenes:
             if input_data.get("scope") != "scene":
                 full_payload = json_dumps(
@@ -1585,6 +2070,7 @@ class ShotService:
                         "场次之间必须通过上一镜 end_state 与下一镜 start_state 保持连续，"
                         "不得遗漏任何场次或剧情事实。\n"
                         f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
+                        f"{unmatched_note}"
                         f"来源内容：\n{full_payload}"
                     ),
                     schema=ShotExtractionOutput,
@@ -1649,13 +2135,7 @@ class ShotService:
                 update_progress = getattr(self.jobs, "update_progress", None)
                 if update_progress is not None:
                     update_progress(job["id"], 1, 1, message="整章分镜提取完成")
-                return self._save_extracted(
-                    current_chapter,
-                    source_type,
-                    input_data,
-                    all_shots,
-                    all_warnings,
-                )
+                return all_shots, all_warnings
 
             if input_data.get("scope") == "scene":
                 target_index = next(
@@ -1699,6 +2179,7 @@ class ShotService:
                         f"目标场次：{scene_no}\n"
                         f"{self._build_shot_budget_table([scene])}\n"
                         f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
+                        f"{unmatched_note}"
                         "本场剧本事实原文（权威，只能拆镜，不能新增、改写或删减）：\n"
                         f"动作：{scene.get('action', '')}\n"
                         f"叙事目的：{scene.get('objective', '')}\n"
@@ -1767,6 +2248,7 @@ class ShotService:
                     f"范围：{input_data.get('scope', 'all')}\n"
                     f"目标场次：{input_data.get('scene_no') or '全部'}\n"
                     f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
+                    f"{unmatched_note}"
                     f"来源内容：\n{content_raw}"
                 ),
                 schema=ShotExtractionOutput,
@@ -1800,13 +2282,7 @@ class ShotService:
                 all_warnings.extend(self._quality_warnings_for_shots(all_shots))
             else:
                 all_warnings = self._quality_warnings_for_shots(all_shots)
-        return self._save_extracted(
-            current_chapter,
-            source_type,
-            input_data,
-            all_shots,
-            all_warnings,
-        )
+        return all_shots, all_warnings
 
     @staticmethod
     def _synchronize_dialogue_with_source(
@@ -2703,14 +3179,17 @@ class ShotService:
         provided_id: str | None,
         name: str,
     ) -> str | None:
-        resolved_name = self._resolve_asset_name(lookup, name)
+        """解析单个素材绑定：ID 优先，名称只为兜底。
+
+        新绑定协议以素材 ID 为准：模型给出目录中真实存在的 ID 时直接采用，
+        名称只是展示字段，不参与判定；ID 为空或无效时退回名称解析；
+        两者都解析不到返回 None，由调用方决定报缺失还是警告，禁止默认兜底。
+        """
         if provided_id:
-            if provided_id not in lookup["ids"]:
-                return None
-            if name and resolved_name != provided_id:
-                return None
-            return provided_id
-        return resolved_name
+            if provided_id in lookup["ids"]:
+                return provided_id
+            return None
+        return self._resolve_asset_name(lookup, name)
 
     def _resolve_asset_ids(
         self,
@@ -2719,31 +3198,27 @@ class ShotService:
         provided_ids: list[str],
         names: list[str],
     ) -> tuple[list[str], list[str]]:
+        """解析一组素材绑定：ID 优先，名称兜底。
+
+        新绑定协议：模型给出的目录内真实 ID 直接采用，名称只是展示字段，
+        不参与判定（名称与 ID 不一致时以 ID 为准，避免名称漂移误报）；
+        只有模型完全没有给出有效 ID 时，才退化为名称解析兜底（兼容旧模型）。
+        返回 (resolved_ids, unmatched)：unmatched 含无效 ID 与名称均无法解析的项，
+        由调用方区分「模型编造 ID（硬错误）」与「素材缺失（补素材/警告）」。
+        """
         unique_provided = list(dict.fromkeys(provided_ids))
         resolved = [item for item in unique_provided if item in lookup["ids"]]
         unmatched = [item for item in unique_provided if item not in lookup["ids"]]
-        resolved_names: list[tuple[str, str]] = []
+        if resolved:
+            # 已有有效 ID：忽略名称，名称只是展示字段
+            return resolved, unmatched
         for name in names:
             asset_id = self._resolve_asset_name(lookup, name)
             if asset_id:
-                resolved_names.append((name, asset_id))
+                resolved.append(asset_id)
             elif name not in unmatched:
                 unmatched.append(name)
-        if provided_ids and names:
-            provided_set = set(resolved)
-            named_set = {asset_id for _, asset_id in resolved_names}
-            if provided_set != named_set:
-                for name, asset_id in resolved_names:
-                    mismatch = f"{name}（ID 与名称不一致）"
-                    if asset_id not in provided_set and mismatch not in unmatched:
-                        unmatched.append(mismatch)
-                for asset_id in resolved:
-                    mismatch = f"{asset_id}（ID 与名称不一致）"
-                    if asset_id not in named_set and mismatch not in unmatched:
-                        unmatched.append(mismatch)
-        elif names:
-            resolved = list(dict.fromkeys(asset_id for _, asset_id in resolved_names))
-        return resolved, unmatched
+        return list(dict.fromkeys(resolved)), unmatched
 
     def _save_extracted(
         self,
@@ -2769,11 +3244,17 @@ class ShotService:
                 source_ref = re.sub(r"^scene:\d+\|?", "", source_ref)
                 source_ref = f"scene:{scene_no}|{source_ref}"
             scene_name = item.pop("scene_name", "")
+            # missing_assets 是提取阶段供补素材流程使用的临时字段，不落库
+            item.pop("missing_assets", None)
             scene_asset_id = self._resolve_asset_id(
                 asset_lookup["scene"],
                 provided_id=item.pop("scene_asset_id", None),
                 name=scene_name,
             )
+            # 已移除多视角场景（Scene Pack）：分镜不再绑定视角，场景参考图
+            # 直接回退旧版单图（scene_view_id 恒为 NULL），保留场景素材绑定。
+            item.pop("scene_view_key", None)
+            scene_view_id = None
             character_names = item.pop("character_names", [])
             provided_character_ids = item.pop("character_asset_ids", [])
             character_ids, unmatched_characters = self._resolve_asset_ids(
@@ -2784,7 +3265,12 @@ class ShotService:
             character_binding_errors = [
                 value
                 for value in unmatched_characters
-                if value in provided_character_ids or "（ID 与名称不一致）" in value
+                if value in provided_character_ids
+            ]
+            character_unmatched_names = [
+                value
+                for value in unmatched_characters
+                if value not in character_binding_errors
             ]
             prop_names = item.pop("prop_names", [])
             provided_prop_ids = item.pop("prop_asset_ids", [])
@@ -2808,6 +3294,16 @@ class ShotService:
                 binding_errors.append(
                     f"分镜 {shot_label} 未匹配到角色素材：{', '.join(character_binding_errors)}"
                 )
+            if character_unmatched_names:
+                binding_warnings.append(
+                    {
+                        "shot_no": shot_label,
+                        "message": (
+                            "分镜角色名未匹配到素材库，仅保留文字描述，未绑定角色素材："
+                            + "、".join(character_unmatched_names)
+                        ),
+                    }
+                )
             # 物品与角色处理对齐：纯名字未匹配只降级为警告（物品只是增强性绑定，
             # 缺失不阻断视频生成）；只有模型提供了 ID 却解析不到（应为目录中真实
             # ID）才视为硬错误。避免模型多写一个不在库的小物件（如「纸条」）
@@ -2815,7 +3311,7 @@ class ShotService:
             prop_binding_errors = [
                 value
                 for value in unmatched_props
-                if value in provided_prop_ids or "（ID 与名称不一致）" in value
+                if value in provided_prop_ids
             ]
             prop_unmatched_names = [
                 value for value in unmatched_props if value not in prop_binding_errors
@@ -2838,6 +3334,7 @@ class ShotService:
                 "source_type": source_type,
                 "source_ref": source_ref,
                 "scene_asset_id": scene_asset_id,
+                "scene_view_id": scene_view_id,
                 "character_ids": character_ids,
                 "prop_ids": prop_ids,
                 **item,
@@ -2971,13 +3468,7 @@ class ShotService:
             for asset_id, role in requested:
                 if not asset_id:
                     continue
-                image_id = connection.execute(
-                    select(asset_image.c.id).where(
-                        asset_image.c.asset_id == asset_id,
-                        asset_image.c.is_current.is_(True),
-                        asset_image.c.status == "completed",
-                    )
-                ).scalar()
+                image_id = self._current_binding_image_id(connection, current, asset_id, role)
                 if image_id:
                     bindings.append(
                         {
@@ -2989,6 +3480,75 @@ class ShotService:
                 else:
                     warnings.append(f"素材 {asset_id} 缺少当前参考图，将使用纯文字降级")
         return bindings, warnings
+
+    @staticmethod
+    def _current_binding_image_id(
+        connection: Any,
+        current: dict[str, Any],
+        asset_id: str,
+        role: str,
+    ) -> str | None:
+        """取素材当前参考图 id。
+
+        场景素材按 Scene Pack 分区后可能同时存在多张 current 图
+        （旧版场景图 / MASTER / 各 Scene View），必须按 View 优先级取：
+        分镜选中的 View → MASTER → 旧版场景图。
+        角色 / 道具只有单 current，保持原查询。
+        """
+        if role == "scene_layout":
+            view_id = current.get("scene_view_id")
+            if view_id:
+                picked = connection.execute(
+                    select(asset_image.c.id)
+                    .where(
+                        asset_image.c.asset_id == asset_id,
+                        asset_image.c.scene_view_id == view_id,
+                        asset_image.c.is_current.is_(True),
+                        asset_image.c.status == "completed",
+                    )
+                    .order_by(asset_image.c.version_no.desc())
+                ).scalar()
+                if picked:
+                    return str(picked)
+            master_view_id = connection.execute(
+                select(scene_view.c.id).where(
+                    scene_view.c.asset_id == asset_id,
+                    scene_view.c.view_key == "master",
+                )
+            ).scalar()
+            if master_view_id:
+                master = connection.execute(
+                    select(asset_image.c.id)
+                    .where(
+                        asset_image.c.asset_id == asset_id,
+                        asset_image.c.scene_view_id == master_view_id,
+                        asset_image.c.is_current.is_(True),
+                        asset_image.c.status == "completed",
+                    )
+                    .order_by(asset_image.c.version_no.desc())
+                ).scalar()
+                if master:
+                    return str(master)
+            legacy = connection.execute(
+                select(asset_image.c.id)
+                .where(
+                    asset_image.c.asset_id == asset_id,
+                    asset_image.c.scene_view_id.is_(None),
+                    asset_image.c.is_current.is_(True),
+                    asset_image.c.status == "completed",
+                )
+                .order_by(asset_image.c.version_no.desc())
+            ).scalar()
+            return str(legacy) if legacy else None
+        return connection.execute(
+            select(asset_image.c.id)
+            .where(
+                asset_image.c.asset_id == asset_id,
+                asset_image.c.is_current.is_(True),
+                asset_image.c.status == "completed",
+            )
+            .order_by(asset_image.c.version_no.desc())
+        ).scalar()
 
     def _prev_keyframe_binding(self, current: dict[str, Any]) -> dict[str, Any] | None:
         """查询上一镜的已完成关键帧，返回 previous_keyframe binding；无则返回 None。
@@ -3102,6 +3662,13 @@ class ShotService:
         }
 
     async def handle_video_prompt(self, job: dict[str, Any]) -> dict[str, Any]:
+        """视频提示词重新生成：基于当前提示词做自然语言优化，而不是丢弃重写。
+
+        当前最终提示词（用户手工覆盖版优先，其次编译版）是优化基底，
+        保留用户手动编辑过的有效内容；优化结果写入 video_prompt_override。
+        只有在分镜完全没有可用视频提示词时，才回退到从源字段重新生成
+        video_prompt 源字段的旧路径。
+        """
         current = self.get(job["target_id"])
         current_project = self._project(current["project_id"])
         input_data = json_loads(job.get("input_json"), {})
@@ -3113,8 +3680,35 @@ class ShotService:
             expected_revision,
         ):
             return self._skipped_prompt_result(current["id"])
+        final_prompt = (
+            str(current.get("video_prompt_override") or "").strip()
+            or str(current.get("final_video_prompt") or "").strip()
+        )
+        if final_prompt:
+            optimized = await self._optimize_video_prompt_once(
+                current,
+                current_project,
+                final_prompt,
+                provider_id=job.get("provider_id"),
+                params=input_data.get("params", {}),
+            )
+            updated = self._save_generated_prompt(
+                current["id"],
+                "video",
+                input_data,
+                expected_revision,
+                {
+                    "video_prompt_override": optimized,
+                    "status": "ready",
+                },
+                current["negative_prompt"],
+            )
+            if updated is None:
+                return self._skipped_prompt_result(current["id"], {"prompt": optimized})
+            return {"shot_id": updated["id"], "prompt": optimized}
+
         provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
-        # 方案B：注入前后镜衔接信息
+        # 注入前后镜衔接信息
         with self.database.engine.connect() as connection:
             prev_data, next_data = self._adjacent_shot_data(
                 connection, current["chapter_id"], current["id"]
@@ -3154,6 +3748,82 @@ class ShotService:
             return self._skipped_prompt_result(current["id"], generated)
         return {"shot_id": updated["id"], "prompt": generated}
 
+    async def handle_director_plan(self, job: dict[str, Any]) -> dict[str, Any]:
+        """导演设计层：生成 DirectorPlan + 唯一时间轴 + 对白绑定，写入 director_plan。"""
+
+        current = self.get(job["target_id"])
+        current_project = self._project(current["project_id"])
+        input_data = json_loads(job.get("input_json"), {})
+        expected_revision = self._prompt_expected_revision(input_data, current)
+        if expected_revision is not None and current["revision"] != expected_revision:
+            return self._skipped_prompt_result(current["id"])
+        provider, config = self.providers.resolve(kind="text", provider_id=job.get("provider_id"))
+        with self.database.engine.connect() as connection:
+            prev_data, next_data = self._adjacent_shot_data(
+                connection, current["chapter_id"], current["id"]
+            )
+            asset_names = self._asset_names(connection, current)
+        prev_end_state = ""
+        if prev_data:
+            prev_end_state = str(
+                prev_data.get("end_state") or prev_data.get("next_hook") or ""
+            ).strip()
+        context = shot_template_context(current, asset_names, prev_end_state)
+        adjacent_context = self._adjacent_context_text(prev_data, next_data)
+        context_names = {
+            key: context.get(key) for key in ("scene_name", "characters", "props")
+        }
+        output = await provider.generate_json(
+            system_prompt=load_prompt("shot_director_plan"),
+            user_prompt=(
+                f"项目画风：{current_project['style_prompt']}\n"
+                f"实际时长：{current['duration_sec']}\n"
+                f"分镜：{json_dumps({key: current.get(key) for key in _PROMPT_GUARD_FIELDS})}\n"
+                f"素材名称：{json_dumps(context_names)}"
+                + (f"\n\n相邻镜信息：\n{adjacent_context}" if adjacent_context else "")
+            ),
+            schema=ShotDirectorPlanOutput,
+            params={**config["params"], **input_data.get("params", {})},
+        )
+        generated = output.model_dump(mode="json")
+        # 最终一致性校验：blocking 问题不落库不阻断（保留给用户查看与重新生成），
+        # 由 queue_video 在入队视频时硬阻断。
+        bundle = director_bundle_from_llm(generated)
+        consistency_issues = [
+            {
+                "code": issue.code,
+                "severity": issue.severity,
+                "message": issue.message,
+                "details": issue.details,
+            }
+            for issue in validate_shot_consistency(
+                shot={**current, "prop_names": context.get("props") or []},
+                timeline=bundle.timeline,
+                dialogue_bindings=bundle.dialogue_bindings,
+                duration_sec=float(current["duration_sec"]),
+                prev_end_state=prev_end_state,
+            )
+        ]
+        for _attempt in range(2):
+            latest = self.get(current["id"])
+            if expected_revision is not None and latest["revision"] != expected_revision:
+                return self._skipped_prompt_result(current["id"], generated)
+            try:
+                self.update(
+                    current["id"],
+                    {"director_plan": generated},
+                    expected_revision=latest["revision"],
+                )
+                return {
+                    "shot_id": current["id"],
+                    "director_plan": generated,
+                    "consistency_issues": consistency_issues,
+                }
+            except ServiceError as exc:
+                if exc.status_code != 409:
+                    raise
+        return self._skipped_prompt_result(current["id"], generated)
+
     async def _optimize_video_prompt_once(
         self,
         current: dict[str, Any],
@@ -3163,7 +3833,12 @@ class ShotService:
         provider_id: str | None,
         params: dict[str, Any] | None,
     ) -> str:
-        """调用文字模型优化单条视频提示词（有限优化），返回优化后文本。"""
+        """调用文字模型优化单条视频提示词（自然语言化优化），返回优化后文本。
+
+        素材引用是只读硬约束：先从当前提示词提取 @ImageN 集合（编号即该镜
+        真实参考图数组下标），优化结果必须保留完全相同的引用集合，否则拒绝
+        返回，避免引用错位进入视频生成接口。
+        """
         with self.database.engine.connect() as connection:
             asset_names = self._asset_names(connection, current)
             # 传入前后镜衔接信息，避免优化时把承接句当作重复描述删除
@@ -3172,6 +3847,8 @@ class ShotService:
             )
         context = shot_template_context(current, asset_names)
         adjacent_context = self._adjacent_context_text(prev_data, next_data)
+        reference_tokens = _collect_prompt_reference_tokens(original)
+        protected = _reference_token_sentences(original, reference_tokens)
         provider, config = self.providers.resolve(
             kind="text",
             provider_id=provider_id or current_project["default_text_provider_id"],
@@ -3189,7 +3866,12 @@ class ShotService:
                     if adjacent_context
                     else ""
                 )
-                + "\n当前视频提示词（模板已编译）：\n"
+                + (
+                    f"\n素材引用（编号与含义是硬约束，不得新增、删除、改号）：\n{protected}\n"
+                    if protected
+                    else "\n素材引用：本镜没有 @ImageN 引用，不要新增任何 @ImageN。\n"
+                )
+                + "\n当前视频提示词：\n"
                 f"{original}"
             ),
             schema=ShotVideoPromptOptimizeOutput,
@@ -3198,6 +3880,20 @@ class ShotService:
         optimized = str(output.prompt or "").strip()
         if not optimized:
             raise bad_request("文字模型返回了空提示词，请重试")
+        issues = _validate_prompt_reference_identity(original, optimized, reference_tokens)
+        if issues:
+            raise bad_request(
+                "优化结果破坏了素材引用关系，已拒绝返回："
+                + "；".join(issues)
+                + "。请重试优化。"
+            )
+        template_issues = validate_natural_style(optimized)
+        if template_issues:
+            raise bad_request(
+                "优化结果仍是模板化写法，已拒绝返回（"
+                + "；".join(template_issues)
+                + "）。请重试优化。"
+            )
         return optimized
 
     async def optimize_video_prompt(
@@ -3697,10 +4393,33 @@ class ShotService:
                     )
                     if target_id:
                         try:
-                            self.update(target_id, {field: fix["suggested_value"]})
+                            suggested = fix.get("suggested_value")
+                            # 过滤空值，避免把 None 写入 NOT NULL 列导致 IntegrityError。
+                            if suggested is None or suggested == "":
+                                continue
+                            # 用审校快照里的 revision 做乐观锁：并发编辑时跳过该条，
+                            # 避免模型修正静默覆盖用户的最新编辑。
+                            snapshot = (
+                                next(
+                                    (
+                                        item
+                                        for item in (prev_s, next_s)
+                                        if item["id"] == target_id
+                                    ),
+                                    None,
+                                )
+                            )
+                            expected_revision = (
+                                snapshot.get("revision") if snapshot is not None else None
+                            )
+                            self.update(
+                                target_id,
+                                {field: suggested},
+                                expected_revision=expected_revision,
+                            )
                             total_fixes += 1
-                        except ServiceError:
-                            pass  # 并发更新冲突时跳过
+                        except (ServiceError, Exception):  # noqa: BLE001
+                            pass  # 并发更新冲突或数据问题：跳过该条修正
         # ── 第三轮：逆序插入过渡镜（逆序防止后续镜顺移导致插入位置错误）──
         total_transitions = 0
         if insert_transitions:

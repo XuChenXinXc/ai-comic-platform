@@ -17,17 +17,13 @@ from pydantic import ValidationError
 from sqlalchemy import select, update
 
 from app.db import Database
-from app.dynamic_pipeline import materializer as dynamic_materializer
-from app.dynamic_pipeline import normalizers
 from app.dynamic_pipeline.diagnostics import diagnostic, diagnostics_status
-from app.dynamic_pipeline.prompt_compiler import COMPILER_VERSION
 from app.dynamic_pipeline.prompt_ir import AssetVisualAnchor
 from app.dynamic_pipeline.prompt_stage import (
     PromptStageError,
     PromptStageOutput,
     compile_image_prompt_stage,
     compile_video_prompt_stage,
-    prompt_stage_override_hash,
     stage_output_to_stage_json,
 )
 from app.dynamic_pipeline.provider_capabilities import normalize_capabilities
@@ -39,7 +35,6 @@ from app.dynamic_pipeline.reference_resolver import adapt_reference_bindings
 from app.dynamic_pipeline.schemas import CharacterBiosOutput, StageGateResult
 from app.dynamic_pipeline.storyboard_stage import StoryboardOutput
 from app.dynamic_pipeline.visual_anchor import (
-    anchor_version,
     asset_profile_to_anchor,
     build_visual_style_spec,
     character_bio_to_anchor,
@@ -860,9 +855,16 @@ class DynamicPromptStageService:
             if workflow_id:
                 mapping_by_workflow_id[workflow_id] = item
 
-        rows = connection.execute(
-            select(asset).where(asset.c.project_id == run.get("project_id"))
-        ).all()
+        rows = (
+            connection.execute(
+                select(asset).where(
+                    asset.c.project_id == run.get("project_id"),
+                    asset.c.id.in_(sorted(explicit_ids)),
+                )
+            ).all()
+            if explicit_ids
+            else []
+        )
         assets_by_id = {
             _text(row.id): dict(row._mapping) for row in rows if _text(row.id) in explicit_ids
         }
@@ -1461,88 +1463,26 @@ class DynamicPromptStageService:
         stage: Mapping[str, Any],
         job_record: Mapping[str, Any],
     ) -> str:
+        # 签名计算统一委托给 DynamicWorkflowService._prompt_stage_input_signature
+        # 作为唯一权威实现：该函数在确认事务中生成 stage.input_signature 并落库，
+        # 此处（preflight）必须与之完全一致，否则正常任务会被误判为 snapshot
+        # mismatch。两套并行实现（此处旧版与 workflow 版）曾因 asset_versions
+        # 兜底、资产范围、capability 快照来源三处分歧而漂移，此处收敛为单一实现。
+        # 延迟导入避免 app.dynamic_pipeline → app.services 的循环依赖。
+        from app.services.dynamic_workflow_service import DynamicWorkflowService
+
+        workflow_service = DynamicWorkflowService(self.database)
+        stage_key = str(stage.get("stage_key") or "")
         storyboard_stage = self._latest_stage(connection, str(run["id"]), "4-storyboard")
         if storyboard_stage is None or storyboard_stage.get("status") != "confirmed":
             raise PromptStageExecutionError("阶段前置确认未满足：4-storyboard")
-        storyboard = self._parse_storyboard(storyboard_stage)
-        character_stage = self._latest_stage(connection, str(run["id"]), "1-character-bios")
-        character_bios = self._parse_character_bios(character_stage)
-        anchors = self._build_anchors(
+        signature, _ = workflow_service._prompt_stage_input_signature(
             connection,
-            run=run,
-            storyboard=storyboard,
-            character_bios=character_bios,
+            stage_key,
+            run,
+            storyboard_stage,
         )
-        _, _, capabilities, _ = self._provider_snapshot(
-            _ExecutionContext(
-                job_record=dict(job_record),
-                run_record=dict(run),
-                stage_record=dict(stage),
-            )
-        )
-        references, _, _ = self._build_references_and_continuity(
-            connection,
-            project_id=str(run.get("project_id") or ""),
-            chapter_id=str(run.get("chapter_id") or ""),
-            provider_capabilities=capabilities,
-            video_stage=str(stage.get("stage_key")) == "5b-video-prompts",
-        )
-        reference_hashes: dict[str, str] = {}
-        for storyboard_shot in storyboard.shots:
-            reference = references.get(storyboard_shot.external_key)
-            reference_hashes[storyboard_shot.external_key] = (
-                _text(reference.get("snapshot_hash"))
-                if isinstance(reference, Mapping)
-                else ""
-            )
-        asset_versions = [
-            {
-                "asset_id": asset_id,
-                "asset_type": anchor.asset_type,
-                "revision": anchor.asset_revision,
-                "anchor_version": anchor_version(anchor),
-            }
-            for asset_id, anchor in sorted(anchors.items())
-        ]
-        shot_snapshots = [
-            {
-                "external_key": item.external_key,
-                "shot_no": item.shot_no,
-                "ordinal": item.ordinal,
-                "scene_asset_id": item.scene_asset_id or "",
-                "character_asset_ids": list(item.character_asset_ids),
-                "prop_asset_ids": list(item.prop_asset_ids),
-                "reference_plan_hash": reference_hashes.get(item.external_key, ""),
-            }
-            for item in storyboard.shots
-        ]
-        provider_id = _text(capabilities.get("provider_id"))
-        provider_model = _text(capabilities.get("model"))
-        payload = dynamic_materializer.build_prompt_stage_signature_payload(
-            stage_key=str(stage.get("stage_key") or ""),
-            run_input_signature=str(run.get("input_signature") or ""),
-            shots=shot_snapshots,
-            asset_versions=asset_versions,
-            reference_plan_hashes=reference_hashes,
-            provider_id=provider_id,
-            provider_model=provider_model,
-            provider_capabilities=capabilities,
-            compiler_version=COMPILER_VERSION,
-            normalizer_version=normalizers.NORMALIZER_VERSION,
-            gate_version="dynamic-gate-v1",
-        )
-        override_snapshot = self._overrides(self._input_data(job_record))
-        if override_snapshot is None:
-            content = self._stage_content(stage)
-            bundles = content.get("bundles") if isinstance(content, Mapping) else None
-            if isinstance(bundles, Mapping):
-                override_snapshot = {
-                    str(key): value.get("human_override")
-                    for key, value in bundles.items()
-                    if isinstance(value, Mapping) and value.get("human_override") is not None
-                }
-        payload["human_override_hash"] = prompt_stage_override_hash(override_snapshot)
-        return dynamic_materializer.calculate_prompt_stage_input_signature(payload)
+        return signature
 
     @staticmethod
     def _overrides(job_input: Mapping[str, Any]) -> Mapping[str, Any] | None:

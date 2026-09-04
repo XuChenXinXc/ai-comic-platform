@@ -16,6 +16,7 @@ from app.services.job_service import JobService
 from app.services.media_service import MediaService
 from app.services.project_service import ProjectService
 from app.services.provider_service import ProviderService
+from app.services.scene_view_service import SceneViewService
 from app.services.setting_service import SettingService
 from app.services.shot_service import ShotService
 from app.services.subtitle_service import SubtitleService
@@ -59,6 +60,13 @@ def get_shot_service(
     job_service: Annotated[JobService, Depends(get_job_service)],
 ) -> ShotService:
     return ShotService(database, job_service)
+
+
+def get_scene_view_service(
+    database: Annotated[Database, Depends(get_database)],
+    job_service: Annotated[JobService, Depends(get_job_service)],
+) -> SceneViewService:
+    return SceneViewService(database, job_service)
 
 
 def get_media_service(

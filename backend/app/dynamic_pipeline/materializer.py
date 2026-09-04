@@ -581,7 +581,7 @@ def build_asset_materialization_plan(
     project_id: str,
     run_id: str,
     reuse_mapping: Iterable[Any] = (),
-) -> list[dict[str, Any]]:
+) -> MaterializationPlan:
     """从阶段 1 角色小传生成确定性的 Asset create/update payload。"""
 
     project_id = _validate_id(project_id, "project_id")
@@ -608,7 +608,25 @@ def build_asset_materialization_plan(
     for character in content.characters:
         key = character.basic_info.character_key
         workflow_asset_id = f"dynamic-asset:{run_id}:{key}"
-        mapping = mappings.get(workflow_asset_id) or mappings.get(key)
+        mapping = mappings.get(workflow_asset_id)
+        if mapping is None:
+            # 裸 character_key 回退：兼容旧调用方，但可能绕过运行级映射隔离，
+            # 显式记录 warning 诊断供调用方观察。
+            fallback = mappings.get(key)
+            if fallback is not None:
+                mapping = fallback
+                diagnostics.append(
+                    _diag(
+                        "asset_mapping_name_fallback",
+                        (
+                            f"asset mapping 按名称回退匹配 {key!r}，"
+                            "可能绕过运行级隔离"
+                        ),
+                        f"characters[{len(payloads)}]",
+                        {"workflow_asset_id": workflow_asset_id, "character_key": key},
+                        level="warning",
+                    )
+                )
         reuse_mode = "new"
         asset_id = workflow_asset_id
         locked_revision: int | None = None
@@ -863,6 +881,17 @@ def build_shot_materialization_plan(
         assigned_shot_no = next_shot_no
         next_shot_no += 1
         external_key = _text(payload.get("external_key"))
+        # 空 external_key 会生成相同的 `dynamic-shot:{chapter_id}:` id 导致主键
+        # 冲突；用 index 兜底保证唯一，并给出一条可定位的提示。
+        if not external_key:
+            external_key = f"auto-{index}"
+            diagnostics.append(
+                _diag(
+                    "shot_external_key_missing",
+                    "分镜缺少 external_key，已使用自动编号兜底",
+                    f"{path}.external_key",
+                )
+            )
         provenance = _shot_provenance(
             project_id=project_id,
             chapter_id=chapter_id,

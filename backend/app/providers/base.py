@@ -16,14 +16,26 @@ import requests
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel
 
+from app.config import settings
 from app.schemas import ProviderConfig, ProviderPollResult, ProviderSubmission
 from app.services.constants import (
     PROVIDER_REFERENCE_JPEG_QUALITY,
     PROVIDER_REFERENCE_MAX_BYTES,
     PROVIDER_REFERENCE_MAX_SIDE,
 )
-from app.services.file_service import atomic_write_bytes, download_url_atomic
+from app.services.file_service import (
+    atomic_write_bytes,
+    download_url_atomic,
+    file_service,
+)
 from app.services.utils import sanitize_error_message
+
+# Provider 结果 Base64 解码后的字节上限（与平台媒体上限对齐，防止解码耗尽内存/磁盘）。
+_MAX_BASE64_DECODED_BYTES = 100 * 1024 * 1024  # 100 MB
+# 对应的编码后长度上限：4/3 换算 + data URL 头部冗余。
+_MAX_BASE64_ENCODED_CHARS = (_MAX_BASE64_DECODED_BYTES * 4 // 3) + 64
+# data URL 允许的媒体 MIME 前缀；防止把任意文本伪装成媒体落盘。
+_ALLOWED_DATA_URL_MIMES = ("image/", "video/", "audio/", "application/octet-stream")
 
 
 class ProviderError(RuntimeError):
@@ -35,6 +47,22 @@ class ProviderConfigurationError(ProviderError):
 
 
 logger = logging.getLogger(__name__)
+
+# B-L10：ImgBB 平台级密钥的运行时覆盖。main.py 启动时从加密的平台设置读取
+# 并写入该变量，避免直接改写 lru_cache 单例 settings（后者是全局共享配置
+# 对象，被改写后无法区分「环境变量值」与「数据库覆盖值」）。
+_imgbb_api_key_override = ""
+
+
+def set_imgbb_api_key_override(value: str) -> None:
+    """写入运行时 ImgBB Key 覆盖；空字符串表示清除覆盖。"""
+    global _imgbb_api_key_override
+    _imgbb_api_key_override = str(value or "")
+
+
+def get_imgbb_api_key() -> str:
+    """ImgBB Key 读取优先级：运行时覆盖（数据库加密值）> settings 环境变量。"""
+    return _imgbb_api_key_override or settings.imgbb_api_key
 
 
 def compress_reference_image(
@@ -119,9 +147,25 @@ _SENSITIVE_QUERY_ALIASES = {
 
 
 def _is_sensitive_query_name(name: str) -> bool:
-    # 与 provider_service._is_sensitive_name 保持一致：超长输入直接放行，避免 ReDoS。
+    # 与 provider_service._is_sensitive_name 保持一致：超长输入不能直接放行
+    # （否则可绕过 base_url 敏感参数拦截），按敏感后缀判断。
     if len(name) > 200:
-        return False
+        lowered = name.casefold()
+        return any(
+            lowered.endswith(suffix)
+            for suffix in (
+                "key",
+                "token",
+                "secret",
+                "password",
+                "passwd",
+                "auth",
+                "cookie",
+                "signature",
+                "credential",
+                "credentials",
+            )
+        )
     normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
     parts = {part for part in re.split(r"[^a-z0-9]+", normalized.lower()) if part}
     collapsed = re.sub(r"[^a-z0-9]", "", normalized.lower())
@@ -384,10 +428,17 @@ class HttpProviderBase:
         retry_unsafe_methods = bool(options.get("retry_unsafe_methods", False))
         attempts = self.config.max_retries + 1
         safe_method = method_name in {"GET", "HEAD", "OPTIONS"} or retry_unsafe_methods
-        # 非安全方法（POST 等）默认不重试；但瞬时性错误（429/5xx 过载、限流）除外，
-        # 这类错误重试不会造成重复提交语义问题，能显著提升上游短暂过载时的可用性。
-        # 202 是中转渠道返回 error JSON 的瞬时形态（见下方判断），同样需要可重试。
-        transient_statuses = {202, 429, 500, 502, 503, 504}
+        # 非安全方法（POST 等）默认不重试；仅以下两类「服务端明确未受理」的
+        # 瞬时错误可安全重试：
+        # - 429：明确限流，请求未被上游执行；
+        # - 202 + 错误体：中转渠道明确报告提交未被接受（见下方判断）。
+        # 500/502/503/504 等网关模糊失败对 POST 不自动重试：网关超时/断连时
+        # 上游可能已经建立计费任务，盲目重发会造成重复计费；这类失败直接
+        # 返回给上层，交由 Job 层的 interrupted/失败恢复语义处理。
+        # requests.Timeout 同理保持不自动重试。显式配置
+        # retry_unsafe_methods=True 的渠道维持全量重试（由渠道自担重复
+        # 提交风险）。GET/HEAD/OPTIONS 等安全方法幂等，维持现状照常重试。
+        transient_statuses = {202, 429}
         for attempt in range(attempts):
             try:
                 response = requests.request(
@@ -485,21 +536,34 @@ class HttpProviderBase:
         target: Path,
     ) -> Path:
         if result.content_base64:
-            encoded = result.content_base64
+            encoded = str(result.content_base64)
             if encoded.startswith("data:") and "," in encoded:
-                encoded = encoded.split(",", 1)[1]
+                header, encoded = encoded.split(",", 1)
+                mime = header[5:].split(";", 1)[0].strip().lower()
+                if mime and not any(mime.startswith(prefix) for prefix in _ALLOWED_DATA_URL_MIMES):
+                    raise ProviderError(f"Provider 返回的 data URL 媒体类型不受支持：{mime}")
+            # 编码长度预检：解码前就拒绝超限数据，避免恶意/异常结果耗尽内存。
+            if len(encoded) > _MAX_BASE64_ENCODED_CHARS:
+                raise ProviderError("Provider 返回的 Base64 文件超过大小上限")
             try:
                 content = base64.b64decode(encoded, validate=True)
             except ValueError as exc:
                 raise ProviderError("Provider 返回的 Base64 文件无效") from exc
+            if len(content) > _MAX_BASE64_DECODED_BYTES:
+                raise ProviderError("Provider 返回的 Base64 文件超过大小上限")
             return await asyncio.to_thread(atomic_write_bytes, target, content)
         local_file = result.data.get("local_file")
         if local_file:
             # 契约：只有本机 Provider（mock）会返回 local_file，路径由 Provider
             # 自行生成；远程 Provider 实现不得返回该字段，否则等同于任意文件读取。
+            # B-L4 纵深防御：下载前校验该路径确实位于平台工作区内，
+            # 阻止伪造的 Provider 结果把工作区外的任意本机文件复制进媒体目录。
+            resolved_local = Path(str(local_file)).resolve()
+            if not resolved_local.is_relative_to(file_service.workspace_dir):
+                raise ProviderError("Provider 返回的本地文件超出平台工作区范围")
             from app.services.file_service import atomic_copy
 
-            return await asyncio.to_thread(atomic_copy, local_file, target)
+            return await asyncio.to_thread(atomic_copy, resolved_local, target)
         if not result.result_url:
             raise ProviderError("Provider 结果不包含下载地址或文件内容")
         if result.result_url.startswith(("http://", "https://")):

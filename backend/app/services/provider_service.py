@@ -9,7 +9,16 @@ from sqlalchemy import delete, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db import Database, db
-from app.models.tables import api_provider, job, project
+from app.models.tables import (
+    api_provider,
+    asset_image,
+    audio_config,
+    job,
+    keyframe_version,
+    project,
+    shot_audio,
+    video_version,
+)
 from app.providers.base import (
     ProviderConfigurationError,
     redact_provider_base_url,
@@ -49,8 +58,14 @@ class ProviderService:
         result["params"] = params
         has_env_key = bool(result.get("api_key_env") and os.getenv(result["api_key_env"]))
         result["api_key_configured"] = bool(ciphertext) or has_env_key
+        # api_key_source 与 api_key_configured 保持一致：配置了 env 但环境变量
+        # 未设置时不算「已配置」，避免前端误以为密钥可用。
         result["api_key_source"] = (
-            "direct" if ciphertext else "env" if result.get("api_key_env") else "none"
+            "direct"
+            if ciphertext
+            else "env"
+            if has_env_key and result.get("api_key_env")
+            else "none"
         )
         if include_secret:
             result["_api_key_ciphertext"] = ciphertext
@@ -68,9 +83,25 @@ class ProviderService:
     @staticmethod
     def _is_sensitive_name(name: Any) -> bool:
         name_str = str(name)
-        # 防止极长输入导致 ReDoS
+        # 超长输入不能直接放行（否则可绕过脱敏/写入拦截）：
+        # 长度超过 200 时按敏感后缀判断，仍视为敏感并 redact/拒绝。
         if len(name_str) > 200:
-            return False
+            lowered = name_str.casefold()
+            return any(
+                lowered.endswith(suffix)
+                for suffix in (
+                    "key",
+                    "token",
+                    "secret",
+                    "password",
+                    "passwd",
+                    "auth",
+                    "cookie",
+                    "signature",
+                    "credential",
+                    "credentials",
+                )
+            )
         normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name_str)
         parts = {part for part in re.split(r"[^a-z0-9]+", normalized.lower()) if part}
         collapsed = re.sub(r"[^a-z0-9]", "", normalized.lower())
@@ -256,6 +287,9 @@ class ProviderService:
                 changes["api_key_ciphertext"] = encrypt_secret(str(api_key))
             except SecretServiceError as exc:
                 raise bad_request(str(exc)) from exc
+        # 显式传 null 的字段视为「保持不变」：这些列 NOT NULL，
+        # 裸写 None 会触发 IntegrityError 500。
+        changes = {key: value for key, value in changes.items() if value is not None}
         if "params" in changes:
             changes["params_json"] = json_dumps(changes.pop("params"))
         candidate = {**current, **changes}
@@ -291,6 +325,8 @@ class ProviderService:
             raise conflict("内置 Mock Provider 不能删除，可以停用")
         try:
             with self.database.engine.begin() as connection:
+                if self._has_active_job(connection, provider_id):
+                    raise conflict("Provider 存在进行中的任务，不能删除或停用")
                 project_reference = connection.execute(
                     select(project.c.id)
                     .where(
@@ -303,10 +339,28 @@ class ProviderService:
                     .limit(1)
                 ).first()
                 if project_reference:
-                    raise conflict("Provider 已被项目、媒体或任务引用，不能删除")
+                    raise conflict("Provider 已被项目引用，不能删除")
+                # 历史引用（已终态的媒体/任务）允许删除：把引用列置 NULL，
+                # 而不是依赖外键 IntegrityError 永久阻断删除。
+                for reference_column in (
+                    asset_image.c.provider_id,
+                    keyframe_version.c.provider_id,
+                    video_version.c.provider_id,
+                    shot_audio.c.provider_id,
+                ):
+                    connection.execute(
+                        update(reference_column.table)
+                        .where(reference_column == provider_id)
+                        .values(**{reference_column.name: None})
+                    )
+                connection.execute(
+                    update(audio_config)
+                    .where(audio_config.c.tts_provider_id == provider_id)
+                    .values(tts_provider_id=None)
+                )
                 connection.execute(delete(api_provider).where(api_provider.c.id == provider_id))
         except IntegrityError as exc:
-            raise conflict("Provider 已被项目、媒体或任务引用，不能删除") from exc
+            raise conflict("Provider 已被媒体或任务引用，不能删除") from exc
 
     def resolve(
         self,
@@ -347,6 +401,14 @@ class ProviderService:
         resolved_config = dict(config)
         resolved_config.pop("_api_key_ciphertext", None)
         return provider, resolved_config
+
+    def resolve_tts_provider(self, provider_id: str) -> tuple[Any, dict[str, Any]]:
+        """按 ID 解析 TTS Provider（公开接口，供音频服务使用）。
+
+        内部复用 resolve() 的同款校验：存在性、kind 必须为 tts、启用状态、
+        配置校验与 API Key 解密，避免调用方绕过校验直接访问私有方法。
+        """
+        return self.resolve(kind="tts", provider_id=provider_id)
 
     def test(self, provider_id: str) -> dict[str, Any]:
         config = self._get_config(
@@ -432,4 +494,10 @@ class ProviderService:
                 ) from exc
         else:
             runtime["api_key"] = ""
+        # api_key_env 回退：只配环境变量名而未保存明文/密文时，运行时从环境取值，
+        # 与 _probe（连接测试）口径一致。此前该回退只在 _probe 中存在，
+        # 导致仅配 api_key_env 的 TTS Provider 实际运行时拿到空 Key。
+        if not runtime.get("api_key") and runtime.get("api_key_env"):
+            validate_api_key_env(str(runtime.get("kind", "")), str(runtime["api_key_env"]))
+            runtime["api_key"] = os.getenv(runtime["api_key_env"], "")
         return runtime

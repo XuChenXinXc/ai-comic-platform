@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 
@@ -351,7 +352,9 @@ def _sound_cues(shot: StoryboardShot) -> list[dict[str, Any]]:
                     ),
                     shot.duration_sec,
                 ),
-                "volume": payload.get("volume", 1.0),
+                "volume": (
+                    float(payload["volume"]) if payload.get("volume") is not None else 1.0
+                ),
             }
         )
     return cues
@@ -667,19 +670,6 @@ def _bundle_with_channel(
     extra_diagnostics: Sequence[Diagnostic] = (),
 ) -> CompiledPromptBundle:
     diagnostics = _dedupe_diagnostics([*bundle.diagnostics, *extra_diagnostics])
-    if stage_key == "5a-image-prompts":
-        diagnostics = [
-            item
-            for item in diagnostics
-            if item.code
-            not in {
-                "provider_duration_unsupported",
-                "video_action_missing",
-                "video_end_state_missing",
-                "continuous_previous_end_frame_missing",
-                "continuous_previous_reference_missing",
-            }
-        ]
     gate = diagnostics_status(diagnostics)
     provenance = _copy(bundle.provenance)
     if stage_key == "5a-image-prompts":
@@ -851,9 +841,7 @@ def _compile_stage(
             )
         )
     duplicate_keys = sorted(
-        key
-        for key in {shot.external_key for shot in shots}
-        if sum(item.external_key == key for item in shots) > 1
+        key for key, count in Counter(shot.external_key for shot in shots).items() if count > 1
     )
     if duplicate_keys:
         all_diagnostics.append(
@@ -972,17 +960,9 @@ def _compile_stage(
 
         is_image = stage_key == "5a-image-prompts"
         intent = _shot_intent(shot, image=is_image)
-        compiler_intent = intent
-        if is_image:
-            # 当前 compiler 同时生成 image/video 两个内部 channel，并且要求视频
-            # channel 有 action/end_state。这里使用稳定的内部占位值；随后只保留
-            # image channel，故占位值不会进入图片 Prompt、semantic_plan 或 stage JSON。
-            compiler_intent = intent.model_copy(
-                update={
-                    "action": "__image_stage_unused__",
-                    "end_state": "__image_stage_unused__",
-                }
-            )
+        # 5a/5b 分别用显式 channel 调编译入口：image 通道在编译期就跳过
+        # 视频专属诊断（action/end_state、continuous 末帧、时长适配），
+        # 不再需要向 shot 注入占位 action 或事后按 code 白名单过滤。
         if is_image and isinstance(_map_lookup(overrides_by_external_key or {}, key), Mapping):
             raw_override = _map_lookup(overrides_by_external_key or {}, key)
             assert isinstance(raw_override, Mapping)
@@ -1030,12 +1010,13 @@ def _compile_stage(
                     }
             compiled = compile_prompt_bundle(
                 style=_copy(style),
-                shot=compiler_intent,
+                shot=intent,
                 anchors=_copy(anchors),
                 continuity=continuity,
                 reference_plan=_copy(reference_plan),
                 capabilities=normalized_caps.model_copy(deep=True),
                 overrides=compile_override,
+                channel="image" if is_image else "video",
             )
         except (TypeError, ValueError, ValidationError) as exc:
             raise PromptStageError(f"镜头 {key} Prompt 编译失败") from exc

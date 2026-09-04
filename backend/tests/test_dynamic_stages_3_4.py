@@ -697,6 +697,33 @@ def test_storyboard_gate_rejects_unplanned_dialogue_and_structured_state_jump() 
     assert "storyboard_continuity_structured_state_mismatch" in codes
 
 
+def test_storyboard_continuous_missing_boundary_side_emits_structured_state_missing() -> None:
+    """M16：上一镜 continuity_state 存在但缺 end 边界（仅 {"start": ...}）时，
+    连续性比较不得静默跳过，必须产出 structured_state_missing 阻塞诊断。"""
+    previous = _storyboard_shot(
+        end_state="林默保持格挡姿态",
+        continuity_state={"start": {"characters": {"林默": {"position": "中央"}}}},
+    )
+    current = _storyboard_shot(
+        external_key="storyboard:run-1:scene-1:shot-2:ordinal-2",
+        shot_no=2,
+        ordinal=2,
+        start_state="林默保持格挡姿态",
+        transition_from_prev="continuous",
+        duration_sec=10,
+        provider_duration_sec=10,
+        continuity_state={"start": {"characters": {"林默": {"position": "中央"}}}},
+        dialogue=[],
+    )
+    codes = {
+        item.code
+        for item in validate_storyboard_output(
+            _storyboard_output(previous, current, target_duration_sec=20),
+        )
+    }
+    assert "storyboard_continuity_structured_state_missing" in codes
+
+
 def test_storyboard_projection_contains_incremental_json_fields_without_media() -> None:
     shot = _storyboard_shot(image_prompt="静止关键帧", video_prompt="单一动作")
     payload = storyboard_to_shot_payloads(_storyboard_output(shot))[0]

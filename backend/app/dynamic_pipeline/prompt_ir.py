@@ -178,6 +178,7 @@ class ImagePromptBundle(PipelineModel):
     keyframe_time_sec: Literal[0] = 0
     reference_slots: list[ReferenceSlot] = Field(default_factory=list)
     semantic_plan: dict[str, Any] = Field(default_factory=dict)
+    diagnostics: list[Diagnostic] = Field(default_factory=list)
 
 
 class VideoPromptBundle(PipelineModel):
@@ -189,6 +190,7 @@ class VideoPromptBundle(PipelineModel):
     end_state: PromptValue = None
     reference_slots: list[ReferenceSlot] = Field(default_factory=list)
     semantic_plan: dict[str, Any] = Field(default_factory=dict)
+    diagnostics: list[Diagnostic] = Field(default_factory=list)
 
 
 PromptLayer = dict[str, Any] | ImagePromptBundle | VideoPromptBundle | None
@@ -450,36 +452,3 @@ def apply_human_override(
     if validated_override.cleared:
         return copy.deepcopy(generated)
     return _apply_override_to_value(generated, validated_override)
-
-
-def clear_human_override(bundle: CompiledPromptBundle) -> CompiledPromptBundle:
-    """清空人工覆盖并恢复自动生成稿。"""
-
-    if not isinstance(bundle, CompiledPromptBundle):
-        bundle = CompiledPromptBundle.model_validate(bundle)
-    version = bundle.human_override.override_version if bundle.human_override else "1"
-    cleared = HumanOverrideSet(cleared=True, override_version=version)
-    return bundle.model_copy(
-        deep=True,
-        update={
-            "human_override": cleared,
-            "final": copy.deepcopy(bundle.generated),
-            "input_hash": bundle.base_compiler_hash or bundle.input_hash,
-            "override_status": "cleared",
-        },
-    )
-
-
-def is_override_stale(bundle: CompiledPromptBundle, current_input_hash: str) -> bool:
-    """判断人工稿是否基于旧的上游输入。"""
-
-    if not isinstance(bundle, CompiledPromptBundle):
-        bundle = CompiledPromptBundle.model_validate(bundle)
-    if bundle.override_status == "cleared":
-        return False
-    if bundle.human_override is None or bundle.human_override.cleared:
-        return False
-    if bundle.override_status == "stale":
-        return True
-    baseline_hash = bundle.base_compiler_hash or bundle.input_hash
-    return baseline_hash != current_input_hash

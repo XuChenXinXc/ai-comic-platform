@@ -167,9 +167,30 @@ export interface Asset {
   own_signature: string;
   revision: number;
   current_image?: MediaVersion | null;
+  /** 场景素材的 Scene View 列表（仅 scene 类型填充）。 */
+  scene_views?: SceneView[];
   created_at: string;
   updated_at: string;
   is_stale?: boolean;
+}
+
+/** 场景素材的单个视角视图：一张独立场景参考图。 */
+export interface SceneView {
+  id: string;
+  asset_id: string;
+  /** "master" | "front" | "reverse" | "left45" | "right45" | 自定义 */
+  view_key: string;
+  /** 展示名：母版 / 正向 / 反向 / 左前45° / 右前45° */
+  name: string;
+  /** 视角附加提示词（用户可编辑） */
+  prompt: string;
+  /** 用户自定义最终提示词（可为空） */
+  prompt_override: string;
+  sort_order: number;
+  /** 该 View 的当前图（与 Asset.current_image 同形） */
+  current_image?: MediaVersion | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface ReferenceBinding {
@@ -177,10 +198,62 @@ export interface ReferenceBinding {
     | "character_identity"
     | "scene_layout"
     | "prop_identity"
-    | "previous_keyframe";
+    | "previous_keyframe"
+    | "scene_master";
   asset_id?: string;
   asset_image_id?: string;
   keyframe_id?: string;
+}
+
+export interface DirectorAudienceFocus {
+  first: string;
+  second?: string;
+  third?: string;
+}
+
+export interface DirectorMicroPerformance {
+  trigger?: string;
+  action: string;
+  source?: string;
+}
+
+export interface DirectorDialogueBinding {
+  speaker: string;
+  text: string;
+  startTime: number;
+  endTime: number;
+  requiresLipSync: boolean;
+  voiceSource?: string;
+}
+
+export interface DirectorTimelineSegment {
+  start: number;
+  end: number;
+  action: string;
+}
+
+/** 导演设计层：只决定「如何呈现」，不修改剧情 / 连续性 / 资产事实。 */
+export interface DirectorPlan {
+  shotPurpose: string;
+  audienceFocus: DirectorAudienceFocus;
+  composition: string;
+  foreground?: string;
+  midground?: string;
+  background?: string;
+  cameraMotivation?: string;
+  performance?: string;
+  microPerformance?: DirectorMicroPerformance[];
+  environmentMotion?: string;
+  visualTone?: string[];
+  timeline: DirectorTimelineSegment[];
+  dialogueBindings?: DirectorDialogueBinding[];
+}
+
+export interface ConsistencyIssue {
+  code: string;
+  severity: "warning" | "blocking";
+  message: string;
+  details?: Record<string, unknown>;
 }
 
 export interface Shot {
@@ -194,6 +267,12 @@ export interface Shot {
   source_ref: string;
   source_signature: string;
   scene_asset_id?: string | null;
+  /** 绑定场景素材后选中的 Scene View id（只读展示用） */
+  scene_view_id?: string | null;
+  /** 绑定场景素材后选中的 Scene View key（提交给后端，空字符串=默认母版） */
+  scene_view_key?: string | null;
+  /** 后端回填的 Scene View 展示名（如「正向」） */
+  scene_view_name?: string | null;
   scene_name?: string;
   character_ids_json: string[] | string;
   character_ids?: string[];
@@ -227,6 +306,10 @@ export interface Shot {
   negative_prompt: string;
   reference_bindings_json: ReferenceBinding[] | string;
   reference_bindings?: ReferenceBinding[];
+  /** 导演设计层产出：导演计划 + 唯一时间轴 + 对白绑定（空对象表示尚未生成） */
+  director_plan?: DirectorPlan | null;
+  /** 最终一致性校验问题（只读，blocking 问题会阻断视频入队） */
+  consistency_issues?: ConsistencyIssue[];
   status: Exclude<ContentStatus, "generating">;
   own_signature: string;
   revision: number;

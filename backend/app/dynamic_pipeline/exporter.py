@@ -879,6 +879,10 @@ def _checklist_from_preflight(
         values = grouped.get(key)
         if values:
             statuses = {_text(value.get("status")).casefold() for value in values}
+            completed_count = sum(
+                _text(value.get("status")).casefold() in {"ready", "completed"}
+                for value in values
+            )
             if "failed" in statuses:
                 item["status"] = "failed"
             elif "missing" in statuses:
@@ -886,13 +890,16 @@ def _checklist_from_preflight(
             elif "skipped" in statuses:
                 item["status"] = "skipped"
             elif "planned" in statuses:
-                item["status"] = "planned"
+                # 部分完成 + 部分仍计划：标记 partial，避免清单虚高为 completed，
+                # 掩盖尚未完成的成片。
+                item["status"] = (
+                    "partial"
+                    if completed_count > 0 and completed_count < len(values)
+                    else "planned"
+                )
             else:
                 item["status"] = "completed"
-            item["completed"] = sum(
-                _text(value.get("status")).casefold() in {"ready", "completed"}
-                for value in values
-            )
+            item["completed"] = completed_count
             item["total"] = len(values)
             reasons = [
                 _text(value.get("reason"))

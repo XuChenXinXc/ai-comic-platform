@@ -11,12 +11,14 @@ import copy
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from sqlalchemy import Engine, func, insert, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.db import Database, db, utc_now
+from app.dynamic_pipeline.composition_preflight import validate_relative_media_path
 from app.dynamic_pipeline.diagnostics import diagnostic, diagnostics_status
 from app.dynamic_pipeline.media_bridge import (
     DynamicMediaBridgePlan,
@@ -515,6 +517,80 @@ class DynamicMediaQueueService:
         return _ShotMapping(shot_id=str(rows[0].id), diagnostics=())
 
     @staticmethod
+    def _project_root(connection: Any, project_id: str) -> Path | None:
+        """按项目持久化的 storage 字段解析项目目录，解析不了返回 None。"""
+
+        row = connection.execute(
+            select(
+                project.c.storage_root,
+                project.c.storage_name,
+                project.c.storage_layout,
+            ).where(project.c.id == project_id)
+        ).first()
+        if row is None or not _text(row.storage_root):
+            return None
+        root = Path(str(row.storage_root))
+        storage_name = str(row.storage_name or project_id)
+        return root / storage_name if row.storage_layout == "categorized" else root / project_id
+
+    def _previous_end_frame_issue(
+        self,
+        connection: Any,
+        run: Mapping[str, Any],
+        *,
+        external_key: str,
+        path_text: str,
+    ) -> Diagnostic | None:
+        """入队前校验连续上一镜末帧文件存在，缺失时给出显式阻断诊断。"""
+
+        project_root = self._project_root(connection, _text(run.get("project_id")))
+        if project_root is None:
+            # 项目未持久化存储根目录（例如旧数据或测试桩）时无法解析路径，
+            # 降级为 warning 而不是阻断。
+            return _diagnostic(
+                "warning",
+                "media_queue_previous_end_frame_unverifiable",
+                (
+                    "项目存储根目录缺失，无法校验镜头 "
+                    f"{external_key} 的连续上一镜末帧文件"
+                ),
+                path="previous_end_frame_path",
+                details={"external_key": external_key, "previous_end_frame_path": path_text},
+            )
+        checked = validate_relative_media_path(project_root, path_text)
+        if isinstance(checked, Path):
+            return None
+        return _diagnostic(
+            "blocking",
+            "media_queue_previous_end_frame_unavailable",
+            (
+                f"镜头 {external_key} 的连续上一镜末帧文件不可用："
+                f"{path_text}（{checked.message}）"
+            ),
+            path="previous_end_frame_path",
+            details={
+                "external_key": external_key,
+                "previous_end_frame_path": path_text,
+                "reason": checked.code,
+            },
+        )
+
+    _TERMINAL_JOB_STATUSES = frozenset(
+        {"completed", "failed", "cancelled", "interrupted"}
+    )
+
+    @classmethod
+    def _job_is_terminal(cls, connection: Any, job_id: str | None) -> bool:
+        """判断上一镜视频 Job 是否已终态；无 Job 或生成中返回 False。"""
+
+        if not _text(job_id):
+            return False
+        status = connection.scalar(
+            select(job.c.status).where(job.c.id == _text(job_id))
+        )
+        return _text(status) in cls._TERMINAL_JOB_STATUSES
+
+    @staticmethod
     def _keyframe_jobs(
         connection: Any,
         workflow_run_id: str,
@@ -540,7 +616,7 @@ class DynamicMediaQueueService:
         if workflow_stage_id:
             statement = statement.where(job.c.workflow_stage_id == workflow_stage_id)
         rows = connection.execute(statement.order_by(job.c.created_at, job.c.id)).all()
-        result: dict[str, _KeyframeReference] = {}
+        records: list[tuple[str, dict[str, Any]]] = []
         for row in rows:
             record = _row(row)
             if record is None:
@@ -548,17 +624,24 @@ class DynamicMediaQueueService:
             external_key = _text(record.pop("shot_external_key", ""))
             if not external_key or not record.get("id") or not record.get("target_id"):
                 continue
-            version_row = _row(
-                connection.execute(
-                    select(keyframe_version.c.provenance_json).where(
-                        keyframe_version.c.id == record["target_id"]
-                    )
-                ).first()
-            )
-            provenance = _json_column(
-                version_row.get("provenance_json") if version_row else None,
-                {},
-            )
+            records.append((external_key, record))
+
+        # 批量预取全部版本的 provenance，消除每个 Job 一次的 N+1 查询。
+        target_ids = [str(record["target_id"]) for _, record in records]
+        provenance_by_target: dict[str, Any] = {}
+        if target_ids:
+            for version_row in connection.execute(
+                select(
+                    keyframe_version.c.id, keyframe_version.c.provenance_json
+                ).where(keyframe_version.c.id.in_(target_ids))
+            ).all():
+                provenance_by_target[str(version_row.id)] = _json_column(
+                    version_row.provenance_json, {}
+                )
+
+        result: dict[str, _KeyframeReference] = {}
+        for external_key, record in records:
+            provenance = provenance_by_target.get(str(record["target_id"]))
             if not isinstance(provenance, Mapping):
                 continue
             if _text(provenance.get("workflow_run_id")) != workflow_run_id:
@@ -1265,10 +1348,19 @@ class DynamicMediaQueueService:
                 queued_targets: list[_QueuedTarget] = []
                 versions: list[Mapping[str, Any]] = []
                 jobs: list[Mapping[str, Any]] = []
-                target_entries = list(zip(prepared.bundle_keys, base_plan.targets, strict=False))
+                # 严格对齐 bundle 与 target：数量不一致属于内部契约破坏，
+                # 宁可失败也不静默错位（zip(strict=True) 会把媒体挂到错误分镜）。
+                if len(prepared.bundle_keys) != len(base_plan.targets):
+                    raise MediaQueueError(
+                        "Prompt 阶段产物与媒体计划数量不一致："
+                        f"bundle_keys={len(prepared.bundle_keys)} targets={len(base_plan.targets)}"
+                    )
+                target_entries = list(zip(prepared.bundle_keys, base_plan.targets, strict=True))
                 previous_video_job_id: str | None = None
+                previous_target_blocked = False
                 for _index, (bundle_key, base_target) in enumerate(target_entries):
                     target = base_target
+                    end_frame_issues: list[Diagnostic] = []
                     if stage_key == "5b-video-prompts":
                         bundle = stage_output.bundles[bundle_key]
                         metadata = bundle.provenance
@@ -1278,6 +1370,24 @@ class DynamicMediaQueueService:
                             if isinstance(continuity, Mapping)
                             else ""
                         )
+                        # A-M2：入队前校验上一镜末帧文件确实存在，缺失时给显式
+                        # 阻断诊断（错误信息写明哪个镜头缺末帧），不等到生成时才失败。
+                        # 仅当末帧前置已终态（上一镜 Job 完成却无末帧，或失败/取消）
+                        # 或上一镜本轮被阻断时才检查；上一镜尚在生成（queued/running）
+                        # 时末帧将自动产生，由 DAG 依赖保证顺序，不做误阻断。
+                        if previous_end_frame_path:
+                            previous_job_terminal = self._job_is_terminal(
+                                connection, previous_video_job_id
+                            )
+                            if previous_target_blocked or previous_job_terminal:
+                                end_frame_issue = self._previous_end_frame_issue(
+                                    connection,
+                                    run,
+                                    external_key=base_target.external_key,
+                                    path_text=previous_end_frame_path,
+                                )
+                                if end_frame_issue is not None:
+                                    end_frame_issues.append(end_frame_issue)
                         reference = keyframe_jobs.get(base_target.external_key)
                         try:
                             target = build_video_media_plan(
@@ -1299,8 +1409,13 @@ class DynamicMediaQueueService:
                             raise MediaQueueError(
                                 f"媒体目标 {base_target.external_key} 计划生成失败"
                             ) from exc
+                    # _shot_mapping 的结果只依赖 external_key，同一 target 只查一次。
                     mapping = self._shot_mapping(connection, run, target)
-                    target_diagnostics = [*target.diagnostics, *mapping.diagnostics]
+                    target_diagnostics = [
+                        *target.diagnostics,
+                        *mapping.diagnostics,
+                        *end_frame_issues,
+                    ]
                     duplicate_stage_keys = [
                         item.external_key
                         for item in base_plan.targets
@@ -1329,7 +1444,6 @@ class DynamicMediaQueueService:
                         target = _target_with_diagnostics(target, target_diagnostics)
                     plans.append(target)
 
-                    mapping = self._shot_mapping(connection, run, target)
                     if target.status not in _QUEUEABLE_TARGET_STATUSES or mapping.shot_id is None:
                         target_summaries.append(
                             self._target_summary(
@@ -1337,6 +1451,10 @@ class DynamicMediaQueueService:
                                 shot_id=mapping.shot_id,
                             )
                         )
+                        # 未入队的 5b target 不会产生视频，其后续 continuous 镜头
+                        # 的末帧前置已不可得，需要显式阻断下游。
+                        if stage_key == "5b-video-prompts":
+                            previous_target_blocked = True
                         continue
                     keyframe_version_id: str | None = None
                     if target.kind == "video":
@@ -1358,6 +1476,8 @@ class DynamicMediaQueueService:
                                 self._target_summary(blocked, shot_id=mapping.shot_id)
                             )
                             plans[-1] = blocked
+                            if stage_key == "5b-video-prompts":
+                                previous_target_blocked = True
                             continue
                         keyframe_version_id = keyframe_reference.version_id
                     queued_target = self._queue_target(
@@ -1383,6 +1503,7 @@ class DynamicMediaQueueService:
                     )
                     if stage_key == "5b-video-prompts":
                         previous_video_job_id = str(queued_target.job["id"])
+                        previous_target_blocked = False
 
                 # base_plan 仅用于确定 bundle/target 顺序；其中 5b 的初次桥接没有
                 # 上一镜真实 Job，产生的临时连续性诊断不能污染重建后的最终计划。

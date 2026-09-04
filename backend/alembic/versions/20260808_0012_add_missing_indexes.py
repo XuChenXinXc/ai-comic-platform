@@ -23,45 +23,59 @@ branch_labels: str | None = None
 depends_on: str | None = None
 
 
+def _has_index(table: str, index: str) -> bool:
+    """幂等守卫：索引已存在则跳过，避免中断重放时报 already exists。"""
+    inspector = sa.inspect(op.get_bind())
+    if table not in inspector.get_table_names():
+        return False
+    return any(item["name"] == index for item in inspector.get_indexes(table))
+
+
+def _create_index_if_missing(table: str, index: str, columns: list[str]) -> None:
+    if table in sa.inspect(op.get_bind()).get_table_names() and _has_index(table, index):
+        return
+    op.create_index(index, table, columns)
+
+
 def upgrade() -> None:
     inspector = sa.inspect(op.get_bind())
     tables = set(inspector.get_table_names())
 
     # shot 表：按章节查询的索引
     if "shot" in tables:
-        op.create_index("idx_shot_chapter", "shot", ["chapter_id"])
+        _create_index_if_missing("shot", "idx_shot_chapter", ["chapter_id"])
 
     # keyframe_version 表：查询特定分镜的完成版本
     if "keyframe_version" in tables:
-        op.create_index(
-            "idx_keyframe_shot_status",
+        _create_index_if_missing(
             "keyframe_version",
+            "idx_keyframe_shot_status",
             ["shot_id", "status"],
         )
 
     # video_version 表：查询特定分镜的完成版本
     if "video_version" in tables:
-        op.create_index(
-            "idx_video_shot_status",
+        _create_index_if_missing(
             "video_version",
+            "idx_video_shot_status",
             ["shot_id", "status"],
         )
 
     # novel_analysis 表：按状态查询
     if "novel_analysis" in tables:
-        op.create_index("idx_novel_analysis_status", "novel_analysis", ["status"])
+        _create_index_if_missing("novel_analysis", "idx_novel_analysis_status", ["status"])
 
     # screenplay 表：按状态查询
     if "screenplay" in tables:
-        op.create_index("idx_screenplay_status", "screenplay", ["status"])
+        _create_index_if_missing("screenplay", "idx_screenplay_status", ["status"])
 
     # asset 表：按状态查询（project_id + status 复合索引）
     if "asset" in tables:
-        op.create_index("idx_asset_status", "asset", ["project_id", "status"])
+        _create_index_if_missing("asset", "idx_asset_status", ["project_id", "status"])
 
     # job 表：按 chapter_id 查询（如果已存在则跳过）
     if "job" in tables:
-        op.create_index("idx_job_chapter", "job", ["chapter_id"])
+        _create_index_if_missing("job", "idx_job_chapter", ["chapter_id"])
 
 
 def downgrade() -> None:

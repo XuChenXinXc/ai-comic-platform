@@ -228,6 +228,7 @@ novel_analysis = Table(
         name="status",
     ),
 )
+Index("idx_novel_analysis_status", novel_analysis.c.status)
 
 
 screenplay = Table(
@@ -252,6 +253,7 @@ screenplay = Table(
         name="status",
     ),
 )
+Index("idx_screenplay_status", screenplay.c.status)
 
 
 asset = Table(
@@ -281,6 +283,27 @@ asset = Table(
     UniqueConstraint("project_id", "asset_type", "name", name="uq_asset_project_type_name"),
 )
 Index("idx_asset_project_type", asset.c.project_id, asset.c.asset_type)
+Index("idx_asset_status", asset.c.project_id, asset.c.status)
+
+
+scene_view = Table(
+    "scene_view",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("asset_id", Text, ForeignKey("asset.id", ondelete="CASCADE"), nullable=False),
+    Column("view_key", Text, nullable=False),
+    Column("name", Text, nullable=False, server_default=""),
+    Column("prompt", Text, nullable=False, server_default=""),
+    Column("prompt_override", Text, nullable=False, server_default=""),
+    Column("sort_order", Integer, nullable=False, server_default="0"),
+    Column("status", Text, nullable=False, server_default="draft"),
+    Column("created_at", Text, nullable=False),
+    Column("updated_at", Text, nullable=False),
+    CheckConstraint("view_key <> ''", name="view_key_not_empty"),
+    CheckConstraint("status IN ('draft','ready','confirmed','failed')", name="status"),
+    UniqueConstraint("asset_id", "view_key", name="uq_scene_view_asset_key"),
+)
+Index("idx_scene_view_asset", scene_view.c.asset_id)
 
 
 asset_image = Table(
@@ -288,6 +311,9 @@ asset_image = Table(
     metadata,
     Column("id", Text, primary_key=True),
     Column("asset_id", Text, ForeignKey("asset.id", ondelete="CASCADE"), nullable=False),
+    # scene_view_id 不声明 FK：生产迁移为避免级联重建只在服务层置空引用；
+    # 测试库与生产库行为需一致，删除置空语义由 SceneViewService.delete 保证。
+    Column("scene_view_id", Text),
     Column("version_no", Integer, nullable=False),
     Column("file_path", Text),
     Column("provider_url", Text),
@@ -314,11 +340,25 @@ asset_image = Table(
     CheckConstraint("source IN ('generated','uploaded')", name="source"),
     UniqueConstraint("asset_id", "version_no", name="uq_asset_image_asset_version"),
 )
+# 每个 Scene View（含 NULL=旧场景图）各有自己的当前图；
+# NULL 在 SQLite 唯一索引中视为互不相同，旧图与各 View 的 current 可共存。
 Index(
-    "ux_asset_image_current",
+    "ux_asset_image_current_view",
     asset_image.c.asset_id,
+    asset_image.c.scene_view_id,
     unique=True,
     sqlite_where=asset_image.c.is_current == 1,
+)
+# 旧场景图 / 角色 / 道具（scene_view_id 恒为 NULL）仍需「每素材一张当前图」约束：
+# 上面 (asset_id, scene_view_id) 索引在 SQLite 下对 NULL 不生效，须用子集唯一索引兜底。
+Index(
+    "ux_asset_image_current_legacy",
+    asset_image.c.asset_id,
+    unique=True,
+    sqlite_where=sa.and_(
+        asset_image.c.is_current == 1,
+        asset_image.c.scene_view_id.is_(None),
+    ),
 )
 
 
@@ -335,6 +375,8 @@ shot = Table(
     Column("source_signature", Text, nullable=False, server_default=""),
     Column("external_key", Text),
     Column("scene_asset_id", Text, ForeignKey("asset.id", ondelete="SET NULL")),
+    # 同 asset_image.scene_view_id：不声明 FK，删除置空由 SceneViewService.delete 保证。
+    Column("scene_view_id", Text),
     Column("character_ids_json", Text, nullable=False, server_default="[]"),
     Column("prop_ids_json", Text, nullable=False, server_default="[]"),
     Column("positions_json", Text, nullable=False, server_default="[]"),
@@ -362,6 +404,7 @@ shot = Table(
     ),
     Column("continuity_json", Text, nullable=False, server_default="{}"),
     Column("pipeline_metadata_json", Text, nullable=False, server_default="{}"),
+    Column("director_plan_json", Text, nullable=False, server_default="{}"),
     Column("frame_description", Text, nullable=False, server_default=""),
     Column("image_prompt", Text, nullable=False, server_default=""),
     Column("image_prompt_override", Text, nullable=False, server_default=""),
@@ -379,6 +422,7 @@ shot = Table(
     UniqueConstraint("chapter_id", "shot_no", name="uq_shot_chapter_no"),
 )
 Index("idx_shot_chapter_order", shot.c.chapter_id, shot.c.shot_order)
+Index("idx_shot_chapter", shot.c.chapter_id)
 
 
 keyframe_version = Table(
@@ -416,6 +460,7 @@ Index(
     unique=True,
     sqlite_where=keyframe_version.c.is_current == 1,
 )
+Index("idx_keyframe_shot_status", keyframe_version.c.shot_id, keyframe_version.c.status)
 
 
 video_version = Table(
@@ -460,6 +505,7 @@ Index(
     unique=True,
     sqlite_where=video_version.c.is_current == 1,
 )
+Index("idx_video_shot_status", video_version.c.shot_id, video_version.c.status)
 
 
 job = Table(
@@ -503,6 +549,7 @@ Index("idx_job_project_status", job.c.project_id, job.c.status)
 Index("idx_job_batch", job.c.batch_id)
 Index("idx_job_workflow_run_status", job.c.workflow_run_id, job.c.status)
 Index("idx_job_workflow_stage_status", job.c.workflow_stage_id, job.c.status)
+Index("idx_job_chapter", job.c.chapter_id)
 Index(
     "ux_job_idempotency_key",
     job.c.idempotency_key,
@@ -519,6 +566,9 @@ audio_config = Table(
     Column("bgm_volume", Float, nullable=False, server_default="0.3"),
     Column("dialogue_volume", Float, nullable=False, server_default="1.0"),
     Column("sound_effect_volume", Float, nullable=False, server_default="0.5"),
+    # 角色→音色映射（服务端持久化，替代前端 localStorage）：
+    # 形如 {"林舟": "edge-tts:zh-CN-YunjianNeural", ...}
+    Column("voice_mapping_json", Text, nullable=False, server_default="{}"),
     Column("updated_at", Text, nullable=False),
     CheckConstraint("bgm_volume >= 0 AND bgm_volume <= 1", name="bgm_volume"),
     CheckConstraint("dialogue_volume >= 0 AND dialogue_volume <= 1", name="dialogue_volume"),
@@ -566,6 +616,21 @@ Index(
     unique=True,
     sqlite_where=shot_audio.c.is_current == 1,
     postgresql_where=shot_audio.c.is_current == 1,
+)
+# 对话行级索引对 NULL（legacy 单镜音频）互不相同，不构成约束；
+# legacy 路径仍需「每镜最多一条当前音频」，用子集唯一索引兜底。
+Index(
+    "ux_shot_audio_current_legacy",
+    shot_audio.c.shot_id,
+    unique=True,
+    sqlite_where=sa.and_(
+        shot_audio.c.is_current == 1,
+        shot_audio.c.dialogue_line_id.is_(None),
+    ),
+    postgresql_where=sa.and_(
+        shot_audio.c.is_current == 1,
+        shot_audio.c.dialogue_line_id.is_(None),
+    ),
 )
 
 
@@ -646,6 +711,7 @@ ALL_TABLES = (
     screenplay,
     asset,
     asset_image,
+    scene_view,
     shot,
     keyframe_version,
     video_version,
