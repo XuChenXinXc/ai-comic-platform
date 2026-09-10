@@ -17,7 +17,6 @@ import { ChapterSelector } from "../components/chapter-selector";
 import { ImagePreview } from "../components/image-preview";
 import { JsonEditor } from "../components/json-editor";
 import { ProjectRequired } from "../components/project-required";
-import { SceneViewPanel } from "../components/scene-view-panel";
 import {
   EmptyState,
   ErrorState,
@@ -343,7 +342,7 @@ export function AssetsPage() {
             return (
               <Card key={asset.id} className="overflow-hidden">
                 <div className="grid sm:grid-cols-[150px_minmax(0,1fr)]">
-                  <div className="relative min-h-40 border-b border-line bg-[#252925] sm:border-b-0 sm:border-r">
+                  <div className="relative min-h-40 border-b border-line bg-[#0b0b0d] sm:border-b-0 sm:border-r">
                     {asset.current_image && mediaUrl(asset.current_image) ? (
                       <ImagePreview
                         src={mediaUrl(asset.current_image)}
@@ -379,7 +378,7 @@ export function AssetsPage() {
                         <div className="flex flex-wrap items-center gap-2">
                           <h2 className="truncate text-lg font-bold">{asset.name}</h2>
                           {asset.importance === "core" ? (
-                            <Badge className="border-[#d9ae7f] bg-[#fff3e5] text-[#8b4b1e]">
+                            <Badge className="border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
                               核心
                             </Badge>
                           ) : null}
@@ -408,11 +407,11 @@ export function AssetsPage() {
                       </div>
                     ) : null}
 
-                    <div className="mt-4 rounded-md border border-line bg-white/60 p-3">
+                    <div className="mt-4 rounded-2xl border border-black/[0.06] bg-paper/60 p-3 dark:border-white/10 dark:bg-white/[0.05]">
                       <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
                         最终提示词
                       </p>
-                      <p className="mt-2 max-h-44 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+                      <p className="mt-2 max-h-44 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-muted">
                         {asset.compiled_prompt || asset.prompt}
                       </p>
                     </div>
@@ -420,7 +419,7 @@ export function AssetsPage() {
                 </div>
                 <AssetImagePanel asset={asset} />
                 {asset.asset_type === "scene" ? (
-                  <SceneViewPanel asset={asset} />
+                  <SceneFamilyHint asset={asset} />
                 ) : null}
               </Card>
             );
@@ -585,5 +584,25 @@ export function AssetsPage() {
       </div>
       </ChapterRequired>
     </ProjectRequired>
+  );
+}
+
+/** 场景族信息提示：锚点场景与族成员生成时的参考关系。 */
+function SceneFamilyHint({ asset }: { asset: Asset }) {
+  const profile = parseJson<Record<string, unknown>>(asset.profile_json, {});
+  const family = typeof profile.scene_family === "string" ? profile.scene_family.trim() : "";
+  if (!family) return null;
+  const isAnchor = Boolean(profile.family_anchor);
+  return (
+    <div className="border-t border-black/[0.06] bg-canvas/70 p-5 dark:border-white/10 dark:bg-white/[0.03]">
+      <p className="text-xs font-bold uppercase tracking-[0.14em] text-muted">
+        场景族（Scene Family）
+      </p>
+      <p className="mt-1 text-xs leading-5 text-muted">
+        {isAnchor
+          ? `「${family}」锚点场景：同族其他空间生成时将参考本场景图。`
+          : `「${family}」：生成场景图时将参考族内锚点场景的当前图，保证同一建筑群外观一致。`}
+      </p>
+    </div>
   );
 }

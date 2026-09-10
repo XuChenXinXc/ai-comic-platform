@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from types import UnionType
 from typing import Annotated, Any, Union, get_args, get_origin
@@ -9,12 +10,89 @@ from pydantic import BaseModel, ValidationError
 
 from app.schemas import ProviderConfig
 
-from ..base import HttpProviderBase, ProviderError
+from ..base import HttpProviderBase, ProviderError, compress_reference_image
 
 
 class OpenAICompatibleTextProvider(HttpProviderBase):
     def __init__(self, config: ProviderConfig) -> None:
         super().__init__(config)
+
+    @property
+    def supports_vision(self) -> bool:
+        """Provider 参数 supports_vision 为真时允许图片输入（视觉质检）。"""
+        return str(self.config.params.get("supports_vision") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    async def generate_vision_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        images: list[Any],
+        schema: type[BaseModel],
+        params: dict[str, Any],
+    ) -> BaseModel:
+        """带图片输入的结构化生成（OpenAI 视觉格式）。
+
+        images 为本地图片路径（Path）列表，压缩为 JPEG base64 data URL 后
+        作为 image_url 内容块附加到用户消息，复用 generate_json 的 JSON
+        修复流程。
+        """
+        from pathlib import Path
+
+        content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+        for image in images:
+            path = image if isinstance(image, Path) else Path(str(image))
+            if not path.is_file():
+                raise ProviderError(f"视觉输入图片不存在：{path}")
+            encoded = base64.b64encode(
+                compress_reference_image(path, max_side=1536)
+            ).decode("ascii")
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                }
+            )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+        repair_instruction = "上一次输出无法通过校验。请只返回修复后的完整 JSON 对象。"
+        raw = await self._complete(
+            messages,
+            schema,
+            params,
+            json_response=True,
+        )
+        try:
+            return self._validate_output(schema, raw, None)
+        except (ValidationError, ValueError, json.JSONDecodeError) as first_error:
+            repair_messages = [
+                *messages,
+                {"role": "assistant", "content": raw},
+                {
+                    "role": "user",
+                    "content": f"{repair_instruction}\n校验错误：{first_error}",
+                },
+            ]
+            repaired = await self._complete(
+                repair_messages,
+                schema,
+                params,
+                json_response=True,
+            )
+            try:
+                return self._validate_output(schema, repaired, None)
+            except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                summary = repaired.strip().replace("\n", " ")[:500]
+                raise ProviderError(
+                    f"文字 Provider 的视觉质检输出修复失败：{exc}；响应摘要：{summary}"
+                ) from exc
 
     async def generate_json(
         self,
@@ -82,7 +160,7 @@ class OpenAICompatibleTextProvider(HttpProviderBase):
 
     async def _complete(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         schema: type[BaseModel],
         params: dict[str, Any],
         *,

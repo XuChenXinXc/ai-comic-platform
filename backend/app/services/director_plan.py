@@ -19,6 +19,11 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.dynamic_pipeline.visual_validator import (
+    animation_cadence_lock_for,
+    dynamic_negative_rules_for,
+    motion_style_lock_for,
+)
 from app.services.camera_library import (
     DEFAULT_CAMERA_POLICY,
     camera_decision_diagnostics,
@@ -273,7 +278,7 @@ class ConsistencyIssue:
     details: dict[str, Any] = field(default_factory=dict)
 
 
-_EPS = 0.01
+_EPS = 0.05
 
 # 非人物发声源关键词：这些「说话者」不产生画内口型
 _NON_LIP_SYNC_MARKERS = (
@@ -637,6 +642,213 @@ def _prop_issues(
     return issues
 
 
+# 具体包类道具名词：导演计划自由文本里出现与分镜事实不同的包类名词时，
+# 直接指向道具连续性错误（双肩包→公文包），而不是放任视频模型重生成附件。
+_SPECIFIC_BAG_NOUNS = (
+    "双肩包",
+    "公文包",
+    "手提包",
+    "单肩包",
+    "挎包",
+    "邮差包",
+    "登山包",
+    "腰包",
+    "帆布包",
+    "书包",
+)
+
+# 时段标记词：同场连续镜头之间出现不同时段词视为光照跳变风险。
+_TIME_OF_DAY_MARKERS = (
+    "清晨",
+    "早晨",
+    "早上",
+    "上午",
+    "正午",
+    "中午",
+    "午后",
+    "下午",
+    "傍晚",
+    "黄昏",
+    "日间",
+    "白天",
+    "夜间",
+    "夜晚",
+    "晚上",
+    "凌晨",
+    "黎明",
+)
+
+# 毫米级动作描述（约三十度 / 半厘米 / 半寸 / 外碾半圈）：视频模型不区分这种精度，
+# 反而稀释主动作权重；导演计划里出现时给出提示。
+_PRECISE_MEASUREMENT_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:度|厘米|毫米|公分|寸)"
+    r"|(?:半|几|数)\s*(?:厘米|毫米|公分|寸|圈)"
+    r"|(?:约|大约|近|左右)?[一两二三四五六七八九十百零]+\s*度"
+)
+
+
+def _timeline_actions(
+    timeline: Sequence[DirectorTimelineSegment | Mapping[str, Any]],
+) -> list[str]:
+    actions: list[str] = []
+    for item in timeline or []:
+        if isinstance(item, Mapping):
+            actions.append(_text(item.get("action", "")))
+        else:
+            actions.append(item.action)
+    return [action for action in actions if action]
+
+
+def _bag_nouns(text: str) -> set[str]:
+    return {noun for noun in _SPECIFIC_BAG_NOUNS if noun in text}
+
+
+def _plan_prop_name_issues(
+    shot: Mapping[str, Any],
+    plan: DirectorPlan,
+    timeline: Sequence[DirectorTimelineSegment | Mapping[str, Any]],
+    prev_end_state: str,
+) -> list[ConsistencyIssue]:
+    """校验：导演计划文本不得把分镜事实中的道具改称（双肩包→公文包）。"""
+    issues: list[ConsistencyIssue] = []
+    props = shot.get("prop_names") or shot.get("props") or []
+    if isinstance(props, str):
+        props = [props]
+    facts_text = " ".join(
+        [
+            _text(shot.get("start_state")),
+            _text(shot.get("action")),
+            _text(shot.get("end_state")),
+            *[_text(prop) for prop in props],
+            _text(prev_end_state),
+        ]
+    )
+    plan_parts = [
+        plan.performance,
+        *[
+            f"{item.action}{item.trigger or ''}{item.source or ''}"
+            for item in plan.micro_performance
+        ],
+        *_timeline_actions(timeline),
+    ]
+    plan_text = " ".join(_text(part) for part in plan_parts)
+
+    facts_bags = _bag_nouns(facts_text)
+    plan_bags = _bag_nouns(plan_text)
+    drift = sorted(plan_bags - facts_bags)
+    if not drift:
+        return issues
+    if facts_bags:
+        issues.append(
+            ConsistencyIssue(
+                "prop_name_drift",
+                f"导演计划中出现了与分镜事实不同的包类道具：{'、'.join(drift)}，"
+                "请统一为分镜事实中的道具名称",
+                "blocking",
+                {"plan_nouns": drift, "fact_nouns": sorted(facts_bags)},
+            )
+        )
+    else:
+        issues.append(
+            ConsistencyIssue(
+                "prop_name_unattested",
+                f"导演计划引入了分镜事实与上一镜结束状态都未出现的道具：{'、'.join(drift)}",
+                "warning",
+                {"plan_nouns": drift},
+            )
+        )
+    return issues
+
+
+def _measurement_issues(
+    plan: DirectorPlan,
+    timeline: Sequence[DirectorTimelineSegment | Mapping[str, Any]],
+) -> list[ConsistencyIssue]:
+    """校验：导演计划不得用毫米级测量描述微动作，应改成语义化幅度。"""
+    parts = [
+        plan.performance,
+        *[f"{item.action}{item.trigger or ''}" for item in plan.micro_performance],
+        *_timeline_actions(timeline),
+    ]
+    text = " ".join(_text(part) for part in parts)
+    if _PRECISE_MEASUREMENT_RE.search(text):
+        match = _PRECISE_MEASUREMENT_RE.search(text)
+        return [
+            ConsistencyIssue(
+                "precise_measurement",
+                f"表演描述包含精确测量词「{match.group(0)}」，"
+                "视频模型不区分这种精度，请改为语义化幅度描述（如「极轻地探了一下」）",
+                "warning",
+                {"term": match.group(0)},
+            )
+        ]
+    return []
+
+
+def _lighting_shift_issues(
+    transition_from_prev: str,
+    plan: DirectorPlan,
+    prev_visual_tone: Sequence[str],
+) -> list[ConsistencyIssue]:
+    """校验：同场连续镜头之间不得出现时段跳变（清晨→日间台灯主光）。"""
+    if transition_from_prev not in {"continuous", "same_scene_cut"}:
+        return []
+    if not prev_visual_tone:
+        return []
+    current_tone = [str(item) for item in plan.visual_tone]
+    current_tod = {
+        marker for tone in current_tone for marker in _TIME_OF_DAY_MARKERS if marker in tone
+    }
+    prev_tod = {
+        marker for tone in prev_visual_tone for marker in _TIME_OF_DAY_MARKERS if marker in tone
+    }
+    if current_tod and prev_tod and not (current_tod & prev_tod):
+        return [
+            ConsistencyIssue(
+                "lighting_shift_between_shots",
+                f"本镜影像基调时段（{'、'.join(sorted(current_tod))}）与上一镜"
+                f"（{'、'.join(sorted(prev_tod))}）不一致，同场连续镜头请延续上一镜的时段与受光",
+                "warning",
+                {"current_tone": current_tone, "prev_tone": list(prev_visual_tone)},
+            )
+        ]
+    return []
+
+
+def _timeline_density_issues(
+    timeline: Sequence[DirectorTimelineSegment | Mapping[str, Any]],
+    duration_sec: float,
+) -> list[ConsistencyIssue]:
+    """校验：时间轴动作密度——过短分段过多提示拆镜，避免单镜动作主题超载。"""
+    if not timeline or duration_sec <= 0:
+        return []
+    segments: list[tuple[float, float]] = []
+    for item in timeline:
+        if isinstance(item, Mapping):
+            start = float(item.get("start", item.get("start_time", 0.0)) or 0.0)
+            end = float(item.get("end", item.get("end_time", 0.0)) or 0.0)
+        else:
+            start, end = item.start, item.end
+        if end > start:
+            segments.append((start, end))
+    if not segments:
+        return []
+    short_count = sum(1 for start, end in segments if end - start < 1.5)
+    average = duration_sec / len(segments)
+    dense = short_count > 2 or (len(segments) > 6 and average < 2.0)
+    if dense:
+        return [
+            ConsistencyIssue(
+                "timeline_too_dense",
+                f"时间轴共 {len(segments)} 段、其中 {short_count} 段不足 1.5 秒，"
+                "单镜独立动作节点过多，建议拆镜或精简动作主题",
+                "warning",
+                {"segments": len(segments), "short_segments": short_count},
+            )
+        ]
+    return []
+
+
 def _posture_issues(
     start_state: str,
     action: str,
@@ -755,11 +967,14 @@ def validate_shot_consistency(
     duration_sec: float = 0.0,
     prev_end_state: str = "",
     next_start_state: str = "",
+    prev_visual_tone: Sequence[str] = (),
     camera_policy: str = DEFAULT_CAMERA_POLICY,
 ) -> list[ConsistencyIssue]:
     """最终一致性校验器：对单个分镜执行结构性 + 语义性检查。
 
     参数均为只读事实；本函数不修改任何输入，只返回问题列表（空列表表示通过）。
+    prev_visual_tone：上一镜导演计划的影像基调（用于同场连续镜头的光照时段
+    一致性检查，避免「上一镜清晨晨光、下一镜台灯主光」式跳变）。
     """
     shot = dict(shot or {})
     issues: list[ConsistencyIssue] = []
@@ -792,6 +1007,7 @@ def validate_shot_consistency(
 
     camera_motivation = ""
     composition = ""
+    plan: DirectorPlan | None = None
     if director_plan is not None:
         plan = (
             director_plan
@@ -803,6 +1019,20 @@ def validate_shot_consistency(
     issues.extend(
         _camera_issues(camera_motivation, composition, _text(shot.get("camera_move")))
     )
+    if plan is not None:
+        # 导演计划文本层的确定性检查：道具名称漂移 / 毫米级测量词 / 光照时段跳变。
+        issues.extend(
+            _plan_prop_name_issues(shot, plan, timeline, _text(prev_end_state))
+        )
+        issues.extend(_measurement_issues(plan, timeline))
+        issues.extend(
+            _lighting_shift_issues(
+                _text(shot.get("transition_from_prev", "scene_change")),
+                plan,
+                prev_visual_tone,
+            )
+        )
+    issues.extend(_timeline_density_issues(timeline, duration_sec))
     policy = normalize_policy(camera_policy)
     for suggestion in camera_decision_diagnostics(
         shot,
@@ -905,7 +1135,11 @@ def _quote_text(text: str) -> str:
     return f"{stripped}。"
 
 
-def _render_dialogue(bindings: Sequence[DialogueBinding]) -> list[str]:
+def _render_dialogue(
+    bindings: Sequence[DialogueBinding],
+    *,
+    audio_driven: bool = False,
+) -> list[str]:
     if not bindings:
         return ["本镜没有画内对白，人物全程不开口。"]
     lines: list[str] = ["本镜对白按以下顺序进行："]
@@ -918,7 +1152,16 @@ def _render_dialogue(bindings: Sequence[DialogueBinding]) -> list[str]:
                 f"第{index}句是画外或设备发出的声音：“{_quote_text(item.text)}”，"
                 "画面人物不开口。"
             )
-    lines.append("说话人开口时口型自然配合，其余角色保持安静，不抢话、不代说。")
+    if audio_driven:
+        # Provider 收到本镜配音音频，口型由音频驱动，可以要求自然配合。
+        lines.append("说话人开口时口型与配音自然配合，其余角色保持安静，不抢话、不代说。")
+    else:
+        # 无音频输入时模型只能凭空表演说话：要求嘴部动作克制、幅度轻微，
+        # 避免夸张口型与后期配音严重错位；对白由后期配音与字幕呈现。
+        lines.append(
+            "说话人嘴部只做轻微启合、口型幅度克制（对白由后期配音与字幕呈现），"
+            "其余角色保持安静，不抢话、不代说。"
+        )
     return lines
 
 
@@ -926,8 +1169,15 @@ def _timeline_flow_text(timeline: Sequence[DirectorTimelineSegment]) -> str:
     return "；".join(f"{item.start:g}-{item.end:g}秒：{_text(item.action)}" for item in timeline)
 
 
-def _hard_constraint_line(hard: Sequence[str]) -> str:
-    """把硬约束渲染成一条简短的自然语言负面约束。"""
+def _hard_constraint_line(
+    hard: Sequence[str],
+    dynamic_rules: Sequence[str] = (),
+) -> str:
+    """把硬约束渲染成一条简短的自然语言负面约束。
+
+    dynamic_rules 由调用方按画风媒介传入（二维项目传反动态写实化条款，
+    三维CG/真人写实项目传空），不再无条件注入写实化禁用词。
+    """
     base = (
         "画面中不出现：人物身份或服装改变、场景结构被重构、"
         "新增无关人物、画面内文字、道具凭空消失。"
@@ -937,6 +1187,11 @@ def _hard_constraint_line(hard: Sequence[str]) -> str:
         extra_text = _text(item)
         if extra_text and extra_text not in extras and not _HARD_OVERLAP_RE.search(extra_text):
             extras.append(extra_text)
+    # 反动态写实化负向补齐（幂等：base 或既有条款已包含时不重复追加）。
+    for rule in dynamic_rules:
+        if rule in base or any(rule in item for item in extras):
+            continue
+        extras.append(rule)
     if not extras:
         return base
     return base.rstrip("。") + "；" + "、".join(extras) + "。"
@@ -992,8 +1247,6 @@ def _reference_sentences(anchors: Sequence[str]) -> list[str]:
         elif item.role == "prop_identity":
             subject = name or "道具"
             lines.append(f"{subject}沿用 {item.token} 的外观与材质。")
-        elif item.role == "scene_master":
-            lines.append(f"场景母版空间结构沿用 {item.token}。")
         else:
             lines.append(f"{item.token} 作为画面参考。")
     return lines
@@ -1011,19 +1264,38 @@ def render_director_video_prompt(
     shot_type: str = "中景",
     anchors: Sequence[str] = (),
     hard_constraints: Sequence[str] = (),
+    visual_bible: Mapping[str, Any] | None = None,
+    audio_driven: bool = False,
+    transition_from_prev: str = "scene_change",
+    prev_end_state: str = "",
+    scene_name: str = "",
 ) -> str:
     """把导演设计与已算好的时间轴 / 对白渲染成自然语言导演式视频提示词。
 
     只渲染已经计算完成的结果，不再注入「锁定 / 禁止 / 保持稳定 / 唯一时间轴」
     等上游推理规则；时间轴去掉精确秒数，按粗粒度阶段自然表达。
+    audio_driven：True 表示 Provider 收到配音音频，口型由音频驱动。
+    transition_from_prev / prev_end_state / scene_name：渲染承接句——
+    换场景或省略剪辑时明确写出省略式切换，防止视频模型把上一镜的
+    结束动作误当作同一时空连续承接（例如一楼大门→七楼办公区）。
     """
-    from app.services.natural_video_prompt import naturalize_timeline_flow
+    from app.dynamic_pipeline.visual_anchor import (
+        compile_visual_bible,
+        render_visual_style_spec,
+        visual_style_negative_terms,
+    )
+    from app.services.natural_video_prompt import (
+        continuity_opening_sentence,
+        naturalize_timeline_flow,
+    )
 
     plan = (
         director_plan
         if isinstance(director_plan, DirectorPlan)
         else DirectorPlan.model_validate(director_plan)
     )
+    style_spec = compile_visual_bible(style_prompt, visual_bible)
+    structured_style = render_visual_style_spec(style_spec)
 
     paragraphs: list[str] = []
 
@@ -1035,6 +1307,7 @@ def render_director_video_prompt(
             if _text(style_prompt)
             else f"画面比例 {_text(aspect_ratio)}。"
         ),
+        structured_style if structured_style else "",
         f"本镜的叙事意图：{_clean_text(plan.shot_purpose)}。",
         _render_audience_focus(plan.audience_focus),
     ]
@@ -1043,8 +1316,14 @@ def render_director_video_prompt(
         style_lines.append(f"影像基调：{visual_tone}。")
     paragraphs.append("".join(style_lines))
 
-    # 第二段：起始状态与素材引用
-    start_lines = [*_reference_sentences(anchors)]
+    # 第二段：镜间衔接、起始状态与素材引用
+    start_lines: list[str] = []
+    continuity = continuity_opening_sentence(
+        str(transition_from_prev or "scene_change"), prev_end_state, scene_name
+    )
+    if continuity:
+        start_lines.append(continuity)
+    start_lines.extend(_reference_sentences(anchors))
     if _text(initial_state):
         start_lines.append(f"这一镜开始时，{_clean_text(initial_state)}。")
     if start_lines:
@@ -1083,16 +1362,30 @@ def render_director_video_prompt(
         camera_line += f"{depth}。"
     paragraphs.append(camera_line)
 
-    # 第五段：环境动态、对白、结束状态与负面约束
+    # 第五段：环境动态、对白与结束状态
     tail_lines: list[str] = []
     environment_motion = _text(plan.environment_motion).strip("。")
     if environment_motion:
         tail_lines.append(f"{environment_motion}。")
-    tail_lines.extend(_render_dialogue(dialogue_bindings))
+    tail_lines.extend(_render_dialogue(dialogue_bindings, audio_driven=audio_driven))
     if _text(end_state):
         tail_lines.append(f"接近结尾时，{_text(end_state).rstrip('。')}。")
-    tail_lines.append(_hard_constraint_line(hard_constraints))
     paragraphs.append("".join(tail_lines))
+
+    # 协议尾部：负向段与运动风格锁行在渲染器出口注入，格式为行首标签 +
+    # 英文冒号，与视觉校验器的豁免口径一致；不能放进导演计划自由文本
+    # （shot_video_optimize.md 会删除「锁定/保持/稳定」措辞）。
+    constraint_line = _hard_constraint_line(
+        [*hard_constraints, *visual_style_negative_terms(style_spec)],
+        dynamic_rules=dynamic_negative_rules_for(style_spec),
+    )
+    paragraphs.append(f"Negative: {constraint_line}")
+    motion_lock = motion_style_lock_for(style_spec)
+    cadence_lock = animation_cadence_lock_for(style_spec)
+    if motion_lock:
+        paragraphs.append(f"Motion style lock: {motion_lock}")
+    if cadence_lock:
+        paragraphs.append(f"Animation cadence lock: {cadence_lock}")
 
     return "\n\n".join(part for part in paragraphs if part.strip())
 

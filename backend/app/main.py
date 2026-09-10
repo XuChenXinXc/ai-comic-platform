@@ -20,7 +20,6 @@ from app.api import (
     audio,
     chapters,
     composition,
-    dynamic_runs,
     jobs,
     media,
     projects,
@@ -176,7 +175,13 @@ class ProjectMediaStaticFiles(StaticFiles):
         except ValueError as exc:
             raise StarletteHTTPException(status_code=404) from exc
         project_files = self._files_app(project_root)
-        return await project_files.get_response(relative_path.as_posix(), scope)
+        response = await project_files.get_response(relative_path.as_posix(), scope)
+        # 当前版本媒体文件复用固定存储路径（URL 不变，仅文件内容被替换）：
+        # 浏览器对相同 URL 的启发式缓存会让上传/生成新图后仍显示旧内容。
+        # 强制协商缓存：保留 ETag/Last-Modified（未变化时 304 零内容传输），
+        # 但每次请求都必须重新验证，确保新内容及时生效。
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 @asynccontextmanager
@@ -190,12 +195,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         set_imgbb_api_key_override(override_key)
     file_service.migrate_categorized_media_layouts(strict=False)
     register_handlers()
-    # B-L10：恢复入口收敛为 start(recover=True)，由 runner.recover() 内部统一
-    # 走 recover_all_once（dynamic + 普通路径去重后统一 enqueue），不再手工
-    # 重复一遍等价逻辑。
-    # C3 兜底：单个 run 的恢复异常已在 dynamic_recovery 内按 run 隔离；
-    # 这里再整体兜底一次，确保任何恢复错误都不会让 lifespan 失败，
-    # 避免服务反复启动失败形成死循环。
+    # 启动期恢复失败不应让 lifespan 失败，避免服务反复启动失败形成死循环。
     try:
         job_runner.start(recover=True)
     except Exception:
@@ -315,7 +315,6 @@ for api_router in (
     settings_api.router,
     audio.router,
     composition.router,
-    dynamic_runs.router,
 ):
     app.include_router(api_router, prefix="/api")
 

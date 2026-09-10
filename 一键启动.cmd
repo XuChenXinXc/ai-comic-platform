@@ -2,20 +2,38 @@
 setlocal EnableDelayedExpansion
 
 echo ============================================
-echo   AI Comic Platform - One-Click Launch
+echo   AI Comic Platform - Build, Deploy and Launch
 echo ============================================
 echo.
 
 where pwsh.exe >nul 2>&1
 if errorlevel 1 goto use_windows_powershell
 
-echo [1/2] Starting platform with PowerShell 7...
+echo [1/3] Building with PowerShell 7...
+pwsh.exe -NoLogo -NoProfile -File "%~dp0build.ps1"
+if errorlevel 1 goto build_failed
+echo.
+echo [2/3] Starting platform with PowerShell 7...
 pwsh.exe -NoLogo -NoProfile -File "%~dp0restart.ps1" %*
 goto startup_finished
 
 :use_windows_powershell
-echo [1/2] PowerShell 7 not found, falling back to Windows PowerShell 5.1...
+echo PowerShell 7 not found, falling back to Windows PowerShell 5.1...
+echo [1/3] Building with Windows PowerShell 5.1...
+powershell.exe -NoLogo -NoProfile -File "%~dp0build.ps1"
+if errorlevel 1 goto build_failed
+echo.
+echo [2/3] Starting platform with Windows PowerShell 5.1...
 powershell.exe -NoLogo -NoProfile -File "%~dp0restart.ps1" %*
+goto startup_finished
+
+:build_failed
+set "BUILD_EXIT_CODE=%ERRORLEVEL%"
+echo.
+echo [ERROR] Build failed with exit code %BUILD_EXIT_CODE%.
+echo Fix the errors shown above, then run this script again.
+if not "!AI_COMIC_NO_PAUSE!"=="1" pause
+exit /b %BUILD_EXIT_CODE%
 
 :startup_finished
 set "PLATFORM_EXIT_CODE=%ERRORLEVEL%"
@@ -28,7 +46,7 @@ if not "%PLATFORM_EXIT_CODE%"=="0" (
     if not "!AI_COMIC_NO_PAUSE!"=="1" pause
 ) else (
     echo.
-    echo [2/2] Platform started. See the green URL above for access.
+    echo [3/3] Platform built and started. See the green URL above for access.
     echo To stop the platform, run .\stop.ps1
     if not "!AI_COMIC_NO_PAUSE!"=="1" (
         echo.

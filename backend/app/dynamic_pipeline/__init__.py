@@ -1,1 +1,1 @@
-"""动态漫工作流的共享数据合同。"""
+"""视觉一致性共享模块：visual_validator / visual_anchor / prompt_ir / schemas。"""

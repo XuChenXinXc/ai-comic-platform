@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FolderOpen, Info } from "lucide-react";
+import { FolderOpen, Info, Save } from "lucide-react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { api, queryKeys } from "../api/client";
 import {
@@ -7,7 +8,7 @@ import {
   LoadingState,
   PageHeader,
 } from "../components/status";
-import { Button, Card, Input, Label, Select } from "../components/ui";
+import { Button, Card, Input, Label, Select, Textarea } from "../components/ui";
 import { formatError } from "../lib/utils";
 
 const CAMERA_POLICY_HINTS: Record<string, string> = {
@@ -26,6 +27,19 @@ export function PlatformSettingsPage() {
     queryKey: queryKeys.cameraPolicy,
     queryFn: () => api.settings.cameraPolicy.get(),
   });
+  const defaultStylePromptQuery = useQuery({
+    queryKey: queryKeys.defaultStylePrompt,
+    queryFn: () => api.settings.defaultStylePrompt.get(),
+  });
+  const [defaultStylePrompt, setDefaultStylePrompt] = useState("");
+  const [isStylePromptDirty, setIsStylePromptDirty] = useState(false);
+
+  useEffect(() => {
+    if (defaultStylePromptQuery.data && !isStylePromptDirty) {
+      setDefaultStylePrompt(defaultStylePromptQuery.data.style_prompt || "");
+    }
+  }, [defaultStylePromptQuery.data, isStylePromptDirty]);
+
   const selectMutation = useMutation({
     mutationFn: () => api.settings.projectStorage.select(),
     onSuccess: (result) => {
@@ -49,13 +63,24 @@ export function PlatformSettingsPage() {
     },
     onError: (error) => toast.error(formatError(error)),
   });
+  const defaultStylePromptMutation = useMutation({
+    mutationFn: (style_prompt: string) =>
+      api.settings.defaultStylePrompt.set(style_prompt),
+    onSuccess: (result) => {
+      queryClient.setQueryData(queryKeys.defaultStylePrompt, result);
+      setDefaultStylePrompt(result.style_prompt || "");
+      setIsStylePromptDirty(false);
+      toast.success("默认画风已更新");
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
 
   return (
     <div>
       <PageHeader
         eyebrow="Workspace / Settings"
         title="平台设置"
-        description="管理平台级项目存储位置与运镜策略。"
+        description="管理平台级项目存储位置、运镜策略与默认画风。"
       />
 
       {query.isLoading ? <LoadingState label="正在读取平台设置…" /> : null}
@@ -95,7 +120,7 @@ export function PlatformSettingsPage() {
             </div>
           </div>
 
-          <div className="mt-5 flex gap-2 rounded-md border border-[#d9ae7f] bg-[#fff7ec] px-4 py-3 text-sm leading-6 text-[#75471f]">
+          <div className="mt-5 flex gap-2 rounded-xl border border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 px-4 py-3 text-sm leading-6 text-amber-800 dark:text-amber-300">
             <Info className="mt-1 h-4 w-4 shrink-0" />
             <p>仅影响之后新建项目，已有项目不会自动搬迁。</p>
           </div>
@@ -133,6 +158,54 @@ export function PlatformSettingsPage() {
             <p className="mt-2 text-xs leading-5 text-muted">
               {CAMERA_POLICY_HINTS[cameraPolicyQuery.data.policy] ??
                 "未知策略，按克制执行"}
+            </p>
+          </div>
+        </Card>
+      ) : null}
+
+      {defaultStylePromptQuery.isLoading ? (
+        <LoadingState label="正在读取默认画风…" />
+      ) : null}
+      {defaultStylePromptQuery.data !== undefined ? (
+        <Card className="mt-6 max-w-3xl p-5 sm:p-6">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-lg font-bold text-ink">默认画风</h2>
+              <p className="mt-1 text-sm leading-6 text-muted">
+                新建项目时，若未在创建时指定画风，将自动回填该默认画风（留空表示不设默认值）。
+              </p>
+            </div>
+            <Button
+              type="button"
+              variant="primary"
+              className="shrink-0 self-start sm:self-auto"
+              busy={defaultStylePromptMutation.isPending}
+              disabled={!isStylePromptDirty}
+              onClick={() =>
+                defaultStylePromptMutation.mutate(defaultStylePrompt)
+              }
+            >
+              <Save className="h-4 w-4" />
+              保存画风
+            </Button>
+          </div>
+
+          <div className="mt-5">
+            <Label htmlFor="default-style-prompt">
+              默认统一画风 STYLE_ANCHOR
+            </Label>
+            <Textarea
+              id="default-style-prompt"
+              rows={4}
+              value={defaultStylePrompt}
+              placeholder="例如：现代国风水墨动画风格，粗笔焦墨，宣纸微黄底色，工笔重彩与留白结合…"
+              onChange={(event) => {
+                setDefaultStylePrompt(event.target.value);
+                setIsStylePromptDirty(true);
+              }}
+            />
+            <p className="mt-2 text-xs leading-5 text-muted">
+              仅对之后新建的项目生效；已有项目的画风请在各项目的【剧本生成】页面单独调整。
             </p>
           </div>
         </Card>

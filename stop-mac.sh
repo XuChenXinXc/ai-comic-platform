@@ -74,25 +74,35 @@ echo "🧹 清理残留进程..."
 # 查找占用 8012 端口的进程（后端）
 BACKEND_PORT_PID=$(lsof -ti:8012 2>/dev/null || true)
 if [ -n "$BACKEND_PORT_PID" ]; then
-    echo -e "${YELLOW}⚠️  发现占用端口 8012 的进程 (PID: $BACKEND_PORT_PID)，正在停止...${NC}"
-    kill $BACKEND_PORT_PID 2>/dev/null || true
-    sleep 1
-    if kill -0 $BACKEND_PORT_PID 2>/dev/null; then
-        kill -9 $BACKEND_PORT_PID 2>/dev/null || true
+    CMDLINE=$(ps -p $BACKEND_PORT_PID -o args= 2>/dev/null || true)
+    if echo "$CMDLINE" | grep -q "app.main:app"; then
+        echo -e "${YELLOW}⚠️  发现占用端口 8012 的本项目进程 (PID: $BACKEND_PORT_PID)，正在停止...${NC}"
+        kill $BACKEND_PORT_PID 2>/dev/null || true
+        sleep 1
+        if kill -0 $BACKEND_PORT_PID 2>/dev/null; then
+            kill -9 $BACKEND_PORT_PID 2>/dev/null || true
+        fi
+        echo -e "${GREEN}✅ 端口 8012 已释放${NC}"
+    else
+        echo -e "${YELLOW}⚠️  端口 8012 被非本项目进程占用 (PID: $BACKEND_PORT_PID)，已跳过，避免误杀${NC}"
     fi
-    echo -e "${GREEN}✅ 端口 8012 已释放${NC}"
 fi
 
 # 查找占用 3000 端口的进程（前端）
 FRONTEND_PORT_PID=$(lsof -ti:3000 2>/dev/null || true)
 if [ -n "$FRONTEND_PORT_PID" ]; then
-    echo -e "${YELLOW}⚠️  发现占用端口 3000 的进程 (PID: $FRONTEND_PORT_PID)，正在停止...${NC}"
-    kill $FRONTEND_PORT_PID 2>/dev/null || true
-    sleep 1
-    if kill -0 $FRONTEND_PORT_PID 2>/dev/null; then
-        kill -9 $FRONTEND_PORT_PID 2>/dev/null || true
+    CMDLINE=$(ps -p $FRONTEND_PORT_PID -o args= 2>/dev/null || true)
+    if echo "$CMDLINE" | grep -q "$SCRIPT_DIR\|vite"; then
+        echo -e "${YELLOW}⚠️  发现占用端口 3000 的本项目前端进程 (PID: $FRONTEND_PORT_PID)，正在停止...${NC}"
+        kill $FRONTEND_PORT_PID 2>/dev/null || true
+        sleep 1
+        if kill -0 $FRONTEND_PORT_PID 2>/dev/null; then
+            kill -9 $FRONTEND_PORT_PID 2>/dev/null || true
+        fi
+        echo -e "${GREEN}✅ 端口 3000 已释放${NC}"
+    else
+        echo -e "${YELLOW}⚠️  端口 3000 被非本项目进程占用 (PID: $FRONTEND_PORT_PID)，已跳过，避免误杀${NC}"
     fi
-    echo -e "${GREEN}✅ 端口 3000 已释放${NC}"
 fi
 
 # 5. 删除 PID 文件

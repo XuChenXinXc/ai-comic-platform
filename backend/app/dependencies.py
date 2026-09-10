@@ -3,20 +3,14 @@ from typing import Annotated
 from fastapi import Depends
 
 from app.db import Database, get_database
-from app.dynamic_pipeline.media_queue_service import DynamicMediaQueueService
-from app.jobs.dynamic_bridge import DynamicJobBridge
-from app.jobs.repository import JobRepository
-from app.jobs.runner import job_runner
 from app.services.asset_service import AssetService
 from app.services.audio_service import AudioService
 from app.services.chapter_service import ChapterService
 from app.services.composition_service import CompositionService
-from app.services.dynamic_workflow_service import DynamicWorkflowService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
 from app.services.project_service import ProjectService
 from app.services.provider_service import ProviderService
-from app.services.scene_view_service import SceneViewService
 from app.services.setting_service import SettingService
 from app.services.shot_service import ShotService
 from app.services.subtitle_service import SubtitleService
@@ -62,13 +56,6 @@ def get_shot_service(
     return ShotService(database, job_service)
 
 
-def get_scene_view_service(
-    database: Annotated[Database, Depends(get_database)],
-    job_service: Annotated[JobService, Depends(get_job_service)],
-) -> SceneViewService:
-    return SceneViewService(database, job_service)
-
-
 def get_media_service(
     database: Annotated[Database, Depends(get_database)],
     job_service: Annotated[JobService, Depends(get_job_service)],
@@ -106,21 +93,3 @@ def get_composition_service(
     job_service: Annotated[JobService, Depends(get_job_service)],
 ) -> CompositionService:
     return CompositionService(database, job_service)
-
-
-def get_dynamic_workflow_service(
-    database: Annotated[Database, Depends(get_database)],
-) -> DynamicWorkflowService:
-    repository = JobRepository(database)
-    enqueue = job_runner.enqueue
-    job_bridge = DynamicJobBridge(repository, enqueue=enqueue)
-    media_queue = DynamicMediaQueueService(
-        database,
-        job_repository=repository,
-        enqueue=enqueue,
-    )
-    return DynamicWorkflowService(
-        database,
-        job_bridge=job_bridge,
-        media_queue_service=media_queue,
-    )

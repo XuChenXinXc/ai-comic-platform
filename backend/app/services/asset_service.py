@@ -7,6 +7,7 @@ from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db import Database, db
+from app.dynamic_pipeline.visual_anchor import parse_visual_bible, visual_bible_brief
 from app.models.tables import (
     asset,
     asset_image,
@@ -14,7 +15,6 @@ from app.models.tables import (
     job,
     novel_analysis,
     project,
-    scene_view,
     screenplay,
     shot,
 )
@@ -51,6 +51,13 @@ _EXTRACT_EMPTY_RETRY_PROMPT = (
     "\n\n注意：这是该章节的首次素材提取，素材库当前为空。请仔细阅读正文，"
     "至少提取正文中确实出现、需要跨分镜保持一致的素材；"
     "除非本章正文确实没有任何可提取对象，否则不得返回空数组。"
+)
+
+# 视觉语义重解释治理（Phase 2）：素材提取/提示词补全只记录事实，
+# 不写任何画法词；画风由项目统一画风（project.style_prompt）唯一决定。
+_ASSET_FACT_ONLY_CONSTRAINT = (
+    "硬约束：提取结果只记录身份、空间与结构事实，不写任何绘画方式、线条、上色、"
+    "光影、写实度或材质渲染词；画风由项目统一画风唯一决定。"
 )
 
 _ACTIVE_JOB_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
@@ -216,6 +223,7 @@ class AssetService:
             negative_prompt=current["negative_prompt"],
             consistency_keywords=current["consistency_keywords"],
             composition=current["composition"],
+            visual_bible=parse_visual_bible(current_project),
         )
 
     def _current_image(
@@ -239,86 +247,8 @@ class AssetService:
     def _representative_image(
         self, connection: Any, record: dict[str, Any], project_id: str
     ) -> dict[str, Any] | None:
-        """场景素材的展示图：优先 MASTER 当前图，其次旧版场景图。
-
-        场景启用 Scene Pack 后（MASTER + 视图）会同时存在多张 current 图，
-        `current_image` 保持对前端单值字段的兼容：有 MASTER 用 MASTER，
-        否则用旧版场景图（scene_view_id IS NULL）。
-        """
-        if record.get("asset_type") != "scene":
-            return self._current_image(connection, record["id"], project_id)
-        master_view_id = connection.execute(
-            select(scene_view.c.id).where(
-                scene_view.c.asset_id == record["id"],
-                scene_view.c.view_key == "master",
-            )
-        ).scalar()
-
-        def _pick(view_id: Any) -> dict[str, Any] | None:
-            condition = (
-                asset_image.c.scene_view_id == view_id
-                if view_id is not None
-                else asset_image.c.scene_view_id.is_(None)
-            )
-            row = row_dict(
-                connection.execute(
-                    select(asset_image)
-                    .where(
-                        asset_image.c.asset_id == record["id"],
-                        condition,
-                        asset_image.c.is_current.is_(True),
-                        asset_image.c.status == "completed",
-                    )
-                    .order_by(asset_image.c.version_no.desc())
-                ).first()
-            )
-            if not row:
-                return None
-            row["is_current"] = bool(row["is_current"])
-            if row.get("file_path"):
-                row["file_url"] = project_media_url(project_id, row["file_path"])
-                row["media_url"] = row["file_url"]
-            return row
-
-        picked = _pick(master_view_id) if master_view_id else None
-        if picked:
-            return picked
-        return _pick(None)
-
-    def _scene_views(self, connection: Any, scene_id: str, project_id: str) -> list[dict[str, Any]]:
-        """场景素材的 Scene View 列表（含每个 View 的当前图）。"""
-        from app.models.tables import scene_view
-
-        records: list[dict[str, Any]] = []
-        for row in connection.execute(
-            select(scene_view)
-            .where(scene_view.c.asset_id == scene_id)
-            .order_by(scene_view.c.sort_order, scene_view.c.view_key, scene_view.c.id)
-        ):
-            record = dict(row._mapping)
-            view_image = row_dict(
-                connection.execute(
-                    select(asset_image)
-                    .where(
-                        asset_image.c.asset_id == scene_id,
-                        asset_image.c.scene_view_id == record["id"],
-                        asset_image.c.is_current.is_(True),
-                    )
-                    .order_by(asset_image.c.version_no.desc())
-                ).first()
-            )
-            if view_image:
-                view_image["is_current"] = bool(view_image["is_current"])
-                if view_image.get("file_path"):
-                    view_image["file_url"] = project_media_url(
-                        project_id, view_image["file_path"]
-                    )
-                    view_image["media_url"] = view_image["file_url"]
-                record["current_image"] = view_image
-            else:
-                record["current_image"] = None
-            records.append(record)
-        return records
+        """素材展示图：每个素材只有一张当前图（角色/场景/道具一致）。"""
+        return self._current_image(connection, record["id"], project_id)
 
     def list(self, project_id: str, asset_type: str | None = None) -> list[dict[str, Any]]:
         current_project = self._project(project_id)
@@ -336,10 +266,6 @@ class AssetService:
                 record["current_image"] = self._representative_image(
                     connection, record, project_id
                 )
-                if record["asset_type"] == "scene":
-                    record["scene_views"] = self._scene_views(
-                        connection, record["id"], project_id
-                    )
                 records.append(record)
         return records
 
@@ -359,10 +285,6 @@ class AssetService:
             result["current_image"] = self._representative_image(
                 connection, result, result["project_id"]
             )
-            if result["asset_type"] == "scene":
-                result["scene_views"] = self._scene_views(
-                    connection, asset_id, result["project_id"]
-                )
         return result
 
     def _signature(
@@ -380,6 +302,7 @@ class AssetService:
             negative_prompt,
             project_record["style_prompt"],
             prompt_override,
+            visual_bible=parse_visual_bible(project_record),
         )
 
     def create(self, project_id: str, values: dict[str, Any]) -> dict[str, Any]:
@@ -495,17 +418,6 @@ class AssetService:
         image_ids: set[str],
         target_id: str | None,
     ) -> None:
-        # 预先加载该项目全部 Scene View 的 (id → asset_id) 映射，
-        # 用于判断删除/合并场景后 shot.scene_view_id 是否仍然有效，
-        # 避免落库签名（用旧 scene_view_id 计算）与实际列（FK 已 SET NULL）不一致。
-        view_asset_map: dict[str, str] = {
-            str(row.id): str(row.asset_id)
-            for row in connection.execute(
-                select(scene_view.c.id, scene_view.c.asset_id).where(
-                    scene_view.c.asset_id.in_([*source_ids, *(target_id if target_id else [])])
-                )
-            )
-        }
         rows = connection.execute(select(shot).where(shot.c.project_id == project_id)).all()
         for row in rows:
             decoded = dict(row._mapping)
@@ -557,19 +469,6 @@ class AssetService:
                 )
             if scene_asset_id != row.scene_asset_id:
                 changes["scene_asset_id"] = scene_asset_id
-            # scene_view_id 归属校验：若视图属于本次删除/合并涉及的场景素材
-            # 且不再属于（新的）场景素材，则置空，与 FK ON DELETE SET NULL 的
-            # 最终状态保持一致，防止签名失真。视图不在映射中（属于与本次操作
-            # 无关的素材）时不改动，避免无谓失效与绑定丢失。
-            current_view_id = str(row.scene_view_id or "") if row.scene_view_id else None
-            if current_view_id and scene_asset_id:
-                if (
-                    current_view_id in view_asset_map
-                    and view_asset_map[current_view_id] != scene_asset_id
-                ):
-                    changes["scene_view_id"] = None
-            elif current_view_id and not scene_asset_id:
-                changes["scene_view_id"] = None
             if remapped_characters != characters:
                 changes["character_ids_json"] = json_dumps(remapped_characters)
             if remapped_props != props:
@@ -581,8 +480,6 @@ class AssetService:
                 decoded["character_ids"] = remapped_characters
                 decoded["prop_ids"] = remapped_props
                 decoded["reference_bindings"] = remapped_bindings
-                if "scene_view_id" in changes:
-                    decoded["scene_view_id"] = changes["scene_view_id"]
                 semantic = {
                     name: decoded[name]
                     for name in SHOT_SIGNATURE_FIELDS
@@ -666,6 +563,15 @@ class AssetService:
                 )
             }
             self._ensure_no_active_jobs(connection, all_asset_ids, all_image_ids)
+            target_has_current = (
+                connection.execute(
+                    select(asset_image.c.id).where(
+                        asset_image.c.asset_id == target_id,
+                        asset_image.c.is_current.is_(True),
+                    )
+                ).first()
+                is not None
+            )
             next_version = (
                 connection.execute(
                     select(func.max(asset_image.c.version_no)).where(
@@ -679,39 +585,31 @@ class AssetService:
                 .where(asset_image.c.asset_id.in_(source_ids))
                 .order_by(asset_image.c.created_at)
             ).all()
+
+            promoted_image_id: str | None = None
+            if not target_has_current and source_images:
+                source_currents = [
+                    img._mapping["id"]
+                    for img in source_images
+                    if bool(img._mapping.get("is_current"))
+                ]
+                if source_currents:
+                    promoted_image_id = source_currents[-1]
+                else:
+                    promoted_image_id = source_images[-1]._mapping["id"]
+
             for image in source_images:
                 next_version += 1
+                img_id = image._mapping["id"]
                 connection.execute(
                     update(asset_image)
-                    .where(asset_image.c.id == image._mapping["id"])
+                    .where(asset_image.c.id == img_id)
                     .values(
                         asset_id=target_id,
                         version_no=next_version,
-                        is_current=False,
+                        is_current=(img_id == promoted_image_id),
                     )
                 )
-            # 合并场景时把 source 的 Scene Views 迁移到 target（view_key 冲突跳过），
-            # 否则删除 source 时其视图被级联清掉，分镜引用随之丢失。
-            if target["asset_type"] == "scene":
-                existing_view_keys = set(
-                    connection.execute(
-                        select(scene_view.c.view_key).where(scene_view.c.asset_id == target_id)
-                    ).scalars()
-                )
-                source_views = connection.execute(
-                    select(scene_view)
-                    .where(scene_view.c.asset_id.in_(source_ids))
-                    .order_by(scene_view.c.sort_order, scene_view.c.view_key)
-                ).all()
-                for view_row in source_views:
-                    if view_row.view_key in existing_view_keys:
-                        continue
-                    connection.execute(
-                        update(scene_view)
-                        .where(scene_view.c.id == view_row.id)
-                        .values(asset_id=target_id, updated_at=now)
-                    )
-                    existing_view_keys.add(view_row.view_key)
             self._update_shot_asset_references(
                 connection,
                 project_id=target["project_id"],
@@ -911,7 +809,13 @@ class AssetService:
         # 首次提取：该章节所属项目素材库为空；此时若模型返回空结果则判为异常并自动重试。
         # 增量提取（素材库已有内容）结果为空属合法结果（提示词允许数组为空），不重试。
         first_extract = not existing_catalog
+        # 视觉语义重解释治理（Phase 2）：注入项目统一画风与「只记事实、不写画法词」硬约束，
+        # 画风由项目统一画风唯一决定。
+        project_style = current_project.get("style_prompt") or ""
         user_prompt = (
+            f"项目统一画风：{project_style}\n"
+            f"{visual_bible_brief(current_project)}"
+            f"{_ASSET_FACT_ONLY_CONSTRAINT}\n"
             f"本章正文：\n{current_chapter['source_text']}\n\n"
             f"已有素材目录（已存在，本章若出现同一对象请勿重复提取）：\n"
             f"{json_dumps(existing_catalog)}"
@@ -1119,44 +1023,7 @@ class AssetService:
                     updated_at=now,
                 )
             )
-            if asset_type == "scene":
-                # 新场景自动建立默认 Scene View 元数据（MASTER + 4 视角），
-                # 图片由用户在素材库触发生成（MASTER→其余视图的依赖顺序）。
-                self._ensure_default_scene_views(connection, asset_id, now)
             return asset_id
-
-    @staticmethod
-    def _ensure_default_scene_views(
-        connection: Any,
-        scene_asset_id: str,
-        now: str,
-    ) -> None:
-        """为新场景幂等补齐默认 Scene View 行（仅元数据，不生成图片）。"""
-        from app.services.scene_view_service import DEFAULT_SCENE_VIEWS
-
-        existing_keys = set(
-            connection.execute(
-                select(scene_view.c.view_key).where(scene_view.c.asset_id == scene_asset_id)
-            ).scalars()
-        )
-        for view_key, view_name, sort_order, prompt in DEFAULT_SCENE_VIEWS:
-            if view_key in existing_keys:
-                continue
-            connection.execute(
-                insert(scene_view).values(
-                    id=new_id("scene_view"),
-                    asset_id=scene_asset_id,
-                    view_key=view_key,
-                    name=view_name,
-                    prompt=prompt,
-                    prompt_override="",
-                    sort_order=sort_order,
-                    status="draft",
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-            existing_keys.add(view_key)
 
     async def handle_prompt(self, job: dict[str, Any]) -> dict[str, Any]:
         current = self.get(job["target_id"])
@@ -1167,6 +1034,8 @@ class AssetService:
             system_prompt=load_prompt("asset_prompt"),
             user_prompt=(
                 f"项目统一画风：{current_project['style_prompt']}\n"
+                f"{visual_bible_brief(current_project)}"
+                f"{_ASSET_FACT_ONLY_CONSTRAINT}\n"
                 f"素材类型：{current['asset_type']}\n"
                 f"素材名称：{current['name']}\n"
                 f"素材资料：{json_dumps(current['profile'])}"

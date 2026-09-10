@@ -5,6 +5,13 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from app.dynamic_pipeline.prompt_ir import VisualStyleSpec
+from app.dynamic_pipeline.visual_anchor import (
+    compile_visual_bible,
+    merge_visual_bible_negative,
+    render_visual_style_spec,
+)
+from app.dynamic_pipeline.visual_validator import style_medium_of
 from app.services.director_plan import (
     director_bundle_from_llm,
     render_director_video_prompt,
@@ -37,6 +44,12 @@ _TIMELINE_CLAUSE_PATTERN = re.compile(
     r"^\s*(?P<time>\d+(?:\.\d+)?\s*[-–—~－至]\s*\d+(?:\.\d+)?\s*秒\s*[:：，,])"
     r"(?P<body>.*)$"
 )
+# source_ref 形如「scene:1|古寺门口」，前半截是程序内部占位符，
+# 直接写进画面提示词只会变成无意义 token。
+_SOURCE_REF_PREFIX_PATTERN = re.compile(r"^\s*(?:scene|场景)\s*[:：]?\s*\d+\s*[|｜]\s*")
+# 分镜提取残留的「场景1：动作＋旁白」类标签不属于可入画的地点表述。
+_SCENE_LABEL_PREFIX_PATTERN = re.compile(r"^\s*场景\s*\d+\s*[:：]\s*")
+_NON_PLACE_JUNK_PATTERN = re.compile(r"动作|旁白|对白|台词|景别|机位|运镜|镜头")
 _SCENE_CLAUSE_PATTERN = re.compile(r"[^。！？；;\n]+[。！？；;]?\s*")
 _SCENE_PERSON_MARKERS = (
     "人物",
@@ -111,7 +124,13 @@ def style_anchor(
     style_prompt: str,
     aspect_ratio: str,
     novel_style_bridge: str = "",
+    visual_bible: dict[str, Any] | None = None,
 ) -> str:
+    # 结构化画风约束：显式视觉圣经覆盖 + 画风原文关键词自动推导（二维/水墨类）。
+    # 只渲染已设置字段；写实/3D 画风推导为空时不改变既有输出。
+    structured = render_visual_style_spec(
+        compile_visual_bible(style_prompt, visual_bible)
+    )
     return join_non_empty(
         [
             "画面美术风格：",
@@ -119,7 +138,10 @@ def style_anchor(
             "统一画风锁定：上述核心主题是唯一画风来源，角色图、场景图、物品图、分镜图与"
             "视频画面全部严格遵循，不叠加、不混入任何其他画风描述。",
             f"小说风格桥接：{novel_style_bridge.strip()}。" if novel_style_bridge.strip() else "",
-            "统一视觉规范：线条、上色、阴影、材质、色彩、光影与写实度保持一致。",
+            "渲染方式恒定：人物脸部渲染方式、皮肤质感、头发表现、衣服材质抽象程度、"
+            "场景细节密度、阴影软硬逻辑、景深逻辑、线稿强度与写实度全片保持不变；"
+            "各镜只允许在光源、色温与剧情氛围上变化，光色变化不得改变渲染方式。",
+            structured or "",
             f"画面比例：{aspect_ratio}。",
         ]
     )
@@ -185,6 +207,21 @@ def _value(value: Any, fallback: str = "以素材资料与补充描述为准") -
     return result or fallback
 
 
+def _clean_source_ref(source_ref: str) -> str:
+    """剥掉 source_ref 的「scene:1|」内部占位符，只保留有信息量的位置说明。"""
+    return _SOURCE_REF_PREFIX_PATTERN.sub("", str(source_ref or "").strip()).strip()
+
+
+def _clean_time_place(source_ref: str) -> str:
+    """从 source_ref 提取可入画的地点表述，剥离「场景1：」占位标签与动作/旁白类残留。"""
+    text = _SCENE_LABEL_PREFIX_PATTERN.sub("", _clean_source_ref(source_ref))
+    if not text:
+        return ""
+    pieces = [piece.strip(" 。") for piece in re.split(r"[，,、；;]", text) if piece.strip(" 。")]
+    kept = [piece for piece in pieces if not _NON_PLACE_JUNK_PATTERN.search(piece)]
+    return "，".join(kept)
+
+
 def _profile_value(
     profile: dict[str, Any],
     *keys: str,
@@ -233,23 +270,48 @@ def _scene_profile_value(
     return fallback
 
 
-def resolve_asset_negative_prompt(asset_type: str, negative_prompt: str) -> str:
+# 与三维渲染表达相关的默认负向词：项目画风正向启用 PBR/3D 渲染时
+# （VisualStyleSpec.material.pbr 为 True）必须剔除，否则负向会反向禁用正向画风。
+_PBR_RENDER_NEGATIVE_TERMS = (
+    "3D建模渲染",
+    "写实PBR",
+    "镜面反射",
+    "透明折射",
+    "逼真材质贴图",
+)
+
+# 真人写实画风的正向指纹是「真人实拍质感」，与默认负向中的真人摄影类
+# 排除词直接互斥，必须按媒介剔除。
+_PHOTOREAL_NEGATIVE_TERMS = (
+    "真人摄影",
+    "产品摄影",
+    "真实建筑摄影",
+)
+
+
+def resolve_asset_negative_prompt(
+    asset_type: str,
+    negative_prompt: str,
+    style_spec: VisualStyleSpec | None = None,
+) -> str:
+    # 视觉语义重解释治理（Phase 2）：三类默认负向统一排除写实材质渲染表达，
+    # 材质/光影表达方式由项目统一画风决定。
     defaults = {
         "character": "多人、身份漂移、脸型变化、发型变化、服装不一致、畸形手指、"
         "除指定人物资料卡外的其他文字、数字、英文、标识、签名、水印、乱码或无意义符号、"
-        "真人摄影、产品摄影、3D建模渲染",
+        "真人摄影、产品摄影、3D建模渲染、写实PBR、镜面反射、透明折射、逼真材质贴图",
         "prop": "完整人物、人物脸、多件物品、结构错误、比例错误、材质漂移、"
-        "文字、水印、真人摄影、产品摄影、3D建模渲染",
+        "文字、水印、真人摄影、产品摄影、3D建模渲染、写实PBR、镜面反射、透明折射、"
+        "逼真材质贴图",
         "scene": f"{_SCENE_REQUIRED_NEGATIVE_PROMPT}、空间结构矛盾、门窗家具漂移、"
-        "视角冲突、文字、水印、真实建筑摄影、产品摄影、3D建模渲染",
+        "视角冲突、文字、水印、招牌店名、门头文字、真实建筑摄影、产品摄影、"
+        "3D建模渲染、写实PBR、镜面反射、透明折射、逼真材质贴图",
     }
     default_prompt = defaults.get(
         asset_type,
         "文字、水印、真人摄影、产品摄影、3D建模渲染",
     )
     custom_prompt = negative_prompt.strip()
-    if not custom_prompt:
-        return default_prompt
     # 所有素材类型统一合并默认负向约束，避免自定义负向替换掉默认项；
     # 合并保持幂等：默认项已存在时不重复追加。兼容中文顿号与逗号分隔。
     custom_items = [item.strip() for item in re.split(r"[、，,]", custom_prompt) if item.strip()]
@@ -258,6 +320,21 @@ def resolve_asset_negative_prompt(asset_type: str, negative_prompt: str) -> str:
     for item in default_items:
         if item not in merged_items:
             merged_items.append(item)
+    if style_spec is not None:
+        medium = style_medium_of(style_spec)
+        if medium == "3d":
+            # 画风正向启用 PBR/3D 渲染：剔除会反向禁用三维渲染表达的默认负向词，
+            # 风格排除（真人实拍、二维平涂等）由画风指纹与 forbidden_styles 承担。
+            # 无自定义负向时同样生效，否则纯默认负向仍会与正向主画风互相否定。
+            merged_items = [
+                item for item in merged_items if item not in _PBR_RENDER_NEGATIVE_TERMS
+            ]
+        elif medium == "photoreal":
+            # 真人写实画风：正向指纹要求真人实拍质感，剔除默认负向中的
+            # 真人摄影类排除词，避免同一条提示词正负互斥。
+            merged_items = [
+                item for item in merged_items if item not in _PHOTOREAL_NEGATIVE_TERMS
+            ]
     return "、".join(merged_items)
 
 
@@ -331,7 +408,7 @@ def _character_setting_sheet(
         f"不可变视觉锚点：{immutable}。",
         "服装锁定：\n"
         f"角色穿着{costume}，主色调为{main_color}，辅以{accent_color}少量点缀，"
-        f"材质为{material}，清晰表现不同材质之间的纹理、厚度和光泽差异。\n"
+        f"材质为{material}。\n"
         f"上装为{upper}；下装为{lower}；外搭为{outer}；鞋履为{shoes}；"
         f"配饰{accessories}。\n"
         "角色采用标准无道具站姿：双臂自然下垂，双手自然放松，"
@@ -343,16 +420,14 @@ def _character_setting_sheet(
         "整张角色设定展板使用与项目统一画风协调的干净底色（默认纯白；水墨、国画"
         "或古风类画风使用宣纸米白或留白底色），背景干净、明亮、极简、通透。"
         "不要渐变背景，不要杂乱底纹，不要环境场景，不要室内或室外布景。\n"
-        "所有人物模块均置于统一设定稿底色中，仅使用柔和冷暖综合色光塑造人物体积，"
-        "不出现任何环境、布景或场景元素。\n"
+        "所有人物模块均置于统一设定稿底色中，不出现任何环境、布景或场景元素。\n"
         "仅使用极细分隔线建立版面秩序，分隔线颜色与项目统一画风协调，"
         "不使用厚重边框、大面积色块、复杂花纹或抢眼装饰。\n"
         f"采用3:2横向宽幅、分块拼接式专业角色设定面板排版。画面只展示{name}同一名角色，"
         "不出现其他人物。\n"
         "面板只保留人物介绍、主人物立绘、三视图和核心面部特写四类信息，"
         "不加入服装拆解、配饰拆解、发型拆解、道具拆解、场景插图或意境参考图。\n"
-        "整体呈现高规格 AI 漫剧项目的官方角色设定面板质感，"
-        "专业、精致、高级、规整、清晰。",
+        "整体呈现本项目统一画风下的官方角色设定面板质感。",
         "各模块内容：\n"
         "左上角叠放或邻接一个非常简洁的人物信息卡，不遮挡身体，"
         "与左侧主人物立绘形成一个完整区域。人物资料卡内容为：\n"
@@ -363,7 +438,7 @@ def _character_setting_sheet(
         "文字区域留白舒适、排列整齐。中文文字尽量清晰、准确、可读，"
         "不要乱码、错字、重复文字或无意义符号。\n"
         f"主人物立绘位于画面左侧主体区域，并在该区域内部居中完整站立，占整张画面约42%。"
-        "完整展示头部、清晰五官、发型、服装、鞋履和随身配饰；"
+        "完整展示头部、五官、发型、服装、鞋履和随身配饰；"
         "人物从头顶到脚底全部处于画面内，不裁切头部、手臂、腿部或鞋履，"
         "不被人物资料卡和其他模块遮挡。\n"
         "右上约58%×55%区域规整排列三张标准全身视图，依次为正面全身、标准侧面全身、"
@@ -371,7 +446,7 @@ def _character_setting_sheet(
         "三张视图采用统一自然站姿、统一身体比例、统一服装、统一发型和统一光照，"
         "清楚展示人物正面轮廓、侧面结构、背部造型和服装前后结构；"
         "每张视图均保持完整全身，不裁切、不遮挡、不采用夸张透视。\n"
-        f"右下约58%×45%区域排列{expression_count}个高精度面部特写，"
+        f"右下约58%×45%区域排列{expression_count}个面部特写，"
         f"分别为{expression_group}。"
         f"{expression_count}个面部特写必须保持完全一致的脸型、骨相、五官比例、年龄感、"
         "肤色、发型和发色，仅通过眼神、眉形、眼睑和嘴角的细微变化表现状态差异，"
@@ -387,11 +462,11 @@ def _character_setting_sheet(
         "脸型重绘、年龄变化、美型程度变化、发量变化、发际线变化或服装重新设计。",
         f"构图补充：{composition.rstrip('。')}。" if composition else "",
         "灯光与色彩氛围：\n"
-        "采用柔和中性主光，辅以极轻微暖金轮廓光，准确展示肤色、服装颜色和材质，"
-        f"不使用强烈环境染色。角色整体配色以{main_color}和{accent_color}为核心。",
+        "只陈述光源方向与时间等事实，不写布光、氛围、造型气质或妆容画法；"
+        "光影表达方式完全由项目统一画风决定。"
+        f"角色固有色以{main_color}和{accent_color}为核心。",
         "画质与成图要求：\n"
-        "高精度视觉效果，人物发丝、眼眸、服装纹理和配饰细节清楚可见。"
-        "全画面保持高清晰度，无景深模糊，无低清缩略图感，无杂色噪点，无脏污背景。\n"
+        "全画面保持清晰，无景深模糊，无低清缩略图感，无杂色噪点，无脏污背景。\n"
         "无其他人物，无不同版本角色，无重复头部，无多余肢体，无手脚缺失，无错误手指，"
         "无肢体粘连，无五官错位，无年龄漂移，无比例失衡，无服装变化，无发型变化，"
         "无服装穿模。版面模块对齐，间距统一，信息完整但不拥挤，留白舒适，视觉层级明确。",
@@ -457,18 +532,22 @@ def _prop_setting_sheet(
         f"点缀色{accent_color}；表面质感{surface}；固定磨损{wear}。\n"
         "所有纹样、接缝、按钮、接口、结构、磨损位置和配色必须固定，"
         "便于后续AI漫剧分镜图与视频生成保持一致。",
+        "材质降维（只记录事实，不写画法）：\n"
+        "金属、玻璃、塑料、屏幕等材质只记录结构事实：是否透明、是否发光、表面光滑或哑光、"
+        "颜色与磨损。\n"
+        "不使用真实PBR反射、镜面高光、透明折射、逼真材质贴图等渲染表达；"
+        "材质表达方式完全由项目统一画风决定。",
         f"细节补充：{detail_clean}。" if has_detail else "",
         "版面背景与整体要求：\n"
         "整张物品设定展板使用与项目统一画风协调的干净底色（默认纯白；水墨、国画"
         "或古风类画风使用宣纸米白或留白底色），背景干净、明亮、极简、通透。"
         "不要渐变背景，不要杂乱底纹，不要完整环境场景。\n"
         "仅使用极细分隔线建立版面秩序，分隔线颜色与项目统一画风协调。"
-        "整体呈现高规格 AI 漫剧项目的官方道具设定面板质感，"
-        "专业、精致、高级、规整、清晰。",
+        "整体呈现本项目统一画风下的官方道具设定面板质感。",
         "版面排布结构：\n"
         f"采用3:2横向宽幅、分块拼接式专业道具设定面板。画面只展示同一件{name}，"
         "不出现其他无关道具，不出现完整人物角色，不出现完整环境场景。\n"
-        "面板只保留物品介绍、主物品精致展示图、标准多视图、三个关键细节"
+        "面板只保留物品介绍、主物品展示图、标准多视图、三个关键细节"
         "和尺寸使用比例参考。",
         "左上角物品介绍区：\n"
         "在画面左上角设置简洁、规整的物品资料卡。\n"
@@ -483,16 +562,18 @@ def _prop_setting_sheet(
         "资料卡采用官方道具设定稿式排版，标题与正文层级清晰，文字区域留白舒适。"
         "中文尽量清晰、准确、可读，不要乱码、错字或无意义符号。",
         "左侧主物品展示图：\n"
-        f"左侧主体区域放置一张尺寸最大的{name}精致立体展示图，占整张画面约40%至45%。\n"
+        f"左侧主体区域放置一张尺寸最大的{name}立体展示图，占整张画面约40%至45%。\n"
         "采用四十五度略微俯视视角，同时展示正面、顶部和侧面结构，完整表现物品轮廓、"
         "厚度和关键部件。\n"
         "物品不裁切、不遮挡、不变形，不使用夸张透视，是整张面板的视觉中心。"
-        "主体材质只产生受控的边缘反光，不呈现镜面高亮。",
+        "主体材质的光滑度、反光与透明表现只按材质事实（光滑/哑光/透明/发光）受控呈现，"
+        "不使用真实PBR反射、镜面高光、透明折射或逼真材质贴图，"
+        "材质表达方式完全由项目统一画风决定。",
         "右上区域标准多视图：\n"
         "右上区域规整排列四个标准视图：正面视图、侧面视图、背面视图、顶部或底部视图。\n"
         "四个视图保持完全一致的尺寸比例、轮廓、结构、颜色、材质、磨损和部件位置，"
         "不得出现不同型号或不同版本。",
-        f"右侧中部关键细节：\n三个高精度局部细节：{detail_zone}。",
+        f"右侧中部关键细节：\n三个局部细节：{detail_zone}。",
         "右下区域尺寸与使用比例：\n"
         f"展示物品标准尺寸标注与使用比例参考：{scale}。"
         "所有比例参考中的物品外观必须保持完全一致。",
@@ -503,12 +584,12 @@ def _prop_setting_sheet(
         "方向或长度。" + (f"一致性锚点：{anchors}。" if anchors else ""),
         f"构图补充：{composition.rstrip('。')}。" if composition else "",
         "灯光与画质：\n"
-        "采用能清楚展示物品轮廓、厚度与材质的中性柔光（光影风格遵循项目统一画风），"
-        "正面使用干净柔和的主光，右后方使用轮廓光，"
-        "清晰展示物品轮廓、厚度、材质纹理、接缝、按钮和固定磨损。\n"
-        "高精度视觉效果，无景深模糊，无低清区域，无多余物品，无不同型号，无重复部件，"
+        "灯光只用于清楚展示物品轮廓、厚度与材质等事实，光影表达方式完全由项目统一画风决定，"
+        "不指定主光、轮廓光等布光方案。\n"
+        "画面整体清晰，无景深模糊，无低清区域，无多余物品，无不同型号，无重复部件，"
         "无结构错位，无悬浮零件，无错误透视，无材质混乱，无随机文字或品牌标志。"
-        "整张设定面板背景始终保持标准纯白色，版面模块对齐，间距统一，留白舒适。",
+        "整张设定面板背景底色保持统一（默认纯白；水墨、国画或古风类画风使用"
+        "宣纸米白或留白底色），版面模块对齐，间距统一，留白舒适。",
         f"negative prompt: {negative_prompt}" if negative_prompt else "",
     ]
     return "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
@@ -552,8 +633,12 @@ def _scene_setting_sheet(
     color_mood = _scene_profile_value(profile, "color_mood", fallback="主色与点缀色以素材资料为准")
     main_color = _scene_profile_value(profile, "main_color", "color_mood", fallback=color_mood)
     accent_color = _scene_profile_value(profile, "accent_color", fallback="以场景资料为准")
-    color_quality = _scene_profile_value(
-        profile, "color_quality", "color_mood", fallback=color_mood
+    # 视觉语义重解释治理（Phase 2）：场景只陈述受控事实（时间/天气/光源方向/固有色），
+    # 不输出主辅光效果、氛围或色彩气质等自由艺术指导，表达方式由项目统一画风决定。
+    time_of_day = _scene_profile_value(profile, "time_of_day", fallback="昼夜时间以场景资料为准")
+    weather = _scene_profile_value(profile, "weather", fallback="天气以场景资料为准")
+    light_direction = _scene_profile_value(
+        profile, "light_direction", "lighting", "main_light", fallback="光源方向以场景资料为准"
     )
     main_view = _scene_profile_value(profile, "main_view", fallback="主场景透视图（无人空镜）")
     standard_view_1 = _scene_profile_value(
@@ -563,11 +648,6 @@ def _scene_setting_sheet(
         profile, "standard_view_2", fallback="反向或侧向全景（无人空镜）"
     )
     detail_zone = _scene_profile_value(profile, "detail_zone", fallback=furnishings)
-    main_light = _scene_profile_value(
-        profile, "lighting", "main_light", fallback="主光源以场景资料为准"
-    )
-    fill_light = _scene_profile_value(profile, "fill_light", fallback="辅光以场景资料为准")
-    atmosphere = _scene_profile_value(profile, "atmosphere", "color_mood", fallback=color_mood)
     environment_detail = _scene_environment_text(detail, "按上述资料补充环境细节")
     environment_composition = _scene_environment_text(composition, "")
     environment_keywords = []
@@ -598,18 +678,19 @@ def _scene_setting_sheet(
         f"金属/玻璃{glass_metal}；特殊材质{special_material}。\n"
         "家具尺寸、门窗高度、桌椅比例和空间尺度符合真实使用逻辑。"
         "所有核心陈设的位置、外观、颜色和数量固定，"
-        "不得随机增加无关陈设、装饰或复杂文字标识。",
+        "不得随机增加无关陈设、装饰或复杂文字标识。"
+        "任何招牌、门头、指示牌或屏幕只保留色块与材质，不出现店名、logo、英文或符号。",
         "材质与色彩设定：\n"
-        f"主色{main_color}，点缀色{accent_color}，色彩气质{color_quality}。"
-        "配色遵循项目统一画风锚定的要求，不使用杂乱无规律的颜色。",
+        f"固有色：主色{main_color}，点缀色{accent_color}（只记录墙体、家具与陈设的固有颜色事实，"
+        "如「门为暗朱红」）。"
+        "色彩表达方式完全由项目统一画风决定，不使用杂乱无规律的颜色。",
         f"环境补充细节：{environment_detail}。" if environment_detail else "",
         "版面背景与整体要求：\n"
         "整张场景设定展板使用与项目统一画风协调的干净底色（默认纯白；水墨、国画"
         "或古风类画风使用宣纸米白或留白底色），背景干净、明亮、极简、通透。"
         "不要渐变底色，不要杂乱底纹，不要将完整环境延伸为面板背景。\n"
         "仅使用极细分隔线建立版面秩序，分隔线颜色与项目统一画风协调。"
-        "整体呈现高规格 AI 漫剧项目的官方场景设定面板质感，"
-        "专业、精致、高级、规整、清晰。",
+        "整体呈现本项目统一画风下的官方场景设定面板质感。",
         "版面排布结构：\n"
         f"采用16:9横向宽幅、分块拼接式专业场景设定面板。画面只展示{name}这一个场景，"
         "不出现其他无关场景，不出现人物角色或人体残影。\n"
@@ -649,12 +730,13 @@ def _scene_setting_sheet(
         "不得生成不同版本的房间，不得改变空间朝向，不得让门窗或家具在不同视图中随机移动，"
         "不得出现镜像颠倒或空间结构冲突。" + (f"一致性锚点：{anchors}。" if anchors else ""),
         f"构图补充：{environment_composition.rstrip('。')}。" if environment_composition else "",
-        "灯光与色彩氛围：\n"
-        f"主光效果{main_light}，只表现光线结果，不绘制光源持有者；"
-        f"辅光{fill_light}，营造{atmosphere}的氛围。\n"
-        "灯光清晰展示空间结构和材质，不让暗部吞没陈设细节。",
+        "灯光与时间事实：\n"
+        f"只陈述时间{time_of_day}、天气{weather}与光源方向{light_direction}等受控事实；"
+        "不写主光效果、辅光、氛围或色彩气质等自由艺术指导，"
+        "光影与色彩表达方式完全由项目统一画风决定。\n"
+        "各视图保持一致的光照方向，画面清楚展示空间结构和材质事实，"
+        "不让暗部吞没陈设结构。",
         "画质与成图要求：\n"
-        "高精度视觉效果，建筑结构、家具边缘、材质纹理、墙面痕迹和金属细节清晰可见。"
         "全画面无景深模糊，无低清缩略图感，无脏污背景，无人物，无人体残影，"
         "无错误透视，无弯曲墙面，无悬浮家具。\n"
         "最终检查：所有面板均不得出现人物、人影、剪影、倒影中的人物或人体局部。"
@@ -785,27 +867,15 @@ def compile_asset_prompt(
     composition: str,
     reference_mode: bool = False,
     use_template: bool = True,
-    master_mode: bool = False,
+    visual_bible: dict[str, Any] | None = None,
 ) -> str:
-    effective_negative_prompt = resolve_asset_negative_prompt(asset_type, negative_prompt)
+    style_spec = compile_visual_bible(style_prompt, visual_bible)
+    effective_negative_prompt = merge_visual_bible_negative(
+        resolve_asset_negative_prompt(asset_type, negative_prompt, style_spec),
+        style_spec,
+    )
     effective_aspect_ratio = resolve_visual_aspect_ratio(asset_type, aspect_ratio)
     detail = _asset_detail(prompt, profile)
-    if master_mode and asset_type == "scene":
-        # Scene MASTER 母版：单张完整空间透视图（scene_master.md），
-        # 供 Scene Views 以图生图派生，也作为分镜空间锚点。
-        from app.services.prompt_template_renderer import render_scene_master_body
-
-        body = render_scene_master_body(
-            asset_name=asset_name,
-            profile=profile,
-            prompt=prompt,
-            negative_prompt=effective_negative_prompt,
-            consistency_keywords=consistency_keywords,
-            composition=composition,
-        )
-        return apply_content_safety(
-            join_non_empty([style_anchor(style_prompt, effective_aspect_ratio), body])
-        )
     if reference_mode:
         reference_template = {
             "character": _character_clean_reference,
@@ -822,7 +892,16 @@ def compile_asset_prompt(
                 negative_prompt=effective_negative_prompt,
             )
             return apply_content_safety(
-                join_non_empty([style_anchor(style_prompt, effective_aspect_ratio), body])
+                join_non_empty(
+                    [
+                        style_anchor(
+                            style_prompt,
+                            effective_aspect_ratio,
+                            visual_bible=visual_bible,
+                        ),
+                        body,
+                    ]
+                )
             )
     if use_template and asset_type in {"character", "prop", "scene"}:
         # 设定图正文优先由落盘模板渲染；内置函数保留为 use_template=False 的回退路径。
@@ -839,7 +918,16 @@ def compile_asset_prompt(
             composition=composition,
         )
         return apply_content_safety(
-            join_non_empty([style_anchor(style_prompt, effective_aspect_ratio), body])
+            join_non_empty(
+                [
+                    style_anchor(
+                        style_prompt,
+                        effective_aspect_ratio,
+                        visual_bible=visual_bible,
+                    ),
+                    body,
+                ]
+            )
         )
     template = {
         "character": _character_setting_sheet,
@@ -858,7 +946,12 @@ def compile_asset_prompt(
             negative_prompt=effective_negative_prompt,
         )
     return apply_content_safety(
-        join_non_empty([style_anchor(style_prompt, effective_aspect_ratio), body])
+        join_non_empty(
+            [
+                style_anchor(style_prompt, effective_aspect_ratio, visual_bible=visual_bible),
+                body,
+            ]
+        )
     )
 
 
@@ -871,28 +964,64 @@ def compile_keyframe_prompt(
     shot_context: dict[str, Any],
     negative_prompt: str = "",
     continuity_instruction: str = "",
+    visual_bible: dict[str, Any] | None = None,
 ) -> str:
+    style_spec = compile_visual_bible(style_prompt, visual_bible)
+    effective_negative_prompt = merge_visual_bible_negative(negative_prompt, style_spec)
     effective_aspect_ratio = resolve_visual_aspect_ratio("keyframe", aspect_ratio)
     opening_frame = _value(shot_context.get("opening_frame"), image_prompt)
     characters = _value(shot_context.get("characters"), "当前分镜角色")
-    props = _value(shot_context.get("props"), "当前分镜物品")
+    props = _value(shot_context.get("props"), "")
     positions = _value(shot_context.get("positions"), "")
     expressions = _value(shot_context.get("expressions"), "")
     dialogue = _value(shot_context.get("dialogue"), "")
     voice_over = _value(shot_context.get("voice_over"), "")
     shot_type = _value(shot_context.get("shot_type"), "中景")
     camera_angle = _value(shot_context.get("camera_angle"), "平视")
-    focus = _value(shot_context.get("focus"), "当前主要动作")
+    # 无人空镜：本镜未绑定角色、也没有对白/画外音（此时画面确实无人），
+    # 或景别明确标记「空镜」时，所有人物相关要求（人物体量占比、表情、
+    # 双手与手持道具等）一律不适用，避免与空镜定义冲突。
+    empty_shot = "空镜" in shot_type or not bool(
+        _value(shot_context.get("characters"), "")
+        or _value(shot_context.get("dialogue"), "")
+        or _value(shot_context.get("voice_over"), "")
+    )
+    # frame_description 只作静态构图参考；动作时间轴（action）属于视频提示词，
+    # 不得作为关键帧的「焦点」内容。
+    composition = _value(shot_context.get("composition"), "")
     environment_details = str(shot_context.get("environment_details") or "").strip()
+    # 完成精度句按画风媒介分支：真人写实/3D 项目不重复罗列反写实排除词，
+    # 避免与画风指纹互相打架；风格排除交给画风指纹与负向词。
+    style_medium = style_medium_of(style_spec)
+    if style_medium == "2d":
+        completion_precision_line = (
+            "人物、场景与物品的完成精度保持统一，不呈现真人摄影、影视剧照、三次元演员、"
+            "写实实拍或过度三维游戏CG质感。"
+        )
+    elif style_medium == "photoreal":
+        subject = "场景与物品" if empty_shot else "人物、场景与物品"
+        completion_precision_line = (
+            f"{subject}的完成精度保持统一，画面质感与渲染方式以【参考】段画风指纹为准，"
+            "不叠加二维手绘或三维CG渲染质感。"
+        )
+    else:
+        # 3D 画风与未知媒介：不罗列任何排除词，只要求精度与画风指纹恒定。
+        subject = "场景与物品" if empty_shot else "人物、场景与物品"
+        completion_precision_line = (
+            f"{subject}的完成精度保持统一，画面质感与渲染方式以【参考】段画风指纹为准，"
+            "不叠加其他渲染质感。"
+        )
     wide_shot_body_rule = (
         f"\n本镜为{shot_type}，人物仍需保持清晰可辨识的体量，约占画面高度的1/5至1/4，"
         "可明确识别其发型、服装与手持道具，不得缩成远景小黑点。"
-        if ("全景" in shot_type or "远景" in shot_type) and "大远景" not in shot_type
+        if not empty_shot
+        and ("全景" in shot_type or "远景" in shot_type)
+        and "大远景" not in shot_type
         else ""
     )
     paragraphs = [
         "【参考】\n"
-        + style_anchor(style_prompt, effective_aspect_ratio)
+        + style_anchor(style_prompt, effective_aspect_ratio, visual_bible=visual_bible)
         + "\n"
         + "\n".join(anchors)
         + (
@@ -900,76 +1029,156 @@ def compile_keyframe_prompt(
             "不得引入其他镜头的人物、场景或道具。"
             if anchors
             else "\n当前分镜没有可用绑定参考图，按文字描述生成并保持内部一致。"
+        )
+        + (
+            "\n参考图职责隔离：角色图、场景图与物品图只提供身份、服装、空间结构与"
+            "道具外观等事实信息；参考图自带的渲染质感、笔触、材质与光影风格"
+            "不得覆盖【参考】段画风指纹，最终画面严格按画风指纹渲染。"
+            if anchors
+            else ""
         ),
         "【剧情时刻】\n"
         f"{image_prompt.rstrip('。')}。\n"
-        "画面只呈现该剧情时刻对应的单一关键瞬间，不制作多格漫画，不制作设定展板，"
-        "不制作动作分解图，不在同一画面重复展示同一角色，"
-        "不在同一画面重复呈现起始动作和完成动作。",
-        "【人物与动作】\n"
-        f"人物：{characters}。"
-        + (f"\n站位、朝向与视线：{positions}。" if positions else "")
+        "画面只呈现该剧情时刻对应的单一关键瞬间，该瞬间必须是一个已经稳定达成的"
+        "静止状态，任何动作先后顺序、过程或进行中的变化都留给后续视频提示词。\n"
+        "本镜画面完全由【首帧关键构图】确定，剧情时刻中的完整行为链（先…再…、随后、"
+        "然后、正在…等）只作为剧情上下文，不得进入画面；本帧只允许描述："
         + (
-            f"\n对白与口型状态：{dialogue.rstrip('。')}。说话角色呈现与台词对应的自然开口表情，"
-            "非说话角色闭口；对白只作为表演依据，不得生成字幕或画面文字。"
-            if dialogue
-            else ""
+            "人物现在在哪里、现在什么姿势、现在看哪里、现在什么表情、现在手里有什么、"
+            if not empty_shot
+            else "场景此刻的空间结构、陈设与光线状态、"
         )
+        + "镜头在哪里、灯怎么照，除此之外的时间过程全部删除。",
+        "【人物与动作】\n"
         + (
-            f"\n画外音（后期配音，画面人物闭口）：{voice_over.rstrip('。')}。"
-            "本镜台词来自录音或旁白，画面中所有人物全程闭口，不产生说话口型；"
-            "对白由后期配音添加，不得生成字幕或画面文字。"
-            if voice_over
-            else ""
+            f"人物：{characters}。"
+            + (
+                f"\n站位、朝向与视线：{positions}。画面中人物的左右位置关系、朝向与视线落点"
+                "必须与上述描述一致，不得左右颠倒或镜像翻转。"
+                if positions
+                else ""
+            )
+            + (
+                f"\n对白与口型状态：本镜对白为「{dialogue}」。"
+                "本帧锁定对白开始前的短暂停顿瞬间，画面中所有人物均闭口，"
+                "不呈现任何说话口型或半张嘴状态；对白只作为后续视频的表演依据。"
+                if dialogue
+                else ""
+            )
+            + (
+                f"\n画外音（后期配音，画面人物闭口）：{voice_over.rstrip('。')}。"
+                "本镜台词来自录音或旁白，画面中所有人物全程闭口，不产生说话口型。"
+                if voice_over
+                else ""
+            )
+            if not empty_shot
+            else "本镜为无人空镜：画面中不出现任何人物、路人、行人、人影或人体局部，"
+            "人物站位、朝向、表情、口型与手持道具等要求一律不适用。"
         ),
         "【场景与空间关系】\n"
         f"时间地点：{_value(shot_context.get('time_place'), '以当前场景资料为准')}。\n"
         f"场景：{_value(shot_context.get('scene_name'), '当前分镜场景')}。"
-        "空间结构、门窗位置、家具摆放与陈设布局沿用绑定参考图，"
-        "不得随机改变房间朝向、移动陈设、增加无关物品或其他人物，不得将场景镜像翻转。",
-        "【关键物品】\n"
-        f"物品：{props}。"
-        "外观、尺寸、颜色与磨损痕迹沿用绑定参考图，"
-        "不放大、不缩小、不变形、不漂浮、不穿模、不遮挡人物关键动作。",
+        + (
+            "空间结构、门窗位置、家具摆放与陈设布局沿用绑定参考图，"
+            "门窗开启方向、铰链侧、门锁侧与室内—走廊/室外的方位关系必须和参考图完全一致；"
+            "不得随机改变房间朝向、移动陈设、增加无关物品或其他人物，不得将场景镜像翻转。"
+            if any("锁定场景空间结构" in anchor for anchor in anchors)
+            else "空间结构、门窗位置、家具摆放与陈设布局按本提示词文字设定生成，"
+            "并保证各模块内部一致；不得随机改变房间朝向、移动陈设、增加无关物品或其他人物，"
+            "不得将场景镜像翻转。"
+        ),
+        (
+            "【关键物品】\n"
+            f"物品：{props}。"
+            "有绑定参考图的物品严格沿用参考图的外观、尺寸、颜色与磨损痕迹；"
+            "未绑定参考图的物品按描述生成，采用普通无品牌外观，不出现Logo、文字、标签。"
+            "物品不放大、不缩小、不变形、不漂浮、不穿模、不遮挡人物关键动作。"
+            if props
+            else ""
+        ),
         "【镜头构图】\n"
-        f"景别{shot_type}，机位{camera_angle}，焦点{focus}。\n"
-        f"首帧关键构图：{opening_frame.rstrip('。')}。\n"
-        "本帧只表现该动作发生前的单一稳定瞬间，不表现动作开始与结束并存的分解状态；"
-        "画面必须停在首帧关键构图对应的动作前约0.2-0.5秒或动作刚开始的稳定边界，"
-        "不得提前呈现动作完成结果。"
+        f"景别{shot_type}，机位{camera_angle}。\n"
+        "景别只取单一确定值：若描述含多个候选景别，只采用第一个候选，其余忽略。\n"
+        + (
+            f"构图：{composition.rstrip('。')}。\n"
+            if composition
+            else ""
+        )
+        + (
+            "构图只描述静态空间关系：摄像机位置与朝向、人物在画面中的左右位置与前后景层次、"
+            "门框墙面等建筑结构如何切割画面、人物与关键物品的画面占比，"
+            "以及画面焦点落在哪个人物或物体上；不写动作过程、先后顺序、对白或镜头运动方式。\n"
+            if not empty_shot
+            else "构图只描述静态空间关系：摄像机位置与朝向、建筑结构与陈设在画面中的前后景层次、"
+            "门框墙面等建筑结构如何切割画面、关键陈设与物品的画面占比，"
+            "以及画面焦点落在哪个空间局部或物体上；不写动作过程、先后顺序、对白或镜头运动方式。\n"
+        )
+        + f"首帧关键构图：{opening_frame.rstrip('。')}。\n"
+        "本帧只呈现首帧关键构图所描述的、已经稳定达成的这一个静态状态；"
+        "任何「先…再…」「随后」「然后」「正在…」等时间过程表述都不属于本帧画面，"
+        "全部留给后续视频提示词，不得提前呈现动作完成结果。"
         f"{wide_shot_body_rule}\n"
         "用途：生成当前分镜唯一的分镜图，并作为图生视频严格第0秒起始帧。",
-        "【人物神态与情绪】\n"
-        + (
-            f"{expressions}。表情自然细腻、克制真实，不使用夸张颜艺，"
-            "不瞪大双眼，不张大嘴，情绪强度适中。"
-            if expressions
-            else "人物表情自然克制，情绪强度适中，不使用夸张颜艺。"
+        (
+            "【人物神态与情绪】\n"
+            + (
+                f"{expressions}。表情自然细腻、克制真实，不使用夸张颜艺，"
+                "不瞪大双眼，不张大嘴，情绪强度适中。"
+                if expressions
+                else "人物表情自然克制，情绪强度适中，不使用夸张颜艺。"
+            )
+            + "\n神态必须用可直接画出的面部与肢体特征表达（眉心、视线、唇部、下颌、肩颈、"
+            "手部等具体状态），不使用无法直接呈现的抽象情绪词。"
+            if not empty_shot
+            else ""
         ),
         "【灯光与色彩】\n"
         f"{_value(shot_context.get('lighting'), '符合场景设定的光线')}，"
         f"{_value(shot_context.get('color_tone'), '统一色调')}"
         + (f"，环境细节：{environment_details}" if environment_details else "")
         + "。\n"
-        "光线符合场景设定的真实光源逻辑，清晰照亮人物五官、双手与关键物品，"
-        "不让暗部吞没剧情信息，不产生无来源的强光或过度戏剧化阴影。",
+        "光线符合场景设定的真实光源逻辑，"
+        + (
+            "清晰照亮人物五官、双手与关键物品，"
+            if not empty_shot
+            else "清晰照亮场景结构与关键陈设，"
+        )
+        + "不让暗部吞没剧情信息，不产生无来源的强光或过度戏剧化阴影。\n"
+        "光源与色温允许随剧情变化，但渲染方式、皮肤质感、线稿强度、阴影软硬与"
+        "景深逻辑等画风指纹保持不变；色温变化不等于画风变化。",
         "【画面美术质感】\n"
-        f"保持{style_prompt.strip() or '项目既定画风'}的画风与质感，"
-        "面部和手部结构准确，场景空间清晰，材质区分明确，光影符合场景逻辑。\n"
-        "人物双手与关键手持道具清晰可见，手指结构完整，不被衣袖、道具或画面边缘裁切。\n"
-        "人物、场景与物品的完成精度保持统一，不呈现真人摄影、影视剧照、三次元演员、"
-        "写实实拍或过度三维游戏CG质感。",
+        "严格按照【参考】段画风指纹渲染，各镜指纹恒定，不因场景、灯光或新增角色参考图"
+        "而改变；"
+        + (
+            "面部和手部结构准确，场景空间清晰，材质区分明确，光影符合场景逻辑。\n"
+            if not empty_shot
+            else "场景空间清晰，材质区分明确，光影符合场景逻辑。\n"
+        )
+        + (
+            "人物双手与关键手持道具清晰可见，手指结构完整，不被衣袖、道具或画面边缘裁切。\n"
+            if not empty_shot
+            else ""
+        )
+        + completion_precision_line,
         f"【连续性要求】\n{continuity_instruction}" if continuity_instruction.strip() else "",
         "【成图限制】\n"
         "画面只表现当前一个剧情瞬间，不制作多格漫画，不制作设定展板，"
-        "不制作动作分解图，不在同一画面重复展示同一角色。\n"
+        "不制作动作分解图，不在同一画面重复展示同一角色，"
         "不做角色海报、概念插画封面或设定展示页构图。\n"
-        "只出现本镜绑定的角色，不出现背景行人、看客、路人或模糊人影。\n"
-        "无人物漂浮，无物品漂浮，无穿模，无物品尺寸异常，无家具移动，无门窗错位，"
+        + (
+            "只出现本镜绑定的角色，不出现背景行人、看客、路人或模糊人影。\n"
+            if not empty_shot
+            else "本镜为无人空镜，不出现任何人物、行人、看客、路人或模糊人影。\n"
+        )
+        + "无人物漂浮，无物品漂浮，无穿模，无物品尺寸异常，无家具移动，无门窗错位，"
         "无场景镜像翻转，无错误透视。\n"
         "画面中不出现字幕、对白、对话框、旁白文字、水印、品牌标志、"
         "文件文字、乱码或无意义符号。"
-        + (f"\nnegative prompt: {negative_prompt}" if negative_prompt.strip() else ""),
+        + (
+            f"\nnegative prompt: {effective_negative_prompt}"
+            if effective_negative_prompt.strip()
+            else ""
+        ),
     ]
     return apply_content_safety(
         "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
@@ -1003,7 +1212,7 @@ def shot_template_context(
             voice_over_parts.append(f"{speaker}：{deduped}" if deduped else f"{speaker}：{text}")
         else:
             dialogue_entries.append({"speaker": speaker, "text": text})
-            dialogue_parts.append(f"{speaker}自然开口说：{text}")
+            dialogue_parts.append(f"{speaker}：{text}")
     if current.get("narration"):
         narration = str(current.get("narration") or "").strip()
         # narration 内容常已自带「旁白：」「画外音：」前缀，模板外层还会套
@@ -1043,7 +1252,7 @@ def shot_template_context(
         if expression:
             expression_parts.append(f"{character}：{expression}")
     return {
-        "time_place": current.get("source_ref", ""),
+        "time_place": _clean_time_place(current.get("source_ref", "")),
         # previous_state 保持原语义（本镜起始状态），供其他模板段落使用；
         # 上一镜结束状态单独放在 prev_end_state，仅作前情交代
         "previous_state": current.get("start_state", ""),
@@ -1073,6 +1282,9 @@ def shot_template_context(
         "dialogue_entries": dialogue_entries,
         "voice_over": "；".join(voice_over_parts),
         "sound_effects": str(current.get("sound_effects") or ""),
+        # 环境动态只按需下发：不写时视频渲染器不添加通用环境微动（树叶轻摆等），
+        # 避免背景元素全员微动带来的 AI 插值感。
+        "environment_motion": str(current.get("environment_motion") or ""),
     }
 
 
@@ -1248,6 +1460,8 @@ def _render_with_director_plan(
     shot_context: dict[str, Any],
     anchors: list[str],
     negative_prompt: str,
+    visual_bible: dict[str, Any] | None = None,
+    audio_driven: bool = False,
 ) -> str:
     """用导演计划渲染 10 段最终提示词；时间轴为空或结构非法时返回空串由调用方回退。"""
 
@@ -1281,6 +1495,13 @@ def _render_with_director_plan(
         shot_type=shot_type,
         anchors=anchors,
         hard_constraints=hard_constraints,
+        visual_bible=visual_bible,
+        audio_driven=audio_driven,
+        transition_from_prev=_value(
+            shot_context.get("transition_from_prev"), "scene_change"
+        ),
+        prev_end_state=_value(shot_context.get("prev_end_state"), ""),
+        scene_name=_value(shot_context.get("scene_name"), ""),
     )
 
 
@@ -1295,6 +1516,8 @@ def compile_video_prompt(
     negative_prompt: str = "",
     director_plan: dict[str, Any] | None = None,
     reference_tokens: list[dict[str, Any]] | None = None,
+    visual_bible: dict[str, Any] | None = None,
+    audio_driven: bool = False,
 ) -> str:
     """生成视频提示词。
 
@@ -1302,7 +1525,13 @@ def compile_video_prompt(
     渲染成导演口吻的自然语言提示词（不再拼接旧版 12 段【xxx】模板）。
     素材引用由调用方通过 anchors / reference_tokens 先行确定编号，
     生成器只把既有引用自然嵌入句子，不新增、不删除、不重排。
+
+    audio_driven：视频 Provider 支持音频参考输入（对白口型由配音驱动）时为
+    True，允许提示词要求口型自然配合；否则要求嘴部动作克制，避免模型凭空
+    表演说话导致与后期配音错位。
     """
+    style_spec = compile_visual_bible(style_prompt, visual_bible)
+    effective_negative_prompt = merge_visual_bible_negative(negative_prompt, style_spec)
     effective_aspect_ratio = resolve_visual_aspect_ratio("video", aspect_ratio)
 
     if director_plan:
@@ -1312,7 +1541,9 @@ def compile_video_prompt(
             director_plan=director_plan,
             shot_context=shot_context,
             anchors=anchors,
-            negative_prompt=negative_prompt,
+            negative_prompt=effective_negative_prompt,
+            visual_bible=visual_bible,
+            audio_driven=audio_driven,
         )
         if rendered:
             return apply_content_safety(rendered)
@@ -1337,6 +1568,8 @@ def compile_video_prompt(
         shot_context=shot_context,
         dialogue_entries=dialogue_entries,
         tokens=tokens,
-        negative_prompt=negative_prompt,
+        negative_prompt=effective_negative_prompt,
+        visual_bible=visual_bible,
+        audio_driven=audio_driven,
     )
     return apply_content_safety(compiled)

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from fastapi.responses import FileResponse
 
 from app.api.schemas import AssetBatchRequest, GenerateRequest, MediaBatchRequest
@@ -24,10 +24,9 @@ def _read_upload(file: UploadFile, max_bytes: int) -> tuple[str, str, bytes]:
 @router.get("/assets/{asset_id}/images")
 def list_asset_images(
     asset_id: str,
-    scene_view_id: str | None = Query(default=None),
     service: MediaService = Depends(get_media_service),
 ) -> list[dict]:
-    return service.list_asset_images(asset_id, scene_view_id=scene_view_id)
+    return service.list_asset_images(asset_id)
 
 
 @router.post("/assets/{asset_id}/images/generate", status_code=status.HTTP_202_ACCEPTED)

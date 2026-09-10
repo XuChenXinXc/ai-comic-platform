@@ -42,7 +42,7 @@ export function ImagePreview({
         </span>
       </button>
       <Modal open={open} onClose={() => setOpen(false)} title={alt} wide>
-        <div className="flex items-center justify-center bg-[#202420]">
+        <div className="flex items-center justify-center rounded-xl bg-[#0b0b0d]"> 
           <img
             src={src}
             alt={`${alt}大图`}

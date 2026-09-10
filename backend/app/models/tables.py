@@ -41,14 +41,11 @@ project = Table(
         "style_prompt",
         Text,
         nullable=False,
-        server_default=(
-            "电影感古风仙域二维国漫，稳定自然的半写实人物比例，东方审美骨相，"
-            "克制细腻的古风线条，低饱和青灰、玉白、玄黑与暖金综合色调，"
-            "仙气通透但不过度梦幻，真实清晰的微表情，层次分明的电影光影，"
-            "东方山水空间美学，精致但不浮夸。"
-        ),
+        server_default="",
     ),
     Column("aspect_ratio", Text, nullable=False, server_default="16:9"),
+    # 结构化视觉圣经（VisualBible JSON）：为空时由 style_prompt 自动推导
+    Column("visual_bible_json", Text),
     Column("image_size", Text, nullable=False, server_default="1920x1080"),
     Column("video_size", Text, nullable=False, server_default="16:9"),
     Column("default_duration_sec", Float, nullable=False, server_default="6"),
@@ -286,34 +283,11 @@ Index("idx_asset_project_type", asset.c.project_id, asset.c.asset_type)
 Index("idx_asset_status", asset.c.project_id, asset.c.status)
 
 
-scene_view = Table(
-    "scene_view",
-    metadata,
-    Column("id", Text, primary_key=True),
-    Column("asset_id", Text, ForeignKey("asset.id", ondelete="CASCADE"), nullable=False),
-    Column("view_key", Text, nullable=False),
-    Column("name", Text, nullable=False, server_default=""),
-    Column("prompt", Text, nullable=False, server_default=""),
-    Column("prompt_override", Text, nullable=False, server_default=""),
-    Column("sort_order", Integer, nullable=False, server_default="0"),
-    Column("status", Text, nullable=False, server_default="draft"),
-    Column("created_at", Text, nullable=False),
-    Column("updated_at", Text, nullable=False),
-    CheckConstraint("view_key <> ''", name="view_key_not_empty"),
-    CheckConstraint("status IN ('draft','ready','confirmed','failed')", name="status"),
-    UniqueConstraint("asset_id", "view_key", name="uq_scene_view_asset_key"),
-)
-Index("idx_scene_view_asset", scene_view.c.asset_id)
-
-
 asset_image = Table(
     "asset_image",
     metadata,
     Column("id", Text, primary_key=True),
     Column("asset_id", Text, ForeignKey("asset.id", ondelete="CASCADE"), nullable=False),
-    # scene_view_id 不声明 FK：生产迁移为避免级联重建只在服务层置空引用；
-    # 测试库与生产库行为需一致，删除置空语义由 SceneViewService.delete 保证。
-    Column("scene_view_id", Text),
     Column("version_no", Integer, nullable=False),
     Column("file_path", Text),
     Column("provider_url", Text),
@@ -340,25 +314,12 @@ asset_image = Table(
     CheckConstraint("source IN ('generated','uploaded')", name="source"),
     UniqueConstraint("asset_id", "version_no", name="uq_asset_image_asset_version"),
 )
-# 每个 Scene View（含 NULL=旧场景图）各有自己的当前图；
-# NULL 在 SQLite 唯一索引中视为互不相同，旧图与各 View 的 current 可共存。
+# 每素材（角色/场景/道具）只保留一张当前图。
 Index(
-    "ux_asset_image_current_view",
+    "ux_asset_image_current",
     asset_image.c.asset_id,
-    asset_image.c.scene_view_id,
     unique=True,
     sqlite_where=asset_image.c.is_current == 1,
-)
-# 旧场景图 / 角色 / 道具（scene_view_id 恒为 NULL）仍需「每素材一张当前图」约束：
-# 上面 (asset_id, scene_view_id) 索引在 SQLite 下对 NULL 不生效，须用子集唯一索引兜底。
-Index(
-    "ux_asset_image_current_legacy",
-    asset_image.c.asset_id,
-    unique=True,
-    sqlite_where=sa.and_(
-        asset_image.c.is_current == 1,
-        asset_image.c.scene_view_id.is_(None),
-    ),
 )
 
 
@@ -375,8 +336,6 @@ shot = Table(
     Column("source_signature", Text, nullable=False, server_default=""),
     Column("external_key", Text),
     Column("scene_asset_id", Text, ForeignKey("asset.id", ondelete="SET NULL")),
-    # 同 asset_image.scene_view_id：不声明 FK，删除置空由 SceneViewService.delete 保证。
-    Column("scene_view_id", Text),
     Column("character_ids_json", Text, nullable=False, server_default="[]"),
     Column("prop_ids_json", Text, nullable=False, server_default="[]"),
     Column("positions_json", Text, nullable=False, server_default="[]"),
@@ -711,7 +670,6 @@ ALL_TABLES = (
     screenplay,
     asset,
     asset_image,
-    scene_view,
     shot,
     keyframe_version,
     video_version,

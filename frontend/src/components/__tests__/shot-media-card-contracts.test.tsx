@@ -294,7 +294,11 @@ describe("分镜媒体显式提示词门禁", () => {
     await user.type(textarea, "生成前保存的关键帧提示词");
     await user.click(screen.getByRole("button", { name: "生成新版本" }));
 
-    await waitFor(() => expect(generateSpy).toHaveBeenCalledWith("shot-1"));
+    await waitFor(() =>
+      expect(generateSpy).toHaveBeenCalledWith("shot-1", {
+        auto_prepare_references: true,
+      }),
+    );
     expect(updateSpy).toHaveBeenCalledWith("shot-1", {
       image_prompt_override: "生成前保存的关键帧提示词",
     });
@@ -317,7 +321,11 @@ describe("分镜媒体显式提示词门禁", () => {
     renderCard(baseShot, "keyframe");
     await user.click(screen.getByRole("button", { name: "生成新版本" }));
 
-    await waitFor(() => expect(generateSpy).toHaveBeenCalledWith("shot-1"));
+    await waitFor(() =>
+      expect(generateSpy).toHaveBeenCalledWith("shot-1", {
+        auto_prepare_references: true,
+      }),
+    );
     expect(updateSpy).toHaveBeenCalledWith("shot-1", {
       image_prompt_override: "模板编译出的关键帧提示词",
     });

@@ -12,7 +12,6 @@ SHOT_SIGNATURE_FIELDS = (
     "source_type",
     "source_ref",
     "scene_asset_id",
-    "scene_view_id",
     "character_ids",
     "character_ids_json",
     "prop_ids",
@@ -90,6 +89,7 @@ def asset_signature(
     negative_prompt: str,
     style_prompt: str,
     prompt_override: str = "",
+    visual_bible: Mapping[str, Any] | None = None,
 ) -> str:
     values: dict[str, Any] = {
         "profile": profile,
@@ -97,6 +97,9 @@ def asset_signature(
         "negative_prompt": negative_prompt,
         "style_prompt": style_prompt,
     }
+    # 视觉圣经参与签名：画风结构化约束变化时，已生成的素材图标记 stale。
+    if visual_bible:
+        values["visual_bible"] = visual_bible
     # 与分镜 override 语义一致：非空覆盖值纳入签名，空串（未编辑）不参与
     if str(prompt_override or "").strip():
         values["prompt_override"] = prompt_override

@@ -44,10 +44,25 @@ def test_词库完整性_50条且分类数量正确() -> None:
     assert by_category == {"static": 12, "dynamic": 16, "pov": 12, "transition": 10}
 
 
-def test_词库模板_通用模板不包含即梦品牌词() -> None:
+def test_词库模板_双模板均不含品牌词与美术越权词() -> None:
+    # 治理要求：预设文本只保留纯机位/构图/动作描述，品牌词与画风/摄影越权词一律移除
+    banned = (
+        "即梦",
+        "景深",
+        "焦距",
+        "画风",
+        "质感",
+        "模糊",
+        "虚化",
+        "光线",
+        "阴影",
+        "渲染",
+        "线条",
+    )
     for preset in CAMERA_PRESETS:
-        assert "即梦" not in preset.template_core, preset.id
-        assert "即梦 4.5" in preset.template_jimeng, preset.id
+        for template in (preset.template_core, preset.template_jimeng):
+            for word in banned:
+                assert word not in template, (preset.id, word)
 
 
 @pytest.mark.parametrize(

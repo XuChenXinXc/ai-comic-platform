@@ -19,14 +19,6 @@ ProjectStorageSource = Literal["database", "environment", "default"]
 # 批量请求 ids 数量上限：防止一次性排队海量任务造成异常负载。
 _MAX_BATCH_IDS = 200
 
-# 项目默认画风：仅作为新建项目的初始值，之后只允许用户手动修改
-DEFAULT_STYLE_PROMPT = (
-    "电影感古风仙域二维国漫，稳定自然的半写实人物比例，东方审美骨相，"
-    "克制细腻的古风线条，低饱和青灰、玉白、玄黑与暖金综合色调，"
-    "仙气通透但不过度梦幻，真实清晰的微表情，层次分明的电影光影，"
-    "东方山水空间美学，精致但不浮夸。"
-)
-
 
 def _sensitive_param_path(value: Any, path: str = "params") -> str | None:
     if isinstance(value, dict):
@@ -61,7 +53,11 @@ class ApiModel(BaseModel):
 class ProjectCreate(ApiModel):
     name: str = Field(min_length=1, max_length=200)
     source_text: str = ""
-    style_prompt: str = DEFAULT_STYLE_PROMPT
+    # 统一画风：留空时由后端读取平台设置（platform_setting.default_style_prompt）回填；
+    # 画风文本不写死在代码里，只作为数据库数据存在。
+    style_prompt: str = ""
+    # 结构化视觉圣经：为空时由 style_prompt 自动推导
+    visual_bible: dict[str, Any] | None = None
     aspect_ratio: str = "16:9"
     image_size: str = "1920x1080"
     video_size: str = "16:9"
@@ -76,6 +72,7 @@ class ProjectUpdate(ApiModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     source_text: str | None = None
     style_prompt: str | None = None
+    visual_bible: dict[str, Any] | None = None
     aspect_ratio: str | None = None
     image_size: str | None = None
     video_size: str | None = None
@@ -100,6 +97,10 @@ class ImgbbKeyStatus(ApiModel):
     source: Literal["database", "environment", "default"]
 
 
+class SetImgbbKeyRequest(ApiModel):
+    api_key: str = Field(default="", max_length=200)
+
+
 class CameraPolicySetting(ApiModel):
     policy: str
     options: list[str]
@@ -109,12 +110,23 @@ class CameraPolicyUpdate(ApiModel):
     policy: str
 
 
+class DefaultStylePromptSetting(ApiModel):
+    style_prompt: str
+
+
+class DefaultStylePromptUpdate(ApiModel):
+    style_prompt: str = Field(default="", max_length=500)
+
+
 class GenerateRequest(ApiModel):
     provider_id: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     # 素材图生成为 true 时走干净参考图模式：单张设定图（无多视图展板、无资料卡文字），
     # 适合写意水墨等与白底展板版式冲突的画风；其余请求类型忽略该字段。
     reference_mode: bool = False
+    # 关键帧生成为 true 时：缺干净参考图则自动入队参考图模式生成并拦截本次关键帧入队，
+    # 避免设定展板污染分镜画面；仅关键帧相关接口生效，其余请求类型忽略该字段。
+    auto_prepare_references: bool = False
 
     _validate_params = field_validator("params")(_validate_public_params)
 
@@ -188,12 +200,6 @@ class AssetMergeRequest(ApiModel):
             raise ValueError("ids 不能重复")
         self.ids = values
         return self
-
-
-class SceneViewUpdate(ApiModel):
-    """更新 Scene View 的视角附加提示词。"""
-
-    prompt: str = Field(default="", max_length=4000)
 
 
 class AssetBatchRequest(GenerateRequest):
@@ -308,9 +314,6 @@ class ShotFields(ApiModel):
     source_type: ShotSourceType = "screenplay"
     source_ref: str = ""
     scene_asset_id: str | None = None
-    # 分镜使用的 Scene View：空字符串 / null 表示默认（MASTER）。
-    # 兼容两种写法：view id 或 view_key（front/reverse/left45/right45/master）。
-    scene_view_key: str | None = None
     character_ids: list[str] = Field(default_factory=list)
     prop_ids: list[str] = Field(default_factory=list)
     positions: list[ShotPositionInput] = Field(default_factory=list)
@@ -344,9 +347,6 @@ class ShotCreate(ShotFields):
 class ShotUpdate(ApiModel):
     source_ref: str | None = None
     scene_asset_id: str | None = None
-    # 分镜使用的 Scene View：空字符串 / null 表示默认（MASTER）；
-    # 兼容 view id 或 view_key 两种写法。
-    scene_view_key: str | None = None
     character_ids: list[str] | None = None
     prop_ids: list[str] | None = None
     positions: list[ShotPositionInput] | None = None
@@ -608,3 +608,6 @@ class ChapterComposeRequest(ApiModel):
     bgm_volume: float = Field(default=0.3, ge=0, le=1)
     crossfade: bool = False
     crossfade_seconds: float = Field(default=0.5, ge=0.1, le=5)
+    # 动画节奏化：抽帧到 12fps 模拟一拍二手绘张数感，并叠加轻微颗粒，
+    # 用于降低视频 AI 味的后处理选项。
+    anime_cadence: bool = False

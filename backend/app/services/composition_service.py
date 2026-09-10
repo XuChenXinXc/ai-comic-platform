@@ -24,8 +24,6 @@ from app.models.tables import (
     shot,
     shot_audio,
     video_version,
-    workflow_run,
-    workflow_stage,
 )
 from app.services.errors import bad_request, conflict, not_found
 from app.services.file_service import chapter_folder_name, file_service
@@ -45,8 +43,6 @@ from app.services.utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-_DYNAMIC_ACTIVE_JOB_STATUSES = ("queued", "running", "waiting_provider", "downloading")
 
 
 def _ffconcat_escape(value: str) -> str:
@@ -86,7 +82,6 @@ class CompositionService:
         config: dict[str, Any],
         *,
         enqueue: bool = True,
-        workflow_context: Mapping[str, Any] | None = None,
         depends_on: Sequence[str] = (),
     ) -> dict[str, Any]:
         """
@@ -122,84 +117,28 @@ class CompositionService:
                 assert chapter_record is not None
 
                 project_id = chapter_record.project_id
-                context = dict(workflow_context or {})
-                run_id = str(context.get("workflow_run_id") or "") or None
-                stage_id = str(context.get("workflow_stage_id") or "") or None
-                input_signature = str(context.get("input_signature") or "")
-                delivery_generation = str(context.get("delivery_generation") or "")
-
-                # 检查是否已有进行中的合成任务：只做幂等检测，不在循环里写 status。
-                # 失效旧记录交由 _invalidate_stale_compositions 统一批量处理。
-                if run_id:
-                    existing_query = (
-                        select(chapter_composition)
-                        .select_from(
-                            chapter_composition.join(
-                                job,
-                                chapter_composition.c.job_id == job.c.id,
-                            )
-                        )
-                        .where(
-                            chapter_composition.c.chapter_id == chapter_id,
-                            chapter_composition.c.workflow_run_id == run_id,
-                            chapter_composition.c.input_signature == input_signature,
-                            chapter_composition.c.status.in_(("pending", "processing")),
-                        )
+                existing = connection.execute(
+                    select(chapter_composition).where(
+                        chapter_composition.c.chapter_id == chapter_id,
+                        chapter_composition.c.status.in_(["pending", "processing"]),
                     )
-                    if stage_id:
-                        existing_query = existing_query.where(
-                            job.c.workflow_stage_id == stage_id
-                        )
-                    existing = None
-                    for existing_row in connection.execute(existing_query).all():
-                        existing_record = row_dict(existing_row) or {}
-                        provenance = json_loads(existing_record.get("provenance_json"), {})
-                        old_generation = (
-                            str(provenance.get("delivery_generation") or "")
-                            if isinstance(provenance, Mapping)
-                            else ""
-                        )
-                        if delivery_generation and old_generation != delivery_generation:
-                            # delivery_generation 不匹配：留给 _invalidate_stale_compositions
-                            # 统一走 JobRepository.batch_fail + chapter_composition 状态翻转。
-                            continue
-                        existing = existing_record
-                        break
-                else:
-                    existing = connection.execute(
-                        select(chapter_composition).where(
-                            chapter_composition.c.chapter_id == chapter_id,
-                            chapter_composition.c.status.in_(["pending", "processing"]),
-                        )
-                    ).first()
+                ).first()
                 if existing:
                     raise bad_request("章节已有合成任务在进行中")
-                if run_id:
-                    self._invalidate_stale_compositions(
-                        connection,
-                        chapter_id=chapter_id,
-                        run_id=run_id,
-                        stage_id=stage_id or "",
-                        input_signature=input_signature,
-                        delivery_generation=delivery_generation,
-                    )
 
                 # 创建 Job
                 job_id = new_id("job")
                 now = utc_now()
-                input_data = {**dict(config), **context}
+                input_data = dict(config)
                 dependency_ids = [str(value) for value in depends_on if str(value).strip()]
                 connection.execute(
                     insert(job).values(
                         id=job_id,
                         project_id=project_id,
                         chapter_id=chapter_id,
-                        workflow_run_id=run_id,
-                        workflow_stage_id=stage_id,
                         job_type="compose_chapter",
                         target_type="chapter",
                         target_id=chapter_id,
-                        idempotency_key=context.get("idempotency_key"),
                         # 合成是本地 FFmpeg 任务，不是文字 Provider 调用；
                         # 标记为 compose 以免占用 text worker 池（runner 侧
                         # 的 compose 池调度由独立改动提供，未识别前回退
@@ -207,7 +146,6 @@ class CompositionService:
                         provider_kind="compose",
                         status="queued",
                         input_json=json_dumps(input_data),
-                        input_signature=input_signature,
                         depends_on_json=json_dumps(dependency_ids),
                         result_json="{}",
                         error="",
@@ -226,10 +164,6 @@ class CompositionService:
                         id=composition_id,
                         chapter_id=chapter_id,
                         job_id=job_id,
-                        workflow_run_id=run_id,
-                        input_signature=input_signature,
-                        preflight_json=json_dumps(context.get("preflight", {})),
-                        provenance_json=json_dumps(context.get("provenance", {})),
                         resolution=config.get("resolution", "1080p"),
                         include_audio=int(config.get("include_audio", True)),
                         burn_subtitles=int(config.get("burn_subtitles", True)),
@@ -261,241 +195,6 @@ class CompositionService:
 
         return result
 
-    def _invalidate_stale_compositions(
-        self,
-        connection: Any,
-        *,
-        chapter_id: str,
-        run_id: str,
-        stage_id: str,
-        input_signature: str,
-        delivery_generation: str,
-    ) -> list[str]:
-        """把同一章节里所有与当前 (run, stage, signature, generation) 不一致的进行中
-        合成记录标为失败，关联的 job 通过 JobRepository.batch_fail 走 interrupt 路径。
-
-        调用方需保证 connection 处于 IMMEDIATE 事务中。返回被失效的 composition id 列表。
-        """
-        assert connection.in_transaction(), "必须在 IMMEDIATE 事务内失效旧 composition"
-        old_compositions = connection.execute(
-            select(
-                chapter_composition.c.id,
-                chapter_composition.c.job_id,
-                chapter_composition.c.workflow_run_id,
-                chapter_composition.c.input_signature,
-                chapter_composition.c.provenance_json,
-            ).where(
-                chapter_composition.c.chapter_id == chapter_id,
-                chapter_composition.c.status.in_(("pending", "processing")),
-            )
-        ).all()
-        failed_composition_ids: list[str] = []
-        interrupted_job_ids: list[str] = []
-        message = "旧动态 Composition attempt 已失效"
-        for old_row in old_compositions:
-            old_record = row_dict(old_row) or {}
-            composition_id = str(old_record.get("id") or "")
-            if not composition_id:
-                continue
-            old_job_id = str(old_record.get("job_id") or "")
-            old_stage_id = ""
-            if old_job_id:
-                old_job = connection.execute(
-                    select(job.c.workflow_stage_id).where(job.c.id == old_job_id)
-                ).first()
-                if old_job is not None:
-                    old_stage_id = str(getattr(old_job, "workflow_stage_id", "") or "")
-            old_provenance = json_loads(old_record.get("provenance_json"), {})
-            old_generation = (
-                str(old_provenance.get("delivery_generation") or "")
-                if isinstance(old_provenance, Mapping)
-                else ""
-            )
-            if (
-                str(old_record.get("workflow_run_id") or "") != run_id
-                or old_stage_id != str(stage_id or "")
-                or str(old_record.get("input_signature") or "") != input_signature
-                or (delivery_generation and old_generation != delivery_generation)
-            ):
-                connection.execute(
-                    update(chapter_composition)
-                    .where(chapter_composition.c.id == composition_id)
-                    .values(
-                        status="failed",
-                        error=message,
-                        updated_at=utc_now(),
-                    )
-                )
-                failed_composition_ids.append(composition_id)
-                if old_job_id:
-                    interrupted_job_ids.append(old_job_id)
-        if interrupted_job_ids:
-            self.jobs.repository.batch_fail(
-                interrupted_job_ids,
-                message,
-                connection=connection,
-            )
-        return failed_composition_ids
-
-    @staticmethod
-    def _dynamic_context(job_record: Mapping[str, Any]) -> dict[str, Any]:
-        input_data = job_record.get("input_data")
-        if not isinstance(input_data, Mapping):
-            input_data = json_loads(job_record.get("input_json"), {})
-        if not isinstance(input_data, Mapping):
-            return {}
-        context = {
-            key: input_data.get(key)
-            for key in (
-                "workflow_run_id",
-                "workflow_stage_id",
-                "workflow_stage_attempt",
-                "workflow_run_revision",
-                "input_signature",
-                "upstream_input_signature",
-            )
-            if input_data.get(key) is not None
-        }
-        return (
-            context
-            if context.get("workflow_run_id") and context.get("workflow_stage_id")
-            else {}
-        )
-
-    def _assert_dynamic_current(
-        self,
-        connection: Any,
-        job_record: Mapping[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        context = self._dynamic_context(job_record)
-        if not context:
-            return None
-        run_id = str(context["workflow_run_id"])
-        stage_id = str(context["workflow_stage_id"])
-        run = row_dict(
-            connection.execute(select(workflow_run).where(workflow_run.c.id == run_id)).first()
-        )
-        stage = row_dict(
-            connection.execute(
-                select(workflow_stage).where(
-                    workflow_stage.c.id == stage_id,
-                    workflow_stage.c.workflow_run_id == run_id,
-                )
-            ).first()
-        )
-        if run is None or stage is None:
-            raise RuntimeError("动态 Composition 关联的 run/stage 不存在")
-        latest = row_dict(
-            connection.execute(
-                select(workflow_stage)
-                .where(
-                    workflow_stage.c.workflow_run_id == run_id,
-                    workflow_stage.c.stage_key == stage["stage_key"],
-                )
-                .order_by(
-                    workflow_stage.c.attempt.desc(),
-                    workflow_stage.c.updated_at.desc(),
-                    workflow_stage.c.id.desc(),
-                )
-                .limit(1)
-            ).first()
-        )
-        if latest is None or latest["id"] != stage_id:
-            raise RuntimeError("动态 Composition stage attempt 已过期")
-        if str(job_record.get("input_signature") or "") != str(stage.get("input_signature") or ""):
-            raise RuntimeError("动态 Composition input_signature 已变化")
-        if context.get("workflow_stage_attempt") is not None and str(
-            context["workflow_stage_attempt"]
-        ) != str(stage.get("attempt")):
-            raise RuntimeError("动态 Composition stage attempt 已变化")
-        if str(job_record.get("workflow_run_id") or run_id) != run_id:
-            raise RuntimeError("动态 Composition workflow_run_id 已变化")
-        if str(job_record.get("workflow_stage_id") or stage_id) != stage_id:
-            raise RuntimeError("动态 Composition workflow_stage_id 已变化")
-        if run.get("status") in {"cancelled", "stale", "blocked"} or stage.get("status") in {
-            "cancelled",
-            "stale",
-            "blocked",
-        }:
-            raise RuntimeError("动态 Composition 关联的 run/stage 已不可执行")
-        return run, stage
-
-    def _update_dynamic_workflow(
-        self,
-        connection: Any,
-        job_record: Mapping[str, Any],
-        *,
-        stage_status: str,
-        error: str,
-        job_status: str,
-        result: Mapping[str, Any],
-    ) -> None:
-        current = self._assert_dynamic_current(connection, job_record)
-        if current is None:
-            raise RuntimeError("动态 Composition 缺少 workflow 上下文")
-        run, stage = current
-        now = utc_now()
-        stage_update = connection.execute(
-            update(workflow_stage)
-            .where(
-                workflow_stage.c.id == stage["id"],
-                workflow_stage.c.workflow_run_id == run["id"],
-                workflow_stage.c.attempt == stage["attempt"],
-                workflow_stage.c.input_signature == stage.get("input_signature"),
-                workflow_stage.c.status.not_in(("cancelled", "stale")),
-            )
-            .values(
-                status=stage_status,
-                error=error,
-                finished_at=now,
-                updated_at=now,
-            )
-        )
-        if stage_update.rowcount != 1:
-            raise RuntimeError("动态 Composition stage 条件更新未命中")
-        run_update = connection.execute(
-            update(workflow_run)
-            .where(
-                workflow_run.c.id == run["id"],
-                workflow_run.c.revision == run["revision"],
-                workflow_run.c.status.not_in(("cancelled", "stale")),
-            )
-            .values(
-                status=stage_status,
-                error=error,
-                revision=workflow_run.c.revision + 1,
-                finished_at=now,
-                updated_at=now,
-            )
-        )
-        if run_update.rowcount != 1:
-            raise RuntimeError("动态 Composition run 条件更新未命中")
-        job_signature = str(job_record.get("input_signature") or "")
-        job_update = connection.execute(
-            update(job)
-            .where(
-                job.c.id == job_record["id"],
-                job.c.project_id == run.get("project_id"),
-                job.c.workflow_run_id == run["id"],
-                job.c.workflow_stage_id == stage["id"],
-                job.c.status.in_(_DYNAMIC_ACTIVE_JOB_STATUSES),
-                job.c.input_signature == job_signature,
-            )
-            .values(
-                status=job_status,
-                progress_current=job.c.progress_total
-                if job_status == "completed"
-                else job.c.progress_current,
-                result_json=json_dumps(dict(result)),
-                error=error,
-                message="任务完成" if job_status == "completed" else "任务失败",
-                finished_at=now,
-                updated_at=now,
-            )
-        )
-        if job_update.rowcount != 1:
-            raise RuntimeError("动态 Composition Job 条件更新未命中")
-
     async def handle_compose(self, job_record: dict) -> dict[str, Any]:
         """任务处理器：执行合成"""
         chapter_id = job_record["chapter_id"]
@@ -503,72 +202,39 @@ class CompositionService:
         if not isinstance(config, Mapping):
             config = json_loads(job_record["input_json"], {})
         config = dict(config) if isinstance(config, Mapping) else {}
-        dynamic_context = self._dynamic_context(job_record)
 
         logger.info(f"开始合成章节 {chapter_id}，配置：{config}")
 
         with self.database.engine.begin() as connection:
-            if dynamic_context:
-                self._assert_dynamic_current(connection, job_record)
-                connection.execute(
+            # 只更新本次任务关联的合成记录（按 job_id），
+            # 避免把该章节历史已完成记录的状态/路径一并污染。
+            # 测试/直接调用场景下 job_record 可能缺 id，此时退化为
+            # 「该章节最新的 pending/processing 记录」而非全量覆盖。
+            job_id = job_record.get("id")
+            if job_id:
+                legacy_update = connection.execute(
                     update(chapter_composition)
                     .where(
-                        chapter_composition.c.job_id == job_record["id"],
-                        chapter_composition.c.workflow_run_id == dynamic_context[
-                            "workflow_run_id"
-                        ],
-                        chapter_composition.c.input_signature
-                        == job_record.get("input_signature"),
-                        chapter_composition.c.status.in_(("pending", "processing")),
+                        chapter_composition.c.job_id == job_id,
+                        chapter_composition.c.chapter_id == chapter_id,
                     )
                     .values(status="processing", updated_at=utc_now())
                 )
             else:
-                # legacy compose：只更新本次任务关联的合成记录（按 job_id），
-                # 避免把该章节历史已完成记录的状态/路径一并污染。
-                # 测试/直接调用场景下 job_record 可能缺 id，此时退化为
-                # 「该章节最新的 pending/processing 记录」而非全量覆盖。
-                job_id = job_record.get("id")
-                if job_id:
-                    legacy_update = connection.execute(
-                        update(chapter_composition)
-                        .where(
-                            chapter_composition.c.job_id == job_id,
-                            chapter_composition.c.chapter_id == chapter_id,
-                        )
-                        .values(status="processing", updated_at=utc_now())
+                legacy_update = connection.execute(
+                    update(chapter_composition)
+                    .where(
+                        chapter_composition.c.chapter_id == chapter_id,
+                        chapter_composition.c.status.in_(("pending", "processing")),
                     )
-                else:
-                    legacy_update = connection.execute(
-                        update(chapter_composition)
-                        .where(
-                            chapter_composition.c.chapter_id == chapter_id,
-                            chapter_composition.c.status.in_(("pending", "processing")),
-                        )
-                        .values(status="processing", updated_at=utc_now())
-                    )
-                if legacy_update.rowcount < 1 and job_id:
-                    raise RuntimeError("Legacy Composition 置为 processing 条件更新未命中")
+                    .values(status="processing", updated_at=utc_now())
+                )
+            if legacy_update.rowcount < 1 and job_id:
+                raise RuntimeError("Composition 置为 processing 条件更新未命中")
 
         try:
-            if dynamic_context:
-                dependencies = job_record.get("depends_on")
-                if isinstance(dependencies, list):
-                    for dependency_id in dependencies:
-                        dependency = self.jobs.repository.get(str(dependency_id))
-                        if dependency is None:
-                            raise RuntimeError(f"Composition 依赖不存在：{dependency_id}")
-                        if dependency.get("status") != "completed":
-                            raise RuntimeError(
-                                "Composition 依赖尚未完成："
-                                f"{dependency_id}（{dependency.get('status')}）"
-                            )
             # 1. 获取所有分镜视频
-            media_snapshot = config.get("media_snapshot") if dynamic_context else None
-            shots_data = self._get_chapter_shots(
-                chapter_id,
-                media_snapshot=media_snapshot,
-            )
+            shots_data = self._get_chapter_shots(chapter_id)
             if not shots_data:
                 raise RuntimeError("章节无分镜视频")
 
@@ -656,7 +322,12 @@ class CompositionService:
                         ),
                     )
 
-                # 5.5 最终输出
+                # 5.5 动画节奏化（可选）：抽帧到 12fps（一拍二张数感）+ 轻微颗粒，
+                # 用于降低视频 AI 味；在最终输出前处理，分辨率调整仍由 finalize 承担。
+                if config.get("anime_cadence"):
+                    concat_video = self._apply_anime_cadence(concat_video, temp_path)
+
+                # 5.6 最终输出
                 self._finalize_output(concat_video, output_path, config.get("resolution", "1080p"))
 
             # 6. 获取视频时长
@@ -670,52 +341,23 @@ class CompositionService:
                     "status": "completed",
                     "updated_at": utc_now(),
                 }
-                if dynamic_context:
-                    self._assert_dynamic_current(connection, job_record)
-                    updated = connection.execute(
-                        update(chapter_composition)
-                        .where(
-                            chapter_composition.c.job_id == job_record["id"],
-                            chapter_composition.c.workflow_run_id
-                            == dynamic_context["workflow_run_id"],
-                            chapter_composition.c.input_signature
-                            == job_record.get("input_signature"),
-                            chapter_composition.c.status == "processing",
-                        )
-                        .values(**values)
-                    )
-                    if updated.rowcount != 1:
-                        raise RuntimeError("动态 Composition 终态条件更新未命中")
-                    self._update_dynamic_workflow(
-                        connection,
-                        job_record,
-                        stage_status="confirmed",
-                        error="",
-                        job_status="completed",
-                        result={
-                            "status": "completed",
-                            "file_path": values["file_path"],
-                            "duration_sec": duration_sec,
-                        },
+                job_id = job_record.get("id")
+                legacy_statement = update(chapter_composition)
+                if job_id:
+                    legacy_statement = legacy_statement.where(
+                        chapter_composition.c.job_id == job_id,
+                        chapter_composition.c.chapter_id == chapter_id,
+                        chapter_composition.c.status == "processing",
                     )
                 else:
-                    job_id = job_record.get("id")
-                    legacy_statement = update(chapter_composition)
-                    if job_id:
-                        legacy_statement = legacy_statement.where(
-                            chapter_composition.c.job_id == job_id,
-                            chapter_composition.c.chapter_id == chapter_id,
-                            chapter_composition.c.status == "processing",
-                        )
-                    else:
-                        # 直接调用场景（无 job id）：只更新该章节最新 processing 记录。
-                        legacy_statement = legacy_statement.where(
-                            chapter_composition.c.chapter_id == chapter_id,
-                            chapter_composition.c.status == "processing",
-                        )
-                    legacy_update = connection.execute(legacy_statement.values(**values))
-                    if legacy_update.rowcount < 1 and job_id:
-                        raise RuntimeError("Legacy Composition 完成条件更新未命中")
+                    # 直接调用场景（无 job id）：只更新该章节最新 processing 记录。
+                    legacy_statement = legacy_statement.where(
+                        chapter_composition.c.chapter_id == chapter_id,
+                        chapter_composition.c.status == "processing",
+                    )
+                legacy_update = connection.execute(legacy_statement.values(**values))
+                if legacy_update.rowcount < 1 and job_id:
+                    raise RuntimeError("Composition 完成条件更新未命中")
 
             logger.info(f"章节 {chapter_id} 合成完成：{output_path}")
 
@@ -730,114 +372,33 @@ class CompositionService:
             error_text = sanitize_error_message(str(exc))
             logger.error(f"章节 {chapter_id} 合成失败：{error_text}")
             with self.database.engine.begin() as connection:
-                if dynamic_context:
-                    self._assert_dynamic_current(connection, job_record)
-                    failed_update = connection.execute(
-                        update(chapter_composition)
-                        .where(
-                            chapter_composition.c.job_id == job_record["id"],
-                            chapter_composition.c.workflow_run_id
-                            == dynamic_context["workflow_run_id"],
-                            chapter_composition.c.input_signature
-                            == job_record.get("input_signature"),
-                            chapter_composition.c.status.in_(
-                                ("pending", "processing", "failed")
-                            ),
-                        )
-                        .values(status="failed", error=error_text, updated_at=utc_now())
-                    )
-                    if failed_update.rowcount != 1:
-                        raise RuntimeError("动态 Composition 失败状态条件更新未命中") from exc
-                    self._update_dynamic_workflow(
-                        connection,
-                        job_record,
-                        stage_status="partial_failed",
-                        error=error_text,
-                        job_status="failed",
-                        result={
-                            "status": "partial_failed",
-                            "error": error_text,
-                        },
+                job_id = job_record.get("id")
+                legacy_failed_statement = update(chapter_composition)
+                if job_id:
+                    legacy_failed_statement = legacy_failed_statement.where(
+                        chapter_composition.c.job_id == job_id,
+                        chapter_composition.c.chapter_id == chapter_id,
+                        chapter_composition.c.status.in_(("pending", "processing", "failed")),
                     )
                 else:
-                    job_id = job_record.get("id")
-                    legacy_failed_statement = update(chapter_composition)
-                    if job_id:
-                        legacy_failed_statement = legacy_failed_statement.where(
-                            chapter_composition.c.job_id == job_id,
-                            chapter_composition.c.chapter_id == chapter_id,
-                            chapter_composition.c.status.in_(("pending", "processing", "failed")),
-                        )
-                    else:
-                        legacy_failed_statement = legacy_failed_statement.where(
-                            chapter_composition.c.chapter_id == chapter_id,
-                            chapter_composition.c.status.in_(("pending", "processing", "failed")),
-                        )
-                    legacy_failed_update = connection.execute(
-                        legacy_failed_statement.values(
-                            status="failed", error=error_text, updated_at=utc_now()
-                        )
+                    legacy_failed_statement = legacy_failed_statement.where(
+                        chapter_composition.c.chapter_id == chapter_id,
+                        chapter_composition.c.status.in_(("pending", "processing", "failed")),
                     )
-                    if legacy_failed_update.rowcount < 1 and job_id:
-                        raise RuntimeError("Legacy Composition 失败条件更新未命中") from exc
+                legacy_failed_update = connection.execute(
+                    legacy_failed_statement.values(
+                        status="failed", error=error_text, updated_at=utc_now()
+                    )
+                )
+                if legacy_failed_update.rowcount < 1 and job_id:
+                    raise RuntimeError("Composition 失败条件更新未命中") from exc
             raise
-
-    @staticmethod
-    def _validate_snapshot_media(
-        record: Mapping[str, Any],
-        expected: Mapping[str, Any],
-        *,
-        kind: str,
-    ) -> None:
-        expected_id = str(expected.get("version_id") or "")
-        if not expected_id or str(record.get("id") or "") != expected_id:
-            raise RuntimeError(f"动态 Composition {kind} version 已切换")
-        expected_path = str(expected.get("file_path") or "")
-        if str(record.get("file_path") or "") != expected_path:
-            raise RuntimeError(f"动态 Composition {kind} file_path 已切换")
-        expected_signature = str(expected.get("input_signature") or "")
-        if expected_signature and str(record.get("input_signature") or "") != expected_signature:
-            raise RuntimeError(f"动态 Composition {kind} input_signature 已切换")
-        if record.get("is_current") not in (1, True):
-            raise RuntimeError(f"动态 Composition {kind} current version 已切换")
-        provenance = json_loads(record.get("provenance_json"), {})
-        provenance = provenance if isinstance(provenance, Mapping) else {}
-        expected_stage_id = str(expected.get("workflow_stage_id") or "")
-        actual_stage_id = str(
-            provenance.get("workflow_stage_id") or provenance.get("stage_id") or ""
-        )
-        if expected_stage_id and actual_stage_id != expected_stage_id:
-            raise RuntimeError(f"动态 Composition {kind} workflow stage 已切换")
-        expected_attempt = expected.get("attempt")
-        actual_attempt = provenance.get("workflow_stage_attempt") or provenance.get(
-            "source_attempt"
-        )
-        if expected_attempt is not None and str(actual_attempt) != str(expected_attempt):
-            raise RuntimeError(f"动态 Composition {kind} attempt 已切换")
-        expected_revision = expected.get("revision")
-        actual_revision = provenance.get("workflow_run_revision") or provenance.get("run_revision")
-        if expected_revision is not None and actual_revision is not None:
-            if int(actual_revision) > int(expected_revision):
-                raise RuntimeError(f"动态 Composition {kind} revision 已切换")
 
     def _get_chapter_shots(
         self,
         chapter_id: str,
-        *,
-        media_snapshot: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """获取章节分镜媒体；动态任务严格使用已冻结的 version snapshot。"""
-        dynamic_snapshot = media_snapshot is not None
-        snapshot_by_shot: dict[str, Mapping[str, Any]] = {}
-        if dynamic_snapshot:
-            raw_shots = media_snapshot.get("shots")
-            if not isinstance(raw_shots, list):
-                raise RuntimeError("没有已生成的分镜视频：动态 Composition 缺少媒体 snapshot")
-            snapshot_by_shot = {
-                str(item.get("shot_id")): item
-                for item in raw_shots
-                if isinstance(item, Mapping) and item.get("shot_id")
-            }
+        """获取章节分镜媒体：读取章节当前版本。"""
         with self.database.engine.connect() as connection:
             # 获取分镜列表
             shot_records = connection.execute(
@@ -849,64 +410,25 @@ class CompositionService:
             shots_data = []
             for shot_record in shot_records:
                 shot_id = shot_record.id
-
-                if dynamic_snapshot:
-                    snapshot_item = snapshot_by_shot.get(str(shot_id))
-                    if snapshot_item is None:
-                        raise RuntimeError(f"动态 Composition 缺少 shot snapshot：{shot_id}")
-                    video_expected = snapshot_item.get("video")
-                    audio_expected = snapshot_item.get("audio")
-                    video_record = None
-                    audio_record = None
-                    if isinstance(video_expected, Mapping) and video_expected.get("version_id"):
-                        video_record = connection.execute(
-                            select(video_version).where(
-                                video_version.c.id == video_expected["version_id"],
-                                video_version.c.shot_id == shot_id,
-                            )
-                        ).first()
-                        if video_record is None:
-                            raise RuntimeError(f"动态 Composition video version 不存在：{shot_id}")
-                        self._validate_snapshot_media(
-                            dict(video_record._mapping),
-                            video_expected,
-                            kind="video",
-                        )
-                    if isinstance(audio_expected, Mapping) and audio_expected.get("version_id"):
-                        audio_record = connection.execute(
-                            select(shot_audio).where(
-                                shot_audio.c.id == audio_expected["version_id"],
-                                shot_audio.c.shot_id == shot_id,
-                            )
-                        ).first()
-                        if audio_record is None:
-                            raise RuntimeError(f"动态 Composition audio version 不存在：{shot_id}")
-                        self._validate_snapshot_media(
-                            dict(audio_record._mapping),
-                            audio_expected,
-                            kind="audio",
-                        )
-                else:
-                    # legacy compose 继续读取章节当前版本。
-                    video_record = connection.execute(
-                        select(
-                            video_version.c.id,
-                            video_version.c.file_path,
-                            video_version.c.actual_duration_sec,
-                        ).where(
-                            video_version.c.shot_id == shot_id,
-                            video_version.c.is_current == 1,
-                        )
-                    ).first()
-                    audio_record = connection.execute(
-                        select(
-                            shot_audio.c.id,
-                            shot_audio.c.file_path,
-                            shot_audio.c.duration_sec,
-                        ).where(
-                            shot_audio.c.shot_id == shot_id, shot_audio.c.is_current == 1
-                        )
-                    ).first()
+                video_record = connection.execute(
+                    select(
+                        video_version.c.id,
+                        video_version.c.file_path,
+                        video_version.c.actual_duration_sec,
+                    ).where(
+                        video_version.c.shot_id == shot_id,
+                        video_version.c.is_current == 1,
+                    )
+                ).first()
+                audio_record = connection.execute(
+                    select(
+                        shot_audio.c.id,
+                        shot_audio.c.file_path,
+                        shot_audio.c.duration_sec,
+                    ).where(
+                        shot_audio.c.shot_id == shot_id, shot_audio.c.is_current == 1
+                    )
+                ).first()
 
                 shots_data.append(
                     {
@@ -974,10 +496,74 @@ class CompositionService:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
+            return output
+        except subprocess.CalledProcessError as exc:
+            err_msg = exc.stderr.decode("utf-8", errors="ignore")[:200] if exc.stderr else ""
+            logger.warning("直接流复制拼接失败，尝试回退到重编码拼接：%s", err_msg)
+            return self._concat_videos_with_reencode(shots_data, project_id, temp_path)
+
+    def _concat_videos_with_reencode(
+        self,
+        shots_data: list[dict[str, Any]],
+        project_id: str,
+        temp_path: Path,
+    ) -> Path:
+        """回退方案：重编码拼接（当输入视频参数不一致导致 stream copy 失败时使用）。"""
+        video_paths = [
+            file_service.resolve_project_path(project_id, shot["video_path"])
+            for shot in shots_data
+            if shot.get("video_path")
+        ]
+        if not video_paths:
+            raise bad_request("没有可拼接的视频")
+        if len(video_paths) == 1:
+            return video_paths[0]
+
+        first = self._get_video_stream_info(video_paths[0])
+        width, height, fps = first["width"], first["height"], first["fps"]
+        output = temp_path / "concat_reencode.mp4"
+
+        cmd = [settings.ffmpeg_path, "-y"]
+        for path in video_paths:
+            cmd.extend(["-i", str(path)])
+
+        filter_parts: list[str] = []
+        concat_inputs: list[str] = []
+        for i in range(len(video_paths)):
+            filter_parts.append(
+                f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}[v{i}]"
+            )
+            concat_inputs.append(f"[v{i}]")
+
+        filter_parts.append(
+            f"{''.join(concat_inputs)}concat=n={len(video_paths)}:v=1:a=0[outv]"
+        )
+        cmd.extend([
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[outv]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "20",
+            str(output),
+        ])
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                timeout=600,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
         except subprocess.CalledProcessError as exc:
             error_msg = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else "未知错误"
-            raise bad_request(f"视频拼接失败: {error_msg[:200]}") from exc
-
+            raise bad_request(f"重编码视频拼接失败: {error_msg[:200]}") from exc
         return output
 
     @staticmethod
@@ -1413,17 +999,55 @@ class CompositionService:
 
         return output
 
+    def _apply_anime_cadence(self, video_path: Path, temp_path: Path) -> Path:
+        """动画节奏化：抽帧到 12fps（一拍二手绘张数感）并叠加轻微均匀颗粒。
+
+        视频 AI 味的核心是全程均匀插值：把 25fps 合成结果抽到 12fps 后，
+        观感更接近手绘动画的张数节奏；颗粒进一步压掉塑料感。音轨原样保留。
+        """
+        output = temp_path / "anime_cadence.mp4"
+        subprocess.run(
+            [
+                settings.ffmpeg_path,
+                "-y",
+                "-i",
+                str(video_path),
+                "-vf",
+                "fps=12,noise=alls=6:allf=u",
+                "-r",
+                "12",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-c:a",
+                "copy",
+                str(output),
+            ],
+            check=True,
+            timeout=600,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        return output
+
     def _finalize_output(self, video_path: Path, output_path: Path, resolution: str) -> None:
         """最终输出（可选：调整分辨率）
 
         使用等比缩放 + pad，保持竖屏/异形比内容不被强行拉伸变形。
         """
+        stream_info = self._get_video_stream_info(video_path)
+        is_portrait = stream_info["height"] > stream_info["width"]
+
         if resolution == "720p":
-            width, height = 1280, 720
+            width, height = (720, 1280) if is_portrait else (1280, 720)
         elif resolution == "4k":
-            width, height = 3840, 2160
+            width, height = (2160, 3840) if is_portrait else (3840, 2160)
         else:  # 1080p 或其他
-            width, height = 1920, 1080
+            width, height = (1080, 1920) if is_portrait else (1920, 1080)
 
         if resolution in {"720p", "4k"}:
             scale = (

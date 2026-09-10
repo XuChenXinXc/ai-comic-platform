@@ -3,6 +3,7 @@
 处理配音生成、音频管理等功能。
 """
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -170,10 +171,17 @@ class AudioService:
         writing = WritingService(self.database)
         screenplay_record = writing.get_screenplay(chapter_id)
 
-        if not screenplay_record or screenplay_record["status"] != "confirmed":
-            raise bad_request("剧本未确认，无法提取对话")
+        if not screenplay_record:
+            raise bad_request("章节尚未生成剧本，请先在剧本页面生成剧本")
 
-        content = json_loads(screenplay_record["content_json"], {})
+        if screenplay_record["status"] not in ("ready", "confirmed"):
+            raise bad_request(
+                f"剧本状态为 {screenplay_record['status']}，请先在剧本页面完成生成并保存"
+            )
+
+        content = screenplay_record.get("content")
+        if not isinstance(content, dict):
+            content = json_loads(screenplay_record.get("content_json"), {})
         scenes = content.get("scenes", [])
 
         dialogues = []
@@ -291,7 +299,7 @@ class AudioService:
         audio_path = audio_dir / audio_filename
 
         try:
-            atomic_write_bytes(audio_path, audio_data)
+            await asyncio.to_thread(atomic_write_bytes, audio_path, audio_data)
             # 获取音频时长；失败时抛明确错误，不写入 0 时长
             duration_sec = await self._get_audio_duration(audio_path)
         except Exception:
@@ -514,7 +522,7 @@ class AudioService:
         bgm_path = bgm_dir / bgm_filename
 
         try:
-            atomic_write_bytes(bgm_path, file_data)
+            await asyncio.to_thread(atomic_write_bytes, bgm_path, file_data)
             # 获取音频时长；失败时抛明确错误，不写入 0 时长
             duration_sec = await self._get_audio_duration(bgm_path)
             # 校验确实包含音频流：视频/图片文件也能被 ffprobe 读到时长，

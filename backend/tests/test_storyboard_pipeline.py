@@ -331,6 +331,94 @@ def test_extract_retries_with_merge_instruction_when_scene_density_rejected(
     assert len(service.list(chapter["id"])) == 3
 
 
+def test_scene_density_correction_note_includes_dialogue_grouping() -> None:
+    """修正指令必须给出可直接执行的对白分组，而不是只喊合并口号。"""
+    scene = {
+        "scene_no": 1,
+        "target_duration_sec": 42,
+        "dialogue": [
+            {"speaker": "阿萤", "text": "青哥，水洼里有鱼。"},
+            {"speaker": "颜青", "text": "胡扯，雨天哪来的鱼。"},
+            {"speaker": "阿萤", "text": "就在你脚边。"},
+            {"speaker": "颜青", "text": "没眼睛的东西不算活。天一明，它就散了。"},
+            {"speaker": "阿萤", "text": "那它现在是活的，还是散的？"},
+            {"speaker": "阿萤", "text": "明天我去城南给娘坟上添土。听人说，水要来了。"},
+            {"speaker": "颜青", "text": "收拾东西，回家。"},
+        ],
+    }
+    detail = "场次 1 返回 7 个分镜，超过本场 42 秒预算允许的 5 个"
+
+    note = ShotService._scene_density_correction_note(detail, [scene])
+
+    assert "分镜密度修正指令" in note
+    assert "纯对白镜头按 2.5 字/秒" in note
+    assert "第1-3条（25字" in note
+    assert "第4-5条（32字" in note
+    assert "第6-7条（30字" in note
+    assert "不得超过 5 个" in note
+    # 转场标注规则：同场镜头不能标 scene_change，否则自动合并无从下手
+    assert "不得标 scene_change" in note
+
+
+def test_dialogue_grouping_splits_overlong_line_and_counts_effective_shots() -> None:
+    # 52 字台词超出单镜 37 字上限：保存流程会强制拆为 2 镜。分组建议必须按
+    # 拆镜后镜头数计算，并明确要求动作节拍并入对白镜头，否则模型照单执行
+    # 后仍会被密度门禁拒绝。
+    scene = {
+        "scene_no": 2,
+        "target_duration_sec": 45,
+        "dialogue": [
+            {
+                "speaker": "林织",
+                "text": (
+                    "我妈每周日晚上八点准时打电话；我爸不吭声，催婚全推给我阿姨。"
+                    "我相到第七个，对方开口第一句是‘你属什么’。"
+                ),
+            },
+            {
+                "speaker": "男人",
+                "text": (
+                    "我今年第二次。上次对方迟到四十分钟，进门第一句问‘你买得起房吗’。"
+                ),
+            },
+            {"speaker": "林织", "text": "你怎么答？"},
+            {"speaker": "男人", "text": "买不起。她说那AA吧。AA完要加微信，我没通过。"},
+            {"speaker": "林织", "text": "拒得对。"},
+            {"speaker": "男人", "text": "后来她跟我妈告状，说我没礼貌。"},
+        ],
+    }
+    detail = "场次 2 返回 7 个分镜，超过本场 45 秒预算允许的 5 个"
+
+    note = ShotService._dialogue_grouping_suggestions(detail, [scene])[0]
+
+    # 52 字第 1 条按强制拆镜计为 2 镜，对白共占 5 镜 = 预算上限 5
+    assert "自动拆为2镜" in note
+    assert "合并为 5 个纯对白镜头" in note
+    # 对白已占满预算：动作必须并入对白镜头，不得单独成镜
+    assert "必须并入上述对白镜头" in note
+    assert "不得超过 5 个" in note
+
+
+def test_dialogue_grouping_reports_script_conflict_when_over_budget() -> None:
+    # 三条 40 字台词各需拆为 2 镜，共 6 镜 > 30 秒预算上限 4：应直接报告
+    # 剧本问题，而不是给出不可执行的分组方案。
+    scene = {
+        "scene_no": 1,
+        "target_duration_sec": 30,
+        "dialogue": [
+            {"speaker": "甲", "text": "字" * 40},
+            {"speaker": "乙", "text": "字" * 40},
+            {"speaker": "丙", "text": "字" * 40},
+        ],
+    }
+    detail = "场次 1 返回 8 个分镜，超过本场 30 秒预算允许的 4 个"
+
+    note = ShotService._dialogue_grouping_suggestions(detail, [scene])[0]
+
+    assert "至少需要 6 个对白镜头" in note
+    assert "请检查剧本场次时长或精简对白" in note
+
+
 def test_scene_density_rejects_excessive_shots_before_save() -> None:
     # 30 秒场次：下限 ceil(30/15)=2 镜，硬上限 2+2=4 镜
     scenes = [{"scene_no": 1, "duration_sec": 30}]
@@ -598,6 +686,69 @@ def test_auto_merge_skips_pair_when_compressed_capacity_insufficient() -> None:
     # pair(1,2) 压缩后 40 字 > 37 字承载不合并；pair(2,3) 台词 20 字可合并压回 4 镜
     assert len(merged) == 4
     assert [len(item["dialogue"]) for item in merged] == [1, 1, 0, 0]
+
+
+def test_auto_merge_stretches_duration_to_carry_merged_dialogue() -> None:
+    # 模型常把薄台词镜头标成 5 秒：合并后对白在两镜总时长内装不下，但拉伸到
+    # 单镜上限以内即可承载。合并应允许拉伸而不是直接放弃该对。
+    scenes = [{"scene_no": 1, "duration_sec": 30}]
+    shots = [
+        _dense_shot(
+            1,
+            transition="scene_change",
+            duration=5,
+            action="林织开口直说",
+            dialogue=[{"speaker": "林织", "text": "先说好，我不结婚。"}],
+        ),
+        _dense_shot(
+            2,
+            transition="same_scene_cut",
+            duration=5,
+            action="男人抬头看向她",
+            dialogue=[{"speaker": "男人", "text": "巧了，我也不是。"}],
+        ),
+        _dense_shot(3, transition="same_scene_cut"),
+        _dense_shot(4, transition="same_scene_cut"),
+        _dense_shot(5, transition="same_scene_cut"),
+    ]
+
+    merged, notes = ShotService._auto_merge_dense_shots(shots, scenes=scenes)
+
+    # 合并后动作含动作动词（抬头/看向）按 1.6 字/秒，17 字台词需要 11 秒，
+    # 超过两镜总时长 10 秒但未超 15 秒单镜上限：应拉伸合并而非放弃。
+    assert len(merged) == 4
+    assert len(notes) == 1
+    assert merged[0]["duration_sec"] == 11
+    assert [item["speaker"] for item in merged[0]["dialogue"]] == ["林织", "男人"]
+    # 时间轴按 11 秒目标重排：两段都保留且末段落在 11 秒
+    assert "0-5.5秒" in merged[0]["video_prompt"]
+    assert "5.5-11秒" in merged[0]["video_prompt"]
+    assert all(5 <= item["duration_sec"] <= 15 for item in merged)
+
+
+def test_auto_merge_normalizes_same_scene_scene_change_and_merges() -> None:
+    # 同场相邻镜头误标 scene_change 会阻止自动合并；提供预算表时应先降级为
+    # same_scene_cut 再作为对话回合候选参与合并，真实转场只发生在场次切换处。
+    scenes = [{"scene_no": 1, "duration_sec": 30}]
+    shots = [
+        _dense_shot(1, transition="scene_change"),
+        _dense_shot(2, transition="scene_change"),
+        _dense_shot(3, transition="scene_change"),
+        _dense_shot(4, transition="same_scene_cut"),
+        _dense_shot(5, transition="same_scene_cut"),
+    ]
+
+    merged, notes = ShotService._auto_merge_dense_shots(shots, scenes=scenes)
+
+    # 5 镜压回上限 4 镜：首镜 scene_change 保留，其余同场 scene_change 全部降级
+    assert len(merged) == 4
+    assert merged[0]["transition_from_prev"] == "scene_change"
+    assert all(
+        item["transition_from_prev"] != "scene_change" for item in merged[1:]
+    )
+    downgrade_notes = [note for note in notes if "scene_change" in note["message"]]
+    assert len(downgrade_notes) == 2
+    assert len(notes) >= 3  # 2 条降级提示 + 至少 1 条合并提示
 
 
 def test_extracted_continuity_rejects_scene_interleaving() -> None:

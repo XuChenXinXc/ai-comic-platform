@@ -7,10 +7,9 @@ from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import update
 
 from app.config import get_settings
-from app.dynamic_pipeline.stage_catalog import get_stage_prerequisites
 from app.jobs.recovery import (
     recover_jobs,  # noqa: F401  # 保留 export 兼容，recover() 已统一走 recover_all_once
 )
@@ -21,7 +20,6 @@ from app.jobs.repository import (
     job_repository,
 )
 from app.models.tables import job as job_table
-from app.models.tables import workflow_run, workflow_stage
 from app.services.utils import sanitize_error_message, utc_now
 
 JobHandler = Callable[
@@ -173,7 +171,6 @@ class JobRunner:
         if handler is None:
             error = f"未注册任务处理器：{record['job_type']}"
             self.repository.fail(job_id, error)
-            self._mark_dynamic_failure_state(record, error)
             self._propagate_dependency_failure(job_id, error)
             return
         try:
@@ -195,7 +192,6 @@ class JobRunner:
                 if current is not None and current["status"] == "running":
                     error = "处理器未返回结果，任务按失败处理"
                     self.repository.fail(job_id, error)
-                    self._mark_dynamic_failure_state(record, error)
                     self._propagate_dependency_failure(job_id, error)
                 return
             result_mapping = result if isinstance(result, Mapping) else {}
@@ -204,7 +200,6 @@ class JobRunner:
                 error = str(result_mapping.get("error") or result_status)
                 if current is not None and current["status"] in NON_TERMINAL_STATUSES:
                     self.repository.fail(job_id, error)
-                self._mark_dynamic_failure_state(record, error)
                 self._propagate_dependency_failure(job_id, error)
                 return
             if result_status == "interrupted":
@@ -245,7 +240,6 @@ class JobRunner:
                 "failed",
             }:
                 self.repository.fail(job_id, error)
-            self._mark_dynamic_failure_state(record, error)
             self._propagate_dependency_failure(job_id, error)
 
     @staticmethod
@@ -277,84 +271,7 @@ class JobRunner:
                 return "failed", f"任务依赖未成功完成：{dependency_id}（{status}）"
             if status != "completed":
                 pending = True
-        workflow_state, workflow_error = self._workflow_dependency_state(
-            record, connection=connection
-        )
-        if workflow_error is not None:
-            return workflow_state, workflow_error
-        if workflow_state == "pending":
-            pending = True
         return ("pending", None) if pending else ("ready", None)
-
-    def _workflow_dependency_state(
-        self,
-        record: Mapping[str, Any],
-        *,
-        connection: Any | None = None,
-    ) -> tuple[str, str | None]:
-        if str(record.get("job_type") or "") != "dynamic_stage_generate":
-            return "ready", None
-        run_id = str(record.get("workflow_run_id") or "")
-        stage_id = str(record.get("workflow_stage_id") or "")
-        if not run_id or not stage_id:
-            return "ready", None
-
-        def _probe(conn: Any) -> tuple[str, str | None]:
-            stage = conn.execute(
-                select(workflow_stage).where(
-                    workflow_stage.c.id == stage_id,
-                    workflow_stage.c.workflow_run_id == run_id,
-                )
-            ).first()
-            if stage is None:
-                return "failed", f"动态任务关联的阶段不存在：{stage_id}"
-            prerequisite_keys = get_stage_prerequisites(str(stage.stage_key))
-            if not prerequisite_keys:
-                return "ready", None
-            pending = False
-            for prerequisite_key in prerequisite_keys:
-                prerequisite = conn.execute(
-                    select(workflow_stage)
-                    .where(
-                        workflow_stage.c.workflow_run_id == run_id,
-                        workflow_stage.c.stage_key == prerequisite_key,
-                    )
-                    .order_by(
-                        workflow_stage.c.attempt.desc(),
-                        workflow_stage.c.updated_at.desc(),
-                        workflow_stage.c.id.desc(),
-                    )
-                    .limit(1)
-                ).first()
-                if prerequisite is None:
-                    return "failed", f"动态任务前置阶段不存在：{prerequisite_key}"
-                status = str(prerequisite.status or "")
-                if status in {
-                    "failed",
-                    "partial_failed",
-                    "interrupted",
-                    "cancelled",
-                    "stale",
-                    "blocked",
-                }:
-                    return (
-                        "failed",
-                        f"动态任务前置阶段未成功完成：{prerequisite_key}（{status}）",
-                    )
-                if status != "confirmed":
-                    pending = True
-            return ("pending", None) if pending else ("ready", None)
-
-        try:
-            if connection is not None:
-                return _probe(connection)
-            with self.repository.engine.connect() as conn:
-                return _probe(conn)
-        except ValueError as exc:
-            return "failed", str(exc)
-        except Exception:
-            # 读取依赖失败时保持 queued，由恢复/下一次执行重新检查，避免误执行。
-            return "pending", None
 
     def _fail_dependency_blocked_job(
         self,
@@ -385,90 +302,7 @@ class JobRunner:
                 return False
         except Exception:
             return False
-        self._mark_dynamic_failure_state(record, message)
         return True
-
-    def _mark_dynamic_failure_state(
-        self,
-        record: Mapping[str, Any],
-        message: str,
-    ) -> None:
-        """把动态 Job 的 Provider/媒体/组合失败即时汇总到 stage/run。"""
-        run_id = str(record.get("workflow_run_id") or "")
-        stage_id = str(record.get("workflow_stage_id") or "")
-        if not run_id or not stage_id:
-            return
-        try:
-            with self.repository.engine.begin() as connection:
-                run = connection.execute(
-                    select(workflow_run).where(workflow_run.c.id == run_id)
-                ).first()
-                stage = connection.execute(
-                    select(workflow_stage).where(
-                        workflow_stage.c.id == stage_id,
-                        workflow_stage.c.workflow_run_id == run_id,
-                    )
-                ).first()
-                if run is None or stage is None:
-                    return
-                latest = connection.execute(
-                    select(workflow_stage)
-                    .where(
-                        workflow_stage.c.workflow_run_id == run_id,
-                        workflow_stage.c.stage_key == stage.stage_key,
-                    )
-                    .order_by(
-                        workflow_stage.c.attempt.desc(),
-                        workflow_stage.c.updated_at.desc(),
-                        workflow_stage.c.id.desc(),
-                    )
-                    .limit(1)
-                ).first()
-                if latest is None or latest.id != stage_id:
-                    return
-                now = utc_now()
-                stage_update = connection.execute(
-                    update(workflow_stage)
-                    .where(
-                        workflow_stage.c.id == stage_id,
-                        workflow_stage.c.workflow_run_id == run_id,
-                        workflow_stage.c.attempt == latest.attempt,
-                        workflow_stage.c.input_signature == stage.input_signature,
-                        workflow_stage.c.updated_at == stage.updated_at,
-                        workflow_stage.c.status.in_(
-                            ("queued", "running", "ready", "confirmed", "partial_failed")
-                        ),
-                    )
-                    .values(
-                        status="partial_failed",
-                        error=sanitize_error_message(message),
-                        finished_at=now,
-                        updated_at=now,
-                    )
-                )
-                if stage_update.rowcount != 1:
-                    return
-                run_update = connection.execute(
-                    update(workflow_run)
-                    .where(
-                        workflow_run.c.id == run_id,
-                        workflow_run.c.revision == run.revision,
-                        workflow_run.c.updated_at == run.updated_at,
-                        workflow_run.c.status.not_in(
-                            ("cancelled", "stale", "blocked", "failed", "interrupted")
-                        ),
-                    )
-                    .values(
-                        status="partial_failed",
-                        error=sanitize_error_message(message),
-                        revision=workflow_run.c.revision + 1,
-                        updated_at=now,
-                    )
-                )
-                if run_update.rowcount != 1:
-                    raise RuntimeError("动态 run 条件更新未命中")
-        except Exception:
-            return
 
     def _propagate_dependency_failure(self, dependency_job_id: str, message: str) -> None:
         """失败后立即安全失败直接及间接下游，避免等到下一次重启才汇总。
@@ -484,7 +318,7 @@ class JobRunner:
         # Phase 1: collect candidates under lock, no write transactions.
         with self._lock:
             # 一次性扫描，避免每轮 BFS 都触发一次全表读。
-            snapshot = self.repository.list_non_terminal(include_dynamic=True)
+            snapshot = self.repository.list_non_terminal()
             pending: list[tuple[str, str]] = [(dependency_job_id, message)]
             visited = {dependency_job_id}
             candidates: list[tuple[dict[str, Any], str]] = []
@@ -522,7 +356,7 @@ class JobRunner:
         with self._lock:
             ready_ids: list[str] = []
             error_records: list[tuple[dict[str, Any], str]] = []
-            for record in self.repository.list_non_terminal(include_dynamic=True):
+            for record in self.repository.list_non_terminal():
                 if record.get("status") != "queued":
                     continue
                 if completed_job_id not in self._dependency_ids(record):

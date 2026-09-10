@@ -9,7 +9,7 @@ import { toast } from "sonner";
 import { api, queryKeys } from "../api/client";
 import { useChapter } from "../hooks/use-chapter";
 import { useProject } from "../hooks/use-project";
-import { formatError } from "../lib/utils";
+import { cn, formatError } from "../lib/utils";
 import { Button } from "./ui";
 
 export function ChapterSelector() {
@@ -101,33 +101,35 @@ export function ChapterSelector() {
     <div className="relative">
       <button
         type="button"
-        className="border-border bg-card hover:bg-accent flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium transition-colors"
+        className="flex h-10 items-center gap-1.5 rounded-full border border-black/10 bg-white/70 px-4 text-sm font-medium shadow-sm transition hover:border-black/25 dark:border-white/15 dark:bg-white/10 dark:text-white"
         aria-haspopup="listbox"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
       >
-        <BookOpen className="text-muted-foreground h-3.5 w-3.5" />
+        <BookOpen className="h-3.5 w-3.5 text-muted" />
         <span className="max-w-[180px] truncate">
           {activeChapter
             ? `第${activeChapter.chapter_no}章 ${activeChapter.title}`
             : "选择章节"}
         </span>
-        <ChevronDown className="text-muted-foreground h-3.5 w-3.5" />
+        <ChevronDown className="h-3.5 w-3.5 text-muted" />
       </button>
 
       {open && (
         <>
           <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
-          <div className="border-border bg-card absolute left-0 top-full z-20 mt-1 min-w-[240px] rounded-md border shadow-lg">
+          <div className="absolute left-0 top-full z-20 mt-1 min-w-[260px] overflow-hidden rounded-2xl border border-black/[0.06] bg-paper shadow-apple dark:border-white/10 dark:bg-[#1a1a1b]">
             <div className="max-h-64 overflow-y-auto p-1">
               {chapters.map((item, index) => (
                 <div
                   key={item.id}
                   role="button"
                   tabIndex={0}
-                  className={`hover:bg-accent flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm ${
-                    item.id === activeChapterId ? "bg-accent font-medium" : ""
-                  }`}
+                  className={cn(
+                    "flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left text-sm text-ink transition hover:bg-black/5 dark:hover:bg-white/10",
+                    item.id === activeChapterId &&
+                      "bg-black/5 font-medium dark:bg-white/10",
+                  )}
                   onClick={() => {
                     selectChapter(item.id);
                     setOpen(false);
@@ -139,14 +141,14 @@ export function ChapterSelector() {
                     }
                   }}
                 >
-                  <span className="text-muted-foreground w-5 shrink-0 text-xs">
+                  <span className="w-5 shrink-0 text-xs text-muted">
                     {item.chapter_no}
                   </span>
                   <span className="truncate">
                     {item.title || `第${item.chapter_no}章`}
                   </span>
                   {Boolean(item.shot_count) && (
-                    <span className="text-muted-foreground shrink-0 text-xs">
+                    <span className="shrink-0 text-xs text-muted">
                       {item.shot_count} 镜
                     </span>
                   )}
@@ -157,7 +159,7 @@ export function ChapterSelector() {
                     <button
                       type="button"
                       disabled={index === 0 || reorderMutation.isPending}
-                      className="rounded p-0.5 hover:bg-accent disabled:opacity-30"
+                      className="rounded-full p-1 hover:bg-black/10 disabled:opacity-30 dark:hover:bg-white/15"
                       title="上移"
                       aria-label={`上移第${item.chapter_no}章`}
                       onClick={() => moveChapter(index, -1)}
@@ -170,7 +172,7 @@ export function ChapterSelector() {
                         index === chapters.length - 1 ||
                         reorderMutation.isPending
                       }
-                      className="rounded p-0.5 hover:bg-accent disabled:opacity-30"
+                      className="rounded-full p-1 hover:bg-black/10 disabled:opacity-30 dark:hover:bg-white/15"
                       title="下移"
                       aria-label={`下移第${item.chapter_no}章`}
                       onClick={() => moveChapter(index, 1)}
@@ -180,7 +182,7 @@ export function ChapterSelector() {
                     <button
                       type="button"
                       disabled={deleteMutation.isPending}
-                      className="rounded p-0.5 text-[#9b342c] hover:bg-accent disabled:opacity-30"
+                      className="rounded-full p-1 text-[#c93c30] hover:bg-red-50 disabled:opacity-30 dark:hover:bg-red-500/10"
                       title="删除章节"
                       aria-label={`删除第${item.chapter_no}章`}
                       onClick={() => deleteMutation.mutate(item.id)}
@@ -191,11 +193,11 @@ export function ChapterSelector() {
                 </div>
               ))}
             </div>
-            <div className="border-border border-t p-1">
+            <div className="border-t border-black/[0.06] p-1 dark:border-white/10">
               <button
                 type="button"
                 disabled={createMutation.isPending}
-                className="hover:bg-accent flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm disabled:opacity-50"
+                className="flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left text-sm font-medium text-vermilion transition hover:bg-black/5 disabled:opacity-50 dark:hover:bg-white/10"
                 onClick={() => createMutation.mutate()}
               >
                 <Plus className="h-3.5 w-3.5" />

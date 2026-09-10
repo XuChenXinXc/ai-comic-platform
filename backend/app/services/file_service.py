@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 from collections.abc import Mapping
 from pathlib import Path
 from threading import RLock
@@ -38,6 +39,7 @@ class FileServiceError(RuntimeError):
     pass
 
 
+_TUN_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
 _INVALID_WINDOWS_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _MAX_PROJECT_STORAGE_NAME_UTF16_UNITS = 80
 _WINDOWS_MAX_PATH_UTF16_UNITS = 259
@@ -71,13 +73,6 @@ def _truncate_utf16(value: str, max_units: int) -> str:
         if units > max_units:
             return value[:index]
     return value
-
-
-def _media_view_token(view_key: str) -> str:
-    """Scene View 目录 token：view_key 转安全目录名，超长截断。"""
-    safe = _INVALID_WINDOWS_NAME.sub("_", str(view_key or "")).strip().rstrip(". ")
-    safe = _truncate_utf16(safe, 40)
-    return safe or "view"
 
 
 def chapter_folder_name(chapter_no: int, title: str = "") -> str:
@@ -204,14 +199,52 @@ def _reject_private_download_host(url: str) -> None:
     且逐解析仍有 TOCTOU，DNS 重绑定与 30x 跳转到内网属残余风险。
     """
     parsed = urlparse(str(url))
-    hostname = (parsed.hostname or "").strip("[]")
+    hostname = (parsed.hostname or "").strip("[]").lower()
+    if not hostname:
+        raise FileServiceError("下载地址缺少有效主机名")
+
+    if (
+        hostname in ("localhost", "ip6-localhost", "ip6-loopback")
+        or hostname.endswith(".localhost")
+        or hostname.endswith(".local")
+        or hostname.endswith(".internal")
+    ):
+        raise FileServiceError(f"下载地址指向本地或保留主机名，已拒绝：{hostname}")
+
     try:
         address = ipaddress.ip_address(hostname)
-    except ValueError:
-        # 非 IP 字面量（普通主机名）：不做 DNS 预检
+        if (
+            address.is_loopback
+            or address.is_link_local
+            or address.is_private
+            or address.is_reserved
+        ):
+            raise FileServiceError(f"下载地址指向内网或保留地址，已拒绝：{hostname}")
         return
-    if address.is_loopback or address.is_link_local or address.is_private or address.is_reserved:
-        raise FileServiceError(f"下载地址指向内网或保留地址，已拒绝：{hostname}")
+    except ValueError:
+        pass
+
+    # 单元测试与保留测试域名（RFC 2606 / RFC 6761）跳过解析，避免测试环境中假解析或解析超时
+    if hostname.endswith((".test", ".example", ".invalid")):
+        return
+
+    # 普通主机名：做 DNS 解析预检，拦截指向内网/保留地址的主机名（如 *.nip.io）
+    # 排除代理/TUN 模式的 fake-ip 实验网段（198.18.0.0/15），避免开发代理环境下误伤正常外部请求
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None)
+        for entry in addrinfo:
+            sockaddr = entry[4]
+            ip_str = sockaddr[0]
+            addr = ipaddress.ip_address(ip_str)
+            if addr in _TUN_FAKE_IP_NET:
+                continue
+            if addr.is_loopback or addr.is_link_local or addr.is_private or addr.is_reserved:
+                raise FileServiceError(
+                    f"下载地址解析到内网或保留地址，已拒绝：{hostname} -> {ip_str}"
+                )
+    except (socket.gaierror, OSError):
+        # DNS 解析失败在后续请求中会由网络层报错，此处不阻断
+        pass
 
 
 def download_url_atomic(
@@ -578,22 +611,15 @@ class FileService:
         asset_name: str | None = None,
         current: bool = False,
         storage_name: str | None = None,
-        view_key: str | None = None,
     ) -> Path:
         folders = {"character": "characters", "scene": "scenes", "prop": "props"}
         if asset_type not in folders:
             raise FileServiceError(f"未知素材类型：{asset_type}")
-        # Scene View 分区目录：MASTER / 各视角各有独立子目录，
-        # 避免不同视图的 v001 互相覆盖（视图各自独立编号）。
-        view_suffix = ""
-        if asset_type == "scene" and view_key:
-            safe_view = _media_view_token(view_key)
-            view_suffix = f"/views/{safe_view}"
         layout, persisted_storage_name = self._project_storage(project_id)
         if layout == "categorized":
             named_folders = {"character": "角色", "scene": "场景", "prop": "物品"}
             folder = named_folders[asset_type]
-            relative = Path(folder) / f"{view_suffix.lstrip('/')}" / _media_filename(
+            relative = Path(folder) / _media_filename(
                 folder,
                 asset_name or asset_id,
                 version_no,
@@ -610,21 +636,17 @@ class FileService:
             named_folders = {"character": "角色", "scene": "场景", "prop": "物品"}
             safe_name = sanitize_project_storage_name(storage_name or persisted_storage_name or "")
             folder = f"{safe_name}-{named_folders[asset_type]}"
-            view_token = f"{view_suffix.lstrip('/')}" if view_suffix else ""
             relative = (
                 Path(folder)
                 / asset_id
-                / view_token
                 / f"v{version_no:03d}{suffix}"
             )
         else:
             folders_by_type = folders[asset_type]
-            view_token = f"{view_suffix.lstrip('/')}" if view_suffix else ""
             relative = (
                 Path("assets")
                 / folders_by_type
                 / asset_id
-                / view_token
                 / f"v{version_no:03d}{suffix}"
             )
         return self.resolve_project_path(project_id, relative)

@@ -6,13 +6,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-from alembic.config import Config
-from alembic.script import ScriptDirectory
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import func, insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from alembic import command
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from app.config import BACKEND_DIR, PROJECT_ROOT, Settings
 from app.db import Database, init_db, migrate_schema, utc_now
 from app.models.tables import ALL_TABLES, api_provider, job, project

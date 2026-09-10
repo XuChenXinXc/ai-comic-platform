@@ -266,8 +266,12 @@ def _scene_context(
     color_mood = _scene_profile_value(profile, "color_mood", fallback="主色与点缀色以素材资料为准")
     main_color = _scene_profile_value(profile, "main_color", "color_mood", fallback=color_mood)
     accent_color = _scene_profile_value(profile, "accent_color", fallback="以场景资料为准")
-    color_quality = _scene_profile_value(
-        profile, "color_quality", "color_mood", fallback=color_mood
+    # 视觉语义重解释治理（Phase 2）：场景只陈述受控事实（时间/天气/光源方向/固有色），
+    # 不输出主辅光效果、氛围或色彩气质等自由艺术指导，表达方式由项目统一画风决定。
+    time_of_day = _scene_profile_value(profile, "time_of_day", fallback="昼夜时间以场景资料为准")
+    weather = _scene_profile_value(profile, "weather", fallback="天气以场景资料为准")
+    light_direction = _scene_profile_value(
+        profile, "light_direction", "lighting", "main_light", fallback="光源方向以场景资料为准"
     )
     main_view = _scene_profile_value(profile, "main_view", fallback="主场景透视图（无人空镜）")
     standard_view_1 = _scene_profile_value(
@@ -277,11 +281,6 @@ def _scene_context(
         profile, "standard_view_2", fallback="反向或侧向全景（无人空镜）"
     )
     detail_zone = _scene_profile_value(profile, "detail_zone", fallback=furnishings)
-    main_light = _scene_profile_value(
-        profile, "lighting", "main_light", fallback="主光源以场景资料为准"
-    )
-    fill_light = _scene_profile_value(profile, "fill_light", fallback="辅光以场景资料为准")
-    atmosphere = _scene_profile_value(profile, "atmosphere", "color_mood", fallback=color_mood)
     environment_detail = _scene_environment_text(detail, "按上述资料补充环境细节")
     environment_composition = _scene_environment_text(composition, "")
     environment_keywords = []
@@ -309,14 +308,13 @@ def _scene_context(
         "special_material": special_material,
         "main_color": main_color,
         "accent_color": accent_color,
-        "color_quality": color_quality,
+        "time_of_day": time_of_day,
+        "weather": weather,
+        "light_direction": light_direction,
         "main_view": main_view,
         "standard_view_1": standard_view_1,
         "standard_view_2": standard_view_2,
         "detail_zone": detail_zone,
-        "main_light": main_light,
-        "fill_light": fill_light,
-        "atmosphere": atmosphere,
         "environment_detail": environment_detail,
         "anchors": anchors,
         "composition": environment_composition.rstrip("。") if environment_composition else "",
@@ -357,34 +355,5 @@ def render_asset_body(
         negative_prompt=negative_prompt,
     )
     template_path = TEMPLATE_DIR / f"{asset_type}_sheet.md"
-    template_text = template_path.read_text(encoding="utf-8")
-    return render_template(template_text, context)
-
-
-def render_scene_master_body(
-    *,
-    asset_name: str,
-    profile: dict[str, Any],
-    prompt: str,
-    negative_prompt: str,
-    consistency_keywords: list[str],
-    composition: str,
-) -> str:
-    """渲染 Scene MASTER 母版提示词正文（scene_master.md 模板）。
-
-    与 scene_sheet.md（多视图拼板展板）不同：MASTER 是一张完整空间
-    全景透视图，供 Scene Views 以图生图派生，也作为分镜空间锚点。
-    ``negative_prompt`` 应为已合并默认负向的最终值。
-    """
-    detail = _asset_detail(prompt, profile)
-    context = _scene_context(
-        name=asset_name,
-        profile=profile,
-        detail=detail,
-        consistency_keywords=consistency_keywords,
-        composition=composition,
-        negative_prompt=negative_prompt,
-    )
-    template_path = TEMPLATE_DIR / "scene_master.md"
     template_text = template_path.read_text(encoding="utf-8")
     return render_template(template_text, context)

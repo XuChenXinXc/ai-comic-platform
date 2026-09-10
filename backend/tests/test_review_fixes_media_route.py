@@ -111,7 +111,11 @@ def test_media_root_cache_invalidates_when_directory_removed(
 def test_media_requests_are_served_and_cached_across_requests(
     tmp_path: Path,
 ) -> None:
-    """同一项目的连续 /media 请求命中缓存，响应内容一致。"""
+    """同一项目的连续 /media 请求命中缓存，响应内容一致。
+
+    响应必须带 ``Cache-Control: no-cache``：当前版本文件复用固定路径，
+    浏览器无验证缓存会让上传/生成新图后仍显示旧内容。
+    """
     database, fallback_dir, _storage_root = _setup(tmp_path)
     test_app = _build_app(database, fallback_dir)
     try:
@@ -123,11 +127,45 @@ def test_media_requests_are_served_and_cached_across_requests(
 
         assert first.status_code == 200
         assert first.text == "categorized"
+        assert first.headers["cache-control"] == "no-cache"
         assert second.status_code == 200
         assert second.text == "categorized"
         assert missing.status_code == 404
         static = test_app.routes[-1].app  # mount 的 ProjectMediaStaticFiles
         assert "project-1" in static._root_cache
+    finally:
+        database.dispose()
+
+
+def test_media_replaced_file_returns_new_content_with_stale_etag(
+    tmp_path: Path,
+) -> None:
+    """当前版本文件复用固定路径：内容被替换后，旧 ETag 请求必须返回新内容。
+
+    回归：上传/生成新图后 URL 不变，浏览器缓存旧内容导致新图不回显。
+    """
+    database, fallback_dir, storage_root = _setup(tmp_path)
+    test_app = _build_app(database, fallback_dir)
+    target = storage_root / "项目一" / "角色" / "frame.txt"
+    try:
+        with TestClient(test_app) as client:
+            relative_path = quote("角色/frame.txt", safe="/")
+            first = client.get(f"/media/project-1/{relative_path}")
+            old_etag = first.headers["etag"]
+
+            # 模拟上传新图覆盖当前版本文件（路径不变、内容替换）
+            target.write_text("新内容-new-content", encoding="utf-8")
+            second = client.get(
+                f"/media/project-1/{relative_path}",
+                headers={"If-None-Match": old_etag},
+            )
+
+        assert first.status_code == 200
+        assert first.text == "categorized"
+        assert old_etag
+        assert second.status_code == 200
+        assert second.text == "新内容-new-content"
+        assert second.headers["cache-control"] == "no-cache"
     finally:
         database.dispose()
 

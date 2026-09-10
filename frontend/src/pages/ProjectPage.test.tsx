@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, useLocation } from "react-router";
 import { beforeEach, expect, test, vi } from "vitest";
 import { api } from "../api/client";
+import type { Project } from "../types/api";
 import { ProjectPage } from "./ProjectPage";
 
 const initialProject = vi.hoisted(() => ({
@@ -21,15 +22,16 @@ const initialProject = vi.hoisted(() => ({
   default_text_provider_id: null,
   default_image_provider_id: null,
   default_video_provider_id: null,
+  is_free_create: false,
   created_at: "2026-07-29T00:00:00Z",
   updated_at: "2026-07-29T00:00:00Z",
 }));
 
 const projectContext = vi.hoisted(() => ({
-  activeProject: { ...initialProject },
+  activeProject: { ...initialProject } as Project | null,
   activeProjectId: "project-1",
   selectProject: vi.fn(),
-  projects: [],
+  projects: [] as Project[],
   isLoading: false,
   error: null,
 }));
@@ -42,6 +44,12 @@ vi.mock("../hooks/use-project", () => ({
   useProject: () => projectContext,
 }));
 
+/** 记录当前 URL 搜索参数，便于断言删除后的跳转行为。 */
+function LocationProbe() {
+  const { search } = useLocation();
+  return <div data-testid="location">{search}</div>;
+}
+
 function renderProjectPage(initialEntries: string[] = ["/project"]) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -53,6 +61,7 @@ function renderProjectPage(initialEntries: string[] = ["/project"]) {
     <MemoryRouter initialEntries={initialEntries}>
       <QueryClientProvider client={queryClient}>
         <ProjectPage />
+        <LocationProbe />
       </QueryClientProvider>
     </MemoryRouter>,
   );
@@ -61,6 +70,7 @@ function renderProjectPage(initialEntries: string[] = ["/project"]) {
       <MemoryRouter initialEntries={initialEntries}>
         <QueryClientProvider client={queryClient}>
           <ProjectPage />
+          <LocationProbe />
         </QueryClientProvider>
       </MemoryRouter>,
     );
@@ -73,6 +83,7 @@ beforeEach(() => {
   // 重置共享上下文，避免上个测试修改的表单状态泄漏。
   projectContext.activeProject = { ...initialProject };
   projectContext.activeProjectId = "project-1";
+  projectContext.projects = [];
   projectContext.selectProject = vi.fn();
   vi.spyOn(api.providers, "list").mockResolvedValue([]);
 });
@@ -192,4 +203,67 @@ test("test_create_form_survives_project_list_refetch", async () => {
   expect(
     screen.getByRole("button", { name: "创建并保存" }),
   ).toBeEnabled();
+});
+
+test("test_delete_project_selects_next_remaining_project", async () => {
+  // 回归：删除当前项目后应自动显示剩余项目列表中的下一个项目，而不是跳到新建模式。
+  const user = userEvent.setup();
+  vi.spyOn(window, "confirm").mockReturnValue(true);
+  const removeSpy = vi
+    .spyOn(api.projects, "remove")
+    .mockResolvedValue(undefined);
+  const second = { ...initialProject, id: "project-2", name: "第二个项目" };
+  projectContext.projects = [{ ...initialProject }, second];
+  projectContext.selectProject = vi.fn((id: string) => {
+    projectContext.activeProjectId = id;
+    const found = projectContext.projects.find((item) => item.id === id);
+    if (found) {
+      projectContext.activeProject = found;
+    }
+  });
+
+  const { rerender } = renderProjectPage();
+
+  await user.click(
+    await screen.findByRole("button", { name: "删除当前项目" }),
+  );
+
+  await waitFor(() => expect(removeSpy).toHaveBeenCalledTimes(1));
+  // 删除成功后自动选中下一个项目，并清除 create 参数。
+  await waitFor(() =>
+    expect(screen.getByTestId("location").textContent).toBe(""),
+  );
+  expect(projectContext.selectProject).toHaveBeenCalledWith("project-2");
+
+  rerender();
+  await waitFor(() =>
+    expect(screen.getByLabelText("项目名称")).toHaveValue("第二个项目"),
+  );
+});
+
+test("test_delete_last_project_enters_create_mode", async () => {
+  // 删除最后一个项目后没有剩余项目，才进入新建模式。
+  const user = userEvent.setup();
+  vi.spyOn(window, "confirm").mockReturnValue(true);
+  const removeSpy = vi
+    .spyOn(api.projects, "remove")
+    .mockResolvedValue(undefined);
+  projectContext.projects = [{ ...initialProject }];
+  projectContext.activeProject = { ...initialProject };
+  projectContext.activeProjectId = "project-1";
+
+  renderProjectPage();
+
+  await user.click(
+    await screen.findByRole("button", { name: "删除当前项目" }),
+  );
+
+  await waitFor(() => expect(removeSpy).toHaveBeenCalledTimes(1));
+  await waitFor(() =>
+    expect(screen.getByTestId("location").textContent).toBe("?create=1"),
+  );
+  expect(projectContext.selectProject).not.toHaveBeenCalled();
+  expect(
+    screen.getByRole("heading", { name: "创建漫剧项目" }),
+  ).toBeInTheDocument();
 });

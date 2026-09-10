@@ -199,8 +199,13 @@ class JobRepository:
             row = conn.execute(select(job).where(job.c.id == job_id)).first()
         return self._decode(row)
 
-    def require(self, job_id: str) -> dict[str, Any]:
-        record = self.get(job_id)
+    def require(
+        self,
+        job_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> dict[str, Any]:
+        record = self.get(job_id, connection=connection)
         if record is None:
             raise JobNotFoundError(f"任务不存在：{job_id}")
         return record
@@ -545,27 +550,50 @@ class JobRepository:
         )
         return int(result.rowcount or 0)
 
-    def retry(self, job_id: str) -> dict[str, Any]:
+    def retry(
+        self,
+        job_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> dict[str, Any]:
         current = self.require(job_id)
         if current["status"] not in {"failed", "interrupted"}:
             raise JobStateError("只有失败或中断的任务可以重试")
-        if current["provider_task_id"]:
+        if current["status"] == "interrupted" and current["provider_task_id"]:
             next_status = (
                 "downloading"
                 if current["provider_kind"] == "video" and has_download_source(current)
                 else "waiting_provider"
             )
+            provider_task_id = current["provider_task_id"]
+        elif (
+            current["status"] == "failed"
+            and current["provider_kind"] == "video"
+            and has_download_source(current)
+        ):
+            next_status = "downloading"
+            provider_task_id = current["provider_task_id"]
         else:
             next_status = "queued"
-        return self.update(
-            job_id,
-            status=next_status,
-            error="",
-            message="任务已重新入队",
-            retry_count=current["retry_count"] + 1,
-            started_at=None,
-            finished_at=None,
-        )
+            provider_task_id = ""
+
+        now = utc_now()
+        values: dict[str, Any] = {
+            "status": next_status,
+            "provider_task_id": provider_task_id,
+            "error": "",
+            "message": "任务已重新入队",
+            "retry_count": current["retry_count"] + 1,
+            "started_at": None,
+            "finished_at": None,
+            "updated_at": now,
+        }
+        if connection is None:
+            with self.engine.begin() as owned:
+                owned.execute(update(job).where(job.c.id == job_id).values(**values))
+        else:
+            connection.execute(update(job).where(job.c.id == job_id).values(**values))
+        return self.require(job_id, connection=connection)
 
     def cancel(
         self,

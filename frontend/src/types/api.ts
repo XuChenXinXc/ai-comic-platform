@@ -24,6 +24,41 @@ export type JobStatus =
   | "cancelled"
   | "interrupted";
 
+/** 视觉圣经：项目画风的结构化规范。为 null 时由后端按 style_prompt 自动推导。 */
+export interface VisualBible {
+  line?: { type?: string; thickness?: string; continuity?: string };
+  coloring?: { method?: string; saturation?: string; color_count?: string };
+  shading?: {
+    method?: string;
+    gradient?: string;
+    realistic_shading?: boolean | null;
+  };
+  material?: {
+    method?: string;
+    pbr?: boolean | null;
+    photographic_reflection?: boolean | null;
+  };
+  lighting?: {
+    realism?: string;
+    volumetric?: boolean | null;
+    cinematic_glow?: boolean | null;
+  };
+  depth_of_field?: { enabled?: boolean | null };
+  realism?: { character?: number | null; environment?: number | null };
+  texture?: string;
+  forbidden_styles?: string[];
+}
+
+/** 视觉圣经推导预览：当前画风实际生效的结构化规范。 */
+export interface VisualBiblePreview {
+  style_prompt: string;
+  visual_bible?: VisualBible | null;
+  /** 推导 + 覆盖合并后的结构化字段（只含已设置项）。 */
+  derived: VisualBible;
+  /** 推导结果渲染成的一句话提示词文本；无结构化内容时为空串。 */
+  rendered: string;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -32,6 +67,8 @@ export interface Project {
   source_signature: string;
   source_revision: number;
   style_prompt: string;
+  /** 视觉圣经结构化画风规范；null / 缺省 = 自动推导。 */
+  visual_bible?: VisualBible | null;
   aspect_ratio: string;
   image_size: string;
   video_size: string;
@@ -61,6 +98,7 @@ export type ProjectInput = Pick<
       | "default_image_provider_id"
       | "default_video_provider_id"
       | "is_free_create"
+      | "visual_bible"
     >
   >;
 
@@ -78,6 +116,10 @@ export interface ProjectStorageSelection extends ProjectStorageSetting {
 export interface CameraPolicySetting {
   policy: string;
   options: string[];
+}
+
+export interface DefaultStylePromptSetting {
+  style_prompt: string;
 }
 
 export interface ContentRecord<T = Record<string, unknown>> {
@@ -172,30 +214,9 @@ export interface Asset {
   own_signature: string;
   revision: number;
   current_image?: MediaVersion | null;
-  /** 场景素材的 Scene View 列表（仅 scene 类型填充）。 */
-  scene_views?: SceneView[];
   created_at: string;
   updated_at: string;
   is_stale?: boolean;
-}
-
-/** 场景素材的单个视角视图：一张独立场景参考图。 */
-export interface SceneView {
-  id: string;
-  asset_id: string;
-  /** "master" | "front" | "reverse" | "left45" | "right45" | 自定义 */
-  view_key: string;
-  /** 展示名：母版 / 正向 / 反向 / 左前45° / 右前45° */
-  name: string;
-  /** 视角附加提示词（用户可编辑） */
-  prompt: string;
-  /** 用户自定义最终提示词（可为空） */
-  prompt_override: string;
-  sort_order: number;
-  /** 该 View 的当前图（与 Asset.current_image 同形） */
-  current_image?: MediaVersion | null;
-  created_at: string;
-  updated_at: string;
 }
 
 export interface ReferenceBinding {
@@ -272,12 +293,6 @@ export interface Shot {
   source_ref: string;
   source_signature: string;
   scene_asset_id?: string | null;
-  /** 绑定场景素材后选中的 Scene View id（只读展示用） */
-  scene_view_id?: string | null;
-  /** 绑定场景素材后选中的 Scene View key（提交给后端，空字符串=默认母版） */
-  scene_view_key?: string | null;
-  /** 后端回填的 Scene View 展示名（如「正向」） */
-  scene_view_name?: string | null;
   scene_name?: string;
   character_ids_json: string[] | string;
   character_ids?: string[];
@@ -350,6 +365,8 @@ export interface MediaVersion {
   is_stale?: boolean;
   stale_reason?: string;
   warnings?: string[];
+  provenance_json?: string | null;
+  reference_purpose?: string;
 }
 
 export interface ApiProvider {
@@ -453,188 +470,4 @@ export interface Chapter {
   shot_count?: number;
   created_at: string;
   updated_at: string;
-}
-
-// 动态漫 PipelineWorkspace 的独立工作流类型。
-export type DynamicStageKey =
-  | "0-source"
-  | "1-character-bios"
-  | "2-rhythm"
-  | "3-script"
-  | "4-storyboard"
-  | "5a-image-prompts"
-  | "5b-video-prompts"
-  | "6-delivery";
-
-export type DynamicWorkflowStatus =
-  | "pending"
-  | "queued"
-  | "running"
-  | "blocked"
-  | "ready"
-  | "confirmed"
-  | "stale"
-  | "partial_failed"
-  | "failed"
-  | "interrupted"
-  | "cancelled";
-
-export type DynamicStageStatus = DynamicWorkflowStatus;
-export type DynamicSourceKind = "full_text" | "synopsis";
-export type DynamicDiagnosticLevel = "warning" | "blocking";
-export type DynamicGateStatus =
-  | "ready"
-  | "warning"
-  | "blocked"
-  | "partial_failed";
-
-export type DynamicJsonObject = Record<string, unknown>;
-
-export interface DynamicDiagnostic {
-  level: DynamicDiagnosticLevel;
-  code: string;
-  message: string;
-  path?: string | null;
-  details?: DynamicJsonObject;
-}
-
-export interface DynamicGateResult {
-  status: DynamicGateStatus;
-  passed: boolean;
-  diagnostics: DynamicDiagnostic[];
-  checked_at?: string | null;
-  can_confirm: boolean;
-}
-
-export interface DynamicAssetMapping {
-  workflow_asset_id: string;
-  asset_id?: string | null;
-  usage: string;
-  locked_revision?: number | null;
-  reuse_mode?: "new" | "approved_existing" | string;
-  [key: string]: unknown;
-}
-
-export interface DynamicWorkflowRun {
-  id: string;
-  project_id?: string | null;
-  chapter_id?: string | null;
-  title?: string | null;
-  chapter_title?: string | null;
-  kind: string;
-  schema_version: string;
-  status: DynamicWorkflowStatus;
-  current_stage: DynamicStageKey;
-  source_kind: DynamicSourceKind;
-  source_snapshot: DynamicJsonObject;
-  config_snapshot: DynamicJsonObject;
-  asset_mapping: DynamicAssetMapping[];
-  input_signature: string;
-  revision: number;
-  error: string;
-  created_at: string;
-  started_at?: string | null;
-  updated_at: string;
-  finished_at?: string | null;
-  [key: string]: unknown;
-}
-
-export interface DynamicWorkflowStage {
-  id: string;
-  workflow_run_id: string;
-  stage_key: DynamicStageKey;
-  ordinal: number;
-  status: DynamicStageStatus;
-  input_signature: string;
-  raw_output: DynamicJsonObject;
-  normalized_output: DynamicJsonObject;
-  draft_output: DynamicJsonObject;
-  output_refs: DynamicJsonObject[];
-  gate_result: DynamicGateResult;
-  attempt: number;
-  error: string;
-  created_at: string;
-  started_at?: string | null;
-  updated_at: string;
-  finished_at?: string | null;
-  confirmed_at?: string | null;
-  confirmed_revision?: number | null;
-  [key: string]: unknown;
-}
-
-export interface DynamicWorkflowAction {
-  run: DynamicWorkflowRun;
-  stages: DynamicWorkflowStage[];
-}
-
-export interface DynamicRunCreateInput {
-  project_id?: string | null;
-  title: string;
-  chapter_title: string;
-  source_text?: string;
-  synopsis?: string;
-  target_duration_sec: number;
-  aspect_ratio: string;
-  style_prompt: string;
-  auto_run: boolean;
-  generate_audio: boolean;
-  generate_subtitle: boolean;
-  generate_bgm: boolean;
-  generate_composition: boolean;
-  reuse_approved_assets?: boolean;
-}
-
-export interface DynamicStageDraftUpdate {
-  expected_revision: number;
-  draft_output: DynamicJsonObject;
-  // 通过的门禁作为请求上下文传递；阻塞草稿由服务端根据新内容重新计算。
-  gate_result?: DynamicGateResult;
-}
-
-export interface DynamicDeliveryChecklistItem {
-  key: string;
-  label: string;
-  status: string;
-  completed: number;
-  total: number;
-  reason: string;
-  details?: DynamicJsonObject;
-  [key: string]: unknown;
-}
-
-export interface DynamicPreflightItem {
-  kind: string;
-  id: string;
-  status: string;
-  path?: string | null;
-  reason: string;
-  required: boolean;
-  [key: string]: unknown;
-}
-
-export interface DynamicPreflightResult {
-  workflow_run_id: string;
-  project_id: string;
-  chapter_id: string;
-  strict: boolean;
-  allow_partial: boolean;
-  status: "ready" | "warning" | "blocked";
-  items: DynamicPreflightItem[];
-  missing: DynamicPreflightItem[];
-  failed: DynamicPreflightItem[];
-  skipped: DynamicPreflightItem[];
-  estimated_jobs: number;
-  input_signature: string;
-  provenance: DynamicJsonObject;
-}
-
-export interface DynamicChecklistResponse {
-  checklist: DynamicDeliveryChecklistItem[];
-  preflight: DynamicPreflightResult;
-}
-
-export interface DynamicDeliveryOptions {
-  strict?: boolean;
-  allow_partial?: boolean;
-  exported_at?: string;
 }

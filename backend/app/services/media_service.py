@@ -3,6 +3,7 @@ import base64
 import io
 import logging
 import os
+import random
 import re
 import subprocess
 import time
@@ -19,6 +20,12 @@ from sqlalchemy import delete, exists, func, insert, or_, select, update
 
 from app.config import settings
 from app.db import Database, db
+from app.dynamic_pipeline.visual_anchor import (
+    compile_visual_bible,
+    parse_visual_bible,
+    visual_bible_brief,
+)
+from app.dynamic_pipeline.visual_validator import validate_visual_prompt_lenient
 from app.models.tables import (
     api_provider,
     asset,
@@ -27,13 +34,14 @@ from app.models.tables import (
     job,
     keyframe_version,
     project,
-    scene_view,
     shot,
+    shot_audio,
     video_version,
     workflow_run,
     workflow_stage,
 )
-from app.schemas import ProviderPollResult
+from app.prompts import load_prompt
+from app.schemas import KeyframeQaOutput, ProviderPollResult
 from app.services.constants import MAX_IMAGE_SIZE, MAX_VIDEO_SIZE
 from app.services.director_plan import (
     director_bundle_from_llm,
@@ -109,6 +117,13 @@ _MEDIA_TABLES = {
     "keyframe": (keyframe_version, "shot_id"),
     "video": (video_version, "shot_id"),
 }
+
+# 关键帧视觉质检：文字 Provider 启用视觉能力后，关键帧生成完成即自动质检；
+# 不通过时自动换 seed 重新生成，同一分镜最多尝试 KEYFRAME_QA_MAX_ATTEMPTS 次。
+_KEYFRAME_QA_MAX_ATTEMPTS = 3
+_KEYFRAME_QA_PASS_SCORE = 70
+_KEYFRAME_QA_PROVENANCE_KEY = "keyframe_qa"
+
 _DELETED_MEDIA_ERROR = "__deleted_by_user__"
 _ACTIVE_MEDIA_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
 _TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
@@ -257,6 +272,43 @@ class MediaService:
             raise not_found("项目")
         return record
 
+    @staticmethod
+    def _override_style_diagnostics(
+        project_record: dict[str, Any],
+        prompt: str,
+    ) -> list[dict[str, Any]]:
+        """用户覆盖提示词的画风冲突只读诊断（warning，不阻断用户自己的文案）。
+
+        override 会直接替换编译提示词提交模型，不再注入 STYLE_ANCHOR；
+        此处按项目画风（含结构化推导）做一次豁免口径的越权检查，
+        结果由调用方以告警形式记录或返回给前端。
+        """
+        try:
+            style_spec = compile_visual_bible(
+                str(project_record.get("style_prompt") or ""),
+                parse_visual_bible(project_record),
+            )
+            validator_style = {
+                "style_prompt": str(project_record.get("style_prompt") or ""),
+                **style_spec.model_dump(),
+            }
+            return [
+                {
+                    "code": item["code"],
+                    "severity": item["level"],
+                    "message": item["message"],
+                    "details": item.get("details") or {},
+                }
+                for item in validate_visual_prompt_lenient(
+                    prompt,
+                    style=validator_style,
+                    path="prompt_override",
+                )
+            ]
+        except Exception:
+            logger.exception("覆盖提示词画风校验失败")
+            return []
+
     def _project_storage_name(self, project_id: str) -> str:
         current = self._project(project_id)
         return str(current.get("storage_name") or current["name"])
@@ -316,7 +368,6 @@ class MediaService:
         labels = {
             "character_identity": "锁定角色身份与服装",
             "scene_layout": "锁定场景空间结构和光线",
-            "scene_master": "锁定场景母版空间结构",
             "prop_identity": "锁定物品外观、材质和结构",
             "previous_keyframe": "锁定上一镜构图与连续性",
         }
@@ -961,10 +1012,9 @@ class MediaService:
             role = str(binding.get("role", ""))
             asset_id = binding.get("asset_id")
             key = (role, asset_id)
-            # scene_master 是辅助参考（MASTER 空间锚点），单独解析、失败不阻塞。
             if (
                 asset_id
-                and role not in ("previous_keyframe", "scene_master")
+                and role != "previous_keyframe"
                 and key not in requested_keys
             ):
                 requested.append((asset_id, role))
@@ -975,7 +1025,6 @@ class MediaService:
         type_labels = {
             "character_identity": "角色",
             "scene_layout": "场景",
-            "scene_master": "场景母版",
             "prop_identity": "物品",
         }
         with self.database.engine.connect() as connection:
@@ -1060,144 +1109,32 @@ class MediaService:
         asset_id: str,
         role: str,
     ) -> Any | None:
-        """返回分镜生成关键帧时应使用的场景参考图记录。
+        """返回分镜生成关键帧时应使用的素材参考图记录。
 
-        优先级：
-        1. 分镜选中的 Scene View 的当前图（scene_view_id 匹配）；
-        2. Scene MASTER 的当前图（无选中视图或该视图未生成图时回退）；
-        3. 旧版场景图（scene_view_id IS NULL，历史数据兼容）。
-
-        角色/道具不参与 Scene Pack，保持原有 asset_id + is_current 逻辑。
+        优先最新完成的干净参考图（reference_purpose='clean_reference'），
+        避免把带文字、宫格、多视图的设定展板当作图生图参考污染分镜画面；
+        没有干净参考图时退回当前图（is_current=1，可能是设定稿）。
         """
-        if role != "scene_layout":
-            return connection.execute(
-                select(asset_image.c.id, asset_image.c.file_path)
-                .where(
-                    asset_image.c.asset_id == asset_id,
-                    asset_image.c.is_current.is_(True),
-                    asset_image.c.status == "completed",
-                )
-                .order_by(asset_image.c.version_no.desc())
-            ).first()
-
-        scene_view_id = current.get("scene_view_id")
-        if scene_view_id:
-            picked = connection.execute(
-                select(asset_image.c.id, asset_image.c.file_path)
-                .where(
-                    asset_image.c.asset_id == asset_id,
-                    asset_image.c.scene_view_id == scene_view_id,
-                    asset_image.c.is_current.is_(True),
-                    asset_image.c.status == "completed",
-                )
-                .order_by(asset_image.c.version_no.desc())
-            ).first()
-            if picked is not None and picked.file_path:
-                return picked
-        master_view_id = connection.execute(
-            select(scene_view.c.id).where(
-                scene_view.c.asset_id == asset_id,
-                scene_view.c.view_key == "master",
+        preferred = connection.execute(
+            select(asset_image.c.id, asset_image.c.file_path)
+            .where(
+                asset_image.c.asset_id == asset_id,
+                asset_image.c.reference_purpose == "clean_reference",
+                asset_image.c.status == "completed",
             )
-        ).scalar()
-        if master_view_id:
-            master = connection.execute(
-                select(asset_image.c.id, asset_image.c.file_path)
-                .where(
-                    asset_image.c.asset_id == asset_id,
-                    asset_image.c.scene_view_id == master_view_id,
-                    asset_image.c.is_current.is_(True),
-                    asset_image.c.status == "completed",
-                )
-                .order_by(asset_image.c.version_no.desc())
-            ).first()
-            if master is not None and master.file_path:
-                return master
+            .order_by(asset_image.c.version_no.desc())
+        ).first()
+        if preferred is not None:
+            return preferred
         return connection.execute(
             select(asset_image.c.id, asset_image.c.file_path)
             .where(
                 asset_image.c.asset_id == asset_id,
-                asset_image.c.scene_view_id.is_(None),
                 asset_image.c.is_current.is_(True),
                 asset_image.c.status == "completed",
             )
             .order_by(asset_image.c.version_no.desc())
         ).first()
-
-    def _with_scene_master_reference(
-        self,
-        current: dict[str, Any],
-        bindings: list[dict[str, Any]],
-        *,
-        max_reference_files: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """模型能力允许时，为关键帧/视频补充 Scene MASTER 参考。
-
-        仅当分镜场景参考图来自某个非 master 的 Scene View 时追加：
-        MASTER 作为整体空间一致性锚点（role="scene_master"），
-        帮助模型保持空间布局/材质/灯光一致，不改变构图主参考。
-        不写回 shot.reference_bindings（避免刷新循环），只进媒体快照。
-        """
-        limit = max_reference_files if max_reference_files and max_reference_files > 0 else 16
-        if len(bindings) >= limit:
-            return bindings
-        layout_bindings = [
-            binding
-            for binding in bindings
-            if isinstance(binding, dict)
-            and binding.get("role") == "scene_layout"
-            and binding.get("asset_id")
-            and binding.get("asset_image_id")
-        ]
-        if not layout_bindings:
-            return bindings
-        layout_binding = layout_bindings[0]
-        scene_asset_id = str(layout_binding["asset_id"])
-        layout_image_id = str(layout_binding["asset_image_id"])
-        with self.database.engine.connect() as connection:
-            layout_view_key = connection.execute(
-                select(scene_view.c.view_key)
-                .join(asset_image, asset_image.c.scene_view_id == scene_view.c.id)
-                .where(asset_image.c.id == layout_image_id)
-            ).scalar()
-            if not layout_view_key or layout_view_key == "master":
-                # 场景参考已是 MASTER 或旧图：无需重复补充
-                return bindings
-            master_view_id = connection.execute(
-                select(scene_view.c.id).where(
-                    scene_view.c.asset_id == scene_asset_id,
-                    scene_view.c.view_key == "master",
-                )
-            ).scalar()
-            if not master_view_id:
-                return bindings
-            master_image_id = connection.execute(
-                select(asset_image.c.id)
-                .where(
-                    asset_image.c.asset_id == scene_asset_id,
-                    asset_image.c.scene_view_id == master_view_id,
-                    asset_image.c.is_current.is_(True),
-                    asset_image.c.status == "completed",
-                )
-                .order_by(asset_image.c.version_no.desc())
-            ).scalar()
-        if not master_image_id:
-            return bindings
-        if any(
-            isinstance(binding, dict)
-            and binding.get("role") == "scene_master"
-            and binding.get("asset_id") == scene_asset_id
-            for binding in bindings
-        ):
-            return bindings
-        return [
-            *bindings,
-            {
-                "role": "scene_master",
-                "asset_id": scene_asset_id,
-                "asset_image_id": str(master_image_id),
-            },
-        ]
 
     def _refresh_shot_reference_bindings(self, current: dict[str, Any]) -> dict[str, Any]:
         latest = current
@@ -1321,11 +1258,13 @@ class MediaService:
         )
         if project_record is None:
             raise not_found("项目")
-        # 非 MASTER 视角图的输入签名额外包含视角提示词：编辑视角提示词后该 View
-        # 的图片应标记为 stale（与 queue_asset_image 入队口径一致）。
-        extra = self._scene_view_prompt_extra(connection, record.get("scene_view_id"))
+        # 场景族成员：期望参考按当前锚点图重算，锚点图重生成后成员图应标记 stale。
+        reference_files = record["reference_files_json"]
+        family_anchor_path = self._expected_family_anchor_path(connection, record, current)
+        if family_anchor_path is not None:
+            reference_files = [family_anchor_path] if family_anchor_path else []
         return asset_image_signature(
-            self._effective_asset_signature(current, project_record, extra=extra),
+            self._effective_asset_signature(current, project_record),
             record["provider_id"] or "uploaded",
             self._provider_model_value(
                 connection,
@@ -1335,7 +1274,7 @@ class MediaService:
                 record["created_at"],
             ),
             params,
-            record["reference_files_json"],
+            reference_files,
             bool(input_data.get("reference_mode")),
         )
 
@@ -1349,23 +1288,8 @@ class MediaService:
         )
         if project_record is None:
             raise not_found("项目")
-        # 参考绑定基于「当前分镜绑定 + 重算 MASTER 追加」：与入队时口径一致，
-        # 既不因 MASTER 追加差异而恒 stale，也能感知分镜绑定的真实变化。
-        provider_config = row_dict(
-            connection.execute(
-                select(api_provider.c.params_json).where(api_provider.c.id == record["provider_id"])
-            ).first()
-        )
-        max_reference_files = int(
-            json_loads(provider_config.get("params_json") if provider_config else {}, {}).get(
-                "max_reference_files", 16
-            )
-        )
-        expected_bindings = self._with_scene_master_reference(
-            current,
-            current["reference_bindings"],
-            max_reference_files=max_reference_files,
-        )
+        # 参考绑定与入队口径一致，感知分镜绑定的真实变化。
+        expected_bindings = current["reference_bindings"]
         return keyframe_signature(
             self._effective_shot_signature(current, project_record),
             expected_bindings,
@@ -1390,29 +1314,12 @@ class MediaService:
         )
         if project_record is None:
             raise not_found("项目")
-        # 参考绑定基于「当前分镜绑定 + 重算 MASTER 追加」：与入队时口径一致，
-        # 感知分镜绑定变化，但不受 MASTER 系统追加影响。
+        # 参考绑定基于「当前分镜绑定」，感知分镜绑定变化。
         supports_multiple_input_images = bool(
             input_data.get("supports_multiple_input_images") is True
         )
         if supports_multiple_input_images:
-            provider_config = row_dict(
-                connection.execute(
-                    select(api_provider.c.params_json).where(
-                        api_provider.c.id == record["provider_id"]
-                    )
-                ).first()
-            )
-            max_reference_files = int(
-                json_loads(provider_config.get("params_json") if provider_config else {}, {}).get(
-                    "max_reference_files", 16
-                )
-            )
-            snapshot_bindings = self._with_scene_master_reference(
-                current,
-                current["reference_bindings"],
-                max_reference_files=max_reference_files,
-            )
+            snapshot_bindings = current["reference_bindings"]
         else:
             snapshot_bindings = []
         current_model = self._provider_model_value(
@@ -1481,21 +1388,27 @@ class MediaService:
         *,
         extra: Any = None,
     ) -> str:
+        style_spec = compile_visual_bible(
+            str(project_record.get("style_prompt") or ""),
+            parse_visual_bible(project_record),
+        )
         values = [
             VISUAL_PROMPT_TEMPLATE_VERSION,
             current["asset_type"],
             current["name"],
             current["profile"],
             current["prompt"],
-            resolve_asset_negative_prompt(current["asset_type"], current["negative_prompt"]),
+            resolve_asset_negative_prompt(
+                current["asset_type"],
+                current["negative_prompt"],
+                style_spec,
+            ),
             current["consistency_keywords"],
             current["composition"],
             project_record["style_prompt"],
             resolve_visual_aspect_ratio(current["asset_type"], project_record["aspect_ratio"]),
+            parse_visual_bible(project_record),
         ]
-        # 非 MASTER 视角图的视角提示词参与签名（见 _scene_view_prompt_extra）。
-        if extra:
-            values.append(extra)
         # 与分镜 override 语义一致：非空覆盖值纳入签名，空串（未编辑）不参与
         prompt_override = str(current.get("prompt_override") or "").strip()
         if prompt_override:
@@ -1503,22 +1416,108 @@ class MediaService:
         return calculate_signature(*values)
 
     @staticmethod
-    def _scene_view_prompt_extra(connection: Any, scene_view_id: Any) -> str | None:
-        """非 MASTER 视角图参与签名的视角提示词；MASTER/旧图/视图已删除返回 None。"""
-        if not scene_view_id:
+    def _family_anchor_image_path(connection: Any, anchor_id: str) -> str | None:
+        """锚点场景的参考图路径：优先干净参考图，退回当前图。"""
+        preferred = connection.execute(
+            select(asset_image.c.file_path)
+            .where(
+                asset_image.c.asset_id == anchor_id,
+                asset_image.c.reference_purpose == "clean_reference",
+                asset_image.c.status == "completed",
+            )
+            .order_by(asset_image.c.version_no.desc())
+        ).scalar()
+        if preferred:
+            return preferred
+        return connection.execute(
+            select(asset_image.c.file_path)
+            .where(
+                asset_image.c.asset_id == anchor_id,
+                asset_image.c.is_current.is_(True),
+                asset_image.c.status == "completed",
+            )
+            .order_by(asset_image.c.version_no.desc())
+        ).scalar()
+
+    def _scene_family_anchor(
+        self,
+        connection: Any,
+        current: dict[str, Any],
+    ) -> tuple[str, str, str] | None:
+        """场景族锚点：族成员返回 (family, anchor_name, anchor_image_path)；其余返回 None。
+
+        场景族声明后（profile.scene_family 非空且非锚点），锚点场景缺失或尚未生成
+        场景图时抛 conflict：族成员不允许退化为独立文生图，保证同一建筑群的
+        不同视觉空间外观一致。
+        """
+        if current.get("asset_type") != "scene":
             return None
-        view = row_dict(
-            connection.execute(
-                select(
-                    scene_view.c.view_key,
-                    scene_view.c.prompt,
-                    scene_view.c.prompt_override,
-                ).where(scene_view.c.id == scene_view_id)
-            ).first()
-        )
-        if view is None or view["view_key"] == "master":
+        profile = current.get("profile") or {}
+        family = str(profile.get("scene_family") or "").strip()
+        if not family or profile.get("family_anchor"):
             return None
-        return str(view.get("prompt_override") or view.get("prompt") or "").strip() or None
+        anchor_row = None
+        for row in connection.execute(
+            select(asset.c.id, asset.c.name, asset.c.profile_json).where(
+                asset.c.project_id == current["project_id"],
+                asset.c.asset_type == "scene",
+            )
+        ):
+            other = json_loads(row.profile_json, {})
+            if (
+                str(other.get("scene_family") or "").strip() == family
+                and other.get("family_anchor")
+            ):
+                anchor_row = row
+                break
+        if anchor_row is None:
+            raise conflict(
+                f"场景族「{family}」缺少锚点场景（family_anchor=true），"
+                "请先编辑素材档案指定族内锚点"
+            )
+        anchor_name = str(anchor_row.name)
+        anchor_path = self._family_anchor_image_path(connection, str(anchor_row.id))
+        if not anchor_path:
+            raise conflict(
+                f"场景「{current['name']}」属于场景族「{family}」，需先生成锚点场景"
+                f"「{anchor_name}」的场景图，再生成同族其他空间图，以保证建筑外观一致"
+            )
+        return family, anchor_name, anchor_path
+
+    def _expected_family_anchor_path(
+        self,
+        connection: Any,
+        record: dict[str, Any],
+        current: dict[str, Any],
+    ) -> str | None:
+        """族成员的期望参考图路径：按当前锚点图重算，锚点变化即标记 stale。
+
+        非族成员或族锚点本身返回 None（沿用入库时参考）；
+        锚点场景缺失或暂无图返回空串（与已存参考不一致 → stale）。
+        """
+        if current.get("asset_type") != "scene":
+            return None
+        profile = current.get("profile") or {}
+        family = str(profile.get("scene_family") or "").strip()
+        if not family or profile.get("family_anchor"):
+            return None
+        anchor_id = None
+        for row in connection.execute(
+            select(asset.c.id, asset.c.profile_json).where(
+                asset.c.project_id == current["project_id"],
+                asset.c.asset_type == "scene",
+            )
+        ):
+            other = json_loads(row.profile_json, {})
+            if (
+                str(other.get("scene_family") or "").strip() == family
+                and other.get("family_anchor")
+            ):
+                anchor_id = str(row.id)
+                break
+        if anchor_id is None:
+            return ""
+        return self._family_anchor_image_path(connection, anchor_id) or ""
 
     def _effective_shot_signature(
         self,
@@ -1539,6 +1538,7 @@ class MediaService:
             reference_labels,
             project_record["style_prompt"],
             resolve_visual_aspect_ratio("keyframe", project_record["aspect_ratio"]),
+            parse_visual_bible(project_record),
         )
 
     def _effective_video_prompt(
@@ -1578,13 +1578,12 @@ class MediaService:
             prev_end_frame_path or "",
             project_record["style_prompt"],
             resolve_visual_aspect_ratio("video", project_record["aspect_ratio"]),
+            parse_visual_bible(project_record),
         )
 
     def list_asset_images(
         self,
         asset_id: str,
-        *,
-        scene_view_id: str | None = None,
     ) -> list[dict[str, Any]]:
         current = self._asset(asset_id)
         with self.database.engine.connect() as connection:
@@ -1596,8 +1595,6 @@ class MediaService:
                 )
                 .order_by(asset_image.c.version_no.desc())
             )
-            if scene_view_id:
-                statement = statement.where(asset_image.c.scene_view_id == scene_view_id)
             records = []
             for row in connection.execute(statement):
                 record = self._decode_version(dict(row._mapping), current["project_id"])
@@ -1705,110 +1702,57 @@ class MediaService:
         negative_prompt = resolve_asset_negative_prompt(
             current["asset_type"],
             current["negative_prompt"],
+            compile_visual_bible(
+                current_project["style_prompt"], parse_visual_bible(current_project)
+            ),
         )
-        # ---- Scene Pack 分支：MASTER 用「干净场景参考图」模板（单图、无拼板）；
-        # 其他 Scene View 以 MASTER 图为参考图 + 视角附加提示词生成。----
         prompt_override = str(current.get("prompt_override") or "").strip()
-        scene_view_key = str(options.get("scene_view_key") or "")
-        scene_view_id = options.get("scene_view_id")
-        # 非 MASTER 视角图把视角提示词纳入输入签名：编辑视角提示词后该 View
-        # 的当前图会被标记为 stale（与 _asset_expected_signature 口径一致）。
-        view_signature_extra: str | None = None
-        view_record: dict[str, Any] | None = None
-        if scene_view_key:
-            with self.database.engine.connect() as connection:
-                view_record = row_dict(
-                    connection.execute(
-                        select(scene_view).where(scene_view.c.id == scene_view_id)
-                    ).first()
-                )
-            if view_record is None:
-                raise bad_request("场景视图不存在")
-            reference_master_image_id = options.get("reference_master_image_id")
-            if reference_master_image_id:
-                with self.database.engine.connect() as connection:
-                    master_path = connection.execute(
-                        select(asset_image.c.file_path).where(
-                            asset_image.c.id == reference_master_image_id
-                        )
-                    ).scalar()
-                if master_path:
-                    references.append(str(master_path))
-        if scene_view_key == "master":
-            # 母版：单张完整空间全景透视图（scene_master.md 模板），
-            # 不再输出多视图拼板展板；素材级 prompt_override（用户旧版编辑）仍然优先。
-            master_prompt_override = str(current.get("prompt_override") or "").strip()
-            if master_prompt_override:
-                prompt = master_prompt_override
-            else:
-                prompt = compile_asset_prompt(
-                style_prompt=current_project["style_prompt"],
-                aspect_ratio=current_project["aspect_ratio"],
-                asset_type=current["asset_type"],
-                asset_name=current["name"],
-                profile=current["profile"],
-                prompt=current["prompt"],
-                negative_prompt=negative_prompt,
-                consistency_keywords=current["consistency_keywords"],
-                composition=current["composition"],
-                master_mode=True,
-            )
-        elif scene_view_key and view_record is not None:
-            # 视角：以 MASTER 语义为基准 + 视角附加提示词；参考图 = MASTER 图。
-            master_body = compile_asset_prompt(
-                style_prompt=current_project["style_prompt"],
-                aspect_ratio=current_project["aspect_ratio"],
-                asset_type=current["asset_type"],
-                asset_name=current["name"],
-                profile=current["profile"],
-                prompt=current["prompt"],
-                negative_prompt=negative_prompt,
-                consistency_keywords=current["consistency_keywords"],
-                composition=current["composition"],
-                reference_mode=True,
-            )
-            view_prompt = str(
-                view_record.get("prompt_override") or view_record.get("prompt") or ""
-            ).strip()
-            if not view_prompt:
-                raise bad_request(f"场景视图「{view_record.get('name')}」缺少视角提示词")
-            view_signature_extra = view_prompt
-            if current_project.get("is_free_create"):
-                prompt = view_prompt
-            else:
-                prompt = join_non_empty(
-                    [
-                        master_body,
-                        f"【{view_record.get('name')}视角】\n{view_prompt}\n"
-                        "以上视角要求仅改变摄影机位置、方向、景别与构图；"
-                        "空间布局、门窗/家具位置、固定装饰、材质、主色调、灯光环境与"
-                        "空间比例必须与 MASTER 参考图完全一致，不重新设计场景，"
-                        "画面为无人纯背景空镜。",
-                    ]
-                )
+        if current_project.get("is_free_create"):
+            # 自由制作直接使用用户填写的素材提示词生图，不套模板、不追加风格设定
+            prompt = str(current.get("prompt") or "").strip()
         else:
-            if current_project.get("is_free_create"):
-                # 自由制作直接使用用户填写的素材提示词生图，不套模板、不追加风格设定
-                prompt = str(current.get("prompt") or "").strip()
-            else:
-                prompt = compile_asset_prompt(
-                    style_prompt=current_project["style_prompt"],
-                    aspect_ratio=current_project["aspect_ratio"],
-                    asset_type=current["asset_type"],
-                    asset_name=current["name"],
-                    profile=current["profile"],
-                    prompt=current["prompt"],
-                    negative_prompt=negative_prompt,
-                    consistency_keywords=current["consistency_keywords"],
-                    composition=current["composition"],
-                    reference_mode=bool(options.get("reference_mode")),
-                )
-        # 素材级 prompt_override（用户在素材库编辑过的最终提示词）只用于
-        # 旧版场景图（非 Scene View 分支）与 MASTER；Scene View 分支使用
-        # 各自的视角提示词，不被素材级 override 覆盖。
-        if prompt_override and not scene_view_key:
+            prompt = compile_asset_prompt(
+                style_prompt=current_project["style_prompt"],
+                aspect_ratio=current_project["aspect_ratio"],
+                asset_type=current["asset_type"],
+                asset_name=current["name"],
+                profile=current["profile"],
+                prompt=current["prompt"],
+                negative_prompt=negative_prompt,
+                consistency_keywords=current["consistency_keywords"],
+                composition=current["composition"],
+                reference_mode=bool(options.get("reference_mode")),
+                visual_bible=parse_visual_bible(current_project),
+            )
+        if prompt_override:
             # 用户编辑过的最终提示词优先，不再按模板重新编译
             prompt = prompt_override
+            for issue in self._override_style_diagnostics(current_project, prompt):
+                logger.warning(
+                    "素材提示词覆盖版与项目画风冲突（warning 不阻断）："
+                    "project=%s asset=%s issue=%s",
+                    current["project_id"],
+                    asset_id,
+                    issue,
+                )
+        # 场景族一致性：族成员（非锚点）的场景图必须以锚点场景当前图为参考生成，
+        # 提示词追加同族建筑一致性约束；锚点图缺失直接拒绝，
+        # 避免族内空间各自独立文生图导致建筑外观对不上。
+        if current["asset_type"] == "scene":
+            with self.database.engine.connect() as connection:
+                family_info = self._scene_family_anchor(connection, current)
+            if family_info is not None:
+                family, anchor_name, anchor_path = family_info
+                references.append(anchor_path)
+                prompt = join_non_empty(
+                    [
+                        prompt,
+                        f"【场景族一致性】本图与参考图是同一空间群「{family}」的不同视觉空间"
+                        f"（本图空间：「{current['name']}」，参考图空间：「{anchor_name}」）。"
+                        "建筑材料、砖色、配色、门窗样式、材质与整体建筑风格必须与参考图"
+                        "完全一致，只改变空间结构与视角，不得重新设计建筑外观。",
+                    ]
+                )
         reference_mode = bool(options.get("reference_mode"))
         version_values: dict[str, Any] = {
             "file_path": None,
@@ -1820,10 +1764,11 @@ class MediaService:
             "provider_task_id": "",
             "status": "queued",
             "is_current": False,
+            # 标记图片用途：干净参考图（reference_mode）优先被分镜绑定；
+            # 设定展板含文字/宫格/多视图，不适合作为图生图参考。
+            "reference_purpose": "clean_reference" if reference_mode else "setting_sheet",
             "input_signature": asset_image_signature(
-                self._effective_asset_signature(
-                    current, current_project, extra=view_signature_extra
-                ),
+                self._effective_asset_signature(current, current_project),
                 config["id"],
                 config["model"],
                 params,
@@ -1833,9 +1778,6 @@ class MediaService:
             "source": "generated",
             "error": "",
         }
-        if scene_view_id is not None:
-            # 场景视图图片：记录所属 View，激活时按 (asset_id, scene_view_id) 分区。
-            version_values["scene_view_id"] = scene_view_id
         version = self._insert_version(
             table=asset_image,
             parent_column="asset_id",
@@ -1914,6 +1856,23 @@ class MediaService:
             raise bad_request("分镜缺少明确的关键帧提示词")
         current = self._refresh_shot_reference_bindings(current)
         bindings = current["reference_bindings"]
+        # 缺干净参考图的前置拦截（显式开启）：auto_prepare_references=True 时，
+        # 绑定的素材只有设定稿（无干净参考图）则自动入队参考图模式生成并中止本次
+        # 关键帧入队；参考图完成后重试即可。默认关闭以保持存量项目行为不变，
+        # 一键全链编排路径由编排器统一补齐参考图并建立任务依赖。
+        if options.get("auto_prepare_references", False):
+            prepared = self._ensure_clean_references_for_bindings(
+                current["project_id"],
+                bindings,
+                image_provider_id=options.get("provider_id")
+                or current_project["default_image_provider_id"],
+            )
+            if prepared:
+                raise conflict(
+                    "以下素材缺少干净参考图，已自动入队参考图模式生成："
+                    + "、".join(entry["name"] for entry in prepared)
+                    + "。参考图完成后请重新生成关键帧。"
+                )
         _, config = self.providers.resolve(
             kind="image",
             provider_id=options.get("provider_id") or current_project["default_image_provider_id"],
@@ -1925,13 +1884,6 @@ class MediaService:
             provider_config=config,
         )
         params = {**config["params"], **request_params}
-        # 模型能力允许时补充 MASTER 空间锚点参考（媒体快照级，不写回分镜）。
-        max_reference_files = int(config.get("params", {}).get("max_reference_files") or 16)
-        bindings = self._with_scene_master_reference(
-            current,
-            bindings,
-            max_reference_files=max_reference_files,
-        )
         reference_items = self._binding_reference_items(current["project_id"], bindings)
         reference_anchors = [
             f"@Image{index}：{label}。" for index, (_, label) in enumerate(reference_items, start=1)
@@ -1945,7 +1897,17 @@ class MediaService:
                 anchors=reference_anchors,
                 shot_context=self._shot_template_context(current),
                 negative_prompt=current["negative_prompt"],
+                visual_bible=parse_visual_bible(current_project),
             )
+        else:
+            for issue in self._override_style_diagnostics(current_project, prompt_snapshot):
+                logger.warning(
+                    "关键帧提示词覆盖版与项目画风冲突（warning 不阻断）："
+                    "project=%s shot=%s issue=%s",
+                    current["project_id"],
+                    shot_id,
+                    issue,
+                )
         version = self._insert_version(
             table=keyframe_version,
             parent_column="shot_id",
@@ -1984,6 +1946,7 @@ class MediaService:
                 "provider_updated_at": str(config.get("updated_at") or ""),
                 "params": request_params,
             },
+            depends_on=options.get("depends_on") or None,
             batch_id=options.get("_batch_id"),
         )
 
@@ -2038,9 +2001,15 @@ class MediaService:
             # 跨场景也可能是连续动作（如推门从室内走到室外）。
             prev_end_frame_relative = None
             prev_end_state = ""
+            prev_visual_tone: list[str] = []
             if current.get("transition_from_prev") in {"continuous", "elliptical"}:
                 prev_shot_row = connection.execute(
-                    select(shot.c.id, shot.c.end_state, shot.c.next_hook)
+                    select(
+                        shot.c.id,
+                        shot.c.end_state,
+                        shot.c.next_hook,
+                        shot.c.director_plan_json,
+                    )
                     .where(
                         shot.c.chapter_id == current["chapter_id"],
                         shot.c.shot_order < current["shot_order"],
@@ -2053,6 +2022,17 @@ class MediaService:
                     prev_end_state = str(
                         prev_shot_row.end_state or prev_shot_row.next_hook or ""
                     ).strip()
+                    # 上一镜导演计划的影像基调：供同场镜头光照时段一致性校验。
+                    prev_plan_raw = json_loads(prev_shot_row.director_plan_json or "", {})
+                    if isinstance(prev_plan_raw, dict):
+                        tone = (
+                            prev_plan_raw.get("visualTone")
+                            or prev_plan_raw.get("visual_tone")
+                            or []
+                        )
+                        prev_visual_tone = (
+                            [str(item) for item in tone] if isinstance(tone, list) else []
+                        )
                     if current.get("transition_from_prev") == "continuous":
                         prev_video_row = connection.execute(
                             select(video_version.c.id, video_version.c.end_frame_path)
@@ -2112,12 +2092,7 @@ class MediaService:
         generation_current = {**current, "duration_sec": effective_duration}
         supports_multiple_input_images = self._supports_multiple_video_inputs(provider)
         if supports_multiple_input_images:
-            # 多图视频 Provider：可携带 MASTER 空间锚点辅助参考（媒体快照级）。
-            reference_bindings = self._with_scene_master_reference(
-                current,
-                current["reference_bindings"],
-                max_reference_files=int(config.get("params", {}).get("max_reference_files") or 16),
-            )
+            reference_bindings = current["reference_bindings"]
         else:
             reference_bindings = []
         if not supports_multiple_input_images:
@@ -2170,9 +2145,17 @@ class MediaService:
                 shot_context=shot_context,
                 negative_prompt=current["negative_prompt"],
                 director_plan=generation_current.get("director_plan") or None,
+                visual_bible=parse_visual_bible(current_project),
+                audio_driven=getattr(provider, "supports_audio_input", False),
             )
         # 最终一致性校验：导演计划存在时执行硬校验，blocking 问题直接阻断入队。
         consistency_issues: list[dict[str, Any]] = []
+        if video_prompt_override:
+            # 覆盖版不再注入 STYLE_ANCHOR：按项目画风做豁免口径的越权诊断，
+            # 以 warning 返回给前端展示，不阻断用户自己的文案。
+            consistency_issues.extend(
+                self._override_style_diagnostics(current_project, prompt)
+            )
         director_plan_value = generation_current.get("director_plan") or None
         if director_plan_value:
             bundle = director_bundle_from_llm(director_plan_value)
@@ -2192,6 +2175,7 @@ class MediaService:
                     dialogue_bindings=bundle.dialogue_bindings,
                     duration_sec=effective_duration,
                     prev_end_state=prev_end_state,
+                    prev_visual_tone=prev_visual_tone,
                     camera_policy=get_camera_policy(self.database),
                 )
             ]
@@ -2537,13 +2521,6 @@ class MediaService:
         self._verify_image(data)
         current = self._shot(shot_id)
         suffix = self._image_suffix(filename)
-        # 与 _keyframe_expected_signature 同口径：场景参考来自非 master 视图时
-        # 追加 MASTER 参考再算签名，否则上传的关键帧落库即被恒判 stale。
-        expected_bindings = self._with_scene_master_reference(
-            current,
-            current["reference_bindings"],
-            max_reference_files=16,
-        )
         version = self._insert_version(
             table=keyframe_version,
             parent_column="shot_id",
@@ -2562,7 +2539,7 @@ class MediaService:
                 "is_current": False,
                 "input_signature": keyframe_signature(
                     self._effective_shot_signature(current, self._project(current["project_id"])),
-                    expected_bindings,
+                    current["reference_bindings"],
                     "uploaded",
                     "",
                     {},
@@ -2683,7 +2660,6 @@ class MediaService:
                 asset_name=parent["name"],
                 current=current,
                 storage_name=self._project_storage_name(parent["project_id"]),
-                view_key=self._asset_image_view_key(record),
             )
         parent = self._shot(record["shot_id"])
         chapter_no, chapter_title = self._chapter_folder_info(parent.get("chapter_id"))
@@ -2703,25 +2679,6 @@ class MediaService:
             chapter_no=chapter_no,
             chapter_title=chapter_title,
         )
-
-    def _asset_image_view_key(self, record: Mapping[str, Any]) -> str | None:
-        """返回素材图所属 Scene View 的 view_key（用于文件分区目录）。
-
-        旧版场景图 / 角色 / 道具没有 scene_view_id，返回 None（保持原路径）。
-        """
-        view_id = record.get("scene_view_id")
-        if not view_id:
-            return None
-        from app.models.tables import scene_view as scene_view_table
-
-        with self.database.engine.connect() as connection:
-            return str(
-                connection.execute(
-                    select(scene_view_table.c.view_key).where(
-                        scene_view_table.c.id == view_id
-                    )
-                ).scalar() or ""
-            ) or None
 
     @staticmethod
     def _rollback_media_moves(
@@ -2837,17 +2794,13 @@ class MediaService:
         }
 
     def _media_view_condition(self, table: Any, record: Mapping[str, Any]):
-        """asset_image 的 current 分区条件：按 (asset_id, scene_view_id) 分区。
+        """asset_image 的 current 分区条件。
 
-        每个 Scene View（含 NULL=旧版场景图）各有自己的当前图；keyframe/video
-        没有 scene_view_id 列，直接返回无条件 True（保持原单分区行为）。
+        Scene Views 已移除：所有媒体版本均按「每父级一条当前记录」分区，
+        无需额外过滤条件。
         """
-        if "scene_view_id" not in table.c:
-            return None
-        view_id = record.get("scene_view_id")
-        if view_id is None:
-            return table.c.scene_view_id.is_(None)
-        return table.c.scene_view_id == view_id
+        del table, record
+        return None
 
     def _activate_media_version(
         self,
@@ -3427,7 +3380,6 @@ class MediaService:
                     version["version_no"],
                     asset_name=current["name"],
                     storage_name=self._project_storage_name(project_id),
-                    view_key=self._asset_image_view_key(version),
                 )
             else:
                 current = self._shot(version["shot_id"])
@@ -3529,6 +3481,21 @@ class MediaService:
                 job_record=job_record,
             )
             self._store_provider_url(table, version_id, result.result_url)
+            if kind == "keyframe":
+                # 关键帧生成完成后自动视觉质检（文字 Provider 启用视觉能力时）；
+                # 质检不通过会换 seed 自动重生成，新版本完成时再次质检，
+                # 直到通过或达到最大尝试次数。质检入队失败不得影响关键帧主线。
+                try:
+                    self._maybe_queue_keyframe_qa(
+                        project_id=project_id,
+                        shot_id=str(current["id"]),
+                        version_id=str(version_id),
+                        input_data=input_data,
+                    )
+                except Exception:
+                    logger.exception(
+                        "关键帧质检任务入队失败，已跳过（shot=%s）", current["id"]
+                    )
             self._delete_staged_provider_result(project_id, result)
             self._cleanup_dynamic_reference_files(project_id, temporary_references)
             completed_result = {"version_id": version_id, "file_path": completed["file_path"]}
@@ -3553,6 +3520,479 @@ class MediaService:
 
     def _resolve_binding_files(self, project_id: str, bindings: list[dict[str, Any]]) -> list[Path]:
         return [path for path, _ in self._binding_reference_items(project_id, bindings)]
+
+    def _ensure_clean_references_for_bindings(
+        self,
+        project_id: str,
+        bindings: list[dict[str, Any]],
+        *,
+        image_provider_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """为缺少干净参考图的绑定素材入队参考图模式生成。
+
+        返回本次补生成的条目列表 [{name, job_id}]；
+        已有完成或在途（queued/running/waiting_provider）的干净参考图时不重复入队；
+        入队失败只记录日志，不阻断调用方。
+        """
+        asset_ids = {
+            str(binding["asset_id"])
+            for binding in bindings
+            if binding.get("asset_id") and binding.get("role") != "previous_keyframe"
+        }
+        if not asset_ids:
+            return []
+        with self.database.engine.connect() as connection:
+            rows = connection.execute(
+                select(asset.c.id, asset.c.name).where(asset.c.id.in_(asset_ids))
+            ).all()
+            covered = {
+                row.asset_id
+                for row in connection.execute(
+                    select(asset_image.c.asset_id)
+                    .where(
+                        asset_image.c.asset_id.in_(asset_ids),
+                        asset_image.c.reference_purpose == "clean_reference",
+                        asset_image.c.status.in_(
+                            ("completed", "queued", "running", "waiting_provider")
+                        ),
+                    )
+                )
+            }
+        names = {row.id: str(row.name) for row in rows}
+        prepared: list[dict[str, Any]] = []
+        for asset_id in sorted(asset_ids):
+            if asset_id in covered:
+                continue
+            name = names.get(asset_id, asset_id)
+            try:
+                job_record = self.queue_asset_image(
+                    asset_id,
+                    {
+                        "provider_id": image_provider_id,
+                        "params": {},
+                        "reference_mode": True,
+                    },
+                )
+                prepared.append({"name": name, "job_id": job_record.get("id")})
+            except Exception:
+                logger.exception("自动补生成干净参考图失败：asset=%s", asset_id)
+        return prepared
+
+    def _current_shot_audio_paths(self, project_id: str, shot_id: str) -> list[Path]:
+        """当前配音音频文件（按对白行顺序，最多 3 段）。
+
+        供支持音频参考输入的视频模型（Seedance 2.0 等）驱动口型；
+        无当前配音时返回空列表，由 Provider 自行决定是否开 generate_audio。
+        """
+        with self.database.engine.connect() as connection:
+            records = connection.execute(
+                select(shot_audio.c.file_path)
+                .where(
+                    shot_audio.c.shot_id == shot_id,
+                    shot_audio.c.is_current.is_(True),
+                    shot_audio.c.status == "completed",
+                )
+                .order_by(shot_audio.c.line_order)
+                .limit(3)
+            ).scalars()
+        paths: list[Path] = []
+        for relative in records:
+            if not relative:
+                continue
+            path = file_service.resolve_project_path(project_id, relative)
+            if path.is_file() and path.stat().st_size > 0:
+                paths.append(path)
+        return paths
+
+    @staticmethod
+    def _text_provider_supports_vision(config: Mapping[str, Any]) -> bool:
+        """文字 Provider 是否声明支持图片输入（视觉质检能力）。"""
+        params = config.get("params") or {}
+        return str(params.get("supports_vision") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    # ---- 一键全链编排：提示词/导演计划 → 关键帧 → 视频 ----
+
+    def queue_shot_pipeline(
+        self,
+        chapter_id: str,
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        """一键全链编排入口：三步链式任务（提示词 → 关键帧 → 视频）。
+
+        第一步补齐缺失的图/视频提示词与导演计划；第二步等待提示词完成后
+        补齐干净参考图并批量生成关键帧（依赖参考图任务）；第三步等待关键帧
+        完成后批量生成视频。
+        """
+        with self.database.engine.connect() as connection:
+            chapter_record = row_dict(
+                connection.execute(
+                    select(chapter).where(chapter.c.id == chapter_id)
+                ).first()
+            )
+        if chapter_record is None:
+            raise not_found("章节")
+        current_project = self._project(chapter_record["project_id"])
+        return self.jobs.create(
+            project_id=current_project["id"],
+            chapter_id=chapter_id,
+            job_type="run_shot_pipeline",
+            target_type="chapter",
+            target_id=chapter_id,
+            provider_kind="text",
+            provider_id=options.get("provider_id")
+            or current_project["default_text_provider_id"],
+            input_data={
+                "chapter_id": chapter_id,
+                "params": options.get("params", {}),
+            },
+        )
+
+    async def handle_shot_pipeline(self, job_record: dict[str, Any]) -> dict[str, Any]:
+        """第一步：为缺失提示词/导演计划的分镜入队生成任务，并链式触发第二步。"""
+        input_data = dict(job_record.get("input_data") or {})
+        chapter_id = str(input_data["chapter_id"])
+        params = input_data.get("params") or {}
+        with self.database.engine.connect() as connection:
+            chapter_record = row_dict(
+                connection.execute(
+                    select(chapter).where(chapter.c.id == chapter_id)
+                ).first()
+            )
+        if chapter_record is None:
+            return {"status": "failed", "error": "章节不存在"}
+        project_id = chapter_record["project_id"]
+        current_project = self._project(project_id)
+        shots_service = ShotService(self.database, self.jobs)
+        created: list[str] = []
+        failures: list[dict[str, Any]] = []
+        for item in shots_service.list(chapter_id):
+            shot_id = str(item["id"])
+            try:
+                if not str(item.get("image_prompt") or "").strip():
+                    created.append(
+                        str(
+                            shots_service.queue_prompt(
+                                shot_id, "image", {"params": params}
+                            )["id"]
+                        )
+                    )
+                if not str(item.get("video_prompt") or "").strip():
+                    created.append(
+                        str(
+                            shots_service.queue_prompt(
+                                shot_id, "video", {"params": params}
+                            )["id"]
+                        )
+                    )
+                if not item.get("director_plan"):
+                    created.append(
+                        str(
+                            shots_service.queue_director_plan(
+                                shot_id, {"params": params}
+                            )["id"]
+                        )
+                    )
+            except Exception as exc:
+                failures.append(
+                    {"shot_id": shot_id, "error": sanitize_error_message(exc)}
+                )
+        media_step = self.jobs.create(
+            project_id=project_id,
+            chapter_id=chapter_id,
+            job_type="run_shot_pipeline_media",
+            target_type="chapter",
+            target_id=chapter_id,
+            provider_kind="image",
+            provider_id=current_project["default_image_provider_id"],
+            input_data={"chapter_id": chapter_id, "params": params},
+            depends_on=created or None,
+        )
+        return {
+            "status": "media_step_queued",
+            "prompt_jobs": created,
+            "media_job": media_step["id"],
+            "failures": failures,
+        }
+
+    @staticmethod
+    def _has_current_media(
+        connection: Any,
+        table: Any,
+        parent_column: str,
+        parent_id: str,
+    ) -> bool:
+        return bool(
+            connection.execute(
+                select(table.c.id).where(
+                    table.c[parent_column] == parent_id,
+                    table.c.is_current.is_(True),
+                    table.c.status == "completed",
+                )
+            ).first()
+        )
+
+    async def handle_shot_pipeline_media(
+        self, job_record: dict[str, Any]
+    ) -> dict[str, Any]:
+        """第二步：补齐干净参考图并批量生成关键帧，链式触发第三步。"""
+        input_data = dict(job_record.get("input_data") or {})
+        chapter_id = str(input_data["chapter_id"])
+        params = input_data.get("params") or {}
+        with self.database.engine.connect() as connection:
+            chapter_record = row_dict(
+                connection.execute(
+                    select(chapter).where(chapter.c.id == chapter_id)
+                ).first()
+            )
+        if chapter_record is None:
+            return {"status": "failed", "error": "章节不存在"}
+        project_id = chapter_record["project_id"]
+        current_project = self._project(project_id)
+        shots_service = ShotService(self.database, self.jobs)
+        keyframe_jobs: list[str] = []
+        failures: list[dict[str, Any]] = []
+        skipped_keyframes = 0
+        prepared_references = 0
+        for item in shots_service.list(chapter_id):
+            shot_id = str(item["id"])
+            with self.database.engine.connect() as connection:
+                if self._has_current_media(
+                    connection, keyframe_version, "shot_id", shot_id
+                ):
+                    skipped_keyframes += 1
+                    continue
+            current = self._shot(shot_id)
+            prepared = self._ensure_clean_references_for_bindings(
+                project_id,
+                current.get("reference_bindings") or [],
+                image_provider_id=current_project["default_image_provider_id"],
+            )
+            prepared_references += len(prepared)
+            reference_jobs = [
+                str(entry["job_id"]) for entry in prepared if entry.get("job_id")
+            ]
+            try:
+                keyframe_jobs.append(
+                    str(
+                        self.queue_keyframe(
+                            shot_id,
+                            {
+                                "auto_prepare_references": False,
+                                "depends_on": reference_jobs,
+                                "params": params,
+                            },
+                        )["id"]
+                    )
+                )
+            except ServiceError as exc:
+                failures.append(
+                    {"shot_id": shot_id, "error": sanitize_error_message(exc)}
+                )
+        videos_step = self.jobs.create(
+            project_id=project_id,
+            chapter_id=chapter_id,
+            job_type="run_shot_pipeline_videos",
+            target_type="chapter",
+            target_id=chapter_id,
+            provider_kind="video",
+            provider_id=current_project["default_video_provider_id"],
+            input_data={"chapter_id": chapter_id, "params": params},
+            depends_on=keyframe_jobs or None,
+        )
+        return {
+            "status": "video_step_queued",
+            "prepared_references": prepared_references,
+            "keyframe_jobs": keyframe_jobs,
+            "skipped_keyframes": skipped_keyframes,
+            "video_job": videos_step["id"],
+            "failures": failures,
+        }
+
+    async def handle_shot_pipeline_videos(
+        self, job_record: dict[str, Any]
+    ) -> dict[str, Any]:
+        """第三步：关键帧全部完成后批量生成视频。"""
+        input_data = dict(job_record.get("input_data") or {})
+        chapter_id = str(input_data["chapter_id"])
+        params = input_data.get("params") or {}
+        shots_service = ShotService(self.database, self.jobs)
+        video_jobs: list[str] = []
+        failures: list[dict[str, Any]] = []
+        skipped_videos = 0
+        for item in shots_service.list(chapter_id):
+            shot_id = str(item["id"])
+            with self.database.engine.connect() as connection:
+                if self._has_current_media(connection, video_version, "shot_id", shot_id):
+                    skipped_videos += 1
+                    continue
+            try:
+                video_jobs.append(
+                    str(self.queue_video(shot_id, {"params": params})["id"])
+                )
+            except ServiceError as exc:
+                failures.append(
+                    {"shot_id": shot_id, "error": sanitize_error_message(exc)}
+                )
+        return {
+            "status": "completed",
+            "video_jobs": video_jobs,
+            "skipped_videos": skipped_videos,
+            "failures": failures,
+        }
+
+    def _keyframe_qa_attempt_count(self, shot_id: str) -> int:
+        """该分镜已完成视觉质检的关键帧版本数（用于限制自动重试次数）。"""
+        with self.database.engine.connect() as connection:
+            records = connection.execute(
+                select(keyframe_version.c.provenance_json).where(
+                    keyframe_version.c.shot_id == shot_id
+                )
+            ).scalars()
+        count = 0
+        for raw in records:
+            if isinstance(raw, str) and _KEYFRAME_QA_PROVENANCE_KEY in raw:
+                count += 1
+        return count
+
+    def _maybe_queue_keyframe_qa(
+        self,
+        *,
+        project_id: str,
+        shot_id: str,
+        version_id: str,
+        input_data: Mapping[str, Any],
+    ) -> None:
+        """关键帧完成后，若文字 Provider 支持视觉能力则入队质检任务。
+
+        不满足条件时静默跳过：质检是可选的增强路径，不影响关键帧主线。
+        """
+        current_project = self._project(project_id)
+        try:
+            _, config = self.providers.resolve(
+                kind="text",
+                provider_id=current_project.get("default_text_provider_id"),
+            )
+        except ServiceError:
+            return
+        if not self._text_provider_supports_vision(config):
+            return
+        if self._keyframe_qa_attempt_count(shot_id) >= _KEYFRAME_QA_MAX_ATTEMPTS:
+            return
+        self.jobs.create(
+            project_id=project_id,
+            job_type="check_keyframe_quality",
+            target_type="keyframe",
+            target_id=version_id,
+            provider_kind="text",
+            provider_id=config["id"],
+            input_data={"shot_id": shot_id, "params": input_data.get("params", {})},
+        )
+
+    def _write_keyframe_qa_result(self, version_id: str, qa: dict[str, Any]) -> None:
+        """把质检结果写入关键帧版本 provenance（不覆盖既有字段）。"""
+        version = self._get_version("keyframe", version_id)
+        provenance = json_loads(version.get("provenance_json"), {})
+        provenance[_KEYFRAME_QA_PROVENANCE_KEY] = qa
+        with self.database.engine.begin() as connection:
+            connection.execute(
+                update(keyframe_version)
+                .where(keyframe_version.c.id == version_id)
+                .values(provenance_json=json_dumps(provenance))
+            )
+
+    async def handle_keyframe_qa(self, job_record: dict[str, Any]) -> dict[str, Any]:
+        """关键帧视觉质检：角色身份/画风合规/画面可用性，失败自动换 seed 重生成。"""
+        version_id = job_record["target_id"]
+        version = self._get_version("keyframe", version_id)
+        if version["status"] != "completed" or not version.get("file_path"):
+            return {
+                "version_id": version_id,
+                "skipped": True,
+                "reason": "关键帧未完成或文件缺失，跳过质检",
+            }
+        input_data = dict(job_record.get("input_data") or {})
+        shot_record = self._shot(str(version["shot_id"]))
+        project_id = shot_record["project_id"]
+        current_project = self._project(project_id)
+        provider, config = self.providers.resolve(
+            kind="text",
+            provider_id=job_record.get("provider_id")
+            or current_project["default_text_provider_id"],
+        )
+        if not self._text_provider_supports_vision(config) or not hasattr(
+            provider, "generate_vision_json"
+        ):
+            return {
+                "version_id": version_id,
+                "skipped": True,
+                "reason": "文字 Provider 未启用视觉能力",
+            }
+        keyframe_path = file_service.resolve_project_path(project_id, version["file_path"])
+        if not keyframe_path.is_file():
+            return {
+                "version_id": version_id,
+                "skipped": True,
+                "reason": "关键帧文件不存在",
+            }
+        character_bindings = [
+            binding
+            for binding in (version.get("reference_bindings") or [])
+            if binding.get("role") == "character_identity"
+        ]
+        character_refs = [
+            path
+            for path, _ in self._binding_reference_items(project_id, character_bindings)
+            if path.is_file()
+        ]
+        user_prompt = (
+            f"项目画风：{current_project['style_prompt']}\n"
+            f"{visual_bible_brief(current_project)}"
+            f"关键帧画面描述：{version.get('prompt_snapshot') or ''}\n"
+            "请按第一张图（关键帧）与后续角色参考图对比质检。"
+        )
+        output = await provider.generate_vision_json(
+            system_prompt=load_prompt("keyframe_qa"),
+            user_prompt=user_prompt,
+            images=[keyframe_path, *character_refs],
+            schema=KeyframeQaOutput,
+            params={**config["params"], **(input_data.get("params") or {})},
+        )
+        qa = {
+            "passed": bool(output.passed),
+            "score": int(output.score),
+            "face_drift": bool(output.face_drift),
+            "style_violation": bool(output.style_violation),
+            "issues": list(output.issues),
+            "checked_at": utc_now(),
+        }
+        self._write_keyframe_qa_result(version_id, qa)
+        result: dict[str, Any] = {"version_id": version_id, "qa": qa}
+        if (
+            not output.passed
+            and self._keyframe_qa_attempt_count(str(shot_record["id"]))
+            < _KEYFRAME_QA_MAX_ATTEMPTS
+        ):
+            retry = self.queue_keyframe(
+                str(shot_record["id"]),
+                {
+                    "provider_id": str(version["provider_id"] or "")
+                    or current_project["default_image_provider_id"],
+                    "params": {
+                        **input_data.get("params", {}),
+                        "seed": random.randint(1, 2**31 - 1),
+                    },
+                },
+            )
+            result["auto_retry"] = {
+                "job_id": retry.get("id") or retry.get("batch_id"),
+                "reason": f"质检未通过（score={output.score}），自动换 seed 重新生成",
+            }
+        return result
 
     async def handle_video(self, job_record: dict[str, Any]) -> dict[str, Any]:
         version_id = job_record["target_id"]
@@ -3741,12 +4181,27 @@ class MediaService:
                 else:
                     prepared = await provider.prepare_input_image(keyframe_path)
                 submit_prompt = str(version["prompt_snapshot"] or "")
-                submission = await provider.submit(
-                    prompt=submit_prompt,
-                    input_image=prepared,
-                    duration_sec=version["requested_duration_sec"],
-                    params=params,
-                )
+                audio_files: list[Path] | None = None
+                if getattr(provider, "supports_audio_input", False):
+                    audio_files = self._current_shot_audio_paths(
+                        project_id,
+                        str(version["shot_id"]),
+                    )
+                if audio_files:
+                    submission = await provider.submit(
+                        prompt=submit_prompt,
+                        input_image=prepared,
+                        duration_sec=version["requested_duration_sec"],
+                        params=params,
+                        audio_files=audio_files,
+                    )
+                else:
+                    submission = await provider.submit(
+                        prompt=submit_prompt,
+                        input_image=prepared,
+                        duration_sec=version["requested_duration_sec"],
+                        params=params,
+                    )
                 result = await self._await_provider_result(
                     provider,
                     job_record,

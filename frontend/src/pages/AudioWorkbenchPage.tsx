@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { useParams } from "react-router";
+import { useNavigate, useParams } from "react-router";
 import { toast } from "sonner";
 import { api, mediaUrl } from "../api/client";
-import { Modal } from "../components/ui";
+import { PageHeader } from "../components/status";
+import { Button, Modal } from "../components/ui";
 import { formatError } from "../lib/utils";
 import type { Chapter, ApiProvider, MediaVersion } from "../types/api";
 
@@ -50,6 +51,7 @@ function sanitizeVoiceMapping(mapping: Record<string, string>): Record<string, s
 }
 
 export default function AudioWorkbenchPage() {
+  const navigate = useNavigate();
   const { projectId, chapterId } = useParams<{ projectId: string; chapterId: string }>();
   // 组件挂载状态：卸载后停止批量生成循环与状态更新，避免对已卸载组件 setState。
   const mountedRef = useRef(true);
@@ -129,6 +131,9 @@ export default function AudioWorkbenchPage() {
     // 竞态防护：切换章节/卸载后丢弃旧响应，避免旧章节数据覆盖新章节。
     let cancelled = false;
     setLoadError(null);
+    setGenerating(new Set());
+    setLoading(false);
+    setBatchProgress(null);
     Promise.all([
       api.chapters.get(chapterId),
       api.audio.extractDialogues(chapterId),
@@ -309,13 +314,11 @@ export default function AudioWorkbenchPage() {
       console.error(error);
       toast.error(`生成失败：${formatError(error)}`);
     } finally {
-      if (canCommit()) {
-        setGenerating(prev => {
-          const newSet = new Set(prev);
-          newSet.delete(dialogue.shot_no);
-          return newSet;
-        });
-      }
+      setGenerating(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(dialogue.shot_no);
+        return newSet;
+      });
     }
   };
 
@@ -423,24 +426,36 @@ export default function AudioWorkbenchPage() {
   const uniqueSpeakers = Array.from(new Set(dialogues.map(d => d.speaker)));
 
   return (
-    <div className="p-6 max-w-7xl mx-auto">
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold mb-2">配音工作台</h1>
-        <p className="text-gray-600">
-          章节：{chapter?.title || `第 ${chapter?.chapter_no} 章`}
-        </p>
-      </div>
+    <div className="mx-auto max-w-7xl">
+      <PageHeader
+        eyebrow="Step 06 / Audio"
+        title="配音工作台"
+        description={`章节：${chapter?.title || `第 ${chapter?.chapter_no} 章`}`}
+      />
 
       {loadError ? (
         <div
           role="alert"
-          className="mb-6 rounded border border-red-200 bg-red-50 p-4 text-sm text-red-700"
+          className="mb-6 flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 sm:flex-row sm:items-center sm:justify-between dark:border-amber-500/25 dark:bg-amber-500/10 dark:text-amber-200"
         >
-          配音工作台加载失败：{loadError}
+          <div>
+            <p className="font-semibold">配音工作台加载提示：{loadError}</p>
+            <p className="mt-1 text-xs text-amber-800/80 dark:text-amber-300/80">
+              角色配音依赖章节剧本提取的对话台词。请先在【剧本生成】页面生成剧本；已生成的剧本可点击【确认剧本】冻结。
+            </p>
+          </div>
+          <Button
+            size="sm"
+            variant="primary"
+            className="shrink-0"
+            onClick={() => navigate("/writing")}
+          >
+            前往剧本生成
+          </Button>
         </div>
       ) : null}
       {/* 配置面板 */}
-      <div className="bg-white rounded-lg shadow p-4 mb-6">
+      <div className="bg-paper rounded-card border border-black/[0.06] shadow-card p-5 mb-6 dark:border-white/10 dark:bg-[#101010]">
         <h2 className="text-lg font-semibold mb-4">配置</h2>
 
         {/* TTS 模式选择 */}
@@ -457,7 +472,7 @@ export default function AudioWorkbenchPage() {
               />
               <span className="text-sm">
                 Edge TTS（免费，推荐）
-                <span className="text-xs text-gray-500 ml-1">微软提供，音质优秀</span>
+                <span className="text-xs text-muted ml-1">微软提供，音质优秀</span>
               </span>
             </label>
             <label className="flex items-center gap-2 cursor-pointer">
@@ -470,7 +485,7 @@ export default function AudioWorkbenchPage() {
               />
               <span className="text-sm">
                 自定义 Provider
-                <span className="text-xs text-gray-500 ml-1">需要配置 API Key</span>
+                <span className="text-xs text-muted ml-1">需要配置 API Key</span>
               </span>
             </label>
           </div>
@@ -484,7 +499,7 @@ export default function AudioWorkbenchPage() {
               <select
                 value={selectedProvider}
                 onChange={(e) => setSelectedProvider(e.target.value)}
-                className="w-full border rounded px-3 py-2"
+                className="h-11 w-full rounded-2xl border border-black/10 bg-black/[0.02] px-4 text-sm text-ink outline-none transition focus:border-vermilion focus:ring-2 focus:ring-vermilion/15 dark:border-white/10 dark:bg-white/5"
               >
                 <option value="">请选择</option>
                 {ttsProviders.map(provider => (
@@ -514,7 +529,7 @@ export default function AudioWorkbenchPage() {
                     ...voiceMapping,
                     [speaker]: e.target.value,
                   })}
-                  className="flex-1 border rounded px-2 py-1 text-sm"
+                  className="flex-1 h-11 rounded-2xl border border-black/10 bg-black/[0.02] px-4 text-sm text-ink outline-none transition focus:border-vermilion focus:ring-2 focus:ring-vermilion/15 dark:border-white/10 dark:bg-white/5"
                 >
                   {ttsMode === "edge" ? (
                     // Edge TTS 声音列表
@@ -545,7 +560,7 @@ export default function AudioWorkbenchPage() {
         <button
           onClick={handleBatchGenerate}
           disabled={loading || generating.size > 0 || (ttsMode === "provider" && !selectedProvider) || dialogues.length === 0}
-          className="bg-blue-500 text-white px-6 py-2 rounded hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed"
+          className="bg-vermilion text-white px-6 py-2 rounded-full hover:bg-brand-hover disabled:bg-black/10 dark:disabled:bg-white/10 disabled:cursor-not-allowed"
         >
           {loading
             ? batchProgress
@@ -556,7 +571,7 @@ export default function AudioWorkbenchPage() {
       </div>
 
       {/* 对话列表 */}
-      <div className="bg-white rounded-lg shadow">
+      <div className="bg-paper rounded-card border border-black/[0.06] shadow-card dark:border-white/10 dark:bg-[#101010]">
         <div className="p-4 border-b">
           <h2 className="text-lg font-semibold">对话列表 ({dialogues.length})</h2>
         </div>
@@ -570,38 +585,38 @@ export default function AudioWorkbenchPage() {
               : OPENAI_VOICES.find(v => v.id === voiceId)?.name || "未知";
 
             return (
-              <div key={dialogue.shot_no} className="p-4 hover:bg-gray-50">
+              <div key={dialogue.shot_no} className="p-4 hover:bg-black/5 dark:hover:bg-white/10">
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-2">
-                      <span className="text-sm font-medium text-gray-500">
+                      <span className="text-sm font-medium text-muted">
                         分镜 {dialogue.shot_no}
                       </span>
-                      <span className="text-sm px-2 py-0.5 bg-blue-100 text-blue-700 rounded">
+                      <span className="text-xs font-semibold px-2.5 py-1 bg-sky-50 text-sky-700 rounded-full dark:bg-sky-500/10 dark:text-sky-300">
                         {dialogue.speaker}
                       </span>
-                      <span className="text-xs text-gray-400">
+                      <span className="text-xs text-muted">
                         → {voiceName}
                       </span>
                       {isEdgeTTS && (
-                        <span className="text-xs px-1.5 py-0.5 bg-green-100 text-green-700 rounded">
+                        <span className="text-xs px-1.5 py-0.5 bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300 rounded">
                           免费
                         </span>
                       )}
                     </div>
-                    <p className="text-gray-800">{dialogue.text}</p>
+                    <p className="text-ink">{dialogue.text}</p>
 
                     {audioStatus[dialogue.shot_no] && (
                       <div className="mt-2 text-sm">
-                        <span className={`px-2 py-0.5 rounded ${
+                        <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
                           audioStatus[dialogue.shot_no].status === "completed"
-                            ? "bg-green-100 text-green-700"
-                            : "bg-yellow-100 text-yellow-700"
+                            ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300"
+                            : "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300"
                         }`}>
                           {audioStatus[dialogue.shot_no].status === "completed" ? "已生成" : "生成中"}
                         </span>
                         {audioStatus[dialogue.shot_no].duration_sec && (
-                          <span className="ml-2 text-gray-500">
+                          <span className="ml-2 text-muted">
                             时长: {audioStatus[dialogue.shot_no].duration_sec?.toFixed(1)}s
                           </span>
                         )}
@@ -623,7 +638,7 @@ export default function AudioWorkbenchPage() {
                     <button
                       onClick={() => handleGenerateSingle(dialogue)}
                       disabled={generating.has(dialogue.shot_no) || (ttsMode === "provider" && !selectedProvider)}
-                      className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600 disabled:bg-gray-300 disabled:cursor-not-allowed text-sm"
+                      className="px-4 py-2 bg-emerald-500 text-white rounded-full hover:bg-emerald-600 disabled:bg-black/10 dark:disabled:bg-white/10 disabled:cursor-not-allowed text-sm"
                     >
                       {generating.has(dialogue.shot_no)
                         ? "生成中..."
@@ -646,7 +661,7 @@ export default function AudioWorkbenchPage() {
           })}
 
           {dialogues.length === 0 && (
-            <div className="p-8 text-center text-gray-500">
+            <div className="p-8 text-center text-muted">
               <p>该章节暂无对话</p>
               <p className="text-sm mt-1">请先在"文字工作台"确认剧本</p>
             </div>
@@ -669,21 +684,21 @@ export default function AudioWorkbenchPage() {
             <button
               type="button"
               onClick={() => setConfirmDeleteDialogue(null)}
-              className="px-4 py-2 rounded border border-gray-300 bg-white text-sm hover:bg-gray-50"
+              className="px-4 py-2 rounded-full border border-line bg-paper text-sm hover:bg-black/5 dark:hover:bg-white/10"
             >
               取消
             </button>
             <button
               type="button"
               onClick={() => void handleConfirmDeleteAudio()}
-              className="px-4 py-2 rounded bg-red-500 text-white text-sm hover:bg-red-600"
+              className="px-4 py-2 rounded-full bg-red-500 text-white text-sm hover:bg-red-600"
             >
               删除
             </button>
           </>
         }
       >
-        <p className="text-sm text-gray-600">删除后需要重新生成配音。</p>
+        <p className="text-sm text-muted">删除后需要重新生成配音。</p>
       </Modal>
 
       {/* 批量生成结果面板 */}
@@ -695,7 +710,7 @@ export default function AudioWorkbenchPage() {
         {batchResult ? (
           <div>
             <p className="text-sm font-medium mb-3">{batchResult.summary}</p>
-            <ul className="text-sm text-gray-600 space-y-1 max-h-80 overflow-y-auto">
+            <ul className="text-sm text-muted space-y-1 max-h-80 overflow-y-auto">
               {batchResult.details.map((item, idx) => (
                 <li key={idx}>{item}</li>
               ))}

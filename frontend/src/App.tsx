@@ -6,11 +6,8 @@ import { AssetsPage } from "./pages/AssetsPage";
 import AudioWorkbenchPage from "./pages/AudioWorkbenchPage";
 import CompositionPage from "./pages/CompositionPage";
 import { CustomShotsPage } from "./pages/CustomShotsPage";
-import { FreeCreatePage } from "./pages/FreeCreatePage";
 import { JobsPage } from "./pages/JobsPage";
 import { KeyframesPage } from "./pages/KeyframesPage";
-import { PipelineNewPage } from "./pages/PipelineNewPage";
-import { PipelineWorkspacePage } from "./pages/PipelineWorkspacePage";
 import { PlatformSettingsPage } from "./pages/PlatformSettingsPage";
 import { ProjectPage } from "./pages/ProjectPage";
 import { ProvidersPage } from "./pages/ProvidersPage";
@@ -38,21 +35,6 @@ export function App() {
           <Route path="/jobs" element={<JobsPage />} />
           <Route path="/settings" element={<PlatformSettingsPage />} />
         </Route>
-        <Route path="/free-create" element={<FreeCreatePage />} />
-        <Route path="/free-create/pipeline/new" element={<PipelineNewPage />} />
-        <Route path="/free-create/:projectId" element={<FreeCreatePage />} />
-        <Route
-          path="/free-create/:projectId/pipeline/new"
-          element={<PipelineNewPage />}
-        />
-        <Route
-          path="/free-create/:projectId/pipeline/:runId"
-          element={<PipelineWorkspacePage />}
-        />
-        <Route
-          path="/free-create/:projectId/pipeline/:runId/stage/:stageKey"
-          element={<PipelineWorkspacePage />}
-        />
         <Route path="*" element={<Navigate to="/project" replace />} />
       </Routes>
     </ErrorBoundary>

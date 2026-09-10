@@ -37,12 +37,12 @@ export class ErrorBoundary extends Component<Props, State> {
       }
 
       return (
-        <div className="flex min-h-screen items-center justify-center bg-gray-50 px-4">
-          <div className="w-full max-w-md rounded-lg border border-red-200 bg-white p-6 shadow-lg">
+        <div className="flex min-h-screen items-center justify-center bg-canvas px-4">
+          <div className="w-full max-w-md rounded-card border border-black/[0.06] bg-paper p-6 shadow-apple dark:border-white/10 dark:bg-[#101010] dark:shadow-appleDark">
             <div className="mb-4 flex items-center gap-3">
-              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-red-100">
+              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-red-500/10">
                 <svg
-                  className="h-6 w-6 text-red-600"
+                  className="h-6 w-6 text-red-500"
                   fill="none"
                   stroke="currentColor"
                   viewBox="0 0 24 24"
@@ -56,13 +56,13 @@ export class ErrorBoundary extends Component<Props, State> {
                 </svg>
               </div>
               <div>
-                <h1 className="text-lg font-semibold text-gray-900">页面出错了</h1>
-                <p className="text-sm text-gray-600">应用遇到了一个意外错误</p>
+                <h1 className="text-lg font-semibold text-ink">页面出错了</h1>
+                <p className="text-sm text-muted">应用遇到了一个意外错误</p>
               </div>
             </div>
 
-            <div className="mb-4 rounded-md bg-gray-50 p-3">
-              <p className="text-sm font-mono text-gray-700 break-words">
+            <div className="mb-4 rounded-xl bg-black/[0.03] p-3 dark:bg-white/5">
+              <p className="text-sm font-mono text-muted break-words">
                 {this.state.error.message}
               </p>
             </div>
@@ -82,10 +82,10 @@ export class ErrorBoundary extends Component<Props, State> {
 
             {process.env.NODE_ENV === "development" && this.state.error.stack && (
               <details className="mt-4">
-                <summary className="cursor-pointer text-sm text-gray-600 hover:text-gray-900">
+                <summary className="cursor-pointer text-sm text-muted hover:text-ink">
                   查看详细错误信息
                 </summary>
-                <pre className="mt-2 overflow-auto rounded-md bg-gray-900 p-3 text-xs text-gray-100">
+                <pre className="mt-2 overflow-auto rounded-xl bg-black p-3 text-xs text-white/85">
                   {this.state.error.stack}
                 </pre>
               </details>

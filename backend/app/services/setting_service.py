@@ -215,6 +215,52 @@ def set_imagbb_api_key(database: Database, plaintext: str) -> None:
 CAMERA_POLICY_SETTING = "camera_policy"
 
 
+# 默认画风：平台级设置，新建项目未填写统一画风时自动回填。
+# 值只存在数据库 platform_setting 表中，代码里不写死任何画风文本；
+# 未配置时返回空字符串，由页面留空让用户自行填写。
+DEFAULT_STYLE_PROMPT_SETTING = "default_style_prompt"
+_MAX_DEFAULT_STYLE_PROMPT_LENGTH = 500
+
+
+def get_default_style_prompt(database: Database) -> str:
+    """读取平台默认画风；未配置时返回空字符串。"""
+    try:
+        with database.engine.connect() as connection:
+            stored = connection.scalar(
+                select(platform_setting.c.value).where(
+                    platform_setting.c.key == DEFAULT_STYLE_PROMPT_SETTING
+                )
+            )
+    except SQLAlchemyError:
+        stored = None
+    return str(stored or "").strip()
+
+
+def set_default_style_prompt(database: Database, value: str) -> str:
+    """写入平台默认画风；空字符串表示清除。"""
+    normalized = str(value or "").strip()
+    if len(normalized) > _MAX_DEFAULT_STYLE_PROMPT_LENGTH:
+        raise bad_request(
+            f"默认画风长度不能超过 {_MAX_DEFAULT_STYLE_PROMPT_LENGTH} 字符"
+        )
+    now = utc_now()
+    statement = sqlite_insert(platform_setting).values(
+        key=DEFAULT_STYLE_PROMPT_SETTING,
+        value=normalized,
+        updated_at=now,
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=[platform_setting.c.key],
+        set_={"value": normalized, "updated_at": now},
+    )
+    try:
+        with database.engine.begin() as connection:
+            connection.execute(statement)
+    except SQLAlchemyError as exc:
+        raise ServiceError(500, "保存默认画风失败，请重试") from exc
+    return normalized
+
+
 def get_camera_policy(database: Database) -> str:
     """读取平台运镜策略；未配置或非法值一律回落「克制」。"""
     from app.services.camera_library import DEFAULT_CAMERA_POLICY, normalize_policy

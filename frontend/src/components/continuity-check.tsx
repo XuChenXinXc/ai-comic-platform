@@ -33,7 +33,7 @@ function LastFrameVideo({ shot }: { shot: Shot }) {
   const url = mediaUrl(video);
   if (!url) {
     return (
-      <div className="flex aspect-video w-full items-center justify-center rounded-md bg-black/60 text-xs text-white/60">
+      <div className="flex aspect-video w-full items-center justify-center rounded-xl bg-black/60 text-xs text-white/60">
         当前分镜没有可用的视频版本
       </div>
     );
@@ -46,7 +46,7 @@ function LastFrameVideo({ shot }: { shot: Shot }) {
       controls
       playsInline
       preload="metadata"
-      className="aspect-video w-full rounded-md bg-black object-contain"
+      className="aspect-video w-full rounded-xl bg-black object-contain"
       onLoadedMetadata={(event) => {
         const element = event.currentTarget;
         try {
@@ -72,7 +72,7 @@ function LastFrameVideo({ shot }: { shot: Shot }) {
 function EdgeCompare({ previous, next }: { previous: Shot; next: Shot }) {
   const nextKeyframeUrl = mediaUrl(next.current_keyframe);
   return (
-    <div className="rounded-xl border border-line bg-white/60 p-4">
+    <div className="rounded-2xl border border-black/[0.06] bg-paper/60 p-4 dark:border-white/10 dark:bg-white/[0.04]">
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <Badge>分镜 {previous.shot_no}</Badge>
         <ChevronRight className="h-4 w-4 text-muted" />
@@ -97,21 +97,21 @@ function EdgeCompare({ previous, next }: { previous: Shot; next: Shot }) {
               src={nextKeyframeUrl}
               alt={`分镜 ${next.shot_no} 关键帧`}
               loading="lazy"
-              className="aspect-video w-full rounded-md border border-line bg-white object-contain"
+              className="aspect-video w-full rounded-xl border border-line bg-paper object-contain dark:bg-white/[0.06]"
             />
           ) : (
-            <div className="flex aspect-video w-full items-center justify-center rounded-md bg-black/60 text-xs text-white/60">
+            <div className="flex aspect-video w-full items-center justify-center rounded-xl bg-black/60 text-xs text-white/60">
               下一镜还没有关键帧
             </div>
           )}
         </div>
       </div>
-      <div className="mt-3 grid gap-2 text-xs leading-5 text-[#454842] sm:grid-cols-2">
-        <div className="rounded-md bg-white/70 p-2.5">
+      <div className="mt-3 grid gap-2 text-xs leading-5 text-muted sm:grid-cols-2">
+        <div className="rounded-xl bg-paper/70 p-2.5 dark:bg-white/[0.06]">
           <span className="mr-1 font-bold text-ink">上一镜结束：</span>
           {previous.end_state || previous.next_hook || "（无描述）"}
         </div>
-        <div className="rounded-md bg-white/70 p-2.5">
+        <div className="rounded-xl bg-paper/70 p-2.5 dark:bg-white/[0.06]">
           <span className="mr-1 font-bold text-ink">下一镜开始：</span>
           {next.start_state || "（无描述）"}
         </div>
@@ -198,26 +198,26 @@ function PlaybackPreview({ shots }: { shots: Shot[] }) {
               key={shot.id}
               type="button"
               onClick={() => goTo(shotIndex)}
-              className={`h-8 min-w-8 rounded-md px-2 text-xs font-bold transition ${
+              className={`h-8 min-w-8 rounded-full px-2 text-xs font-bold transition ${
                 shotIndex === safeIndex
-                  ? "bg-vermilion text-white"
-                  : "bg-white/70 text-muted hover:bg-white"
+                  ? "bg-vermilion text-white shadow-cta"
+                  : "bg-paper/70 text-muted hover:bg-paper dark:bg-white/10 dark:hover:bg-white/15"
               }`}
             >
               {shot.shot_no}
             </button>
           ))}
         </div>
-        <div className="mt-3 rounded-xl border border-line bg-white/70 p-4">
+        <div className="mt-3 rounded-2xl border border-black/[0.06] bg-paper/70 p-4 dark:border-white/10 dark:bg-white/[0.06]">
           <div className="flex items-center gap-2">
             <h3 className="font-bold">分镜 {current.shot_no}</h3>
             <Badge>{current.scene_name || "未绑定场景"}</Badge>
             <Badge>{current.duration_sec}s</Badge>
           </div>
-          <p className="mt-2 line-clamp-3 text-xs leading-5 text-[#454842]">
+          <p className="mt-2 line-clamp-3 text-xs leading-5 text-muted">
             {current.action || current.image_prompt}
           </p>
-          <div className="mt-3 space-y-1.5 text-xs leading-5 text-[#454842]">
+          <div className="mt-3 space-y-1.5 text-xs leading-5 text-muted">
             <p>
               <span className="font-bold text-ink">开始：</span>
               {current.start_state || "（无描述）"}

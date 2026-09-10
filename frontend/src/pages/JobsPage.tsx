@@ -165,7 +165,7 @@ export function JobsPage() {
           {query.isFetching ? (
             <LoaderCircle className="h-4 w-4 animate-spin text-vermilion" />
           ) : (
-            <span className="h-2 w-2 rounded-full bg-[#6f8c71]" />
+            <span className="h-2 w-2 rounded-full bg-emerald-500" />
           )}
           {query.isFetching ? "正在同步任务状态" : "任务状态自动轮询"}
         </div>
@@ -227,7 +227,7 @@ export function JobsPage() {
                       </h3>
                     </div>
                     {failed ? (
-                      <Badge className="border-[#e0a39e] bg-[#fff0ee] text-[#9b342c]">
+                      <Badge className="border-red-200 dark:border-red-500/25 bg-red-50 dark:bg-red-500/10 text-[#c93c30] dark:text-red-400">
                         {failed} 失败
                       </Badge>
                     ) : null}
@@ -311,7 +311,7 @@ export function JobsPage() {
                   </p>
                 </div>
                 <div className="min-w-0 text-xs">
-                  <p className="truncate font-semibold text-[#444741]">
+                  <p className="truncate font-semibold text-ink">
                     {job.target_name ||
                       `${job.target_type || "项目"} ${job.target_id?.slice(0, 8) || ""}`}
                   </p>
@@ -362,7 +362,7 @@ export function JobsPage() {
                     <Button
                       size="sm"
                       variant="ghost"
-                      className="text-[#9b342c]"
+                      className="text-[#c93c30] dark:text-red-400"
                       busy={
                         mutation.isPending &&
                         mutation.variables?.action === "cancel" &&
@@ -419,13 +419,13 @@ export function JobsPage() {
               </div>
             </dl>
             {detail.error ? (
-              <div className="rounded-md border border-[#e1b3ad] bg-[#fff3f0] p-4 text-sm leading-6 text-[#943c33]">
+              <div className="rounded-xl border border-red-200 dark:border-red-500/25 bg-red-50 dark:bg-red-500/10 p-4 text-sm leading-6 text-red-700 dark:text-red-300">
                 {detail.error}
               </div>
             ) : null}
             <div>
               <p className="mb-2 text-xs font-bold text-muted">结果 / 恢复信息</p>
-              <pre className="max-h-80 overflow-auto rounded-md border border-line bg-[#222622] p-4 text-xs leading-5 text-[#e7e4db]">
+              <pre className="max-h-80 overflow-auto rounded-xl border border-line bg-[#0b0b0d] p-4 text-xs leading-5 text-white/85">
                 {prettyJson(detail.result_json || {})}
               </pre>
             </div>

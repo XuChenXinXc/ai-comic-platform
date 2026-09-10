@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import type { MediaVersion } from "../types/api";
 import { mediaUrl } from "../api/client";
-import { cn, formatDate } from "../lib/utils";
+import { cn, formatDate, parseJson } from "../lib/utils";
 import { ImagePreview } from "./image-preview";
 import { EmptyState, StaleNotice, StatusBadge } from "./status";
 import { Badge, Button } from "./ui";
@@ -43,6 +43,16 @@ export function MediaVersions({
     visibleVersions.find((version) => version.is_current) ||
     visibleVersions.find((version) => version.status === "completed") ||
     null;
+  // 关键帧视觉质检结果（后端写入 provenance_json.keyframe_qa）
+  const qa = current
+    ? parseJson<{
+        keyframe_qa?: {
+          passed?: boolean;
+          score?: number;
+          issues?: string[];
+        };
+      }>(current.provenance_json ?? "", {}).keyframe_qa
+    : null;
 
   if (!versions.length) {
     return (
@@ -60,7 +70,7 @@ export function MediaVersions({
         <div
           key={version.id}
           role="alert"
-          className="rounded-md border border-[#e0a39e] bg-[#fff0ee] px-3 py-2 text-[#9b342c]"
+          className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-[#c93c30] dark:border-red-500/25 dark:bg-red-500/10 dark:text-red-300"
         >
           <div className="flex gap-2">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -75,7 +85,7 @@ export function MediaVersions({
             <Button
               variant="ghost"
               size="sm"
-              className="min-h-7 px-2 text-[#9b342c]"
+              className="min-h-7 px-2 text-[#c93c30] dark:text-red-400"
               busy={deletingId === version.id}
               onClick={() => onDelete(version)}
               aria-label={`删除失败版本 ${version.version_no}`}
@@ -94,7 +104,7 @@ export function MediaVersions({
   return (
     <div className="space-y-3">
       {failureNotice}
-      <div className="relative overflow-hidden rounded-lg border border-[#cdc8bd] bg-[#222622]">
+      <div className="relative overflow-hidden rounded-2xl border border-black/[0.06] bg-[#0b0b0d] dark:border-white/10">
         {current && mediaUrl(current) ? (
           mediaKind === "image" ? (
             <ImagePreview
@@ -126,10 +136,38 @@ export function MediaVersions({
             <Badge className="border-white/15 bg-black/60 text-white backdrop-blur">
               当前 · V{String(current.version_no).padStart(2, "0")}
             </Badge>
+            {qa && typeof qa.score === "number" ? (
+              <Badge
+                className={cn(
+                  "border-white/15 text-white backdrop-blur",
+                  qa.passed ? "bg-emerald-700/80" : "bg-red-700/80",
+                )}
+                title={qa.issues?.join("；") || ""}
+              >
+                {qa.passed ? "质检通过" : "质检未通过"} · {qa.score}
+              </Badge>
+            ) : null}
             <StatusBadge status={current.status} className="backdrop-blur" />
           </div>
         ) : null}
       </div>
+
+      {qa && !qa.passed && qa.issues?.length ? (
+        <div
+          role="alert"
+          className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900 dark:border-amber-500/25 dark:bg-amber-500/10 dark:text-amber-300"
+        >
+          <p className="text-xs font-bold">质检发现的问题</p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4 text-xs leading-5">
+            {qa.issues.map((issue) => (
+              <li key={issue}>{issue}</li>
+            ))}
+          </ul>
+          <p className="mt-1 text-[11px] text-muted">
+            已自动换 seed 重新生成；仍不理想可点击「生成新版本」重试。
+          </p>
+        </div>
+      ) : null}
 
       {current?.is_stale ? (
         <StaleNotice reason={current.stale_reason} compact />
@@ -163,7 +201,7 @@ export function MediaVersions({
               <div
                 key={version.id}
                 className={cn(
-                  "relative w-32 shrink-0 overflow-hidden rounded-md border bg-white",
+                  "relative w-32 shrink-0 overflow-hidden rounded-xl border bg-paper",
                   version.is_current
                     ? "border-vermilion ring-1 ring-vermilion"
                     : "border-line",
@@ -174,7 +212,7 @@ export function MediaVersions({
                     <ImagePreview
                       src={url}
                       alt={`${alt} 版本 ${version.version_no}`}
-                      imageClassName="aspect-video w-full bg-[#252925] object-cover"
+                      imageClassName="aspect-video w-full bg-[#0b0b0d] object-cover"
                       loading="lazy"
                     />
                     {details}
@@ -187,7 +225,7 @@ export function MediaVersions({
                     disabled={version.is_current || version.status !== "completed"}
                     aria-label={`选择版本 ${version.version_no}`}
                   >
-                    <div className="flex aspect-video items-center justify-center bg-[#252925] text-white/60">
+                    <div className="flex aspect-video items-center justify-center bg-[#0b0b0d] text-white/60">
                       {mediaKind === "video" ? (
                         <Film className="h-5 w-5" />
                       ) : (
@@ -225,7 +263,7 @@ export function MediaVersions({
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="min-h-7 flex-1 rounded-none px-1 text-[#9b342c]"
+                    className="min-h-7 flex-1 rounded-none px-1 text-[#c93c30] dark:text-red-400"
                     busy={deletingId === version.id}
                     disabled={version.is_current}
                     onClick={() => onDelete(version)}

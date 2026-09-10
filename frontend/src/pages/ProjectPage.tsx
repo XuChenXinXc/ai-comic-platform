@@ -20,8 +20,8 @@ import type { Project, ProjectInput, ProviderKind } from "../types/api";
 const emptyProject: ProjectInput = {
   name: "",
   source_text: "",
-  style_prompt:
-    "电影感古风仙域二维国漫，稳定自然的半写实人物比例，东方审美骨相，克制细腻的古风线条，低饱和青灰、玉白、玄黑与暖金综合色调，仙气通透但不过度梦幻，真实清晰的微表情，层次分明的电影光影，东方山水空间美学，精致但不浮夸。",
+  // 留空：后端会用平台默认画风（数据库设置）回填，画风文本不写死在前端。
+  style_prompt: "",
   aspect_ratio: "16:9",
   image_size: "2560x1440",
   video_size: "16:9",
@@ -133,9 +133,25 @@ export function ProjectPage() {
   const deleteMutation = useMutation({
     mutationFn: () => api.projects.remove(activeProjectId),
     onSuccess: async () => {
+      // 删除后自动切换到剩余项目列表中的下一个项目，而不是跳到新建模式。
+      const deletedId = activeProjectId;
       await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
+      const deletedIndex = projects.findIndex((item) => item.id === deletedId);
+      const remaining =
+        deletedIndex >= 0
+          ? projects.filter((item) => item.id !== deletedId)
+          : projects;
+      if (remaining.length > 0) {
+        // 原删除位置顺延的下一个；删除的是最后一个时回退到前一个。
+        const next =
+          remaining[Math.max(0, Math.min(deletedIndex, remaining.length - 1))];
+        selectProject(next.id);
+        setSearchParams({}, { replace: true });
+      } else {
+        // 没有剩余项目时才进入新建模式。
+        setSearchParams({ create: "1" }, { replace: true });
+      }
       toast.success("项目已删除");
-      setSearchParams({ create: "1" }, { replace: true });
     },
     onError: (mutationError) => toast.error(formatError(mutationError)),
   });
@@ -282,7 +298,7 @@ export function ProjectPage() {
                 providersByKind.image.length +
                 providersByKind.video.length ===
                 0 ? (
-                <p className="rounded-md border border-[#dfb98f] bg-[#fff5e9] px-3 py-2 text-xs leading-5 text-[#7b4b22]">
+                <p className="rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-800 dark:border-sky-500/25 dark:bg-sky-500/10 dark:text-sky-300">
                   尚未配置接口。可先使用默认 Mock Provider 跑通生产链。
                 </p>
               ) : null}
@@ -315,10 +331,10 @@ export function ProjectPage() {
                     type="button"
                     key={project.id}
                     onClick={() => selectProject(project.id)}
-                    className={`flex w-full items-center gap-3 rounded-md border px-3 py-3 text-left ${
+                    className={`flex w-full items-center gap-3 rounded-2xl border px-3 py-3 text-left transition ${
                       activeProjectId === project.id
-                        ? "border-vermilion bg-[#fff3ed]"
-                        : "border-line bg-white hover:border-[#bdb8ad]"
+                        ? "border-vermilion bg-vermilion/5"
+                        : "border-black/[0.06] bg-paper hover:border-black/20 dark:border-white/10 dark:bg-white/[0.04] dark:hover:border-white/20"
                     }`}
                   >
                     <FileText className="h-4 w-4 text-muted" />

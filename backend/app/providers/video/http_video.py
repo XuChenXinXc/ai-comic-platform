@@ -216,6 +216,13 @@ class HttpVideoProvider(HttpProviderBase):
             options.setdefault("max_duration_sec", 15)
             options.setdefault("duration_integer_only", True)
             options.setdefault("duration_round_up", False)
+            # Seedance 2.0 支持音频参考（≤3 段）驱动口型：当前配音音频经素材
+            # 上传接口换 URL 后放入 audio_urls 数组；字段与路径均可被页面 params 覆盖。
+            options.setdefault("audio_input_field", "audio_urls")
+            options.setdefault("audio_upload_path", "uploads/audios")
+            options.setdefault("audio_upload_file_field", "file")
+            options.setdefault("audio_upload_result_path", "url")
+            options.setdefault("max_audio_files", 3)
             # 与其他视频协议共用同一份协议控制字段清单，防止 params 里的
             # 控制键（payload/headers/verify_ssl 等）漏进发往上游的 JSON 载荷。
             options.setdefault("ignored_payload_fields", _VIDEO_PROTOCOL_CONTROL_FIELDS)
@@ -282,6 +289,11 @@ class HttpVideoProvider(HttpProviderBase):
         return bool(self._options().get("input_image_list", False))
 
     @property
+    def supports_audio_input(self) -> bool:
+        """是否支持音频参考输入（Seedance 2.0 等协议用 audio_urls 驱动口型）。"""
+        return bool(self._options().get("audio_input_field"))
+
+    @property
     def prefers_public_reference_urls(self) -> bool:
         """天悦 image_urls 优先使用公网 URL，缺失时由调用方回退 base64。"""
         return self._uses_tianyue_video_protocol(self._options())
@@ -322,6 +334,7 @@ class HttpVideoProvider(HttpProviderBase):
         input_image: dict[str, Any],
         duration_sec: float,
         params: dict[str, Any],
+        audio_files: list[Path] | None = None,
     ) -> ProviderSubmission:
         if duration_sec <= 0:
             raise ProviderError("视频时长必须大于 0")
@@ -371,6 +384,16 @@ class HttpVideoProvider(HttpProviderBase):
         if self.config.model and model_field:
             payload.setdefault(model_field, self.config.model)
         payload[str(options.get("duration_field", "duration"))] = effective_duration
+        # 音频输入（对白口型同步）：支持音频参考的协议（Seedance 2.0）把当前配音
+        # 音频上传为 audio_urls 数组；模型据音频驱动口型，而不是凭空表演说话。
+        audio_field = str(options.get("audio_input_field", ""))
+        if audio_files and audio_field:
+            maximum_audio = options.get("max_audio_files")
+            if maximum_audio is not None and len(audio_files) > int(maximum_audio):
+                audio_files = audio_files[: int(maximum_audio)]
+            payload[audio_field] = [
+                (await self._upload_audio(path, options))["value"] for path in audio_files
+            ]
         headers = self._headers(options)
         transport = str(options.get("submit_transport", "json"))
         if transport == "multipart":
@@ -521,6 +544,50 @@ class HttpVideoProvider(HttpProviderBase):
             )
             if not value:
                 raise ProviderError("关键帧上传响应缺少结果标识")
+            return {"value": value, "mode": "upload", "raw": payload}
+
+        return await asyncio.to_thread(upload)
+
+    async def _upload_audio(
+        self,
+        local_file: Path,
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        """把配音音频文件上传到 Provider 素材接口，返回音频引用标识。
+
+        音频不做图片式压缩，按原始文件上传；返回字段路径由
+        audio_upload_result_path 控制（默认与图片一致的 url）。
+        """
+        upload_path = str(options.get("audio_upload_path", ""))
+        if not upload_path:
+            raise ProviderError("音频输入必须配置 audio_upload_path")
+        if not local_file.is_file() or local_file.stat().st_size <= 0:
+            raise ProviderError(f"配音音频文件不存在或为空：{local_file}")
+
+        def upload() -> dict[str, Any]:
+            headers = self._headers(options)
+            field = str(options.get("audio_upload_file_field", "file"))
+            filename = Path(re.sub(r"[^A-Za-z0-9_.-]", "_", local_file.name))
+            with local_file.open("rb") as file_handle:
+                content = file_handle.read()
+            response = self._request(
+                str(options.get("upload_method", "POST")),
+                self._url(upload_path),
+                options=options,
+                headers=headers,
+                files={field: (filename.name, content, "audio/mpeg")},
+                data=dict(options.get("upload_data", {})),
+            )
+            try:
+                payload = response.json()
+            except requests.JSONDecodeError as exc:
+                raise ProviderError("配音上传接口返回的不是 JSON") from exc
+            value = extract_path(
+                payload,
+                str(options.get("audio_upload_result_path", "url")),
+            )
+            if not value:
+                raise ProviderError("配音上传响应缺少音频标识")
             return {"value": value, "mode": "upload", "raw": payload}
 
         return await asyncio.to_thread(upload)

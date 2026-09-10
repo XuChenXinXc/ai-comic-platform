@@ -100,8 +100,9 @@ describe("任务轮询", () => {
     expect(predicate({ queryKey: ["assets", "project-1", "all"] })).toBe(true);
     expect(predicate({ queryKey: ["chapters", "project-1"] })).toBe(true);
     expect(predicate({ queryKey: ["projects", "project-1"] })).toBe(true);
+    expect(predicate({ queryKey: ["shot-quality", "project-1"] })).toBe(true);
     expect(
-      predicate({ queryKey: ["projects", "project-1", "scene-views"] }),
+      predicate({ queryKey: ["projects", "project-1", "settings"] }),
     ).toBe(true);
     // projects 全局列表仍然刷新。
     expect(predicate({ queryKey: ["projects"] })).toBe(true);
@@ -109,6 +110,7 @@ describe("任务轮询", () => {
     expect(predicate({ queryKey: ["assets", "project-2", "all"] })).toBe(false);
     expect(predicate({ queryKey: ["chapters", "project-2"] })).toBe(false);
     expect(predicate({ queryKey: ["projects", "project-2"] })).toBe(false);
+    expect(predicate({ queryKey: ["shot-quality", "project-2"] })).toBe(false);
     // 章节/分镜维度无法映射项目，保持前缀失效。
     expect(predicate({ queryKey: ["shots", "chapter-1"] })).toBe(true);
     expect(predicate({ queryKey: ["keyframes", "shot-1"] })).toBe(true);

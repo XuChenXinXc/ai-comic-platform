@@ -137,7 +137,7 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
   });
 
   return (
-    <div className="border-t border-line bg-[#f8f6f0] p-5">
+    <div className="border-t border-black/[0.06] bg-canvas/70 p-5 dark:border-white/10 dark:bg-white/[0.03]">
       <div className="mb-4 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
         <div>
           <p className="text-xs font-bold uppercase tracking-[0.14em] text-muted">
@@ -156,7 +156,7 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
               type="checkbox"
               checked={referenceMode}
               onChange={(event) => setReferenceMode(event.target.checked)}
-              className="h-4 w-4 accent-[#d95c3a]"
+              className="h-4 w-4 accent-vermilion"
             />
             单图参考模式
           </label>
@@ -201,11 +201,11 @@ export function AssetImagePanel({ asset }: { asset: Asset }) {
       </div>
 
       {asset.prompt_override ? (
-        <div className="mb-3 rounded-md border border-line bg-white/60 p-3">
+        <div className="mb-3 rounded-2xl border border-black/[0.06] bg-paper/60 p-3 dark:border-white/10 dark:bg-white/[0.05]">
           <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
             已保存的图片提示词覆盖
           </p>
-          <p className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+          <p className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-muted">
             {asset.prompt_override}
           </p>
         </div>

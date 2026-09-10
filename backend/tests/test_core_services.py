@@ -465,6 +465,23 @@ def test_download_url_atomic_decodes_gzip_content(
     assert target.read_bytes() == payload
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8000/media.mp4",
+        "http://localhost:8000/media.mp4",
+        "http://ip6-localhost/media.mp4",
+        "http://service.local/media.mp4",
+        "http://internal.cluster.internal/media.mp4",
+        "http://169.254.169.254/latest/meta-data/",
+    ],
+)
+def test_download_url_atomic_blocks_private_and_local_hosts(tmp_path: Path, url: str) -> None:
+    """SSRF 防护：严禁下载指向内网 IP、localhost 与本地/保留主机的地址。"""
+    with pytest.raises(FileServiceError, match="指向内网或保留地址|指向本地或保留主机名"):
+        download_url_atomic(url, tmp_path / "out.bin")
+
+
 def test_first_chapter_inherits_project_source_text(tmp_path: Path) -> None:
     """首章自动继承项目创建时录入的正文，避免分章模型下小说正文丢失。"""
     from app.db import Database

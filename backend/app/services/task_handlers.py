@@ -1,7 +1,4 @@
 from app.db import Database, db
-from app.dynamic_pipeline.audio_job_service import DynamicAudioJobService
-from app.dynamic_pipeline.delivery import DynamicDeliveryJobService
-from app.jobs.dynamic_handlers import make_dynamic_stage_generate_handler
 from app.jobs.runner import JobRunner, job_runner
 from app.services.asset_service import AssetService
 from app.services.composition_service import CompositionService
@@ -28,15 +25,6 @@ def register_handlers(
     shots = ShotService(current_database, jobs)
     media = MediaService(current_database, jobs)
     composition = CompositionService(current_database, jobs)
-    dynamic_audio = DynamicAudioJobService(current_database)
-    dynamic_delivery = DynamicDeliveryJobService(
-        current_database,
-        repository=current_runner.repository,
-        job_service=jobs,
-        audio_service=dynamic_audio,
-        composition_service=composition,
-        enqueue=getattr(current_runner, "enqueue", None),
-    )
 
     handlers = {
         "analyze_novel": writing.handle_analysis,
@@ -55,15 +43,11 @@ def register_handlers(
         "generate_asset_image": media.handle_asset_image,
         "generate_keyframe": media.handle_keyframe,
         "generate_video": media.handle_video,
+        "check_keyframe_quality": media.handle_keyframe_qa,
+        "run_shot_pipeline": media.handle_shot_pipeline,
+        "run_shot_pipeline_media": media.handle_shot_pipeline_media,
+        "run_shot_pipeline_videos": media.handle_shot_pipeline_videos,
         "compose_chapter": composition.handle_compose,
-        "generate_dialogue_audio": dynamic_audio.handle_job,
-        "generate_dynamic_subtitle": dynamic_delivery.handle_subtitle_job,
-        "prepare_dynamic_bgm": dynamic_delivery.handle_bgm_job,
-        "dynamic_stage_generate": make_dynamic_stage_generate_handler(
-            current_database,
-            repository=current_runner.repository,
-            delivery_service=dynamic_delivery,
-        ),
     }
     for job_type, handler in handlers.items():
         current_runner.register_handler(job_type, handler)

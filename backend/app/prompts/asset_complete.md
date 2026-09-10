@@ -28,6 +28,8 @@ AssetExtractionOutput 结构），不要输出 Markdown 或额外说明。
 4. 场景拆分原则与 asset_extract 一致：按可复用视觉空间判断，不是按地点名拆分。
    缺失清单中若有多项建议实际属于同一视觉空间（就应合并为一个场景素材），
    合并为一项并说明；清单未覆盖但属于同一空间的合理叫法，加入该项的 `aliases`。
+   若缺失场景与已有场景同属一个实体地点（场景族），`scene_family` 必须与已有
+   族名逐字一致，`family_anchor` 按「每族恰好一个」的规则设置（已有锚点则补 false）。
 5. `name`、`prompt`、`negative_prompt`、`composition` 不得为空；
    `consistency_keywords` 至少包含一项可见且稳定的识别特征。
 6. 所有文本字段必须使用中文；专有名词可按原文保留，不得输出英文提示词或一致性关键词。

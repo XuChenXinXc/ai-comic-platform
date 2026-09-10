@@ -87,6 +87,10 @@ data_export/
 *.temp
 tmp/
 temp/
+*.db-shm
+*.db-wal
+backend/_*
+backend/gen_*
 
 # 密钥和证书
 *.key

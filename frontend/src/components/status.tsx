@@ -34,9 +34,9 @@ export function StatusBadge({
     <Badge
       className={cn(
         status === "confirmed" || status === "completed"
-          ? "border-[#9cb79c] bg-[#eef5eb] text-[#355d39]"
+          ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-300"
           : status === "failed" || status === "interrupted"
-            ? "border-[#e0a39e] bg-[#fff0ee] text-[#9b342c]"
+            ? "border-red-200 bg-red-50 text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-300"
             : [
                   "queued",
                   "running",
@@ -44,7 +44,7 @@ export function StatusBadge({
                   "waiting_provider",
                   "downloading",
                 ].includes(status)
-              ? "border-[#d9ae7f] bg-[#fff3e5] text-[#8b4b1e]"
+              ? "border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-300"
               : "",
         className,
       )}
@@ -64,8 +64,8 @@ export function StaleNotice({
   return (
     <div
       className={cn(
-        "flex gap-2 border border-[#e2aa88] bg-[#fff3e9] text-[#833f24]",
-        compact ? "rounded-md px-3 py-2 text-xs" : "rounded-lg px-4 py-3 text-sm",
+        "flex gap-2 border border-sky-200 bg-sky-50 text-sky-800 dark:border-sky-500/25 dark:bg-sky-500/10 dark:text-sky-300",
+        compact ? "rounded-xl px-3 py-2 text-xs" : "rounded-2xl px-4 py-3 text-sm",
       )}
     >
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -93,9 +93,11 @@ export function ErrorState({
   onRetry?: () => void;
 }) {
   return (
-    <Card className="flex min-h-52 flex-col items-center justify-center border-[#e1b3ad] bg-[#fff8f6] p-8 text-center">
-      <AlertTriangle className="mb-4 h-7 w-7 text-[#b34539]" />
-      <h3 className="text-base font-bold text-ink">{title}</h3>
+    <Card className="flex min-h-52 flex-col items-center justify-center border-red-100 bg-red-50/40 p-8 text-center dark:border-red-500/20 dark:bg-red-500/[0.06]">
+      <div className="flex h-14 w-14 items-center justify-center rounded-full bg-red-500/10">
+        <AlertTriangle className="h-6 w-6 text-red-500" />
+      </div>
+      <h3 className="mt-4 text-base font-semibold text-ink">{title}</h3>
       <p className="mt-2 max-w-xl text-sm leading-6 text-muted">{message}</p>
       {onRetry ? (
         <Button className="mt-5" onClick={onRetry}>
@@ -121,14 +123,21 @@ export function EmptyState({
   return (
     <Card
       className={cn(
-        "flex flex-col items-center justify-center border-dashed bg-white/35 text-center",
+        "flex flex-col items-center justify-center border-dashed border-black/15 bg-transparent text-center shadow-none hover:border-vermilion/40 dark:border-white/20 dark:bg-transparent dark:shadow-none",
         compact ? "min-h-32 p-5" : "min-h-64 p-10",
       )}
     >
-      <FileQuestion
-        className={cn("text-[#92958e]", compact ? "h-5 w-5" : "h-8 w-8")}
-      />
-      <h3 className="mt-3 text-base font-bold text-ink">{title}</h3>
+      <div
+        className={cn(
+          "flex items-center justify-center rounded-[18px] bg-vermilion/10 text-vermilion",
+          compact ? "h-9 w-9" : "h-14 w-14",
+        )}
+      >
+        <FileQuestion className={compact ? "h-4 w-4" : "h-6 w-6"} />
+      </div>
+      <h3 className="mt-4 text-base font-semibold text-ink md:text-lg">
+        {title}
+      </h3>
       <p className="mt-2 max-w-lg text-sm leading-6 text-muted">{description}</p>
       {action ? <div className="mt-5">{action}</div> : null}
     </Card>
@@ -147,15 +156,15 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <header className="mb-7 flex flex-col justify-between gap-5 border-b border-line pb-6 xl:flex-row xl:items-end">
+    <header className="mb-9 flex flex-col justify-between gap-5 md:flex-row md:items-end">
       <div className="max-w-3xl">
-        <p className="mb-2 text-[11px] font-bold uppercase tracking-[0.2em] text-vermilion">
+        <p className="mb-2.5 text-[12px] font-semibold uppercase tracking-[0.16em] text-vermilion">
           {eyebrow}
         </p>
-        <h1 className="text-3xl font-extrabold tracking-[-0.035em] text-ink md:text-4xl">
+        <h1 className="text-[32px] font-semibold leading-[1.05] tracking-[-0.04em] text-ink md:text-[40px]">
           {title}
         </h1>
-        <p className="mt-3 text-sm leading-6 text-muted md:text-base">
+        <p className="mt-3 text-sm leading-6 text-muted md:text-[15px]">
           {description}
         </p>
       </div>
@@ -168,5 +177,5 @@ export function PageHeader({
 
 export function FieldError({ children }: { children?: ReactNode }) {
   if (!children) return null;
-  return <p className="mt-1.5 text-xs text-[#a4362d]">{children}</p>;
+  return <p className="mt-1.5 text-xs text-[#e0442e]">{children}</p>;
 }

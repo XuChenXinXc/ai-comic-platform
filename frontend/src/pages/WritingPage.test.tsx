@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { toast } from "sonner";
 import { ApiError, api, queryKeys } from "../api/client";
 import type {
   ContentRecord,
@@ -11,7 +12,18 @@ import type {
 } from "../types/api";
 import { WritingPage } from "./WritingPage";
 
-const projectContext = vi.hoisted(() => ({
+const projectContext = vi.hoisted<{
+  activeProject: {
+    id: string;
+    name: string;
+    source_text: string;
+    style_prompt: string;
+    source_revision: number;
+    source_signature: string;
+    visual_bible?: unknown;
+  };
+  activeProjectId: string;
+}>(() => ({
   activeProject: {
     id: "chapter-1",
     name: "验收项目",
@@ -19,6 +31,7 @@ const projectContext = vi.hoisted(() => ({
     style_prompt: "二维国风漫剧",
     source_revision: 1,
     source_signature: "source-1",
+    visual_bible: null,
   },
   activeProjectId: "chapter-1",
 }));
@@ -457,5 +470,181 @@ describe("文字工作台延迟保存", () => {
       status: "ready",
     });
     expect(projectBTitle).toHaveValue("项目 B 本地编辑");
+  });
+});
+
+describe("视觉圣经 VisualBible 编辑面板", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    projectContext.activeProject = {
+      id: "project-1",
+      name: "验收项目",
+      source_text: "测试小说原文",
+      style_prompt: "二维国风漫剧",
+      source_revision: 1,
+      source_signature: "source-1",
+      visual_bible: null,
+    };
+    projectContext.activeProjectId = "chapter-1";
+    vi.spyOn(api.analysis, "get").mockRejectedValue(
+      new ApiError("分析不存在", 404),
+    );
+    vi.spyOn(api.screenplay, "get").mockResolvedValue(
+      screenplayRecord(1, "视觉圣经剧本"),
+    );
+  });
+
+  function createQueryClient() {
+    return new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+  }
+
+  async function openPanel() {
+    await screen.findByLabelText("统一画风 STYLE_ANCHOR");
+    await userEvent.click(screen.getByText("视觉圣经 VisualBible"));
+  }
+
+  test("test_visual_bible_panel_collapsed_by_default_with_auto_badge", async () => {
+    renderWritingPage(createQueryClient());
+
+    await screen.findByLabelText("统一画风 STYLE_ANCHOR");
+    expect(screen.getByText("视觉圣经 VisualBible")).toBeInTheDocument();
+    expect(screen.getByText("自动推导")).toBeInTheDocument();
+    expect(screen.queryByText("已自定义")).not.toBeInTheDocument();
+    // 默认收起：面板内容不渲染，字段不可见。
+    expect(screen.queryByLabelText("类型 type")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByText("视觉圣经 VisualBible"));
+    expect(screen.getByLabelText("类型 type")).toBeInTheDocument();
+  });
+
+  test("test_visual_bible_save_builds_structured_payload", async () => {
+    const updateProject = vi.spyOn(api.projects, "update").mockResolvedValue({
+      ...projectContext.activeProject,
+      visual_bible: {
+        line: { type: "粗笔焦墨" },
+        shading: { realistic_shading: true },
+        realism: { character: 0.8 },
+        forbidden_styles: ["低多边形", "赛博朋克"],
+      },
+    } as never);
+    renderWritingPage(createQueryClient());
+    await openPanel();
+
+    await userEvent.type(screen.getByLabelText("类型 type"), "粗笔焦墨");
+    await userEvent.selectOptions(
+      screen.getByLabelText("写实明暗 realistic_shading"),
+      "true",
+    );
+    fireEvent.change(screen.getByLabelText("角色 character（0-1）"), {
+      target: { value: "0.8" },
+    });
+    // jsdom 的键盘事件会丢失顿号字符，改用直接赋值触发 change。
+    fireEvent.change(
+      screen.getByLabelText("禁用风格 forbidden_styles（逗号或顿号分隔）"),
+      { target: { value: "低多边形、赛博朋克" } },
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "保存视觉圣经" }),
+    );
+
+    await waitFor(() => {
+      expect(updateProject).toHaveBeenCalledWith("chapter-1", {
+        visual_bible: {
+          line: { type: "粗笔焦墨" },
+          shading: { realistic_shading: true },
+          realism: { character: 0.8 },
+          forbidden_styles: ["低多边形", "赛博朋克"],
+        },
+      });
+    });
+  });
+
+  test("test_visual_bible_reset_sends_null", async () => {
+    projectContext.activeProject = {
+      ...projectContext.activeProject,
+      visual_bible: { texture: "宣纸颗粒" },
+    };
+    const updateProject = vi.spyOn(api.projects, "update").mockResolvedValue({
+      ...projectContext.activeProject,
+      visual_bible: null,
+    } as never);
+    renderWritingPage(createQueryClient());
+
+    await screen.findByLabelText("统一画风 STYLE_ANCHOR");
+    expect(screen.getByText("已自定义")).toBeInTheDocument();
+    await userEvent.click(screen.getByText("视觉圣经 VisualBible"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "重置为自动推导" }),
+    );
+
+    await waitFor(() => {
+      expect(updateProject).toHaveBeenCalledWith("chapter-1", {
+        visual_bible: null,
+      });
+    });
+  });
+
+  test("test_visual_bible_rejects_out_of_range_realism", async () => {
+    const updateProject = vi.spyOn(api.projects, "update").mockResolvedValue({
+      ...projectContext.activeProject,
+    } as never);
+    renderWritingPage(createQueryClient());
+    await openPanel();
+
+    fireEvent.change(screen.getByLabelText("角色 character（0-1）"), {
+      target: { value: "1.5" },
+    });
+    await userEvent.click(
+      screen.getByRole("button", { name: "保存视觉圣经" }),
+    );
+
+    expect(updateProject).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledWith(
+      "写实度·角色 必须是 0 到 1 之间的数值",
+    );
+  });
+
+  test("test_visual_bible_inputs_show_derived_preview_values", async () => {
+    vi.spyOn(api.projects, "visualBiblePreview").mockResolvedValue({
+      style_prompt: "二维国风漫剧",
+      visual_bible: null,
+      derived: {
+        line: { type: "粗笔焦墨", thickness: "中粗" },
+        coloring: { method: "湿墨铺色", saturation: "低至中" },
+        shading: { method: "墨色明暗块", realistic_shading: false },
+        material: { method: "绘画概括", pbr: false },
+        lighting: { realism: "写意" },
+        depth_of_field: { enabled: false },
+        realism: { character: 0.8, environment: 0.7 },
+        texture: "宣纸、水墨晕染、粗笔笔触",
+        forbidden_styles: ["3D", "PBR"],
+      },
+      rendered: "结构化画风规范：线条：类型「粗笔焦墨」。",
+    });
+    renderWritingPage(createQueryClient());
+    await openPanel();
+
+    // 表单输入框回显当前画风的自动推导值，而不是空白。
+    await waitFor(() => {
+      expect(screen.getByLabelText("类型 type")).toHaveValue("粗笔焦墨");
+    });
+    expect(screen.getByLabelText("粗细 thickness")).toHaveValue("中粗");
+    expect(screen.getByLabelText("饱和度 saturation")).toHaveValue("低至中");
+    expect(
+      screen.getByLabelText("写实明暗 realistic_shading"),
+    ).toHaveValue("false");
+    expect(screen.getByLabelText("PBR pbr")).toHaveValue("false");
+    expect(screen.getByLabelText("角色 character（0-1）")).toHaveValue(0.8);
+    expect(screen.getByLabelText("质感 texture")).toHaveValue(
+      "宣纸、水墨晕染、粗笔笔触",
+    );
+    expect(
+      screen.getByLabelText("禁用风格 forbidden_styles（逗号或顿号分隔）"),
+    ).toHaveValue("3D、PBR");
   });
 });

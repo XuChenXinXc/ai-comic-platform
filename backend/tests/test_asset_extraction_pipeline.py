@@ -8,7 +8,11 @@ import pytest
 
 from app.db import Database
 from app.schemas import AssetExtractionOutput
-from app.services.asset_service import _EXTRACT_EMPTY_RETRIES, AssetService
+from app.services.asset_service import (
+    _ASSET_FACT_ONLY_CONSTRAINT,
+    _EXTRACT_EMPTY_RETRIES,
+    AssetService,
+)
 from app.services.chapter_service import ChapterService
 from app.services.file_service import FileService
 from app.services.project_service import ProjectService
@@ -223,7 +227,10 @@ def test_extract_assets_with_minor_screenplay_characters_saves_only_key_roles_on
 
     characters = service.list(str(project["id"]), "character")
     assert len(provider.calls) == 1
+    # 视觉语义重解释治理（Phase 2）：提取调用头部注入项目统一画风与只记事实硬约束
     assert provider.calls[0]["user_prompt"] == (
+        f"项目统一画风：{project['style_prompt']}\n"
+        f"{_ASSET_FACT_ONLY_CONSTRAINT}\n"
         f"本章正文：\n{chapter['source_text']}\n\n"
         "已有素材目录（已存在，本章若出现同一对象请勿重复提取）：\n[]"
         "\n\n本集已生成剧本的场次名（提取场景素材时：正文地点若与本集剧本"
@@ -468,8 +475,10 @@ def test_extract_first_empty_retry_with_content_saves_asset(
     )
 
     assert len(provider.calls) == 2
-    # 首次调用 user_prompt 保持原拼装方式不变
+    # 首次调用 user_prompt 保持原拼装方式不变（含画风与只记事实硬约束头部）
     assert provider.calls[0]["user_prompt"] == (
+        f"项目统一画风：{project['style_prompt']}\n"
+        f"{_ASSET_FACT_ONLY_CONSTRAINT}\n"
         f"本章正文：\n{chapter['source_text']}\n\n"
         "已有素材目录（已存在，本章若出现同一对象请勿重复提取）：\n[]"
     )
@@ -552,3 +561,57 @@ def test_extract_incremental_empty_is_valid_no_retry(
 
     assert len(provider.calls) == 1
     assert result["count"] == 0
+
+
+def test_merge_assets_without_target_image_promotes_source_current_image(
+    asset_extraction_services: tuple[Database, AssetService, dict[str, object], dict[str, object]],
+) -> None:
+    """素材合并保护：若目标素材原本无图，源素材的当前图应晋升为目标当前图。"""
+    from sqlalchemy import insert, select
+
+    from app.models.tables import asset_image
+
+    database, service, project, _chapter = asset_extraction_services
+    target = service.create(
+        str(project["id"]),
+        {"asset_type": "scene", "name": "目标场景", "prompt": "空旷大厅"},
+    )
+    source = service.create(
+        str(project["id"]),
+        {"asset_type": "scene", "name": "源场景", "prompt": "大厅角落"},
+    )
+
+    now = "2026-09-07T00:00:00Z"
+    with database.engine.begin() as conn:
+        conn.execute(
+            insert(asset_image).values(
+                id="img_src_1",
+                asset_id=str(source["id"]),
+                version_no=1,
+                file_path="uploads/src1.png",
+                prompt_snapshot="大厅角落",
+                negative_prompt_snapshot="",
+                reference_files_json="[]",
+                provider_id=None,
+                model="",
+                provider_task_id="",
+                status="completed",
+                is_current=True,
+                input_signature="sig_1",
+                source="generated",
+                error="",
+                created_at=now,
+            )
+        )
+
+    merged = service.merge(str(target["id"]), [str(source["id"])])
+    assert merged["id"] == target["id"]
+
+    with database.engine.connect() as conn:
+        images = conn.execute(
+            select(asset_image).where(asset_image.c.asset_id == str(target["id"]))
+        ).mappings().all()
+
+    assert len(images) == 1
+    assert images[0]["id"] == "img_src_1"
+    assert bool(images[0]["is_current"]) is True

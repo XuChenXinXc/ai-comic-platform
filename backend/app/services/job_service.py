@@ -170,7 +170,9 @@ class JobService:
 
     def retry(self, job_id: str) -> dict[str, Any]:
         try:
-            record = self.repository.retry(job_id)
+            with self.repository.engine.begin() as connection:
+                record = self.repository.retry(job_id, connection=connection)
+                self._sync_retried_target(record, connection=connection)
         except JobNotFoundError as exc:
             raise not_found("任务") from exc
         except JobStateError as exc:
@@ -197,6 +199,25 @@ class JobService:
         message: str = "",
     ) -> None:
         self.repository.update_progress(job_id, current, total=total, message=message)
+
+    def _sync_retried_target(
+        self,
+        record: dict[str, Any],
+        *,
+        connection: Any,
+    ) -> None:
+        target_type = record["target_type"]
+        target_id = record["target_id"]
+        media_table = _MEDIA_TARGET_TABLES.get(target_type)
+        if media_table is not None and target_id:
+            connection.execute(
+                update(media_table)
+                .where(
+                    media_table.c.id == target_id,
+                    media_table.c.status.in_(("failed", "interrupted")),
+                )
+                .values(status="queued", error="")
+            )
 
     def _sync_cancelled_target(
         self,

@@ -102,6 +102,22 @@ export function ProvidersPage() {
     setParamsError("");
   };
 
+  const supportsVision = Boolean(
+    ((form.params as Record<string, unknown> | undefined) ?? {})[
+      "supports_vision"
+    ],
+  );
+
+  const toggleSupportsVision = (checked: boolean) => {
+    const nextParams: Record<string, unknown> = {
+      ...(form.params as Record<string, unknown>),
+      supports_vision: checked,
+    };
+    setForm((current) => ({ ...current, params: nextParams }));
+    setParamsText(prettyJson(nextParams));
+    setParamsError("");
+  };
+
   const saveMutation = useMutation({
     mutationFn: () =>
       editing === "new"
@@ -237,13 +253,13 @@ export function ProvidersPage() {
                 <div className="flex flex-wrap items-center gap-2">
                   <h2 className="truncate text-lg font-bold">{provider.name}</h2>
                   {provider.is_default ? (
-                    <Badge className="border-[#d9ae7f] bg-[#fff3e5] text-[#8b4b1e]">
+                    <Badge className="border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-300">
                       默认
                     </Badge>
                   ) : null}
                   {/* 用 Badge 展示停用状态，不再向 StatusBadge 传入非任务状态的枚举值 */}
                   {!provider.enabled ? (
-                    <Badge className="border-[#b9bcb4] bg-[#f3f2ec] text-[#6f726b]">
+                    <Badge className="border-black/10 dark:border-white/10 bg-black/5 dark:bg-white/10 text-muted">
                       已停用
                     </Badge>
                   ) : null}
@@ -264,7 +280,7 @@ export function ProvidersPage() {
                 <Button
                   size="icon"
                   variant="ghost"
-                  className="text-[#9b342c]"
+                  className="text-[#c93c30] dark:text-red-400"
                   busy={
                     deleteMutation.isPending &&
                     deleteMutation.variables === provider.id
@@ -319,9 +335,9 @@ export function ProvidersPage() {
             <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
               <div className="flex min-w-0 items-center gap-2 text-xs">
                 {provider.last_test_ok === true ? (
-                  <CheckCircle2 className="h-4 w-4 shrink-0 text-[#4d7b51]" />
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
                 ) : provider.last_test_ok === false ? (
-                  <CircleSlash className="h-4 w-4 shrink-0 text-[#b34539]" />
+                  <CircleSlash className="h-4 w-4 shrink-0 text-red-500" />
                 ) : (
                   <PlugZap className="h-4 w-4 shrink-0 text-muted" />
                 )}
@@ -491,6 +507,23 @@ export function ProvidersPage() {
               }
             />
           </div>
+          {form.kind === "text" ? (
+            <label className="flex items-start gap-3 rounded-xl border border-line bg-paper px-3 py-3 text-sm font-semibold sm:col-span-2">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={supportsVision}
+                onChange={(event) => toggleSupportsVision(event.target.checked)}
+              />
+              <span>
+                启用视觉能力（supports_vision）
+                <span className="mt-1 block text-xs font-normal leading-5 text-muted">
+                  接口需支持图片输入。启用后，关键帧生成完成会自动做视觉质检
+                  （身份一致 / 画风合规 / 画面可用性），不通过自动换 seed 重生成。
+                </span>
+              </span>
+            </label>
+          ) : null}
           <div className="sm:col-span-2">
             <Label htmlFor="provider-params">默认请求参数（JSON）</Label>
             <Textarea
@@ -513,10 +546,10 @@ export function ProvidersPage() {
               }}
             />
             {paramsError ? (
-              <p className="mt-1.5 text-xs text-[#a4362d]">{paramsError}</p>
+              <p className="mt-1.5 text-xs text-[#e0442e]">{paramsError}</p>
             ) : null}
           </div>
-          <label className="flex items-center gap-3 rounded-md border border-line bg-white px-3 py-3 text-sm font-semibold">
+          <label className="flex items-center gap-3 rounded-xl border border-line bg-paper px-3 py-3 text-sm font-semibold">
             <input
               type="checkbox"
               checked={form.enabled}
@@ -529,7 +562,7 @@ export function ProvidersPage() {
             />
             启用此接口
           </label>
-          <label className="flex items-center gap-3 rounded-md border border-line bg-white px-3 py-3 text-sm font-semibold">
+          <label className="flex items-center gap-3 rounded-xl border border-line bg-paper px-3 py-3 text-sm font-semibold">
             <input
               type="checkbox"
               checked={form.is_default}

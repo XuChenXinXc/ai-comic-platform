@@ -393,6 +393,11 @@ class HttpProviderBase:
         validate_provider_base_url(config.base_url)
         self.config = config
 
+    @property
+    def supports_vision(self) -> bool:
+        """是否支持图片输入（视觉质检用）。默认为否，按 Provider 实现覆盖。"""
+        return False
+
     def _api_key(self) -> str:
         if self.config.api_key:
             return self.config.api_key

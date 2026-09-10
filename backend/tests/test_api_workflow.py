@@ -944,3 +944,62 @@ def test_delete_project_default_provider_returns_409_and_keeps_record(
     assert response.status_code == 409
     provider_ids = {item["id"] for item in api_client.get("/api/providers").json()}
     assert provider["id"] in provider_ids
+
+
+def test_keyframe_generate_and_batch_accept_auto_prepare_references(
+    api_client: TestClient,
+) -> None:
+    project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
+    created = api_client.post(
+        f"/api/chapters/{chapter['id']}/shots",
+        json={
+            "action": "主角推开房门。",
+            "image_prompt": "主角站在旧屋门口，右手按住木门。",
+            "video_prompt": "镜头缓缓推进，木门被推开。",
+            "duration_sec": 5,
+        },
+    )
+    assert created.status_code == 201
+    shot_id = created.json()["id"]
+
+    # 单镜生成接收 auto_prepare_references 不应报 422 Extra inputs are not permitted
+    keyframe_job = api_client.post(
+        f"/api/shots/{shot_id}/keyframes/generate",
+        json={"auto_prepare_references": True},
+    )
+    assert keyframe_job.status_code == 202
+
+    # 批量生成接收 auto_prepare_references 不应报 422 Extra inputs are not permitted
+    batch_job = api_client.post(
+        f"/api/chapters/{chapter['id']}/keyframes/batch",
+        json={"ids": [shot_id], "auto_prepare_references": True},
+    )
+    assert batch_job.status_code == 202
+
+
+def test_shot_consistency_issues_prefixed_with_source_target(
+    api_client: TestClient,
+) -> None:
+    project = _create_project(api_client)
+    chapter = _create_chapter(api_client, project["id"])
+    created = api_client.post(
+        f"/api/chapters/{chapter['id']}/shots",
+        json={
+            "action": "主角推开房门。",
+            "image_prompt": "主角站在旧屋门口，地面呈现真实反射。",
+            "video_prompt": "主角向前迈步，地面呈现真实反射。",
+            "duration_sec": 5,
+        },
+    )
+    assert created.status_code == 201
+    shot_data = created.json()
+    issues = shot_data.get("consistency_issues") or []
+    image_issue = [item for item in issues if item["message"].startswith("【分镜图】")]
+    video_issue = [item for item in issues if item["message"].startswith("【视频】")]
+    assert len(image_issue) >= 1
+    assert len(video_issue) >= 1
+    assert "真实反射" in image_issue[0]["message"]
+    assert "真实反射" in video_issue[0]["message"]
+
+

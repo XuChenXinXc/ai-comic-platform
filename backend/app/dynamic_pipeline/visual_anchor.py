@@ -9,10 +9,12 @@ from urllib.parse import urlsplit
 
 from app.dynamic_pipeline.prompt_ir import (
     AssetVisualAnchor,
+    MaterialSpec,
     VisualStyleSpec,
     prompt_input_hash,
 )
 from app.dynamic_pipeline.schemas import CharacterBio, Diagnostic
+from app.dynamic_pipeline.visual_validator import DYNAMIC_REALISM_NEGATIVE_RULES
 
 AssetType = Literal["character", "scene", "prop"]
 ReferencePurpose = Literal[
@@ -42,6 +44,7 @@ _DEFAULT_STYLE: dict[str, Any] = {
     "global_negative_rules": [
         "真人摄影、影视实拍、产品摄影",
         "三维写实渲染、游戏 CG 质感",
+        *DYNAMIC_REALISM_NEGATIVE_RULES,
         "角色身份漂移、资产结构漂移、镜像翻转",
         "错误透视、结构错位、无来源光线",
         "字幕、对白、标题、Logo、签名、水印、乱码",
@@ -84,6 +87,271 @@ _STYLE_OVERRIDE_ALIASES = {
     "material": "material_style",
     "realism": "realism_level",
 }
+_STRUCTURED_STYLE_FIELDS = (
+    "line",
+    "coloring",
+    "shading",
+    "material",
+    "lighting",
+    "depth_of_field",
+    "realism",
+    "texture",
+    "forbidden_styles",
+)
+_BASE_TWO_D_FORBIDDEN_STYLES = [
+    "3D",
+    "photorealistic",
+    "PBR",
+    "cel-shading",
+    "concept art",
+    "oil painting",
+]
+
+
+def _derive_structured_style(style_prompt: str) -> dict[str, Any]:
+    """从项目画风文本推导结构化视觉 DNA 默认值（只覆盖二维/国漫/水墨类画风）。
+
+    未命中任何二维关键词、或画风明确偏向写实/3D/真人时返回空 dict，
+    不强行给用户画风套用二维规则。半写实漫风按二维处理，但不禁用写实明暗。
+    """
+
+    prompt = style_prompt.strip()
+    if not prompt:
+        return {}
+    folded = prompt.casefold()
+    two_dimensional = any(
+        key in folded for key in ("二维", "国漫", "漫画", "动漫", "2d", "漫风", "仿真人")
+    )
+    ink = any(key in folded for key in ("水墨", "写意", "国画"))
+    semi_realistic = "半写实" in folded
+    realistic = (
+        ("写实" in folded and not semi_realistic)
+        or ("真人" in folded and "仿真人" not in folded)
+        or any(
+            key in folded
+            for key in ("3d", "三维", "实拍", "摄影", "电影级", "cg渲染")
+        )
+    )
+    if realistic:
+        # 写实/3D 画风不套用二维禁则，改为锁定「摄影写实 / 三维CG」的正向指纹：
+        # 用户自由文本（style_prompt）仍然唯一可信，但推导出的结构化字段把宽泛的
+        # 写实语义压成一组稳定视觉参数，防止逐镜滑向二维手绘或真人实拍互相漂移。
+        realistic_3d = any(
+            key in folded for key in ("3d", "三维", "cg渲染", "游戏cg", "建模")
+        )
+        cinematic = "电影级" in folded or "影视级" in folded or "电影感" in folded
+        if realistic_3d:
+            # 渲染描述压缩：每个渲染概念只声明一次。媒介与排除（CG 动画质感、
+            # 非真人实拍、非二维手绘）由渲染指纹声明；PBR、全局光照、写实明暗、
+            # 写实度各占一个结构化字段，不在「上色/材质/光影/指纹」里重复锁多遍。
+            return {
+                "line": {
+                    "type": "无描线（三维模型轮廓）",
+                    "thickness": "无",
+                    "continuity": "不适用",
+                },
+                "coloring": {
+                    "method": "材质着色自然色彩",
+                    "saturation": "自然",
+                    "color_count": "自然过渡",
+                },
+                "shading": {
+                    "method": "写实体积明暗",
+                    "gradient": "柔和渐变",
+                    "realistic_shading": True,
+                },
+                "material": {
+                    "method": "PBR 材质",
+                    "pbr": True,
+                    "photographic_reflection": True,
+                },
+                "lighting": {
+                    "realism": "三维全局光照",
+                    "volumetric": None,
+                    "cinematic_glow": False,
+                },
+                "depth_of_field": {"enabled": True},
+                "realism": {"character": 1.0, "environment": 1.0},
+                "texture": "真实材质纹理与模型精度",
+                "forbidden_styles": [
+                    "二维平涂动漫",
+                    "赛璐璐",
+                    "手绘水墨",
+                    "手绘线稿",
+                    "真人实拍",
+                ],
+                # 三维CG项目不沿用默认的反写实化负向（默认列表含
+                # 「三维写实渲染、游戏 CG 质感」「PBR 材质」等反3D条款）。
+                "global_negative_rules": [
+                    "真人摄影、影视实拍、产品摄影",
+                    "二维平涂动漫、赛璐璐、手绘水墨、手绘线稿",
+                    "角色身份漂移、资产结构漂移、镜像翻转",
+                    "错误透视、结构错位、无来源光线",
+                    "字幕、对白、标题、Logo、签名、水印、乱码",
+                ],
+                "render_fingerprint": (
+                    "画面为三维建模渲染的 CG 动画质感，不是真人实拍、不是二维手绘动漫；"
+                    "人物与场景采用三维渲染表达，模型轮廓干净、无手绘描线；"
+                    "光影、材质与反射表现按上述结构化规范渲染，保持全片一致；"
+                    "保持三维建模渲染质感，但避免写实到像真人实拍，"
+                    "避免夸张游戏宣传海报式高反光、重特效、过饱和与塑料感。"
+                ),
+            }
+        return {
+            "line": {
+                "type": "无描线（摄影写实轮廓）",
+                "thickness": "无",
+                "continuity": "不适用",
+            },
+            "coloring": {
+                "method": "自然色彩与肤色还原",
+                "saturation": "自然",
+                "color_count": "自然过渡",
+            },
+            "shading": {
+                "method": "写实体积明暗",
+                "gradient": "柔和渐变",
+                "realistic_shading": True,
+            },
+            "material": {
+                "method": "真实物理材质",
+                "pbr": None,
+                "photographic_reflection": None,
+            },
+            "lighting": {
+                "realism": "写实电影布光" if cinematic else "写实自然布光",
+                "volumetric": None,
+                "cinematic_glow": False,
+            },
+            "depth_of_field": {"enabled": True},
+            "realism": {"character": 1.0, "environment": 1.0},
+            "texture": "真实皮肤与面料质感",
+            "forbidden_styles": [
+                "二维平涂动漫",
+                "赛璐璐",
+                "手绘水墨",
+                "卡通渲染",
+            ],
+            # 真人写实项目排除二维手绘与三维CG漂移，不沿用默认的反3D条款。
+            "global_negative_rules": [
+                "二维平涂动漫、赛璐璐、手绘水墨、卡通渲染、三维CG",
+                "角色身份漂移、资产结构漂移、镜像翻转",
+                "错误透视、结构错位、无来源光线",
+                "字幕、对白、标题、Logo、签名、水印、乱码",
+            ],
+            "render_fingerprint": (
+                "画面为真人实拍质感的写实影像，不是二维手绘动漫、不是三维CG；"
+                "人物皮肤与衣物呈现真实物理质感，五官与肤色按真人比例还原；"
+                "光影符合真实光学规律，不使用二维平涂明暗或手绘笔触；"
+                "材质与反射表现保持全片一致。"
+            ),
+        }
+    if not two_dimensional and not ink:
+        return {}
+    result: dict[str, Any] = {
+        "material": {"method": "绘画概括", "pbr": False, "photographic_reflection": False},
+        "lighting": {
+            "realism": "写意" if ink else "",
+            "volumetric": False,
+            "cinematic_glow": False,
+        },
+        "depth_of_field": {"enabled": False},
+        "shading": {
+            "method": "墨色明暗块" if ink else "",
+            "gradient": "弱" if ink else "",
+            # 半写实画风需要写实明暗，不输出「禁用写实明暗」限制。
+            "realistic_shading": None if semi_realistic else False,
+        },
+    }
+    # 赛璐璐/平涂类画风禁用 cel-shading 会反向禁用自身表达方式，
+    # 画风原文声明该词时从默认禁则中剔除。
+    forbidden_styles = copy.deepcopy(_BASE_TWO_D_FORBIDDEN_STYLES)
+    if "赛璐璐" in folded or "平涂" in folded:
+        forbidden_styles = [
+            item for item in forbidden_styles if item.casefold() != "cel-shading"
+        ]
+    result["forbidden_styles"] = forbidden_styles
+    if not ink and not semi_realistic:
+        # 普通二维（国漫/漫画/动漫/2d/漫风）默认：清晰描线 + 平涂上色，
+        # 让视觉圣经面板的线条/上色分组也有推导回显，而不是永远空白。
+        result["line"] = {
+            "type": "清晰描线",
+            "thickness": "中等",
+            "continuity": "连贯",
+        }
+        result["coloring"] = {
+            "method": "平涂上色",
+            "saturation": "自然",
+            "color_count": "自然",
+        }
+    if semi_realistic:
+        # 半写实仿真人漫风：主体仍是二维绘画，但保留写实明暗、真实比例与
+        # 细腻肤色渲染；「影视级/电影感」变体额外放开写实电影布光与浅景深，
+        # 让结构化视觉圣经对这类画风产出完整的正向约束而不是只有禁用条目。
+        cinematic = "影视级" in folded or "电影感" in folded
+        result["line"] = {
+            "type": "精细写实勾线",
+            "thickness": "细",
+            "continuity": "连贯",
+        }
+        result["coloring"] = {
+            "method": "写实肤色与自然色上色",
+            "saturation": "中高",
+            "color_count": "自然过渡",
+        }
+        result["shading"] = {
+            "method": "写实体积明暗",
+            "gradient": "柔和渐变",
+            "realistic_shading": True,
+        }
+        result["material"] = {
+            "method": "半写实绘画质感",
+            "pbr": False,
+            "photographic_reflection": False,
+        }
+        result["lighting"] = {
+            "realism": "写实电影布光" if cinematic else "自然写实布光",
+            "volumetric": None if cinematic else False,
+            "cinematic_glow": None if cinematic else False,
+        }
+        result["depth_of_field"] = {"enabled": True if cinematic else False}
+        result["realism"] = {
+            "character": 0.85 if cinematic else 0.8,
+            "environment": 0.8 if cinematic else 0.7,
+        }
+        result["texture"] = (
+            "细腻皮肤质感、电影级光影过渡、半写实绘画笔触"
+            if cinematic
+            else "细腻皮肤质感、半写实绘画笔触"
+        )
+        # 渲染方式指纹：把宽泛的半写实仿真人漫拆成一组稳定视觉参数，
+        # 每镜逐字重复同一套指纹，才能压住场景、灯光或新增角色参考图带来的漂移。
+        result["render_fingerprint"] = (
+            "人物采用接近真人比例的半写实人漫造型，五官真实但保留轻微漫画概括；"
+            "皮肤为细腻哑光手绘质感，不出现真人毛孔摄影质感；"
+            "轮廓线极弱，仅在局部结构转折处可见；"
+            "头发采用成束塑形与细碎发丝结合；"
+            "衣物保持真实褶皱但带适度绘制概括；"
+            "场景材质真实但不过度PBR化；"
+            "阴影柔和自然，不采用硬边赛璐璐阴影；"
+            f"整体为{'影视动画' if cinematic else '手绘动画'}渲染，"
+            "不是真人照片，不是3D游戏CG，不是二维平涂动漫。"
+        )
+        return result
+    if ink:
+        line_type = "工笔细线" if "工笔" in folded else "粗笔焦墨"
+        result["line"] = {
+            "type": line_type,
+            "thickness": "中粗" if "粗笔" in folded or "焦墨" in folded else "",
+            "continuity": "允许自然断续",
+        }
+        result["coloring"] = {
+            "method": "重彩点染+湿墨铺色" if "重彩" in folded else "湿墨铺色",
+            "saturation": "低至中",
+            "color_count": "克制",
+        }
+        result["texture"] = "宣纸、水墨晕染、粗笔笔触"
+    return result
 _REFERENCE_TYPE_BY_PURPOSE = {
     "clean_identity": frozenset({"character", "character_identity", "clean_identity"}),
     "layout_reference": frozenset({"scene", "scene_layout", "layout_reference"}),
@@ -364,8 +632,14 @@ def build_visual_style_spec(
     """
 
     values = copy.deepcopy(_DEFAULT_STYLE)
+    structured_supplied = False
     if overrides:
         for key, value in overrides.items():
+            # 结构化字段直接作为结构化覆盖（值为 Mapping 时）；其余键按别名走旧字段。
+            if key in _STRUCTURED_STYLE_FIELDS and isinstance(value, Mapping):
+                values[key] = copy.deepcopy(dict(value))
+                structured_supplied = True
+                continue
             field_name = _STYLE_OVERRIDE_ALIASES.get(key, key)
             if field_name not in VisualStyleSpec.model_fields or field_name in {
                 "style_prompt",
@@ -377,6 +651,10 @@ def build_visual_style_spec(
     values["style_version"] = _text(style_version) or "dynamic-style-v1"
     supplemental = _text(style_prompt)
     values["style_prompt"] = supplemental or None
+    if not structured_supplied and supplemental:
+        derived = _derive_structured_style(supplemental)
+        for field, field_value in derived.items():
+            values[field] = copy.deepcopy(field_value)
     return VisualStyleSpec.model_validate(values)
 
 
@@ -696,12 +974,194 @@ def anchor_version(anchor: AssetVisualAnchor | Mapping[str, Any]) -> str:
     return prompt_input_hash(values)
 
 
+def parse_visual_bible(project: Mapping[str, Any]) -> dict[str, Any] | None:
+    """从项目记录中读取结构化视觉圣经。
+
+    兼容两种来源：ProjectService._public_record 解析后的 ``visual_bible`` 键，
+    以及直接查表得到的原始 ``visual_bible_json`` 字符串。空值返回 None（自动推导）。
+    """
+    visual_bible = project.get("visual_bible")
+    if visual_bible is None:
+        raw = project.get("visual_bible_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                visual_bible = json.loads(raw)
+            except (TypeError, ValueError):
+                visual_bible = None
+        elif isinstance(raw, Mapping):
+            visual_bible = dict(raw)
+    if not isinstance(visual_bible, Mapping) or not visual_bible:
+        return None
+    return dict(visual_bible)
+
+
+def compile_visual_bible(
+    style_prompt: str,
+    visual_bible: Mapping[str, Any] | None,
+) -> VisualStyleSpec:
+    """合并画风原文与结构化覆盖，得到可渲染的视觉规范。
+
+    visual_bible 为空时按 style_prompt 关键词自动推导（只覆盖二维/水墨类画风）。
+    """
+    return build_visual_style_spec(
+        style_prompt=style_prompt or "",
+        overrides=visual_bible or None,
+    )
+
+
+def _tri_state(value: bool | None, label: str) -> str:
+    if value is None:
+        return ""
+    return f"{'启用' if value else '禁用'}{label}"
+
+
+def _material_style_pairs(material: MaterialSpec) -> list[tuple[str, Any]]:
+    """材质分句：方式文本已含 PBR 时不再重复输出「启用PBR」开关，避免同一概念锁多遍。"""
+    pairs: list[tuple[str, Any]] = [("方式", material.method)]
+    if material.pbr is not None and "PBR" not in (material.method or ""):
+        pairs.append(("", _tri_state(material.pbr, "PBR")))
+    if material.photographic_reflection is not None:
+        pairs.append(
+            ("", _tri_state(material.photographic_reflection, "摄影级反射"))
+        )
+    return pairs
+
+
+def _render_style_clause(
+    label: str,
+    pairs: Sequence[tuple[str, Any]],
+) -> str:
+    """把一个结构化分组的已设置字段渲染为「标签：字段「值」」分句。
+
+    name 为空的条目表示已是完整文本（三态开关渲染为「禁用PBR」），直接追加。
+    """
+    bits: list[str] = []
+    for name, value in pairs:
+        text = str(value).strip() if value is not None else ""
+        if not text:
+            continue
+        bits.append(text if not name else f"{name}「{text}」")
+    return f"{label}：" + "、".join(bits) if bits else ""
+
+
+def render_visual_style_spec(spec: VisualStyleSpec) -> str:
+    """把已设置的结构化字段渲染成提示词约束文本；无结构化内容时返回空串。
+
+    只渲染用户设置过或关键词推导出的字段，不渲染默认占位文本；
+    bool 三态渲染为「启用/禁用」，避免把关闭语义写成正向要求。
+    """
+    clauses = [
+        clause
+        for clause in (
+            _render_style_clause(
+                "线条",
+                (
+                    ("类型", spec.line.type),
+                    ("粗细", spec.line.thickness),
+                    ("连贯性", spec.line.continuity),
+                ),
+            ),
+            _render_style_clause(
+                "上色",
+                (
+                    ("方式", spec.coloring.method),
+                    ("饱和度", spec.coloring.saturation),
+                    ("用色", spec.coloring.color_count),
+                ),
+            ),
+            _render_style_clause(
+                "明暗",
+                (
+                    ("方式", spec.shading.method),
+                    ("渐变", spec.shading.gradient),
+                    ("", _tri_state(spec.shading.realistic_shading, "写实明暗")),
+                ),
+            ),
+            _render_style_clause(
+                "材质",
+                _material_style_pairs(spec.material),
+            ),
+            _render_style_clause(
+                "光影",
+                (
+                    ("写实度", spec.lighting.realism),
+                    ("", _tri_state(spec.lighting.volumetric, "体积光")),
+                    ("", _tri_state(spec.lighting.cinematic_glow, "电影级辉光")),
+                ),
+            ),
+        )
+        if clause
+    ]
+    if spec.depth_of_field.enabled is not None:
+        clauses.append(
+            f"景深：{'启用' if spec.depth_of_field.enabled else '禁用'}"
+        )
+    realism_bits = []
+    for name, value in (
+        ("角色写实度", spec.realism.character),
+        ("环境写实度", spec.realism.environment),
+    ):
+        if value is not None:
+            realism_bits.append(f"{name}「{value:g}」")
+    if realism_bits:
+        clauses.append("写实度：" + "、".join(realism_bits))
+    if _text(spec.texture):
+        clauses.append(f"画面质感「{_text(spec.texture)}」")
+    if _text(spec.render_fingerprint):
+        clauses.append(
+            f"渲染方式锁定：{_text(spec.render_fingerprint).rstrip('。')}"
+        )
+    return "结构化画风规范：" + "；".join(clauses) + "。" if clauses else ""
+
+
+def visual_style_negative_terms(spec: VisualStyleSpec) -> list[str]:
+    """把禁用风格列表归一化为负面提示词条目。"""
+    return [str(item).strip() for item in spec.forbidden_styles if str(item).strip()]
+
+
+def merge_visual_bible_negative(
+    negative_prompt: str,
+    spec: VisualStyleSpec,
+) -> str:
+    """把禁用风格幂等地并入负面提示词（兼容顿号/逗号/分号分隔）。"""
+    terms = visual_style_negative_terms(spec)
+    if not terms:
+        return negative_prompt
+    existing = [
+        item.strip()
+        for item in re.split(r"[、，,；;]", str(negative_prompt or ""))
+        if item.strip()
+    ]
+    merged = list(existing)
+    for term in terms:
+        if term not in merged:
+            merged.append(term)
+    return "、".join(merged)
+
+
+def visual_bible_brief(project: Mapping[str, Any]) -> str:
+    """LLM 系统提示词引用的画风结构化约束片段；无内容时返回空串。"""
+    brief = render_visual_style_spec(
+        compile_visual_bible(
+            project.get("style_prompt") or "",
+            parse_visual_bible(project),
+        )
+    )
+    return f"项目画风结构化约束：{brief}\n" if brief else ""
+
+
 __all__ = [
     "anchor_version",
     "asset_profile_to_anchor",
     "build_visual_style_spec",
     "character_bio_to_anchor",
+    "compile_visual_bible",
     "filter_generation_references",
+    "merge_visual_bible_negative",
+    "parse_visual_bible",
     "ReferenceDiagnostic",
     "reference_is_usable",
+    "render_visual_style_spec",
+    "visual_bible_brief",
+    "visual_style_negative_terms",
 ]

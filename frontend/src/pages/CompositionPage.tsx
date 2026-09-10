@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router";
 import { toast } from "sonner";
 import { api, mediaUrl } from "../api/client";
+import { PageHeader } from "../components/status";
 import { Modal } from "../components/ui";
 import { formatError } from "../lib/utils";
 import type { Chapter, MediaVersion } from "../types/api";
@@ -19,6 +20,7 @@ interface CompositionConfig {
   burn_subtitles: boolean;
   bgm_id: string;
   bgm_volume: number;
+  anime_cadence: boolean;
 }
 
 export default function CompositionPage() {
@@ -32,6 +34,7 @@ export default function CompositionPage() {
     burn_subtitles: true,
     bgm_id: "",
     bgm_volume: 0.3,
+    anime_cadence: false,
   });
   const [composing, setComposing] = useState(false);
   const [compositionStatus, setCompositionStatus] = useState<{
@@ -133,6 +136,7 @@ export default function CompositionPage() {
         burn_subtitles: config.burn_subtitles,
         bgm_id: config.bgm_id || undefined,
         bgm_volume: config.bgm_volume,
+        anime_cadence: config.anime_cadence,
       });
 
       setCompositionStatus(result);
@@ -238,27 +242,28 @@ export default function CompositionPage() {
   };
 
   return (
-    <div className="p-6 max-w-5xl mx-auto">
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold mb-2">最终合成</h1>
-        <p className="text-gray-600">生成完整的章节视频（包含配音、BGM、字幕）</p>
-      </div>
+    <div className="mx-auto max-w-5xl">
+      <PageHeader
+        eyebrow="Step 07 / Composition"
+        title="最终合成"
+        description="生成完整的章节视频（包含配音、BGM、字幕）"
+      />
 
       {loadError ? (
         <div
           role="alert"
-          className="mb-6 rounded border border-red-200 bg-red-50 p-4 text-sm text-red-700"
+          className="mb-6 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700 dark:border-red-500/25 dark:bg-red-500/10 dark:text-red-300"
         >
           视频合成初始化失败：{loadError}
         </div>
       ) : null}
       {/* 章节选择 */}
-      <div className="bg-white rounded-lg shadow p-4 mb-6">
+      <div className="bg-paper rounded-card border border-black/[0.06] shadow-card p-5 mb-6 dark:border-white/10 dark:bg-[#101010]">
         <h2 className="text-lg font-semibold mb-4">选择章节</h2>
         <select
           value={selectedChapter}
           onChange={(e) => setSelectedChapter(e.target.value)}
-          className="w-full border rounded px-3 py-2"
+          className="h-11 w-full rounded-2xl border border-black/10 bg-black/[0.02] px-4 text-sm text-ink outline-none transition focus:border-vermilion focus:ring-2 focus:ring-vermilion/15 dark:border-white/10 dark:bg-white/5"
         >
           <option value="">请选择章节</option>
           {chapters.map(chapter => (
@@ -271,7 +276,7 @@ export default function CompositionPage() {
 
       {/* 合成配置 */}
       {selectedChapter && (
-        <div className="bg-white rounded-lg shadow p-4 mb-6">
+        <div className="bg-paper rounded-card border border-black/[0.06] shadow-card p-5 mb-6 dark:border-white/10 dark:bg-[#101010]">
           <h2 className="text-lg font-semibold mb-4">合成配置</h2>
 
           <div className="space-y-4">
@@ -309,13 +314,29 @@ export default function CompositionPage() {
               <label className="text-sm font-medium">烧录字幕</label>
             </div>
 
+            <div className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                id="anime-cadence"
+                checked={config.anime_cadence}
+                onChange={(e) => setConfig(prev => ({ ...prev, anime_cadence: e.target.checked }))}
+                className="mt-0.5"
+              />
+              <label htmlFor="anime-cadence" className="text-sm">
+                <span className="font-medium">动画节奏化（去 AI 味）</span>
+                <span className="block text-xs text-muted mt-0.5">
+                  成片抽帧到 12fps 模拟手绘张数感，并叠加轻微颗粒，降低视频顺滑塑料感
+                </span>
+              </label>
+            </div>
+
             <div>
               <div className="flex items-center justify-between mb-2">
                 <label className="block text-sm font-medium">背景音乐（可选）</label>
                 <button
                   onClick={handleUploadBGM}
                   disabled={uploadingBGM}
-                  className="text-sm text-blue-500 hover:text-blue-600 disabled:text-gray-400"
+                  className="text-sm text-vermilion hover:text-brand-hover disabled:text-muted"
                 >
                   {uploadingBGM ? "上传中..." : "+ 上传 BGM"}
                 </button>
@@ -326,12 +347,12 @@ export default function CompositionPage() {
                 value={bgmName}
                 onChange={(e) => setBgmName(e.target.value)}
                 placeholder="上传时使用的 BGM 名称（留空使用文件名）"
-                className="mb-2 w-full border rounded px-3 py-2 text-sm"
+                className="mb-2 h-11 w-full rounded-2xl border border-black/10 bg-black/[0.02] px-4 text-sm text-ink outline-none transition focus:border-vermilion focus:ring-2 focus:ring-vermilion/15 dark:border-white/10 dark:bg-white/5"
               />
               <select
                 value={config.bgm_id}
                 onChange={(e) => setConfig(prev => ({ ...prev, bgm_id: e.target.value }))}
-                className="w-full border rounded px-3 py-2"
+                className="h-11 w-full rounded-2xl border border-black/10 bg-black/[0.02] px-4 text-sm text-ink outline-none transition focus:border-vermilion focus:ring-2 focus:ring-vermilion/15 dark:border-white/10 dark:bg-white/5"
               >
                 <option value="">无</option>
                 {bgms.map(bgm => (
@@ -380,7 +401,7 @@ export default function CompositionPage() {
             <button
               onClick={handleCompose}
               disabled={composing || !selectedChapter}
-              className="bg-blue-500 text-white px-6 py-2 rounded hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed"
+              className="bg-vermilion text-white px-6 py-2 rounded-full hover:bg-brand-hover disabled:bg-black/10 dark:disabled:bg-white/10 disabled:cursor-not-allowed"
             >
               {composing ? "创建中..." : "开始合成"}
             </button>
@@ -390,19 +411,19 @@ export default function CompositionPage() {
 
       {/* 合成状态 */}
       {compositionStatus && (
-        <div className="bg-white rounded-lg shadow p-4">
+        <div className="bg-paper rounded-card border border-black/[0.06] shadow-card p-5 dark:border-white/10 dark:bg-[#101010]">
           <h2 className="text-lg font-semibold mb-4">合成状态</h2>
 
           <div className="space-y-2">
             <div className="flex items-center gap-2">
               <span className="text-sm font-medium">状态:</span>
-              <span className={`px-2 py-0.5 rounded text-sm ${
+              <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
                 compositionStatus.status === "completed"
-                  ? "bg-green-100 text-green-700"
+                  ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300"
                   : compositionStatus.status === "failed"
                   ? "bg-red-100 text-red-700"
                   : compositionStatus.status === "cancelled" || compositionStatus.status === "interrupted"
-                  ? "bg-gray-100 text-gray-600"
+                  ? "bg-canvas/70 dark:bg-white/[0.06] text-muted"
                   : "bg-yellow-100 text-yellow-700"
               }`}>
                 {compositionStatus.status === "completed" ? "已完成" :
@@ -437,26 +458,26 @@ export default function CompositionPage() {
                       <video
                         controls
                         src={compositionMediaUrl}
-                        className="w-full max-w-2xl rounded border"
+                        className="w-full max-w-2xl rounded-2xl border border-black/[0.06] dark:border-white/10"
                       />
                       <a
                         href={compositionMediaUrl}
                         download
-                        className="inline-block bg-green-500 text-white px-6 py-2 rounded hover:bg-green-600"
+                        className="inline-block bg-emerald-500 text-white px-6 py-2 rounded-full hover:bg-emerald-600"
                       >
                         下载成品视频
                       </a>
                     </>
                   );
                 })()}
-                <p className="text-sm text-gray-500 mt-2">
+                <p className="text-sm text-muted mt-2">
                   文件路径: {compositionStatus.file_path}
                 </p>
               </div>
             )}
 
             {compositionStatus.job_id && compositionStatus.status === "processing" && (
-              <p className="text-sm text-gray-500 mt-2">
+              <p className="text-sm text-muted mt-2">
                 任务 ID: {compositionStatus.job_id}（可在任务列表查看详情）
               </p>
             )}
@@ -475,21 +496,21 @@ export default function CompositionPage() {
             <button
               type="button"
               onClick={() => setConfirmDeleteBgmId(null)}
-              className="px-4 py-2 rounded border border-gray-300 bg-white text-sm hover:bg-gray-50"
+              className="px-4 py-2 rounded-full border border-line bg-paper text-sm hover:bg-black/5 dark:hover:bg-white/10"
             >
               取消
             </button>
             <button
               type="button"
               onClick={() => void handleConfirmDeleteBGM()}
-              className="px-4 py-2 rounded bg-red-500 text-white text-sm hover:bg-red-600"
+              className="px-4 py-2 rounded-full bg-red-500 text-white text-sm hover:bg-red-600"
             >
               删除
             </button>
           </>
         }
       >
-        <p className="text-sm text-gray-600">删除后无法恢复。</p>
+        <p className="text-sm text-muted">删除后无法恢复。</p>
       </Modal>
     </div>
   );

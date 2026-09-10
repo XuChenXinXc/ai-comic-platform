@@ -225,6 +225,9 @@ class CharacterAssetOutput(AssetVisualPromptFields):
     shoes: str = ""
     accessories: str = ""
     carried_item: str = ""
+    # 视觉语义重解释治理（Phase 2）：角色只输出身份事实，不再生成布光/氛围描述。
+    # 以下两个字段仅为兼容存量档案保留；若历史数据存在内容，只允许光源方向/时间等
+    # 事实性描述，不得写入布光、氛围、造型气质或妆容画法（表达方式由项目统一画风决定）。
     lighting: str = ""
     atmosphere: str = ""
     expression_group: list[str] = Field(default_factory=list)
@@ -285,6 +288,11 @@ class SceneAssetOutput(AssetVisualPromptFields):
     worldview: str = ""
     indoor_outdoor: str = ""
     place_type: str = ""
+    # 场景族：同一实体地点按视觉空间拆出的多个场景共享同一个 scene_family
+    # （如「古城墙」）；family_anchor 标记族内锚点场景（每族恰好一个）。
+    # 族成员生成设定图时以锚点场景的当前场景图为参考，保证同一建筑群外观一致。
+    scene_family: str = ""
+    family_anchor: bool = False
     plot_function: str = ""
     time_of_day: str = ""
     weather: str = ""
@@ -304,9 +312,15 @@ class SceneAssetOutput(AssetVisualPromptFields):
     furniture_material: str = ""
     glass_metal_material: str = ""
     special_material: str = ""
+    # 固有颜色事实（如「门为暗朱红」）：只记录墙体、家具与陈设的固有色，
+    # 不写色彩气质、色彩氛围等自由艺术指导（表达方式由项目统一画风决定）。
     main_color: str = ""
     accent_color: str = ""
+    # 以下字段为兼容存量档案保留，不再生成自由艺术指导内容；
+    # 场景光线只允许受控事实：time_of_day（昼/夜）、weather（天气）、
+    # light_direction（光源方向）。旧字段如出现内容，仅作事实性参考。
     color_quality: str = ""
+    light_direction: str = ""
     main_view: str = ""
     standard_view_1: str = ""
     standard_view_2: str = ""
@@ -380,10 +394,14 @@ class PropAssetOutput(AssetVisualPromptFields):
     back_structure: str = ""
     other_structure: str = ""
     key_structure_position: str = ""
+    # 视觉语义重解释治理（Phase 2）：材质只记录结构事实（金属/玻璃/塑料/屏幕是否
+    # 透明、是否发光、光滑或哑光、颜色、磨损），不写渲染表达（真实PBR反射、镜面高光、
+    # 透明折射、逼真材质贴图等由项目统一画风决定）。
     material: str = ""
     secondary_material: str = ""
     color: str = ""
     accent_color: str = ""
+    # 受控词表：光滑/哑光/粗糙/透明/发光/带磨损等事实，不写渲染画法。
     surface_texture: str = ""
     wear: str = ""
     detail_zone: list[str] = Field(default_factory=list)
@@ -534,9 +552,6 @@ class ShotOutput(OutputModel):
     # 允许为空：剧情发生地无法对应素材库中任何场景时留空，并通过
     # missing_assets 报告缺失，由后端补素材后重新绑定，禁止强行绑定近似素材。
     scene_asset_id: str = ""
-    # 场景视角（Scene View）：只能从素材目录中该场景已有的视图里选择；
-    # 空串表示默认（MASTER）。禁止为视角新建场景素材或编造不存在的视图 key。
-    scene_view_key: str = ""
     character_names: list[NonEmptyText]
     character_asset_ids: list[NonEmptyText]
     prop_names: list[NonEmptyText]
@@ -807,6 +822,16 @@ class ShotVideoPromptOptimizeOutput(OutputModel):
     plain_text_output_field: ClassVar[str] = "prompt"
 
     prompt: NonEmptyText
+
+
+class KeyframeQaOutput(OutputModel):
+    """关键帧视觉质检结果（视觉模型评估）。"""
+
+    passed: bool
+    score: int = Field(ge=0, le=100)
+    face_drift: bool = False
+    style_violation: bool = False
+    issues: list[str] = Field(default_factory=list)
 
 
 DirectorComposition = Literal[

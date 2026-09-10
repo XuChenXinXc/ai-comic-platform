@@ -151,7 +151,10 @@ export function ShotMediaCard({
         applySavedPrompt(updatedShot, requestedPrompt);
       }
       return kind === "keyframe"
-        ? api.shots.keyframes.generate(shot.id)
+        ? api.shots.keyframes.generate(shot.id, {
+            // 缺干净参考图时自动入队参考图模式生成，避免设定展板污染分镜画面
+            auto_prepare_references: true,
+          })
         : api.shots.videos.generate(shot.id);
     },
     onSuccess: async () => {
@@ -258,7 +261,7 @@ export function ShotMediaCard({
           </div>
         ) : (
           <div className="flex min-w-0 items-start gap-3">
-            <label className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded bg-sidebar text-xs font-bold text-white">
+            <label className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-ink text-xs font-bold text-white dark:bg-white dark:text-black">
               <input
                 type="checkbox"
                 className="sr-only"
@@ -367,11 +370,11 @@ export function ShotMediaCard({
             />
           </div>
           {shot.negative_prompt ? (
-            <div className="rounded-md border border-line bg-white/55 p-3">
+            <div className="rounded-2xl border border-black/[0.06] bg-paper/55 p-3 dark:border-white/10 dark:bg-white/[0.05]">
               <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
                 禁止事项
               </p>
-              <p className="mt-2 line-clamp-4 text-xs leading-5 text-[#454842]">
+              <p className="mt-2 line-clamp-4 text-xs leading-5 text-muted">
                 {shot.negative_prompt}
               </p>
             </div>

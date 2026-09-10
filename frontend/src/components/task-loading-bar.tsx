@@ -56,13 +56,13 @@ export function TaskLoadingBar({ jobs }: { jobs: Job[] }) {
     <aside
       role="status"
       aria-live="polite"
-      className="sticky top-0 z-10 mb-5 overflow-hidden rounded-lg border border-[#e2aa88] bg-[#fff8f2]/95 shadow-sm backdrop-blur"
+      className="mb-5 overflow-hidden rounded-2xl border border-sky-200/70 bg-white/80 shadow-card backdrop-blur lg:sticky lg:top-[84px] lg:z-10 dark:border-sky-500/25 dark:bg-[#101010]/80"
     >
       <div className="flex items-center gap-3 px-4 py-3">
         <LoaderCircle className="h-5 w-5 shrink-0 animate-spin text-vermilion" />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <p className="text-sm font-bold text-ink">{title}</p>
+            <p className="text-sm font-semibold text-ink">{title}</p>
             {singleJob ? <StatusBadge status={singleJob.status} /> : null}
           </div>
           <p className="mt-0.5 truncate text-xs text-muted">
@@ -72,7 +72,7 @@ export function TaskLoadingBar({ jobs }: { jobs: Job[] }) {
         <Link
           to="/jobs"
           aria-label="查看任务中心"
-          className="flex shrink-0 items-center gap-1.5 rounded-md border border-[#d9ae7f] bg-white px-3 py-2 text-xs font-bold text-[#7b431d] hover:bg-[#fff3e5]"
+          className="flex shrink-0 items-center gap-1.5 rounded-full border border-black/10 bg-white px-3.5 py-2 text-xs font-semibold text-ink shadow-sm transition hover:bg-black hover:text-white dark:border-white/15 dark:bg-white/10 dark:text-white dark:hover:bg-white dark:hover:text-black"
         >
           <ListChecks className="h-4 w-4" />
           <span className="hidden sm:inline">任务中心</span>
@@ -85,9 +85,9 @@ export function TaskLoadingBar({ jobs }: { jobs: Job[] }) {
           <div
             role="progressbar"
             aria-label="任务正在处理"
-            className="h-1.5 overflow-hidden rounded-full bg-black/10"
+            className="h-1.5 overflow-hidden rounded-full bg-black/10 dark:bg-white/10"
           >
-            <div className="h-full w-1/2 animate-pulse rounded-full bg-vermilion" />
+            <div className="progress-shine h-full w-1/2 rounded-full bg-vermilion" />
           </div>
         )}
       </div>

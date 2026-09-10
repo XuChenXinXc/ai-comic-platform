@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -9,6 +10,7 @@ from app.db import Database, db
 from app.models.tables import api_provider, job, project
 from app.services.errors import ServiceError, bad_request, conflict, not_found
 from app.services.file_service import FileService, FileServiceError, derive_file_service
+from app.services.setting_service import get_default_style_prompt
 from app.services.signature_service import source_signature
 from app.services.utils import new_id, row_dict, utc_now
 
@@ -36,6 +38,14 @@ class ProjectService:
         result.pop("storage_name", None)
         result["storage_path"] = str(self.storage.project_path(record["id"]))
         result["is_free_create"] = bool(record.get("is_free_create", 0))
+        visual_bible_json = result.get("visual_bible_json")
+        if isinstance(visual_bible_json, str) and visual_bible_json.strip():
+            try:
+                result["visual_bible"] = json.loads(visual_bible_json)
+            except ValueError:
+                result["visual_bible"] = None
+        else:
+            result["visual_bible"] = None
         return result
 
     @staticmethod
@@ -58,6 +68,9 @@ class ProjectService:
     def create(self, values: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
         source_text = values.get("source_text", "")
+        # 统一画风留空时回填平台默认画风（数据库设置，非代码写死）。
+        if not str(values.get("style_prompt") or "").strip():
+            values["style_prompt"] = get_default_style_prompt(self.database)
         project_id = new_id("project")
         defaults = {}
         with self.database.engine.connect() as connection:

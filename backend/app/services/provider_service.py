@@ -358,6 +358,14 @@ class ProviderService:
                     .where(audio_config.c.tts_provider_id == provider_id)
                     .values(tts_provider_id=None)
                 )
+                # 历史任务同样允许删除：置空引用，与媒体表口径一致。
+                # 此前遗漏 job.provider_id，导致任何跑过任务的 Provider
+                # 都会撞外键 IntegrityError 被误报为「已被任务引用」。
+                connection.execute(
+                    update(job)
+                    .where(job.c.provider_id == provider_id)
+                    .values(provider_id=None)
+                )
                 connection.execute(delete(api_provider).where(api_provider.c.id == provider_id))
         except IntegrityError as exc:
             raise conflict("Provider 已被媒体或任务引用，不能删除") from exc

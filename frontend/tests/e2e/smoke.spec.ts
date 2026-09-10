@@ -179,10 +179,10 @@ test("test_narrow_viewport_exposes_settings_provider_and_job_navigation", async 
   await expect(page.getByRole("link", { name: "接口配置" })).toBeVisible();
   await expect(page.getByRole("link", { name: "任务中心" })).toBeVisible();
   const productionNav = page.getByRole("navigation", {
-    name: "四步生产轨道",
+    name: "生产步骤导航",
   });
-  // 生产轨道已扩展为 8 项（项目/剧本/素材/分镜/配音/合成/自由制作/动态漫）。
-  await expect(productionNav.getByRole("link")).toHaveCount(8);
+  // 生产轨道为 7 项（项目/剧本/素材/分镜/配音/合成/自由制作）。
+  await expect(productionNav.getByRole("link")).toHaveCount(7);
   await expect(
     productionNav.getByRole("link", { name: /分镜视频/ }),
   ).toHaveCount(1);

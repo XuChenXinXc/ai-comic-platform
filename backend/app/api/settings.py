@@ -3,18 +3,22 @@ from fastapi import APIRouter, Depends
 from app.api.schemas import (
     CameraPolicySetting,
     CameraPolicyUpdate,
+    DefaultStylePromptSetting,
+    DefaultStylePromptUpdate,
     ImgbbKeyStatus,
     ProjectStorageSelectionResult,
     ProjectStorageSetting,
+    SetImgbbKeyRequest,
 )
 from app.dependencies import get_setting_service
 from app.services.camera_library import SUPPORTED_POLICIES
-from app.services.errors import bad_request
 from app.services.setting_service import (
     SettingService,
     get_camera_policy,
+    get_default_style_prompt,
     get_imagbb_api_key_override,
     set_camera_policy,
+    set_default_style_prompt,
     set_imagbb_api_key,
 )
 
@@ -54,14 +58,11 @@ def get_imgbb_key_status(
 
 @router.post("/imgbb-key", response_model=ImgbbKeyStatus)
 def set_imgbb_key(
-    body: dict,
+    body: SetImgbbKeyRequest,
     service: SettingService = Depends(get_setting_service),
 ) -> dict:
     """保存 ImgBB Key（DPAPI/Keychain 加密）。空字符串表示清除。"""
-    plaintext = str(body.get("api_key") or "")
-    if plaintext and len(plaintext) > 200:
-        raise bad_request("ImgBB API Key 长度不能超过 200 字符")
-    set_imagbb_api_key(service.database, plaintext)
+    set_imagbb_api_key(service.database, body.api_key.strip())
     return get_imgbb_key_status(service=service)  # type: ignore[arg-type]
 
 
@@ -71,6 +72,24 @@ def get_camera_policy_setting(
 ) -> dict:
     """读取平台运镜策略（克制 / 标准 / 丰富）。"""
     return {"policy": get_camera_policy(service.database), "options": list(SUPPORTED_POLICIES)}
+
+
+@router.get("/default-style-prompt", response_model=DefaultStylePromptSetting)
+def get_default_style_prompt_setting(
+    service: SettingService = Depends(get_setting_service),
+) -> dict:
+    """读取平台默认画风（新建项目未填写统一画风时回填该值）。"""
+    return {"style_prompt": get_default_style_prompt(service.database)}
+
+
+@router.post("/default-style-prompt", response_model=DefaultStylePromptSetting)
+def set_default_style_prompt_setting(
+    body: DefaultStylePromptUpdate,
+    service: SettingService = Depends(get_setting_service),
+) -> dict:
+    """保存平台默认画风；空字符串表示清除。"""
+    style_prompt = set_default_style_prompt(service.database, body.style_prompt)
+    return {"style_prompt": style_prompt}
 
 
 @router.post("/camera-policy", response_model=CameraPolicySetting)

@@ -38,6 +38,7 @@ from app.services.prompt_service import compile_video_prompt
 from app.services.shot_service import (
     ShotService,
     _collect_prompt_reference_tokens,
+    _extract_protocol_tail,
     _validate_prompt_reference_identity,
 )
 
@@ -338,22 +339,61 @@ def test_output_avoids_template_style_and_banned_words() -> None:
     )
 
     assert "【" not in prompt
+    # 协议尾部（Negative / Motion style lock / Animation cadence lock）是渲染器
+    # 有意注入的约束文本，模板化措辞检查只针对正文部分（与视觉校验器豁免口径一致）。
+    body = prompt.split("\n\nMotion style lock:", 1)[0]
+    body = body.split("\n\nNegative:", 1)[0]
     for word in _FORBIDDEN_TEMPLATE_WORDS:
-        assert word not in prompt
+        assert word not in body
+    assert "Motion style lock:" in prompt
+    assert "Animation cadence lock:" in prompt
+    assert "一拍二" in prompt
     # 不再出现「所有物体禁止移动」式场景冻结
     assert "不得在动画中移动、旋转、重构或重新生成" not in prompt
     assert "移动、旋转、重构" not in prompt
 
 
-def test_outdoor_scene_gets_wind_not_indoor_clutter() -> None:
+def test_3d_style_uses_3d_locks_and_skips_2d_negative_rules() -> None:
+    """三维CG画风：运动锁/节奏锁为3D版，反写实化负向不注入，正向PBR不被反向禁用。"""
+    prompt = _render(style="半写实3D国漫风，摄影级反射")
+
+    assert "Motion style lock:" in prompt
+    motion_line = prompt.split("\n\nMotion style lock: ", 1)[1].split("\n\n", 1)[0]
+    assert "三维渲染画面" in motion_line
+    assert "二维绘画画面" not in prompt
+    assert "光线与阴影以二维绘画语言保持稳定" not in prompt
+    # 3D 版节奏锁不再强制一拍二/涂抹帧：细微动作保持自然连续，避免走路顿、转头跳
+    assert "自然连续" in prompt
+    assert "一拍二" not in prompt
+    assert "手绘二维动画节奏" not in prompt
+    # 负向段不再出现与正向 PBR/反射冲突的反写实条款
+    negative_line = prompt.split("\n\nNegative: ", 1)[1].split("\n\n", 1)[0]
+    assert "PBR 材质" not in negative_line
+    assert "真实反射" not in negative_line
+    assert "摄影级景深" not in negative_line
+    assert "二维平涂动漫" in negative_line
+
+
+def test_environment_motion_written_only_when_requested() -> None:
+    """环境微动按需启用：默认不写通用微动，避免背景全员微动造成 AI 插值感。"""
     outdoor = _render(scene_name="公司楼下街道")
     indoor = _render(scene_name="中关村办公区一楼大厅")
 
-    assert "树叶、草叶等自然物受轻风影响" in outdoor
-    assert "室内光线与阴影允许细微的自然变化" in indoor
-    # 室内不要出现树叶，室外不要出现窗帘
-    assert "树叶" not in indoor
-    assert "窗帘" not in outdoor
+    # 默认不再无条件添加树叶草叶轻摆 / 窗帘纸张飘动
+    assert "树叶" not in outdoor
+    assert "草叶" not in outdoor
+    assert "轻风" not in outdoor
+    assert "窗帘" not in indoor
+    assert "纸张" not in indoor
+
+    with_motion = _render(
+        scene_name="公司楼下街道",
+        environment_motion="玉兰树叶在风中轻摆一次后恢复静止",
+    )
+    assert "玉兰树叶在风中轻摆一次后恢复静止" in with_motion
+
+    empty_motion = _render(scene_name="公司楼下街道", environment_motion="")
+    assert "树叶" not in empty_motion
 
 
 def test_dialogue_entries_keep_verbatim_text_and_speaker() -> None:
@@ -396,10 +436,30 @@ def test_opening_placeholder_is_not_repeated_as_start_sentence() -> None:
     assert "这一镜开始时，承接上一镜结束状态" not in prompt
 
 
-def test_office_building_outdoor_scene_gets_wind_not_indoor_clutter() -> None:
+def test_action_section_uses_animation_rhythm_not_live_action_language() -> None:
+    """动作段用动画节奏语言（快出慢收/持帧/过冲），不再写实拍匀速语言。"""
+    prompt = _render()
+
+    assert "快出、慢收" in prompt
+    assert "短暂持帧" in prompt
+    assert "轻微过冲" in prompt
+    # 实拍匀速语言不再出现
+    assert "自然连贯" not in prompt
+    assert "自然惯性" not in prompt
+
+
+def test_animation_cadence_lock_follows_motion_style_lock() -> None:
+    prompt = _render()
+
+    assert "Animation cadence lock:" in prompt
+    assert prompt.index("Motion style lock:") < prompt.index("Animation cadence lock:")
+
+
+def test_office_building_outdoor_scene_keeps_scene_details() -> None:
     prompt = _render(scene_name="中关村科技公司办公楼外（玉兰树下）")
 
-    assert "树叶、草叶等自然物受轻风影响" in prompt
+    # 默认无通用环境微动，但场景名本身保留
+    assert "这一镜发生在中关村科技公司办公楼外（玉兰树下）" in prompt
     assert "窗帘、纸张" not in prompt
 
 
@@ -452,6 +512,15 @@ def test_validate_natural_style_detects_template_output() -> None:
     assert any("本镜只执行" in issue for issue in issues)
 
 
+def test_validate_natural_style_detects_precise_measurement() -> None:
+    """毫米级动作描述（约三十度 / 半厘米）在优化验收时被拒绝。"""
+    issues = validate_natural_style(
+        "他颈转向玻璃方向约三十度，下巴朝玻璃探出又缩回半厘米。"
+    )
+    assert any("精确测量词" in issue for issue in issues)
+    assert validate_natural_style("他颈转向玻璃方向，下巴极轻地向前探了一下。") == []
+
+
 def test_director_plan_render_is_natural_not_template() -> None:
     """导演设计存在时，最终提示词也必须是自然语言而不是 10 段模板。"""
     from app.services.director_plan import (
@@ -493,6 +562,7 @@ def test_director_plan_render_is_natural_not_template() -> None:
     assert "以 @Image1 作为这一镜的起始画面" in prompt
     assert "第1句，苏月说：“又要走了。”" in prompt
     assert "先苏月背对镜头站立，随后转身望向自动门" in prompt
+    assert "Animation cadence lock:" in prompt
     assert validate_prompt_references(
         prompt, parse_reference_anchors(["@Image1：当前分镜关键帧。"])
     ).ok
@@ -631,8 +701,32 @@ def test_handle_video_prompt_optimizes_and_preserves_user_edits(
 
     assert result["shot_id"] == shot["id"]
     refreshed = service.get(shot["id"])
-    assert refreshed["video_prompt_override"] == optimized_text
+    # 优化结果保留原引用集合，且协议尾段（画风约束）逐字回补到 override。
+    protocol_tail = _extract_protocol_tail(original)
+    expected = optimized_text + (f"\n\n{protocol_tail}" if protocol_tail else "")
+    assert refreshed["video_prompt_override"] == expected
     # 优化结果保留原引用集合
     assert _collect_prompt_reference_tokens(optimized_text) == _collect_prompt_reference_tokens(
         original
     )
+
+
+def test_半写实电影感视频光影与负向不互斥() -> None:
+    prompt = render_natural_video_prompt(
+        style_prompt="影视级半写实仿真人漫风",
+        aspect_ratio="16:9",
+        duration_sec=6,
+        action_flow="他推门进入。",
+        shot_context={"scene_name": "办公楼大厅", "characters": ["徐尘心"]},
+        dialogue_entries=[],
+        tokens=(),
+        negative_prompt="",
+    )
+
+    # 光影句用写实电影布光版本，不再与正向「景深：启用」互相否定
+    assert "写实电影布光逻辑" in prompt
+    assert "摄影级景深" not in prompt
+    assert "景深：启用" in prompt
+    # 二维防漂移运动锁保留，节奏锁为电影感版本
+    assert "Motion style lock:" in prompt
+    assert "Animation cadence lock:" in prompt

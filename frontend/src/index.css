@@ -2,14 +2,40 @@
 @tailwind components;
 @tailwind utilities;
 
+/* 设计令牌：明暗主题下的表面色，驱动 tailwind 中的 canvas/ink/paper/line/muted/vermilion */
 :root {
-  color: #191a17;
-  background: #f2f0ea;
+  --c-canvas: 245 245 247;
+  --c-ink: 29 29 31;
+  --c-paper: 255 255 255;
+  --c-line: 229 229 234;
+  --c-muted: 110 110 115;
+  --c-sidebar: 29 29 31;
+  --c-brand: 0 113 227;
+  --c-brand-hover: 0 119 237;
+  --c-card: 255 255 255;
+  --c-card-dark: 16 16 16;
+  color: #1d1d1f;
+  background: #f5f5f7;
   font-family:
-    Manrope, "Noto Sans SC", "Microsoft YaHei", "PingFang SC", "Helvetica Neue",
-    Arial, sans-serif;
+    -apple-system, "SF Pro Display", "SF Pro Text", "PingFang SC",
+    "Microsoft YaHei", "Noto Sans SC", "Helvetica Neue", Arial, sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+}
+
+.dark {
+  --c-canvas: 0 0 0;
+  --c-ink: 245 245 247;
+  --c-paper: 22 22 23;
+  --c-line: 58 58 60;
+  --c-muted: 134 134 139;
+  --c-sidebar: 10 10 10;
+  --c-brand: 41 151 255;
+  --c-brand-hover: 71 162 255;
+  --c-card: 22 22 23;
+  --c-card-dark: 16 16 16;
+  color: #f5f5f7;
+  background: #000;
 }
 
 * {
@@ -17,13 +43,21 @@
 }
 
 html {
-  background: #f2f0ea;
+  background: #f5f5f7;
+  scroll-behavior: smooth;
+}
+
+html.dark {
+  background: #000;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  letter-spacing: -0.01em;
+  background: rgb(var(--c-canvas));
+  color: rgb(var(--c-ink));
 }
 
 button,
@@ -42,8 +76,8 @@ button:disabled {
 }
 
 ::selection {
-  color: #191a17;
-  background: rgba(232, 97, 58, 0.24);
+  color: #1d1d1f;
+  background: rgba(0, 113, 227, 0.22);
 }
 
 ::-webkit-scrollbar {
@@ -54,8 +88,156 @@ button:disabled {
 ::-webkit-scrollbar-thumb {
   border: 3px solid transparent;
   border-radius: 999px;
-  background: rgba(25, 26, 23, 0.2);
+  background: rgba(0, 0, 0, 0.18);
   background-clip: content-box;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.24);
+  background-clip: content-box;
+}
+
+@layer components {
+  /* 顶部导航毛玻璃 */
+  .glass {
+    background: rgba(255, 255, 255, 0.72);
+    backdrop-filter: saturate(180%) blur(22px);
+    -webkit-backdrop-filter: saturate(180%) blur(22px);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+  }
+  .dark .glass {
+    background: rgba(0, 0, 0, 0.68);
+    border-bottom-color: rgba(255, 255, 255, 0.09);
+  }
+
+  /* 大标题渐变文字 */
+  .hero-gradient {
+    background: linear-gradient(90deg, #0071e3 0%, #6e5ce7 52%, #bf5af2 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* 卡片悬停浮起 */
+  .soft-card {
+    transition:
+      transform 0.3s ease,
+      box-shadow 0.3s ease,
+      border-color 0.3s ease,
+      background-color 0.3s ease;
+  }
+  .soft-card:hover {
+    transform: translateY(-4px);
+  }
+
+  /* 胶囊按钮微动效 */
+  .pill {
+    transition:
+      transform 0.3s ease,
+      opacity 0.3s ease,
+      background-color 0.3s ease,
+      border-color 0.3s ease;
+  }
+  .pill:hover {
+    transform: translateY(-1px);
+  }
+  .pill:active {
+    transform: translateY(0) scale(0.98);
+  }
+
+  /* 入场动画 */
+  .fade-up {
+    opacity: 0;
+    transform: translateY(18px);
+    transition:
+      opacity 0.7s ease,
+      transform 0.7s ease;
+  }
+  .fade-up.is-visible {
+    opacity: 1;
+    transform: none;
+  }
+
+  /* 模态框入场 */
+  .modal-backdrop-in {
+    animation: modalBackdropIn 0.25s ease;
+  }
+  .modal-panel-in {
+    animation: modalPanelIn 0.3s cubic-bezier(0.21, 1.02, 0.73, 1);
+  }
+  @keyframes modalBackdropIn {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes modalPanelIn {
+    from {
+      opacity: 0;
+      transform: translateY(16px) scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  /* 进度条扫光 */
+  .progress-shine {
+    position: relative;
+    overflow: hidden;
+  }
+  .progress-shine::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      rgba(255, 255, 255, 0.45),
+      transparent
+    );
+    transform: translateX(-100%);
+    animation: shine 1.8s infinite;
+  }
+  @keyframes shine {
+    to {
+      transform: translateX(100%);
+    }
+  }
+
+  /* 角标弹跳 */
+  .badge-pop {
+    animation: badgePop 0.35s ease;
+  }
+  @keyframes badgePop {
+    0% {
+      transform: scale(1);
+    }
+    50% {
+      transform: scale(0.68);
+    }
+    100% {
+      transform: scale(1);
+    }
+  }
+
+  /* 封面噪点 */
+  .cover-noise {
+    background-image:
+      radial-gradient(circle at 20% 10%, rgba(255, 255, 255, 0.18), transparent 25%),
+      radial-gradient(circle at 80% 80%, rgba(255, 255, 255, 0.12), transparent 28%);
+  }
+
+  /* 导航横向滚动时隐藏滚动条 */
+  .nav-scroll::-webkit-scrollbar {
+    display: none;
+  }
+  .nav-scroll {
+    scrollbar-width: none;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

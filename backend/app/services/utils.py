@@ -42,9 +42,11 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def json_loads(value: str | None, default: Any) -> Any:
-    if not value:
+def json_loads(value: Any, default: Any) -> Any:
+    if value is None or value == "":
         return default
+    if isinstance(value, dict | list):
+        return value
     try:
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):

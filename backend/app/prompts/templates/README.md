@@ -63,10 +63,10 @@
 | `entrance` `windows` `movement` | entrance_position / window_position / movement_path | 各自兜底语 |
 | `wall_material` `floor_material` `furniture_material` | 同名字段 | 回退 architecture |
 | `glass_metal` `special_material` | glass_metal_material / special_material | 各自兜底语 |
-| `main_color` `accent_color` `color_quality` | main_color → color_mood / accent_color / color_quality → color_mood | 各自兜底语 |
+| `main_color` `accent_color` | main_color → color_mood / accent_color（只写固有色事实，如「门为暗朱红」） | 各自兜底语 |
 | `main_view` `standard_view_1` `standard_view_2` | 同名字段 | 含「无人空镜」兜底语 |
 | `detail_zone` | detail_zone（拼接） | 回退 furnishings |
-| `main_light` `fill_light` `atmosphere` | lighting → main_light / fill_light / atmosphere → color_mood | 各自兜底语 |
+| `time_of_day` `weather` `light_direction` | time_of_day / weather / light_direction → lighting → main_light（只写时间/天气/光源方向受控事实） | 各自兜底语 |
 | `environment_detail` | 素材 prompt（过滤人物标记） | 按上述资料补充环境细节 |
 | `anchors` | consistency_keywords（逐项过滤） | 空则不渲染该片段 |
 | `composition` `negative_prompt` | composition（过滤）/ 已合并默认负向 | 空则不渲染该段 |
@@ -84,7 +84,7 @@
 | `other` `key_position` | other_structure / key_structure_position | 回退 special_features |
 | `material` `secondary_material` | material / secondary_material | 各自兜底语 |
 | `color` `accent_color` | color → main_color / accent_color | 各自兜底语 |
-| `surface` `wear` | surface_texture / wear → usage_marks | 各自兜底语 |
+| `surface` `wear` | surface_texture（受控词表：光滑/哑光/粗糙/透明/发光/磨损等事实） / wear → usage_marks | 各自兜底语 |
 | `detail_zone` | detail_zone | 回退 special_features |
 | `scale` | scale_reference | 与成年人手掌的比例以素材资料为准 |
 | `anchors` | consistency_keywords（拼接） | 空则不渲染该片段 |
@@ -95,6 +95,23 @@
 
 三份模板的版式结构、纯白背景、三视图/表情特写、无人空镜、资料卡等默认约束
 **全部保留**（full 档），由模板文件固定，整项目统一生效，无逐素材开关。
+
+### 视觉语义边界（Phase 2：资产模块只记事实，不写画法）
+
+- 角色模板只输出身份事实（外貌/服装/固有色），不写布光、氛围、造型气质或妆容画法；
+  灯光段只陈述光源方向与时间事实，光影表达方式完全由项目统一画风决定。
+- 场景模板只输出空间事实 + 受控变量（固有色、时间 `time_of_day`、天气 `weather`、
+  光源方向 `light_direction`），不写主光效果、辅光、氛围、色彩气质等自由艺术指导。
+- 道具模板含「材质降维」段：金属/玻璃/塑料/屏幕只记录是否透明、是否发光、
+  光滑或哑光、颜色、磨损等事实；明确不使用真实 PBR 反射、镜面高光、透明折射、
+  逼真材质贴图，材质表达由项目统一画风决定。
+- 三类默认负向（`resolve_asset_negative_prompt`）默认追加「写实PBR、镜面反射、
+  透明折射、逼真材质贴图、3D建模渲染」；项目画风启用 PBR（半写实3D国漫、三维CG等，
+  `VisualStyleSpec.material.pbr` 为 True）时自动剔除这组写实渲染排除词，
+  避免负向与正向主画风互相否定。
+- `asset_extract.md` / `asset_prompt.md` 已加硬约束：身份/空间/结构事实字段禁止写入
+  绘画方式、线条、上色、光影、写实度或材质渲染词汇（如写实金属反射、玻璃通透折射、
+  每根发丝、精致、电影感）——这些由项目统一画风唯一决定。
 
 需要调整默认约束时直接改对应模板文件（增删段落或条件块）即可；渲染器与
 `use_template=False` 内置路径的逐字一致测试会提示你同步修改内置函数或接受

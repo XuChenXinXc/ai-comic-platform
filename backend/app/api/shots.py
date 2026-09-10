@@ -15,7 +15,8 @@ from app.api.schemas import (
     ShotSplitRequest,
     ShotUpdate,
 )
-from app.dependencies import get_shot_service
+from app.dependencies import get_media_service, get_shot_service
+from app.services.media_service import MediaService
 from app.services.shot_service import ShotService
 
 router = APIRouter(tags=["shots"])
@@ -28,6 +29,19 @@ def extract_shots(
     service: ShotService = Depends(get_shot_service),
 ) -> dict:
     return service.queue_extract(chapter_id, body.model_dump())
+
+
+@router.post(
+    "/chapters/{chapter_id}/shots/pipeline",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def run_shot_pipeline(
+    chapter_id: str,
+    body: GenerateRequest,
+    media: MediaService = Depends(get_media_service),
+) -> dict:
+    """一键全链编排：提示词/导演计划 → 关键帧 → 视频。"""
+    return media.queue_shot_pipeline(chapter_id, body.model_dump())
 
 
 @router.get("/chapters/{chapter_id}/shots")

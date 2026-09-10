@@ -383,6 +383,10 @@ function CustomShotsInner() {
         : "1080p";
     },
   );
+  // 动画节奏化：成片抽帧到 12fps（一拍二手绘张数感）+ 轻微颗粒，降低视频 AI 味
+  const [animeCadence, setAnimeCadence] = useState(
+    () => localStorage.getItem("manual-anime-cadence") === "1",
+  );
   const [composing, setComposing] = useState(false);
   const [composition, setComposition] = useState<{
     status: string;
@@ -574,6 +578,11 @@ function CustomShotsInner() {
   const changeResolution = (value: "720p" | "1080p" | "4k") => {
     setResolution(value);
     localStorage.setItem("manual-resolution", value);
+  };
+
+  const changeAnimeCadence = (value: boolean) => {
+    setAnimeCadence(value);
+    localStorage.setItem("manual-anime-cadence", value ? "1" : "0");
   };
 
   const invalidateShots = async () => {
@@ -927,21 +936,36 @@ function CustomShotsInner() {
     }
   };
 
-  // 批量保存已填写的分镜位草稿；返回是否全部保存成功。
-  // 已填写但没有对应分镜位记录的槽位无法持久化，同样计入失败。
-  const saveFilledDrafts = async (): Promise<boolean> => {
-    const tasks: Promise<boolean>[] = [];
-    let skippedFilled = false;
+  // 批量保存已填写的分镜位草稿；返回保存成功的槽位索引集合与失败槽位编号列表。
+  const saveFilledDrafts = async (): Promise<{
+    savedIndices: Set<number>;
+    failedSlotNumbers: number[];
+  }> => {
+    const savedIndices = new Set<number>();
+    const failedSlotNumbers: number[] = [];
+    const tasks: Promise<void>[] = [];
+
     slotDrafts.forEach((draft, index) => {
-      if (!draft.imagePrompt.trim() && !draft.videoPrompt.trim()) return;
-      if (!slotShot(index)) {
-        skippedFilled = true;
+      if (!draft.imagePrompt.trim() && !draft.videoPrompt.trim()) {
+        savedIndices.add(index);
         return;
       }
-      tasks.push(saveSlot(index));
+      if (!slotShot(index)) {
+        failedSlotNumbers.push(index + 1);
+        return;
+      }
+      tasks.push(
+        saveSlot(index).then((success) => {
+          if (success) {
+            savedIndices.add(index);
+          } else {
+            failedSlotNumbers.push(index + 1);
+          }
+        }),
+      );
     });
-    const results = await Promise.all(tasks);
-    return !skippedFilled && results.every((result) => result);
+    await Promise.all(tasks);
+    return { savedIndices, failedSlotNumbers };
   };
 
   const mediaMutation = useMutation({
@@ -949,6 +973,8 @@ function CustomShotsInner() {
       kind === "keyframe"
         ? api.shots.keyframes.generate(id, {
             provider_id: imageProviderId || undefined,
+            // 缺干净参考图时自动入队参考图模式生成，避免设定展板污染分镜画面
+            auto_prepare_references: true,
           })
         : api.shots.videos.generate(id, {
             provider_id: videoProviderId || undefined,
@@ -977,11 +1003,17 @@ function CustomShotsInner() {
 
   const mediaBatchMutation = useMutation({
     mutationFn: async (kind: "keyframe" | "video") => {
-      await saveFilledDrafts();
+      const { savedIndices, failedSlotNumbers } = await saveFilledDrafts();
+      if (failedSlotNumbers.length > 0) {
+        toast.error(
+          `分镜 ${failedSlotNumbers.join("、")} 草稿保存失败，已跳过批量生成`,
+        );
+      }
       const ids = slotDrafts
-        .map((draft, index) => ({ draft, shot: slotShot(index) }))
-        .filter(({ draft, shot }) => {
+        .map((draft, index) => ({ draft, shot: slotShot(index), index }))
+        .filter(({ draft, shot, index }) => {
           if (!shot) return false;
+          if (!savedIndices.has(index)) return false;
           // 时长非法（含 NaN）的槽位不参与批量生成，与单槽校验口径一致
           if (!tianyueFixedVideo && !isSlotDurationValid(draft.duration)) {
             return false;
@@ -1005,6 +1037,7 @@ function CustomShotsInner() {
             ids,
             only_missing: true,
             provider_id: imageProviderId || undefined,
+            auto_prepare_references: true,
           })
         : api.shots.videos.batch(manualChapterId, {
             ids,
@@ -1055,6 +1088,7 @@ function CustomShotsInner() {
         burn_subtitles: false,
         crossfade: true,
         crossfade_seconds: 0.5,
+        anime_cadence: animeCadence,
       });
       setComposition(result);
       toast.success("合成任务已创建，正在合成成片");
@@ -1292,7 +1326,7 @@ function CustomShotsInner() {
               return (
                 <div
                   key={asset.id}
-                  className="rounded-md border border-line bg-white/60 p-3"
+                  className="rounded-xl border border-line bg-paper/60 p-3 dark:bg-white/[0.05]"
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
@@ -1319,7 +1353,7 @@ function CustomShotsInner() {
                         }
                       }}
                     >
-                      <Trash2 className="h-4 w-4 text-[#a3332a]" />
+                      <Trash2 className="h-4 w-4 text-[#c93c30] dark:text-red-400" />
                     </Button>
                   </div>
 
@@ -1439,7 +1473,7 @@ function CustomShotsInner() {
             return (
               <div
                 key={index}
-                className="rounded-md border border-line bg-white/70 p-4"
+                className="rounded-xl border border-line bg-paper/70 p-4 dark:bg-white/[0.06]"
               >
                 <div className="mb-3 flex flex-wrap items-center gap-2">
                   <span className="text-sm font-bold">分镜 {index + 1}</span>
@@ -1489,7 +1523,7 @@ function CustomShotsInner() {
 
                 <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
                   <div className="flex shrink-0 gap-4">
-                    <div className="flex aspect-video w-48 items-center justify-center overflow-hidden rounded-md border border-line bg-canvas">
+                    <div className="flex aspect-video w-48 items-center justify-center overflow-hidden rounded-xl border border-line bg-canvas">
                       {keyframeReady && keyframe ? (
                         <ImagePreview
                           src={mediaUrl(keyframe)}
@@ -1501,7 +1535,7 @@ function CustomShotsInner() {
                         <ImageOff className="h-6 w-6 text-muted" />
                       )}
                     </div>
-                    <div className="flex aspect-video w-48 items-center justify-center overflow-hidden rounded-md border border-line bg-canvas">
+                    <div className="flex aspect-video w-48 items-center justify-center overflow-hidden rounded-xl border border-line bg-canvas">
                       {video?.status === "completed" && video ? (
                         <video
                           src={mediaUrl(video)}
@@ -1566,7 +1600,7 @@ function CustomShotsInner() {
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div>
                         <Label>出场角色</Label>
-                        <div className="max-h-20 space-y-1 overflow-y-auto rounded-md border border-line bg-white p-2">
+                        <div className="max-h-20 space-y-1 overflow-y-auto rounded-xl border border-line bg-paper p-2">
                           {assets
                             .filter((asset) => asset.asset_type === "character")
                             .map((asset) => (
@@ -1600,7 +1634,7 @@ function CustomShotsInner() {
                       </div>
                       <div>
                         <Label>使用物品</Label>
-                        <div className="max-h-20 space-y-1 overflow-y-auto rounded-md border border-line bg-white p-2">
+                        <div className="max-h-20 space-y-1 overflow-y-auto rounded-xl border border-line bg-paper p-2">
                           {assets
                             .filter((asset) => asset.asset_type === "prop")
                             .map((asset) => (
@@ -1706,6 +1740,23 @@ function CustomShotsInner() {
               <option value="4k">4K</option>
             </Select>
           </div>
+          <div className="flex items-start gap-2">
+            <input
+              id="free-compose-anime-cadence"
+              type="checkbox"
+              checked={animeCadence}
+              onChange={(event) => changeAnimeCadence(event.target.checked)}
+              className="mt-1"
+            />
+            <div>
+              <Label htmlFor="free-compose-anime-cadence">
+                动画节奏化（去 AI 味）
+              </Label>
+              <p className="text-xs text-muted">
+                抽帧到 12fps 模拟手绘张数感 + 轻微颗粒，降低顺滑塑料感
+              </p>
+            </div>
+          </div>
           <Button
             variant="primary"
             busy={composing}
@@ -1729,12 +1780,12 @@ function CustomShotsInner() {
                 <video
                   controls
                   src={`/media/${manualProjectId}/${composition.file_path}`}
-                  className="w-full max-w-2xl rounded-md border border-line"
+                  className="w-full max-w-2xl rounded-xl border border-line"
                 />
                 <a
                   href={`/media/${manualProjectId}/${composition.file_path}`}
                   download
-                  className="mt-2 inline-block rounded-md bg-green-500 px-4 py-2 text-sm text-white hover:bg-green-600"
+                  className="mt-2 inline-block rounded-xl bg-green-500 px-4 py-2 text-sm text-white hover:bg-green-600"
                 >
                   下载成片
                 </a>

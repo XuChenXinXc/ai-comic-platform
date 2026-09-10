@@ -18,9 +18,16 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+from app.dynamic_pipeline.visual_validator import (
+    animation_cadence_lock_for,
+    dynamic_negative_rules_for,
+    motion_style_lock_for,
+    style_medium_of,
+)
 
 _IMAGE_TOKEN_RE = re.compile(r"@Image(\d+)")
 _ANCHOR_LINE_RE = re.compile(r"^\s*@Image(\d+)\s*[:：]\s*(.*?)\s*$")
@@ -77,49 +84,6 @@ _POSTURE_LEAD = (
     "处于",
     "半蹲",
 )
-_OUTDOOR_SCENE_MARKS = (
-    "户外",
-    "室外",
-    "街道",
-    "路边",
-    "马路",
-    "公园",
-    "庭院",
-    "花园",
-    "树林",
-    "森林",
-    "山顶",
-    "山间",
-    "湖",
-    "海边",
-    "天空",
-    "天台",
-    "楼顶",
-    "楼外",
-    "楼下",
-    "门外",
-    "树下",
-    "广场",
-    "校门口",
-    "门口",
-    "巷道",
-    "巷口",
-)
-_INDOOR_SCENE_MARKS = (
-    "室内",
-    "办公",
-    "房间",
-    "厅",
-    "室",
-    "店",
-    "公寓",
-    "电梯",
-    "走廊",
-    "楼道",
-    "宿舍",
-    "病房",
-    "教室",
-)
 
 _DEFAULT_STYLE = "项目既定画风"
 
@@ -141,6 +105,28 @@ _FORBIDDEN_TEMPLATE_WORDS = (
 
 _MECHANICAL_TIMELINE_RE = re.compile(r"\d+(?:\.\d+)?\s*[-–—~－至]\s*\d+(?:\.\d+)?\s*秒")
 
+# 毫米级动作描述（约三十度 / 半厘米 / 半寸 / 几公分 / 半圈）：视频模型不区分
+# 这种精度，反而稀释主动作权重；验收时按语义化幅度要求拒绝。
+_PRECISE_MEASUREMENT_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:度|厘米|毫米|公分|寸)"
+    r"|(?:半|几|数)\s*(?:厘米|毫米|公分|寸|圈)"
+    r"|(?:约|大约|近|左右)?[一两二三四五六七八九十百零]+\s*度"
+)
+
+# 协议段标签（与 app.dynamic_pipeline.visual_validator 的豁免口径一致）：
+# 这些行首标签之后是约束文本而非正文，不参与模板化措辞检查。
+_PROTOCOL_SECTION_LABELS = ("Negative", "Motion style lock", "Animation cadence lock")
+
+
+def _cut_protocol_sections(prompt: str) -> str:
+    """切掉协议段（负向、运动风格锁），只返回可读正文，用于风格检查。"""
+    body = prompt or ""
+    for label in _PROTOCOL_SECTION_LABELS:
+        match = re.search(rf"^\s*{label}\s*:", body, re.MULTILINE)
+        if match:
+            body = body[: match.start()]
+    return body
+
 
 def validate_natural_style(prompt: str) -> list[str]:
     """确定性检查提示词是否仍是模板/机械写法，返回问题列表。
@@ -148,14 +134,19 @@ def validate_natural_style(prompt: str) -> list[str]:
     用于优化结果验收：自然语言化后的提示词不应再出现【】段落标题、
     0-2秒 式机械时间轴和规则说明书词汇；出现问题即拒绝采用，
     避免「优化提示词」把提示词改回旧模板。
+    协议段（Negative / Motion style lock）是渲染器尾部注入的约束文本，
+    与视觉校验器豁免口径一致，不参与模板化检查。
     """
+    body = _cut_protocol_sections(prompt)
     issues: list[str] = []
-    if "【" in prompt:
+    if "【" in body:
         issues.append("仍包含【】模板段落标题")
-    if _MECHANICAL_TIMELINE_RE.search(prompt or ""):
+    if _MECHANICAL_TIMELINE_RE.search(body or ""):
         issues.append("仍包含机械时间轴（N-M秒 分段）")
+    if _PRECISE_MEASUREMENT_RE.search(body or ""):
+        issues.append("仍包含精确测量词（度数、厘米、寸等），应改为语义化幅度描述")
     for word in _FORBIDDEN_TEMPLATE_WORDS:
-        if word in prompt:
+        if word in body:
             issues.append(f"仍包含机器化措辞「{word}」")
             break
     return issues
@@ -404,15 +395,19 @@ def _camera_sentence(camera_move: Any) -> str:
         return "机位固定，画面变化由人物动作推动。"
     if "跟随" in raw:
         return f"镜头{raw}人物运动。"
-    return f"镜头{raw}，并跟随人物的运动自然调整。"
+    return f"镜头{raw}，幅度小而明确，中间不调整速度。"
 
 
-def _scene_environment_sentence(scene_name: str) -> str:
-    if any(mark in scene_name for mark in _OUTDOOR_SCENE_MARKS):
-        return "树叶、草叶等自然物受轻风影响产生克制而自然的小幅摆动。"
-    if any(mark in scene_name for mark in _INDOOR_SCENE_MARKS):
-        return "室内光线与阴影允许细微的自然变化，窗帘、纸张等轻质陈设可有微弱环境动态。"
-    return ""
+def _environment_motion_sentence(shot_context: dict[str, Any]) -> str:
+    """环境动态只按需写入：分镜明确标注 environment_motion 时才描述。
+
+    默认不写树叶草叶轻摆、窗帘纸张飘动等通用微动——背景元素全员微动
+    是视频 AI 味（全程均匀插值）的主要来源之一，无戏元素应静止持帧。
+    """
+    environment_motion = str(shot_context.get("environment_motion") or "").strip()
+    if not environment_motion:
+        return ""
+    return _ensure_sentence_end(environment_motion.rstrip("。"))
 
 
 def _continuity_sentence(transition: str, prev_ending: str, scene_name: str) -> str:
@@ -425,7 +420,11 @@ def _continuity_sentence(transition: str, prev_ending: str, scene_name: str) -> 
             )
         return "这一镜直接接在上一镜之后，人物的位置、姿态与朝向保持连续。"
     if transition == "elliptical":
-        return "上一镜结束后省略了一段过程，本镜重新建立画面；人物的服装与随身物品保持连续。"
+        location = f"直接切至{scene_name}" if scene_name else "重新建立画面"
+        return (
+            f"上一镜结束后省略了一段过程，本镜{location}，不连续展示中间的移动或转场；"
+            "人物的服装与随身物品保持连续。"
+        )
     if transition == "same_scene_cut":
         location = f"{scene_name}内" if scene_name else "同一场景"
         return (
@@ -433,10 +432,21 @@ def _continuity_sentence(transition: str, prev_ending: str, scene_name: str) -> 
             "不承接上一镜的画面构图；人物的空间位置与持有物承接上一镜，"
             "构图以本镜起始画面为准。"
         )
+    if scene_name:
+        return f"镜头切换至{scene_name}，本镜是全新的画面，不承接上一镜的构图。"
     return "本镜是全新的画面，不承接上一镜的构图。"
 
 
-def _negative_line(negative_prompt: str) -> str:
+def continuity_opening_sentence(transition: str, prev_ending: str, scene_name: str) -> str:
+    """连续性开头句的公开入口：导演计划渲染器与自然语言渲染器共用同一口径。
+
+    换场景（scene_change / elliptical 且空间不同）时明确写出省略式切换，
+    避免「上一镜结束动作」被视频模型理解成同一时空连续承接。
+    """
+    return _continuity_sentence(transition, prev_ending, scene_name)
+
+
+def _negative_line(negative_prompt: str, dynamic_rules: Sequence[str] = ()) -> str:
     base = "画面中不出现：人物变形或服装变化、新增人物、画面内文字或字幕、道具瞬移。"
     extra = re.sub(
         r"^禁止出现\s*[:：]\s*",
@@ -450,6 +460,11 @@ def _negative_line(negative_prompt: str) -> str:
     covered = ("人物变形", "服装变化", "新增人物", "文字", "字幕", "道具瞬移", "水印")
     clauses = [item.strip() for item in re.split(r"[，,；;、]", extra) if item.strip()]
     kept = [item for item in clauses if not any(word in item for word in covered)]
+    # 反动态写实化负向补齐：追加协议词表中尚不存在的条款（幂等：已存在不重复）。
+    # 条款集合由调用方按画风媒介传入，不再无条件注入写实化禁用词。
+    for rule in dynamic_rules:
+        if rule not in base and not any(rule in item for item in kept):
+            kept.append(rule)
     if not kept:
         return base
     return base.rstrip("。") + "；" + "、".join(kept) + "。"
@@ -465,8 +480,18 @@ def render_natural_video_prompt(
     dialogue_entries: Sequence[dict[str, str]],
     tokens: Sequence[ReferenceToken] = (),
     negative_prompt: str = "",
+    visual_bible: Mapping[str, Any] | None = None,
+    audio_driven: bool = False,
 ) -> str:
     """把结构化事实渲染成自然语言视频提示词（少量自然段）。"""
+    from app.dynamic_pipeline.visual_anchor import (
+        compile_visual_bible,
+        render_visual_style_spec,
+        visual_style_negative_terms,
+    )
+
+    style_spec = compile_visual_bible(style_prompt, visual_bible)
+    structured_style = render_visual_style_spec(style_spec)
     scene_name = str(shot_context.get("scene_name") or "").strip()
     characters = [str(item).strip() for item in (shot_context.get("characters") or []) if item]
     props = [str(item).strip() for item in (shot_context.get("props") or []) if item]
@@ -495,8 +520,7 @@ def render_natural_video_prompt(
     extra_tokens = [
         item
         for item in token_list
-        if item.role
-        in {"scene_master", "reference"}
+        if item.role == "reference"
         or (
             item.role == "character_identity"
             and item.token not in {matched.token for matched in character_tokens.values()}
@@ -519,6 +543,7 @@ def render_natural_video_prompt(
             )
             + f"画面比例 {aspect_ratio}，时长约 {duration_sec:g} 秒。"
         ),
+        structured_style if structured_style else "",
     ]
     if scene_token:
         opening_lines.append(
@@ -574,10 +599,23 @@ def render_natural_video_prompt(
     if flow:
         action_lines = [f"从这一起始状态出发，{flow}"]
         if characters:
-            action_lines.append(
-                "动作过程中，人物的重心转移、视线与手部动作自然连贯，"
-                "头发和衣摆带出轻微的自然惯性。"
-            )
+            # 节奏句按画风媒介分支：二维绘画保留关键姿势顿挫（快出慢收 + 短暂持帧）；
+            # 三维CG / 真人写实要求细微动作自然连续，不强制逐帧持帧，
+            # 避免走路顿、转头跳、眼神卡。
+            medium = style_medium_of(style_spec)
+            if medium in {"3d", "photoreal"}:
+                action_lines.append(
+                    "动作按快出、慢收的节奏执行，短暂停顿时有清晰的关键姿势；"
+                    "人物步行、转头、视线变化与细微肢体动作保持自然连续，"
+                    "不做机械匀速运动，也不强制逐帧持帧；"
+                    "头发与衣摆随动作带出轻微过冲，主体停住后短暂回稳。"
+                )
+            else:
+                action_lines.append(
+                    "动作按快出、慢收的节奏执行，关键姿势之间快速过渡，"
+                    "停顿时有短暂持帧；头发与衣摆随动作带出轻微过冲，"
+                    "主体停住后短暂回稳。"
+                )
         if props:
             prop_note = _ensure_sentence_end(f"本镜道具：{'、'.join(props)}")
             if prop_tokens:
@@ -616,9 +654,18 @@ def render_natural_video_prompt(
             _ensure_sentence_end(f"第{index}句，{item['speaker']}说：“{item['text']}”")
             for index, item in enumerate(dialogue_entries, start=1)
         )
-        tail_lines.append(
-            "说话人开口时口型自然配合，其余角色在该时段保持安静，不抢话、不代说。"
-        )
+        if audio_driven:
+            # Provider 收到本镜配音音频，口型由音频驱动，可以要求自然配合。
+            tail_lines.append(
+                "说话人开口时口型与配音自然配合，其余角色在该时段保持安静，不抢话、不代说。"
+            )
+        else:
+            # 无音频输入时模型只能凭空表演说话：要求嘴部动作克制、幅度轻微，
+            # 避免夸张口型与后期配音严重错位；对白由后期配音与字幕呈现。
+            tail_lines.append(
+                "说话人嘴部只做轻微启合、口型幅度克制（对白由后期配音与字幕呈现），"
+                "其余角色在该时段保持安静，不抢话、不代说。"
+            )
     else:
         no_dialogue = "本镜没有画内对白，人物全程不开口"
         no_dialogue += (
@@ -627,12 +674,9 @@ def render_natural_video_prompt(
         tail_lines.append(no_dialogue)
     if sound_effects:
         tail_lines.append(_ensure_sentence_end(f"环境与动作声：{sound_effects}"))
-    env_motion = _scene_environment_sentence(scene_name)
+    env_motion = _environment_motion_sentence(shot_context)
     if env_motion:
         tail_lines.append(env_motion)
-    tail_lines.append(
-        "光线与阴影随人物和镜头的移动产生自然的细微变化。"
-    )
     tail_lines.append(_continuity_sentence(transition, prev_ending, scene_name))
     if ending:
         tail_lines.append(
@@ -643,8 +687,45 @@ def render_natural_video_prompt(
         tail_lines.append(
             "；".join(f"{item.token} 作为画面参考" for item in extra_tokens) + "。"
         )
-    tail_lines.append(_negative_line(negative_prompt))
+    # 光影稳定句按画风媒介分支：二维绘画 / 半写实电影感 / 三维渲染 / 真人写实
+    # 各有对应措辞；unknown 媒介不注入任何预置光影表达。
+    medium = style_medium_of(style_spec)
+    if medium == "2d":
+        if getattr(style_spec.lighting, "realism", "") == "写实电影布光":
+            tail_lines.append(
+                "光线与阴影按写实电影布光逻辑保持稳定，光源方向与明暗关系不漂移、不跳变。"
+            )
+        else:
+            tail_lines.append(
+                "光线与阴影以二维绘画语言保持稳定，不随人物与镜头移动产生写实光影变化。"
+            )
+    elif medium == "3d":
+        tail_lines.append(
+            "光线与阴影随人物与镜头运动保持三维渲染的光影一致，"
+            "光源方向与明暗关系不漂移、不跳变。"
+        )
+    elif medium == "photoreal":
+        tail_lines.append(
+            "光线与阴影随人物与镜头运动保持真实光学规律一致，"
+            "光源方向与明暗关系不漂移、不跳变。"
+        )
     paragraphs.append("".join(tail_lines))
+
+    # 协议尾部：负向段与运动风格锁行均在渲染器出口注入，格式为
+    # 行首标签 + 英文冒号，与视觉校验器的豁免口径一致。
+    negative = negative_prompt
+    for term in visual_style_negative_terms(style_spec):
+        if term not in str(negative or ""):
+            negative = f"{negative or ''}、{term}"
+    paragraphs.append(
+        f"Negative: {_negative_line(negative, dynamic_negative_rules_for(style_spec))}"
+    )
+    motion_lock = motion_style_lock_for(style_spec)
+    cadence_lock = animation_cadence_lock_for(style_spec)
+    if motion_lock:
+        paragraphs.append(f"Motion style lock: {motion_lock}")
+    if cadence_lock:
+        paragraphs.append(f"Animation cadence lock: {cadence_lock}")
 
     compiled = "\n\n".join(part for part in paragraphs if part.strip())
     return compiled

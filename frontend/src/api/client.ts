@@ -5,42 +5,20 @@ import type {
   AssetType,
   BatchResponse,
   ContentRecord,
-  DynamicChecklistResponse,
-  DynamicDeliveryOptions,
-  DynamicPreflightResult,
-  DynamicRunCreateInput,
-  DynamicStageDraftUpdate,
-  DynamicStageKey,
-  DynamicWorkflowAction,
-  DynamicWorkflowRun,
-  DynamicWorkflowStage,
   Job,
   MediaVersion,
   CameraPolicySetting,
+  DefaultStylePromptSetting,
   Project,
   ProjectInput,
   ProjectStorageSelection,
   ProjectStorageSetting,
   ProviderInput,
-  SceneView,
   ScreenplayContent,
   Shot,
   ShotQualityReport,
+  VisualBiblePreview,
 } from "../types/api";
-
-export function getDynamicRunTitle(
-  run: Pick<DynamicWorkflowRun, "title" | "source_snapshot">,
-) {
-  // 兼容旧接口把项目名放在 title 的情况；source_snapshot 保存真正的运行标题。
-  const snapshotTitle = run.source_snapshot?.title;
-  if (typeof snapshotTitle === "string" && snapshotTitle.trim()) {
-    return snapshotTitle.trim();
-  }
-  if (typeof run.title === "string" && run.title.trim()) {
-    return run.title.trim();
-  }
-  return "未命名运行";
-}
 
 /**
  * 解析 VITE_API_BASE_URL。空、相对路径、原型 localhost 的相对形式都接受；
@@ -167,8 +145,6 @@ function shotPayload(body: Partial<Shot>, includeCreateFields: boolean) {
     : rawSourceRef;
   const payload: Record<string, unknown> = {
     scene_asset_id: body.scene_asset_id,
-    // 后端 shot update 接收 scene_view_key（空字符串=默认母版）；scene_view_id 只读展示用，不提交
-    scene_view_key: body.scene_view_key,
     character_ids: body.character_ids_json ?? body.character_ids,
     prop_ids: body.prop_ids_json ?? body.prop_ids,
     positions: body.positions_json ?? body.positions,
@@ -280,10 +256,6 @@ async function downloadBlob(path: string, filename: string, init?: RequestInit) 
   window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
-function safeDownloadFilename(value: string) {
-  return value.replace(/[\\/:*?"<>|]+/g, "-").trim() || "dynamic-delivery";
-}
-
 export const queryKeys = {
   projects: ["projects"] as const,
   project: (id: string) => ["projects", id] as const,
@@ -298,9 +270,8 @@ export const queryKeys = {
   providers: ["providers"] as const,
   projectStorage: ["settings", "project-storage"] as const,
   cameraPolicy: ["settings", "camera-policy"] as const,
+  defaultStylePrompt: ["settings", "default-style-prompt"] as const,
   jobs: (projectId?: string) => ["jobs", projectId || "all"] as const,
-  dynamicRuns: (projectId?: string) => ["dynamic-runs", projectId || "all"] as const,
-  dynamicRun: (runId: string) => ["dynamic-runs", runId] as const,
 };
 
 export const api = {
@@ -323,6 +294,15 @@ export const api = {
           json("POST", { policy }),
         ),
     },
+    defaultStylePrompt: {
+      get: () =>
+        request<DefaultStylePromptSetting>("/settings/default-style-prompt"),
+      set: (style_prompt: string) =>
+        request<DefaultStylePromptSetting>(
+          "/settings/default-style-prompt",
+          json("POST", { style_prompt }),
+        ),
+    },
   },
   projects: {
     list: async (filters: { kind?: "regular" | "free" } = {}) =>
@@ -336,6 +316,8 @@ export const api = {
     update: (id: string, body: Partial<ProjectInput>) =>
       request<Project>(`/projects/${id}`, json("PUT", body)),
     remove: (id: string) => request<void>(`/projects/${id}`, json("DELETE")),
+    visualBiblePreview: (id: string) =>
+      request<VisualBiblePreview>(`/projects/${id}/visual-bible-preview`),
     exportVideos: (id: string, filename: string) =>
       download(`/projects/${id}/videos/export`, filename),
   },
@@ -435,13 +417,10 @@ export const api = {
         json("POST", body),
       ),
     images: {
-      list: async (
-        assetId: string,
-        filters: { scene_view_id?: string } = {},
-      ) =>
+      list: async (assetId: string) =>
         asList(
           await request<MediaVersion[] | { items: MediaVersion[] }>(
-            `/assets/${assetId}/images${params(filters)}`,
+            `/assets/${assetId}/images`,
           ),
         ),
       generate: (assetId: string, body: Record<string, unknown> = {}) =>
@@ -471,25 +450,6 @@ export const api = {
         request<MediaVersion>(`/asset-images/${id}/current`, json("PUT")),
       remove: (id: string) =>
         request<void>(`/asset-images/${id}`, json("DELETE")),
-    },
-    sceneViews: {
-      list: (assetId: string) =>
-        request<SceneView[]>(`/assets/${assetId}/scene-views`),
-      ensure: (assetId: string) =>
-        request<SceneView[]>(`/assets/${assetId}/scene-views/ensure`, json("POST")),
-      update: (viewId: string, body: { prompt: string }) =>
-        request<SceneView>(`/scene-views/${viewId}`, json("PUT", body)),
-      remove: (viewId: string) =>
-        request<void>(`/scene-views/${viewId}`, json("DELETE")),
-      generate: (
-        assetId: string,
-        viewKey: string,
-        body: { provider_id?: string } = {},
-      ) =>
-        request<Job>(
-          `/assets/${assetId}/scene-views/${viewKey}/generate`,
-          json("POST", body),
-        ),
     },
   },
   shots: {
@@ -554,6 +514,8 @@ export const api = {
         `/chapters/${chapterId}/shots/prompts/batch`,
         json("POST", body),
       ),
+    pipeline: (chapterId: string, body: Record<string, unknown> = {}) =>
+      request<Job>(`/chapters/${chapterId}/shots/pipeline`, json("POST", body)),
     checkContinuity: (
       projectId: string,
       body: {
@@ -611,6 +573,7 @@ export const api = {
           scene_no?: number;
           only_missing?: boolean;
           provider_id?: string | null;
+          auto_prepare_references?: boolean;
         } = {},
       ) =>
         request<BatchResponse>(
@@ -706,103 +669,6 @@ export const api = {
     cancel: (id: string) => request<Job>(`/jobs/${id}/cancel`, json("POST")),
     batch: (id: string) =>
       request<{ batch_id: string; jobs: Job[] }>(`/jobs/batches/${id}`),
-  },
-
-  dynamicRuns: {
-    createFreeCreate: (body: DynamicRunCreateInput) =>
-      request<DynamicWorkflowAction>("/free-create/dynamic-runs", json("POST", body)),
-    createForProject: (projectId: string, body: DynamicRunCreateInput) =>
-      request<DynamicWorkflowAction>(
-        `/projects/${projectId}/dynamic-runs`,
-        json("POST", { ...body, project_id: projectId }),
-      ),
-    list: async (projectId: string) =>
-      asList(
-        await request<DynamicWorkflowRun[] | { items: DynamicWorkflowRun[] }>(
-          `/projects/${projectId}/dynamic-runs`,
-        ),
-      ),
-    get: (runId: string) =>
-      request<DynamicWorkflowRun>(`/dynamic-runs/${runId}`),
-    getWithStages: (runId: string) =>
-      request<DynamicWorkflowAction>(`/dynamic-runs/${runId}/stages`),
-    getStage: (runId: string, stageKey: DynamicStageKey) =>
-      request<DynamicWorkflowStage>(`/dynamic-runs/${runId}/stages/${stageKey}`),
-    start: (runId: string, expectedRevision: number) =>
-      request<DynamicWorkflowAction>(
-        `/dynamic-runs/${runId}/start`,
-        json("POST", { expected_revision: expectedRevision }),
-      ),
-    pause: (runId: string, expectedRevision: number) =>
-      request<DynamicWorkflowAction>(
-        `/dynamic-runs/${runId}/pause`,
-        json("POST", { expected_revision: expectedRevision }),
-      ),
-    resume: (runId: string, expectedRevision: number) =>
-      request<DynamicWorkflowAction>(
-        `/dynamic-runs/${runId}/resume`,
-        json("POST", { expected_revision: expectedRevision }),
-      ),
-    cancel: (runId: string, expectedRevision: number) =>
-      request<DynamicWorkflowAction>(
-        `/dynamic-runs/${runId}/cancel`,
-        json("POST", { expected_revision: expectedRevision }),
-      ),
-    saveDraft: (
-      runId: string,
-      stageKey: DynamicStageKey,
-      body: DynamicStageDraftUpdate,
-    ) =>
-      request<DynamicWorkflowAction>(
-        `/dynamic-runs/${runId}/stages/${stageKey}/draft`,
-        json("PUT", body),
-      ),
-    confirmStage: (
-      runId: string,
-      stageKey: DynamicStageKey,
-      expectedRevision: number,
-    ) =>
-      request<DynamicWorkflowAction>(
-        `/dynamic-runs/${runId}/stages/${stageKey}/confirm`,
-        json("POST", { expected_revision: expectedRevision }),
-      ),
-    regenerateStage: (
-      runId: string,
-      stageKey: DynamicStageKey,
-      expectedRevision: number,
-    ) =>
-      request<DynamicWorkflowAction>(
-        `/dynamic-runs/${runId}/stages/${stageKey}/regenerate`,
-        json("POST", { expected_revision: expectedRevision }),
-      ),
-    checklist: (runId: string) =>
-      request<DynamicChecklistResponse>(`/dynamic-runs/${runId}/delivery/checklist`),
-    preflight: (
-      runId: string,
-      options: DynamicDeliveryOptions = {},
-    ) =>
-      request<DynamicPreflightResult>(
-        `/dynamic-runs/${runId}/delivery/preflight`,
-        json("POST", {
-          strict: options.strict ?? true,
-          allow_partial: options.allow_partial ?? false,
-        }),
-      ),
-    exportZip: async (
-      runId: string,
-      options: DynamicDeliveryOptions = {},
-    ) => {
-      const fallbackName = `dynamic-delivery-${safeDownloadFilename(runId)}.zip`;
-      await downloadBlob(
-        `/dynamic-runs/${runId}/delivery/export`,
-        fallbackName,
-        json("POST", {
-          strict: options.strict ?? true,
-          allow_partial: options.allow_partial ?? false,
-          exported_at: options.exported_at,
-        }),
-      );
-    },
   },
 
   audio: {
@@ -1020,6 +886,8 @@ export const api = {
       bgm_volume?: number;
       crossfade?: boolean;
       crossfade_seconds?: number;
+      // 动画节奏化：抽帧到 12fps（一拍二手绘张数感）+ 轻微颗粒，降低视频 AI 味
+      anime_cadence?: boolean;
     }) =>
       request<{
         id: string;

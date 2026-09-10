@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>漫制局 Pro · 舒适极简工作台</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            app: {
+              bg: '#0e0f12',
+              surface: '#16171c',
+              elevated: '#1e1f25',
+              border: 'rgba(255, 255, 255, 0.09)',
+              text: '#f4f4f7',
+              muted: '#9ca3af',
+              brand: '#3b82f6',
+              brandHover: '#60a5fa'
+            }
+          },
+          fontFamily: {
+            sans: [
+              '-apple-system',
+              'BlinkMacSystemFont',
+              '"PingFang SC"',
+              '"Hiragino Sans GB"',
+              '"Microsoft YaHei"',
+              'system-ui',
+              'sans-serif'
+            ],
+            mono: ['"SF Mono"', 'Menlo', 'monospace']
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* 等宽数字保证时间码与镜头编号对齐 */
+    .tabular { font-variant-numeric: tabular-nums; }
+    
+    /* 隐藏滚动条但保留滚动功能 */
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+    /* 舒展平滑的自然过渡 */
+    * { transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease; }
+
+    /* 浅色主题柔和模式 (Light Mode) */
+    .light {
+      --bg: #f5f6f8;
+      --surface: #ffffff;
+      --border: rgba(0, 0, 0, 0.08);
+      --text: #18181b;
+      --muted: #64748b;
+    }
+    .light body {
+      background-color: var(--bg) !important;
+      color: var(--text) !important;
+    }
+  </style>
+</head>
+<body class="bg-[#0e0f12] text-[#f4f4f7] h-screen flex flex-col overflow-hidden select-none antialiased text-base">
+
+  <!-- ================= 顶栏：轻量清晰导航 (高度舒适 58px) ================= -->
+  <header class="h-[58px] px-6 border-b border-white/[0.08] flex items-center justify-between shrink-0 bg-[#14151a]/90 backdrop-blur z-20">
+    
+    <!-- 左：Logo 与项目/章节上下文 (字号提升到 14px~15px，清晰饱满) -->
+    <div class="flex items-center gap-4">
+      <div class="flex items-center gap-2.5">
+        <span class="w-2.5 h-2.5 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.6)]"></span>
+        <span class="font-bold text-base tracking-tight text-white">漫制局</span>
+      </div>
+      <span class="text-zinc-600 text-sm">/</span>
+      <button class="text-sm font-medium text-zinc-200 hover:text-white flex items-center gap-1.5 transition">
+        <span>雨夜旧案</span>
+        <i data-lucide="chevron-down" class="w-3.5 h-3.5 text-zinc-400"></i>
+      </button>
+      <span class="text-zinc-600 text-sm">/</span>
+      <span class="text-sm text-zinc-400 font-medium">第 02 章 · 破晓追踪</span>
+    </div>
+
+    <!-- 中：大字号舒展管线步骤 (13px~14px，间距适度放大) -->
+    <nav class="hidden lg:flex items-center gap-8 text-sm text-zinc-400 font-medium">
+      <button class="hover:text-zinc-200 transition">1. 剧本分场</button>
+      <button class="hover:text-zinc-200 transition">2. 资产角色</button>
+      <!-- 当前步骤：高亮突出 -->
+      <button class="text-white font-semibold flex items-center gap-2 relative">
+        <span class="w-2 h-2 rounded-full bg-blue-500"></span>
+        <span>3. 分镜制作</span>
+        <span class="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full font-mono font-bold">12 / 15</span>
+      </button>
+      <button class="hover:text-zinc-200 transition text-zinc-500">4. 角色配音</button>
+      <button class="hover:text-zinc-200 transition text-zinc-500">5. 最终合成</button>
+    </nav>
+
+    <!-- 右：清晰视图切换 + 舒适明暗模式切换 -->
+    <div class="flex items-center gap-3">
+      <!-- 渲染状态清晰提示 -->
+      <div class="hidden sm:flex items-center gap-2 text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1.5 rounded-full">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+        <span class="font-medium">2 个镜头渲染中 (68%)</span>
+      </div>
+
+      <!-- 单镜精修 / 故事板全览切换 -->
+      <div class="flex items-center bg-white/[0.06] p-1 rounded-lg border border-white/[0.08]">
+        <button onclick="switchView('focus')" id="btn-focus" class="px-3 py-1.5 text-xs font-semibold rounded-md bg-white/15 text-white transition shadow-sm">
+          单镜精修
+        </button>
+        <button onclick="switchView('grid')" id="btn-grid" class="px-3 py-1.5 text-xs font-semibold rounded-md text-zinc-400 hover:text-white transition">
+          故事板全览
+        </button>
+      </div>
+
+      <!-- 明亮 / 暗黑切换开关 (解决暗光视疲劳) -->
+      <button onclick="toggleTheme()" class="p-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 hover:text-white transition" title="切换色彩模式">
+        <i data-lucide="sun" class="w-4 h-4 hidden" id="theme-sun"></i>
+        <i data-lucide="moon" class="w-4 h-4" id="theme-moon"></i>
+      </button>
+    </div>
+  </header>
+
+  <!-- ================= 主体内容区：单镜专注精修 (Focus View) ================= -->
+  <main id="view-focus" class="flex-1 flex flex-col min-h-0 overflow-hidden">
+    
+    <!-- 上半部：左右双栏 (黄金比例大画面 + 舒展大字号剧本编辑) -->
+    <div class="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
+      
+      <!-- 【左侧】电影级大画面主视口 (舒展大画幅) -->
+      <section class="flex-1 bg-[#090a0d] flex flex-col items-center justify-center p-6 lg:p-8 relative overflow-hidden group">
+        
+        <!-- 画面主框体 (16:9 大画幅容器) -->
+        <div class="w-full max-w-5xl aspect-video rounded-2xl overflow-hidden bg-black shadow-2xl border border-white/10 relative">
+          <!-- 关键帧大图 -->
+          <img id="stageImage" src="https://images.unsplash.com/photo-1578632767115-351597cf2477?q=80&w=1600&auto=format&fit=crop" class="w-full h-full object-cover" alt="Shot Scene" />
+
+          <!-- 顶部常驻微标：清晰大字号 (14px) -->
+          <div class="absolute top-5 inset-x-6 flex items-center justify-between pointer-events-none">
+            <div class="bg-black/75 backdrop-blur-md px-4 py-1.5 rounded-full text-sm font-mono text-zinc-100 border border-white/15 flex items-center gap-3 shadow-lg">
+              <span class="font-bold text-white text-base tracking-wide" id="badgeShotNo">镜头 #03</span>
+              <span class="text-zinc-600">|</span>
+              <span class="text-zinc-300 font-medium font-sans" id="badgeShotScale">特写 · 缓慢推进</span>
+              <span class="text-zinc-600">|</span>
+              <span class="text-emerald-400 font-semibold font-sans flex items-center gap-1.5">
+                <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                已确认
+              </span>
+            </div>
+
+            <!-- 视频 / 原画 切换 -->
+            <div class="bg-black/75 backdrop-blur-md p-1 rounded-full border border-white/15 pointer-events-auto flex items-center shadow-lg">
+              <button onclick="setMediaMode('image')" id="btn-type-img" class="px-4 py-1 rounded-full bg-white/20 text-white font-semibold text-xs transition">原画图像</button>
+              <button onclick="setMediaMode('video')" id="btn-type-vid" class="px-4 py-1 rounded-full text-zinc-400 hover:text-white font-semibold text-xs transition">生成视频</button>
+            </div>
+          </div>
+
+          <!-- 底部舒展台词浮层 (字号提升到 16px，行高舒适自然) -->
+          <div class="absolute bottom-0 inset-x-0 bg-gradient-to-t from-black/90 via-black/50 to-transparent p-6 lg:p-8 flex items-end justify-between gap-6">
+            
+            <!-- 台词正文 -->
+            <div class="space-y-2 max-w-2xl">
+              <div class="flex items-center gap-3 text-sm">
+                <span class="px-2 py-0.5 rounded bg-blue-500/20 text-blue-400 font-bold border border-blue-500/30 text-xs" id="stageSpeaker">陈平安</span>
+                <span class="text-zinc-400 text-xs font-medium">角色配音 (EdgeTTS · 云希)</span>
+                <button onclick="playVoice()" class="text-zinc-300 hover:text-white text-xs flex items-center gap-1 px-2 py-0.5 rounded bg-white/10 transition">
+                  <i data-lucide="volume-2" class="w-3.5 h-3.5 text-blue-400"></i>
+                  试听台词
+                </button>
+              </div>
+              <p class="text-lg lg:text-xl font-medium text-white leading-relaxed drop-shadow-md tracking-wide" id="stageDialogue">
+                “这雨势……今夜怕是走不出这小镇了。”
+              </p>
+            </div>
+
+            <!-- 历史版本快速切换胶囊 (文字清晰易触达) -->
+            <div class="flex items-center gap-2 bg-black/70 backdrop-blur-md px-3 py-1.5 rounded-xl border border-white/15 text-xs font-mono shrink-0 shadow-lg">
+              <span class="text-zinc-400 text-xs mr-1 font-sans">版本:</span>
+              <button onclick="selectVersion(1)" id="ver-btn-1" class="px-2.5 py-1 rounded-md text-zinc-300 hover:text-white transition font-medium">V1</button>
+              <button onclick="selectVersion(2)" id="ver-btn-2" class="px-2.5 py-1 rounded-md text-zinc-300 hover:text-white transition font-medium">V2</button>
+              <button onclick="selectVersion(3)" id="ver-btn-3" class="px-2.5 py-1 rounded-md bg-blue-600 text-white font-bold transition shadow-sm">V3 (当前)</button>
+            </div>
+
+          </div>
+
+        </div>
+
+      </section>
+
+      <!-- 【右侧】大字号舒服的剧本参数面板 (宽度适度放大到 460px，间距开阔) -->
+      <aside class="w-full lg:w-[460px] bg-[#14151a] border-l border-white/[0.08] flex flex-col shrink-0 overflow-y-auto">
+        
+        <!-- 面板顶部：大标题 + 左右切换镜头按键 -->
+        <div class="p-6 border-b border-white/[0.08] flex items-center justify-between">
+          <div>
+            <div class="text-xs font-mono font-bold tracking-widest text-zinc-500 uppercase">场次 02 · 镜头 03</div>
+            <h2 class="text-xl font-bold text-white mt-1 tracking-tight" id="panelTitle">推门雨夜 · 破旧酒肆</h2>
+          </div>
+
+          <!-- 上下镜大号轻按钮 -->
+          <div class="flex items-center gap-2">
+            <button onclick="prevShot()" class="p-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 hover:text-white transition" title="上一个镜头 (快捷键: ←)">
+              <i data-lucide="arrow-left" class="w-4 h-4"></i>
+            </button>
+            <button onclick="nextShot()" class="p-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 hover:text-white transition" title="下一个镜头 (快捷键: →)">
+              <i data-lucide="arrow-right" class="w-4 h-4"></i>
+            </button>
+          </div>
+        </div>
+
+        <!-- 面板主体内容区：字号 14px~15px，开阔易读 -->
+        <div class="p-6 space-y-7 flex-1">
+          
+          <!-- 1. 剧情动作与叙事 -->
+          <div class="space-y-2">
+            <label class="text-xs font-bold uppercase tracking-wider text-zinc-400">剧情动作与环境叙事</label>
+            <textarea id="panelAction" rows="3" class="w-full bg-white/[0.02] hover:bg-white/[0.04] focus:bg-white/[0.06] p-3.5 rounded-xl border border-white/[0.08] focus:border-blue-500 text-zinc-200 text-sm leading-relaxed outline-none resize-none transition">陈平安身披蓑衣，推开腐朽的客栈木门，雨水顺着斗笠滑落。门内只有一盏昏暗的油灯在阴影中闪烁。</textarea>
+          </div>
+
+          <!-- 2. 对白台词输入 -->
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-xs font-bold uppercase tracking-wider text-zinc-400">对白台词</label>
+              <span class="text-xs font-medium text-blue-400">说话人：陈平安</span>
+            </div>
+            <textarea id="panelDialogue" rows="2" class="w-full bg-white/[0.02] hover:bg-white/[0.04] focus:bg-white/[0.06] p-3.5 rounded-xl border border-white/[0.08] focus:border-blue-500 text-white font-medium text-sm leading-relaxed outline-none resize-none transition">“这雨势……今夜怕是走不出这小镇了。”</textarea>
+          </div>
+
+          <!-- 3. 画面提示词 PROMPT (大字体、宽行高，不费眼) -->
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-xs font-bold uppercase tracking-wider text-zinc-400">绘图提示词 (PROMPT)</label>
+              <button class="text-xs text-blue-400 hover:text-blue-300 font-medium flex items-center gap-1">
+                <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+                AI 导演润色
+              </button>
+            </div>
+            <textarea id="panelPrompt" rows="4" class="w-full bg-white/[0.03] hover:bg-white/[0.05] focus:bg-white/[0.07] p-3.5 rounded-xl border border-white/[0.1] focus:border-blue-500 text-zinc-200 text-sm leading-relaxed outline-none resize-y transition">国风厚涂水墨, 陈平安侧身推开古旧木门, 门缝透出暖黄色油灯微光, 暴雨丝飞溅, 冷暖光线交错, 电影级光影景深, 细腻质感, 8k resolution, cinematic lighting</textarea>
+            <div class="flex items-center justify-between text-xs text-zinc-500 pt-1">
+              <span>画风：已继承统一水墨设定</span>
+              <span class="font-mono">132 字符</span>
+            </div>
+          </div>
+
+          <!-- 4. 镜头构图与运镜参数 (大药丸按钮，点击轻松) -->
+          <div class="space-y-2.5">
+            <label class="text-xs font-bold uppercase tracking-wider text-zinc-400">镜头语言构图</label>
+            <div class="flex flex-wrap gap-2.5 text-xs font-medium">
+              <span class="px-3 py-1.5 rounded-lg bg-white/[0.05] border border-white/[0.08] text-zinc-200">特写 (Close-up)</span>
+              <span class="px-3 py-1.5 rounded-lg bg-white/[0.05] border border-white/[0.08] text-zinc-200">平视 (Eye Level)</span>
+              <span class="px-3 py-1.5 rounded-lg bg-white/[0.05] border border-white/[0.08] text-zinc-200">缓慢推进 (Slow Push)</span>
+              <span class="px-3 py-1.5 rounded-lg bg-white/[0.05] border border-white/[0.08] text-blue-400 font-mono">时长 4.5s</span>
+            </div>
+          </div>
+
+          <!-- 5. 关联出场资产 -->
+          <div class="space-y-2.5 pt-2 border-t border-white/[0.06]">
+            <label class="text-xs font-bold uppercase tracking-wider text-zinc-400">绑定出场资产</label>
+            <div class="flex items-center gap-3">
+              <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.05] border border-white/[0.08] text-xs font-medium text-zinc-200">
+                <span class="w-2 h-2 rounded-full bg-amber-400"></span>
+                <span>陈平安 (已锁定形象)</span>
+              </div>
+              <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.05] border border-white/[0.08] text-xs font-medium text-zinc-200">
+                <span class="w-2 h-2 rounded-full bg-blue-400"></span>
+                <span>破败酒肆场景</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- 底部大号主按钮 (高度 44px，点击踏实舒适) -->
+        <div class="p-6 border-t border-white/[0.08] bg-[#14151a] flex items-center gap-3.5">
+          <button class="flex-1 h-11 rounded-xl border border-white/15 hover:bg-white/[0.08] text-sm font-semibold text-zinc-200 transition flex items-center justify-center gap-2">
+            <i data-lucide="refresh-cw" class="w-4 h-4 text-zinc-400"></i>
+            重绘关键帧
+          </button>
+          <button class="flex-1 h-11 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold shadow-lg shadow-blue-600/30 transition flex items-center justify-center gap-2">
+            <i data-lucide="video" class="w-4 h-4"></i>
+            渲染分镜视频
+          </button>
+        </div>
+
+      </aside>
+    </div>
+
+    <!-- 下半部：大号横向胶卷导轨 (高度 130px，缩略图大、文字大，一眼辨认) -->
+    <footer class="h-[136px] border-t border-white/[0.08] bg-[#111216] px-6 flex items-center gap-5 shrink-0 overflow-x-auto no-scrollbar">
+      
+      <!-- 导轨标题与统计 -->
+      <div class="shrink-0 flex flex-col justify-center border-r border-white/[0.08] pr-5 space-y-1">
+        <span class="text-sm font-bold text-white tracking-tight">分镜轨道</span>
+        <span class="text-xs text-zinc-400 font-mono tabular">15 个镜头</span>
+        <span class="text-[11px] text-zinc-500">按 ← / → 快切</span>
+      </div>
+
+      <!-- 横排大缩略图卡片 -->
+      <div class="flex items-center gap-4 overflow-x-auto no-scrollbar py-2" id="filmstripList">
+        <!-- JS 渲染 -->
+      </div>
+
+    </footer>
+
+  </main>
+
+  <!-- ================= 模式 2：故事板画廊全景视图 (Grid View) ================= -->
+  <div id="view-grid" class="flex-1 p-8 overflow-y-auto hidden">
+    <div class="max-w-7xl mx-auto space-y-6">
+      <div class="flex items-center justify-between border-b border-white/[0.08] pb-5">
+        <div>
+          <h2 class="text-2xl font-bold text-white tracking-tight">全篇故事板画廊</h2>
+          <p class="text-sm text-zinc-400 mt-1">全局审阅全片节奏、色调连贯性；点击任意大卡片即可直接进入单镜精修。</p>
+        </div>
+        <button onclick="switchView('focus')" class="px-4 py-2 rounded-xl bg-blue-600 text-white text-sm font-bold shadow-md hover:bg-blue-500 transition">
+          返回单镜精修
+        </button>
+      </div>
+
+      <!-- 舒适大尺寸卡片网格 -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6" id="storyboardGrid">
+        <!-- JS 渲染 -->
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // 真实分镜镜头数据
+    const shots = [
+      {
+        no: 1,
+        title: '暴雨倾盆 · 小镇街道',
+        scale: '全景',
+        move: '慢速横移',
+        speaker: '旁白',
+        dialogue: '大雨如注，打落在泥瓶巷青黑色的石板上，泛起白茫茫的雨雾。',
+        action: '空镜，暴雨中的小镇街道，远处有一盏昏黄的灯笼在风雨中摇摆。',
+        image: 'https://images.unsplash.com/photo-1519681393784-d120267933ba?q=80&w=1200&auto=format&fit=crop',
+        status: '已确认',
+        duration: '3.5s',
+        prompt: '远景空镜，暴雨倾盆的小镇石板街道，古风黑瓦建筑，昏黄灯笼微光，青蓝色冷调水墨厚涂，8k'
+      },
+      {
+        no: 2,
+        title: '蓑衣人影 · 踏碎水洼',
+        scale: '中景',
+        move: '跟拍向前',
+        speaker: '',
+        dialogue: '（只有沉重的踏水脚步声与风雨呼啸）',
+        action: '陈平安身披蓑衣斗笠，快步在泥泞中前行，草鞋踏碎一处水洼。',
+        image: 'https://images.unsplash.com/photo-1534447677768-be436bb09401?q=80&w=1200&auto=format&fit=crop',
+        status: '已确认',
+        duration: '4.0s',
+        prompt: '低角度跟拍，草鞋踏碎水洼慢镜头，水花四溅，蓑衣斗笠背影，冷色调国风动漫风格'
+      },
+      {
+        no: 3,
+        title: '推门雨夜 · 破旧酒肆',
+        scale: '特写',
+        move: '缓慢推进',
+        speaker: '陈平安',
+        dialogue: '“这雨势……今夜怕是走不出这小镇了。”',
+        action: '陈平安身披蓑衣，推开腐朽的客栈木门，雨水顺着斗笠滑落。门内只有一盏昏暗的油灯在阴影中闪烁。',
+        image: 'https://images.unsplash.com/photo-1578632767115-351597cf2477?q=80&w=1200&auto=format&fit=crop',
+        status: '已确认',
+        duration: '4.5s',
+        prompt: '国风厚涂水墨, 陈平安侧身推开古旧木门, 门缝透出暖黄色油灯微光, 暴雨丝飞溅, 冷暖光线交错, 电影级光影景深, 细腻质感, 8k resolution, cinematic lighting'
+      },
+      {
+        no: 4,
+        title: '掌柜抬头 · 浑浊眼眸',
+        scale: '中景',
+        move: '静止锁定',
+        speaker: '酒肆老掌柜',
+        dialogue: '“客官打尖还是住店？小店只剩最后一间柴房了。”',
+        action: '柜台后算账的老人停下手中算盘，用脏抹布擦拭木桌，眼皮微抬。',
+        image: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?q=80&w=1200&auto=format&fit=crop',
+        status: '渲染中',
+        duration: '4.2s',
+        prompt: '昏暗客栈柜台，白发沧桑老掌柜，算盘油灯，阴影明暗对比强烈，怀旧复古电影质感'
+      },
+      {
+        no: 5,
+        title: '背上剑匣 · 寒芒微敛',
+        scale: '大特写',
+        move: '轻微变焦',
+        speaker: '陈平安',
+        dialogue: '“无妨，能避雨即可。”',
+        action: '陈平安解下斗笠，露出被雨水打湿的额发，背后的黑木剑匣显露出一角。',
+        image: 'https://images.unsplash.com/photo-1563089145-599997674d42?q=80&w=1200&auto=format&fit=crop',
+        status: '草稿',
+        duration: '3.8s',
+        prompt: '黑木剑匣细节特写，古朴符文，雨水顺着剑柄流淌，冰冷神秘质感，微距摄影'
+      }
+    ];
+
+    let currentShotIdx = 2; // 默认选中第 3 镜
+
+    function init() {
+      renderFilmstrip();
+      renderGrid();
+      updateStageView();
+      lucide.createIcons();
+
+      // 键盘左右键直接前后切镜
+      window.addEventListener('keydown', (e) => {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        if (e.key === 'ArrowLeft') prevShot();
+        if (e.key === 'ArrowRight') nextShot();
+      });
+    }
+
+    // 渲染底部大号横向胶卷轨道 (缩略图 160px 宽，大字号)
+    function renderFilmstrip() {
+      const container = document.getElementById('filmstripList');
+      container.innerHTML = shots.map((shot, idx) => {
+        const isActive = idx === currentShotIdx;
+        return `
+          <div onclick="selectShot(${idx})" class="group cursor-pointer shrink-0 w-44 rounded-xl overflow-hidden border-2 ${isActive ? 'border-blue-500 ring-4 ring-blue-500/20' : 'border-white/[0.08] hover:border-white/20'} bg-black relative transition shadow-md">
+            <div class="aspect-video w-full overflow-hidden">
+              <img src="${shot.image}" class="w-full h-full object-cover group-hover:scale-105 transition duration-200" />
+            </div>
+            <div class="p-2 bg-[#181920] flex items-center justify-between text-xs">
+              <span class="font-mono font-bold text-sm ${isActive ? 'text-blue-400' : 'text-zinc-200'}">#0${shot.no}</span>
+              <span class="text-zinc-400 font-medium">${shot.scale}</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // 渲染故事板大画廊卡片
+    function renderGrid() {
+      const grid = document.getElementById('storyboardGrid');
+      grid.innerHTML = shots.map((shot, idx) => `
+        <div onclick="selectShot(${idx}); switchView('focus');" class="group rounded-2xl border border-white/[0.08] bg-[#16171c] overflow-hidden hover:border-blue-500/50 transition cursor-pointer shadow-xl">
+          <div class="aspect-video bg-black relative overflow-hidden">
+            <img src="${shot.image}" class="w-full h-full object-cover group-hover:scale-105 transition duration-300" />
+            <div class="absolute top-3 left-3 bg-black/75 backdrop-blur-md px-3 py-1 rounded-full text-sm font-mono font-bold text-white">#0${shot.no}</div>
+            <div class="absolute top-3 right-3 bg-black/75 backdrop-blur-md px-2.5 py-1 rounded-full text-xs text-zinc-200 font-medium">${shot.scale} · ${shot.duration}</div>
+          </div>
+          <div class="p-5 space-y-2.5">
+            <h3 class="text-base font-bold text-white truncate tracking-tight">${shot.title}</h3>
+            <p class="text-sm text-zinc-400 line-clamp-2 leading-relaxed">${shot.dialogue || shot.action}</p>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    function selectShot(idx) {
+      currentShotIdx = idx;
+      renderFilmstrip();
+      updateStageView();
+    }
+
+    function prevShot() {
+      if (currentShotIdx > 0) selectShot(currentShotIdx - 1);
+    }
+    function nextShot() {
+      if (currentShotIdx < shots.length - 1) selectShot(currentShotIdx + 1);
+    }
+
+    function updateStageView() {
+      const s = shots[currentShotIdx];
+      document.getElementById('badgeShotNo').innerText = `镜头 #0${s.no}`;
+      document.getElementById('badgeShotScale').innerText = `${s.scale} · ${s.move}`;
+      document.getElementById('stageImage').src = s.image;
+      document.getElementById('stageSpeaker').innerText = s.speaker || '环境旁白';
+      document.getElementById('stageDialogue').innerText = s.dialogue || '（无对白）';
+
+      document.getElementById('panelTitle').innerText = s.title;
+      document.getElementById('panelAction').value = s.action;
+      document.getElementById('panelDialogue').value = s.dialogue;
+      document.getElementById('panelPrompt').value = s.prompt;
+    }
+
+    function switchView(mode) {
+      if (mode === 'focus') {
+        document.getElementById('view-focus').classList.remove('hidden');
+        document.getElementById('view-grid').classList.add('hidden');
+        document.getElementById('btn-focus').classList.add('bg-white/15', 'text-white');
+        document.getElementById('btn-focus').classList.remove('text-zinc-400');
+        document.getElementById('btn-grid').classList.remove('bg-white/15', 'text-white');
+        document.getElementById('btn-grid').classList.add('text-zinc-400');
+      } else {
+        document.getElementById('view-focus').classList.add('hidden');
+        document.getElementById('view-grid').classList.remove('hidden');
+        document.getElementById('btn-grid').classList.add('bg-white/15', 'text-white');
+        document.getElementById('btn-grid').classList.remove('text-zinc-400');
+        document.getElementById('btn-focus').classList.remove('bg-white/15', 'text-white');
+        document.getElementById('btn-focus').classList.add('text-zinc-400');
+      }
+      lucide.createIcons();
+    }
+
+    function selectVersion(v) {
+      const imgs = {
+        1: 'https://images.unsplash.com/photo-1534447677768-be436bb09401?q=80&w=1600&auto=format&fit=crop',
+        2: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=1600&auto=format&fit=crop',
+        3: 'https://images.unsplash.com/photo-1578632767115-351597cf2477?q=80&w=1600&auto=format&fit=crop'
+      };
+      [1, 2, 3].forEach(num => {
+        const b = document.getElementById('ver-btn-' + num);
+        b.className = 'px-2.5 py-1 rounded-md text-zinc-300 hover:text-white transition font-medium';
+        b.innerText = `V${num}`;
+      });
+      const activeBtn = document.getElementById('ver-btn-' + v);
+      activeBtn.className = 'px-2.5 py-1 rounded-md bg-blue-600 text-white font-bold transition shadow-sm';
+      activeBtn.innerText = `V${v} (当前)`;
+      document.getElementById('stageImage').src = imgs[v];
+    }
+
+    function setMediaMode(mode) {
+      const imgBtn = document.getElementById('btn-type-img');
+      const vidBtn = document.getElementById('btn-type-vid');
+      if (mode === 'image') {
+        imgBtn.className = 'px-4 py-1 rounded-full bg-white/20 text-white font-semibold text-xs transition';
+        vidBtn.className = 'px-4 py-1 rounded-full text-zinc-400 hover:text-white font-semibold text-xs transition';
+      } else {
+        vidBtn.className = 'px-4 py-1 rounded-full bg-white/20 text-white font-semibold text-xs transition';
+        imgBtn.className = 'px-4 py-1 rounded-full text-zinc-400 hover:text-white font-semibold text-xs transition';
+      }
+    }
+
+    function toggleTheme() {
+      document.documentElement.classList.toggle('dark');
+      document.documentElement.classList.toggle('light');
+      const isLight = document.documentElement.classList.contains('light');
+      document.getElementById('theme-sun').classList.toggle('hidden', isLight);
+      document.getElementById('theme-moon').classList.toggle('hidden', !isLight);
+    }
+
+    function playVoice() {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(300, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(500, ctx.currentTime + 0.25);
+        gain.gain.setValueAtTime(0.15, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.35);
+      } catch (e) {}
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>

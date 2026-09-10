@@ -35,6 +35,9 @@ describe("平台设置", () => {
       policy: "克制",
       options: ["克制", "标准", "丰富"],
     });
+    vi.spyOn(api.settings.defaultStylePrompt, "get").mockResolvedValue({
+      style_prompt: "水墨国风画风",
+    });
   });
 
   test("test_project_storage_load_displays_current_path_and_scope_notice", async () => {
@@ -137,5 +140,38 @@ describe("平台设置", () => {
 
     expect(await screen.findByLabelText("当前策略")).toHaveValue("标准");
     expect(toast.success).toHaveBeenCalledWith("运镜策略已更新");
+  });
+
+  test("test_default_style_prompt_load_displays_current_value", async () => {
+    renderPage();
+
+    expect(
+      await screen.findByLabelText("默认统一画风 STYLE_ANCHOR"),
+    ).toHaveValue("水墨国风画风");
+  });
+
+  test("test_default_style_prompt_save_updates_value_and_shows_success", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api.settings.defaultStylePrompt, "set").mockResolvedValue({
+      style_prompt: "赛博朋克写实风",
+    });
+    renderPage();
+
+    const textarea = await screen.findByLabelText(
+      "默认统一画风 STYLE_ANCHOR",
+    );
+    await user.clear(textarea);
+    await user.type(textarea, "赛博朋克写实风");
+
+    const saveButton = screen.getByRole("button", { name: "保存画风" });
+    expect(saveButton).toBeEnabled();
+    await user.click(saveButton);
+
+    await waitFor(() =>
+      expect(api.settings.defaultStylePrompt.set).toHaveBeenCalledWith(
+        "赛博朋克写实风",
+      ),
+    );
+    expect(toast.success).toHaveBeenCalledWith("默认画风已更新");
   });
 });

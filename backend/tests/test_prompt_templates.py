@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.dynamic_pipeline.visual_anchor import compile_visual_bible
 from app.prompts import load_prompt
 from app.services.prompt_service import (
     _normalize_sentence_end,
@@ -197,7 +198,26 @@ def test_shot_template_context_normalizes_dialogue_aliases() -> None:
         {},
     )
 
-    assert context["dialogue"] == "林雪自然开口说：别动。；守卫自然开口说：站住。"
+    assert context["dialogue"] == "林雪：别动。；守卫：站住。"
+
+
+def test_shot_template_context_drops_storyboard_junk_from_time_place() -> None:
+    """「场景1：动作＋旁白」类分镜残留不得成为时间地点内容。"""
+    context = shot_template_context(
+        {"source_ref": "scene:2|场景1：动作＋旁白"},
+        {},
+    )
+
+    assert context["time_place"] == ""
+
+
+def test_shot_template_context_keeps_place_and_drops_junk_clauses() -> None:
+    context = shot_template_context(
+        {"source_ref": "scene:2|古寺门口，角色抬手动作，旁白响起"},
+        {},
+    )
+
+    assert context["time_place"] == "古寺门口"
 
 
 @pytest.mark.parametrize(
@@ -315,11 +335,12 @@ def test_character_sheet_counts_expression_group_and_strips_scene_staging() -> N
         composition="主人物立绘位于画面左侧主体区域，并在该区域内部居中完整站立。",
     )
 
-    assert "排列4个高精度面部特写" in prompt
+    assert "排列4个面部特写" in prompt
     assert "4个面部特写必须保持完全一致" in prompt
     assert "命灯金暖光与夜色冷光" not in prompt
     assert "旧铜油壶" not in prompt
-    assert "柔和中性主光，辅以极轻微暖金轮廓光" in prompt
+    assert "只陈述光源方向与时间等事实" in prompt
+    assert "柔和中性主光" not in prompt
     assert "双臂自然下垂，双手自然放松" in prompt
     assert "不出现任何环境、布景或场景元素" in prompt
     assert "【角色身份唯一性】" in prompt
@@ -339,6 +360,42 @@ def test_scene_negative_prompt_merge_is_idempotent() -> None:
 
     assert resolve_asset_negative_prompt("scene", merged) == merged
     assert merged.count("人物、角色、人群、路人、行人、人影、人形、剪影") == 1
+
+
+def test_asset_negative_prompt_pbr_style_drops_realistic_render_exclusions() -> None:
+    """PBR 画风（半写实3D国漫）下默认负向不得反向禁用三维渲染表达。"""
+    style_spec = compile_visual_bible("近未来科技职场题材，半写实 3D 国漫风", None)
+
+    merged = resolve_asset_negative_prompt("scene", "", style_spec)
+
+    assert "3D建模渲染" not in merged
+    assert "写实PBR" not in merged
+    assert "镜面反射" not in merged
+    assert "透明折射" not in merged
+    assert "逼真材质贴图" not in merged
+    assert "人物、角色、人群" in merged
+    assert "招牌店名" in merged
+
+
+def test_asset_negative_prompt_pbr_style_drops_exclusions_with_custom_items() -> None:
+    """自定义负向存在时，PBR 画风同样剔除写实渲染排除词。"""
+    style_spec = compile_visual_bible("近未来科技职场题材，半写实 3D 国漫风", None)
+
+    merged = resolve_asset_negative_prompt("scene", "现代装修", style_spec)
+
+    assert merged.startswith("现代装修")
+    assert "3D建模渲染" not in merged
+    assert "写实PBR" not in merged
+
+
+def test_asset_negative_prompt_2d_style_keeps_realistic_render_exclusions() -> None:
+    style_spec = compile_visual_bible("水墨二维国漫", None)
+
+    merged = resolve_asset_negative_prompt("scene", "", style_spec)
+
+    assert "3D建模渲染" in merged
+    assert "写实PBR" in merged
+    assert "逼真材质贴图" in merged
 
 
 def test_compile_scene_asset_prompt_enforces_empty_background_with_custom_negative_prompt() -> None:
@@ -372,6 +429,8 @@ def test_compile_scene_asset_prompt_enforces_empty_background_with_custom_negati
     assert "林舟" not in prompt
     assert "儿童阅读区" in prompt
     assert "手电光扫过挂钟墙" in prompt
+    assert "任何招牌、门头、指示牌或屏幕只保留色块与材质，不出现店名、logo、英文或符号" in prompt
+    assert "招牌店名、门头文字" in prompt
     assert "negative prompt: 现代装修、人物、角色、人群、路人、行人、人影、人形、剪影" in prompt
 
 
@@ -514,6 +573,100 @@ def test_compile_keyframe_prompt_wide_shot_requires_readable_character_size() ->
 
     assert "约占画面高度的1/5至1/4" in prompt
     assert "不得缩成远景小黑点" in prompt
+    # 二维画风仍保留写实化排除句，与画风指纹不打架
+    assert "不呈现真人摄影、影视剧照、三次元演员、写实实拍或过度三维游戏CG质感" in prompt
+
+
+def test_compile_keyframe_prompt_empty_shot_drops_character_requirements() -> None:
+    """无人空镜不追加人物体量、表情、双手与手持道具等人物要求。"""
+    prompt = compile_keyframe_prompt(
+        style_prompt="近未来科技职场题材，半写实 3D 国漫风，整体克制，带轻微黑色幽默与都市荒诞感",
+        aspect_ratio="16:9",
+        image_prompt="清晨，空无一人的未来科技公司开放式办公区，落地窗外城市天际线。",
+        anchors=[],
+        shot_context={
+            "opening_frame": "空无一人的办公区，晨光斜照",
+            "characters": [],
+            "scene_name": "未来科技公司办公区",
+            "shot_type": "大全景空镜",
+            "camera_angle": "平视",
+        },
+    )
+
+    assert "本镜为无人空镜" in prompt
+    assert "当前分镜角色" not in prompt
+    assert "1/5至1/4" not in prompt
+    assert "人物仍需保持清晰可辨识" not in prompt
+    assert "人物表情自然克制" not in prompt
+    assert "双手与关键手持道具" not in prompt
+    assert "人物现在在哪里" not in prompt
+    assert "清晰照亮人物五官" not in prompt
+    assert "只出现本镜绑定的角色" not in prompt
+    assert "不出现任何人物、行人、看客、路人或模糊人影" in prompt
+    assert "清晰照亮场景结构与关键陈设" in prompt
+    # 3D 画风下不再输出与画风指纹打架的「游戏CG」排除句
+    assert "过度三维游戏CG质感" not in prompt
+    assert "不叠加其他渲染质感" in prompt
+
+
+def test_compile_keyframe_prompt_empty_shot_keeps_empty_label_from_unbound_shot() -> None:
+    """未绑定角色且景别不含「空镜」字样时，同样按无人空镜处理。"""
+    prompt = compile_keyframe_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        image_prompt="晨雾中的空山古寺全景。",
+        anchors=[],
+        shot_context={
+            "opening_frame": "空山古寺全景，晨雾弥漫",
+            "characters": [],
+            "scene_name": "古寺",
+            "shot_type": "大全景",
+            "camera_angle": "平视",
+        },
+    )
+
+    assert "本镜为无人空镜" in prompt
+    assert "1/5至1/4" not in prompt
+    assert "人物仍需保持清晰可辨识" not in prompt
+
+
+def test_compile_keyframe_prompt_without_scene_anchor_uses_text_based_layout() -> None:
+    """无场景绑定参考图时不得出现「沿用绑定参考图」，改用文字设定自洽表述。"""
+    prompt = compile_keyframe_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        image_prompt="空无一人的古寺大殿。",
+        anchors=[],
+        shot_context={
+            "characters": [],
+            "scene_name": "古寺大殿",
+            "shot_type": "大全景空镜",
+            "camera_angle": "平视",
+        },
+    )
+
+    assert "沿用绑定参考图" not in prompt
+    assert "按本提示词文字设定生成" in prompt
+    assert "保证各模块内部一致" in prompt
+
+
+def test_compile_keyframe_prompt_with_scene_anchor_keeps_reference_wording() -> None:
+    """有场景绑定参考图时保留「沿用绑定参考图」的方位一致性约束。"""
+    prompt = compile_keyframe_prompt(
+        style_prompt="东方奇幻二维动画",
+        aspect_ratio="16:9",
+        image_prompt="古寺偏殿全景。",
+        anchors=["@Image1：古寺偏殿，锁定场景空间结构和光线。"],
+        shot_context={
+            "characters": [],
+            "scene_name": "古寺偏殿",
+            "shot_type": "全景空镜",
+            "camera_angle": "平视",
+        },
+    )
+
+    assert "沿用绑定参考图" in prompt
+    assert "必须和参考图完全一致" in prompt
 
 
 def test_compile_keyframe_prompt_close_shot_omits_wide_body_rule() -> None:
@@ -586,8 +739,11 @@ def test_compile_keyframe_prompt_includes_dialogue_aliases() -> None:
         shot_context=context,
     )
 
-    assert "林雪自然开口说：别动。" in prompt
-    assert "守卫自然开口说：站住。" in prompt
+    assert "林雪：别动。" in prompt
+    assert "守卫：站住。" in prompt
+    assert "自然开口说" not in prompt
+    assert "本帧锁定对白开始前的短暂停顿瞬间" in prompt
+    assert "画面中所有人物均闭口" in prompt
 
 
 def test_compile_video_prompt_uses_v2_template_and_reference_order() -> None:
@@ -637,7 +793,10 @@ def test_compile_video_prompt_uses_v2_template_and_reference_order() -> None:
     assert "道具穿模" in prompt
     assert "画面比例 16:9" in prompt
     assert "时长约 6 秒" in prompt
-    # 旧模板特征词不得残留
+    # 旧模板特征词不得残留在正文；协议尾部（Negative / Motion style lock）
+    # 是渲染器有意注入的约束文本，不参与该检查。
+    body = prompt.split("\n\nMotion style lock:", 1)[0]
+    body = body.split("\n\nNegative:", 1)[0]
     for banned in (
         "严格保持",
         "全程保持",
@@ -647,7 +806,8 @@ def test_compile_video_prompt_uses_v2_template_and_reference_order() -> None:
         "连续覆盖",
         "忽略其他描述",
     ):
-        assert banned not in prompt
+        assert banned not in body
+    assert "Motion style lock:" in prompt
 
 
 def test_compile_video_prompt_includes_positions_and_expressions() -> None:
@@ -724,7 +884,7 @@ def test_camera_line_treats_stable_move_as_moving() -> None:
         shot_context={"camera_move": "稳定横移"},
     )
 
-    assert "镜头稳定横移，并跟随人物的运动自然调整。" in prompt
+    assert "镜头稳定横移，幅度小而明确，中间不调整速度。" in prompt
     assert "机位固定" not in prompt
 
 
@@ -990,3 +1150,28 @@ def test_prop_negative_prompt_merges_default_items() -> None:
     assert "完整人物、人物脸" in merged
     assert "不要现代电子表" in merged
     assert resolve_asset_negative_prompt("prop", merged) == merged
+
+
+def test_真人写实素材负向剔除真人摄影类排除词() -> None:
+    style_spec = compile_visual_bible("写实真人风格", None)
+    negative = resolve_asset_negative_prompt("character", "畸形手指", style_spec)
+
+    # 正向指纹是真人实拍质感：与真人摄影类默认负向互斥的词必须剔除
+    assert "真人摄影" not in negative
+    assert "产品摄影" not in negative
+    # 三维CG 排除保留（写实指纹明确「不是三维CG」）
+    assert "3D建模渲染" in negative
+
+
+def test_真人写实关键帧完成精度句不写反写实排除词() -> None:
+    prompt = compile_keyframe_prompt(
+        style_prompt="写实真人风格",
+        aspect_ratio="16:9",
+        image_prompt="他站在窗前。",
+        anchors=[],
+        shot_context={"opening_frame": "他站在窗前。", "characters": "他"},
+    )
+
+    assert "不呈现真人摄影" not in prompt
+    assert "画风指纹为准" in prompt
+    assert "不叠加二维手绘或三维CG渲染质感" in prompt

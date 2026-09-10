@@ -58,6 +58,7 @@ def export_data_before_deletion() -> None:
     print(f"数据导出到: {export_dir.absolute()}")
     print(f"{'='*60}\n")
 
+    failed_tables: list[str] = []
     for table_name in tables_to_export:
         if table_name not in existing_tables:
             continue
@@ -77,6 +78,12 @@ def export_data_before_deletion() -> None:
             print(f"  ✓ {table_name}: {len(rows)} 条记录已导出")
         except Exception as e:
             print(f"  ✗ {table_name}: 导出失败 - {e}")
+            failed_tables.append(f"{table_name}: {e}")
+
+    if failed_tables:
+        raise RuntimeError(
+            f"迁移前数据备份失败，已终止迁移以防止数据丢失：{', '.join(failed_tables)}"
+        )
 
     if not export_dir.exists():
         print("  （无数据需要导出，未创建导出目录）")

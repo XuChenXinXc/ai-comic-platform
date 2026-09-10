@@ -60,6 +60,7 @@ export function useJobPolling(projectId: string) {
         "shots",
         "keyframes",
         "videos",
+        "shot-quality",
       ];
       void queryClient.invalidateQueries({
         predicate: (query) => {
@@ -70,7 +71,12 @@ export function useJobPolling(projectId: string) {
           // 无第二维度的全局列表（projects）必须刷新。
           if (second === undefined) return true;
           // 键维度即 projectId 的查询精确匹配当前项目，避免误失效其他项目缓存。
-          if (first === "projects" || first === "assets" || first === "chapters") {
+          if (
+            first === "projects" ||
+            first === "assets" ||
+            first === "chapters" ||
+            first === "shot-quality"
+          ) {
             return String(second) === projectId;
           }
           // analysis/screenplay/asset-images/shots/keyframes/videos 的键维度是

@@ -15,8 +15,65 @@ from app.dynamic_pipeline.schemas import Diagnostic, PipelineModel, ReferenceSlo
 PromptValue = str | list[Any] | dict[str, Any] | None
 
 
+class LineSpec(PipelineModel):
+    """线条的结构化视觉 DNA。"""
+
+    type: str = ""
+    thickness: str = ""
+    continuity: str = ""
+
+
+class ColoringSpec(PipelineModel):
+    """上色的结构化视觉 DNA。"""
+
+    method: str = ""
+    saturation: str = ""
+    color_count: str = ""
+
+
+class ShadingSpec(PipelineModel):
+    """阴影的结构化视觉 DNA。"""
+
+    method: str = ""
+    gradient: str = ""
+    realistic_shading: bool | None = None
+
+
+class MaterialSpec(PipelineModel):
+    """材质表达的结构化视觉 DNA。"""
+
+    method: str = ""
+    pbr: bool | None = None
+    photographic_reflection: bool | None = None
+
+
+class LightingSpec(PipelineModel):
+    """光影的结构化视觉 DNA。"""
+
+    realism: str = ""
+    volumetric: bool | None = None
+    cinematic_glow: bool | None = None
+
+
+class DepthOfFieldSpec(PipelineModel):
+    """景深开关。"""
+
+    enabled: bool | None = None
+
+
+class RealismSpec(PipelineModel):
+    """分对象写实度（0-1）。"""
+
+    character: float | None = Field(default=None, ge=0, le=1)
+    environment: float | None = Field(default=None, ge=0, le=1)
+
+
 class VisualStyleSpec(PipelineModel):
-    """可编译的结构化视觉规范，用户自由文本只作为补充信息。"""
+    """可编译的结构化视觉规范，用户自由文本只作为补充信息。
+
+    结构化字段是项目级 VisualBible 的真正风格锁；自由文本字段兼容存量快照，
+    仅在结构化字段未设置时参与渲染。
+    """
 
     medium: str = ""
     line_style: str = ""
@@ -30,6 +87,30 @@ class VisualStyleSpec(PipelineModel):
     immutable_rules: list[str] = Field(default_factory=list)
     style_version: str = "1"
     style_prompt: str | None = None
+    line: LineSpec = Field(default_factory=LineSpec)
+    coloring: ColoringSpec = Field(default_factory=ColoringSpec)
+    shading: ShadingSpec = Field(default_factory=ShadingSpec)
+    material: MaterialSpec = Field(default_factory=MaterialSpec)
+    lighting: LightingSpec = Field(default_factory=LightingSpec)
+    depth_of_field: DepthOfFieldSpec = Field(default_factory=DepthOfFieldSpec)
+    realism: RealismSpec = Field(default_factory=RealismSpec)
+    texture: str = ""
+    render_fingerprint: str = ""
+    forbidden_styles: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_structured_consistency(self) -> VisualStyleSpec:
+        forbidden = {str(item).casefold() for item in self.forbidden_styles}
+        if self.material.pbr is True and "pbr" in forbidden:
+            raise ValueError("forbidden_styles 含 PBR 时 material.pbr 必须为 False")
+        if self.depth_of_field.enabled is True and forbidden & {
+            "无景深",
+            "no depth of field",
+        }:
+            raise ValueError("forbidden_styles 禁用景深时 depth_of_field.enabled 必须为 False")
+        if self.lighting.cinematic_glow is True and forbidden & {"电影光", "cinematic"}:
+            raise ValueError("forbidden_styles 含电影光时 lighting.cinematic_glow 必须为 False")
+        return self
 
 
 class AssetVisualAnchor(PipelineModel):

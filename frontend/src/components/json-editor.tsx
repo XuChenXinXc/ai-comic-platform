@@ -43,8 +43,10 @@ export function JsonEditor({
   return (
     <div>
       <div className="mb-2 flex items-center justify-between gap-3">
-        <span className="text-xs font-bold text-[#555852]">{label}</span>
-        <span className="text-[11px] text-muted">JSON</span>
+        <span className="text-[13px] font-semibold text-ink">{label}</span>
+        <span className="rounded-full bg-black/5 px-2 py-0.5 text-[11px] font-semibold text-muted dark:bg-white/10">
+          JSON
+        </span>
       </div>
       <Textarea
         value={text}

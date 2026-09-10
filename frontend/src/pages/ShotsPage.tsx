@@ -15,6 +15,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Rocket,
   Scissors,
   Trash2,
   TriangleAlert,
@@ -359,7 +360,11 @@ export function ShotsPage() {
   const mediaBatchMutation = useMutation({
     mutationFn: (kind: "keyframe" | "video") =>
       kind === "keyframe"
-        ? api.shots.keyframes.batch(activeChapterId, { ids: batchIds })
+        ? api.shots.keyframes.batch(activeChapterId, {
+            ids: batchIds,
+            // 缺干净参考图时自动入队参考图模式生成，避免设定展板污染分镜画面
+            auto_prepare_references: true,
+          })
         : api.shots.videos.batch(activeChapterId, { ids: batchIds }),
     onSuccess: async (result, kind) => {
       await queryClient.invalidateQueries({
@@ -421,6 +426,23 @@ export function ShotsPage() {
     }
     promptBatchMutation.mutate();
   };
+
+  // 一键全链编排：三步链式任务（补提示词/导演计划 → 补干净参考图+批量关键帧
+  // → 关键帧完成后批量视频），已有当前媒体的分镜自动跳过。
+  const pipelineMutation = useMutation({
+    mutationFn: () => api.shots.pipeline(activeChapterId),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.jobs(activeProjectId),
+      });
+      toast.success("一键全链生成已入队", {
+        description:
+          "任务将依次执行：补齐提示词与导演设计 → 参考图与关键帧（含自动视觉质检）→ 分镜视频；可在任务中心查看进度。",
+        duration: 8000,
+      });
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
 
   // 导演设计层：按分镜事实与相邻镜关系生成叙事意图/构图/运镜动机/
   // 微表演/唯一时间轴/对白绑定，完成后分镜列表由任务轮询自动刷新。
@@ -647,6 +669,16 @@ export function ShotsPage() {
               </Button>
               <Button
                 variant="secondary"
+                busy={pipelineMutation.isPending}
+                disabled={!shots.length}
+                title="一键全链生成：自动补齐提示词与导演设计 → 干净参考图与关键帧（含自动视觉质检）→ 分镜视频；已有结果的镜自动跳过"
+                onClick={() => pipelineMutation.mutate()}
+              >
+                <Rocket className="h-4 w-4" />
+                一键全链生成
+              </Button>
+              <Button
+                variant="secondary"
                 busy={continuityFixMutation.isPending}
                 disabled={!shots.length}
                 title="把相邻分镜的起止状态与旁白交给文字模型逐对审校并自动修正源字段；生成视频时会按最新源字段自动重写视频提示词"
@@ -806,7 +838,7 @@ export function ShotsPage() {
             </div>
           </div>
 
-          <div className="flex flex-col gap-4 border-t border-line bg-white/40 p-4 xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex flex-col gap-4 border-t border-line bg-paper/40 p-4 xl:flex-row xl:items-center xl:justify-between dark:bg-white/[0.04]">
             <div className="flex flex-wrap gap-2 text-xs text-muted">
               <Badge>{shots.length} 个分镜</Badge>
               <Badge>
@@ -985,9 +1017,9 @@ export function ShotsPage() {
                 onDrop={() => reorder(draggedId, shot.id)}
               >
                 <div className="grid md:grid-cols-[64px_minmax(0,1fr)]">
-                  <div className="flex items-center gap-3 border-b border-line bg-[#252a27] px-4 py-3 text-white md:flex-col md:border-b-0 md:border-r md:px-2 md:py-5">
+                  <div className="flex items-center gap-3 border-b border-line bg-[#111113] px-4 py-3 text-white md:flex-col md:border-b-0 md:border-r md:px-2 md:py-5">
                     <GripVertical className="h-5 w-5 cursor-grab text-white/35" />
-                    <span className="text-xl font-extrabold">
+                    <span className="text-xl font-semibold">
                       {String(shot.shot_no).padStart(2, "0")}
                     </span>
                     <input
@@ -1021,12 +1053,12 @@ export function ShotsPage() {
                               "场景切换"}
                           </Badge>
                           {stale ? (
-                            <Badge className="border-[#e2aa88] bg-[#fff3e9] text-[#833f24]">
+                            <Badge className="border-sky-200 dark:border-sky-500/25 bg-sky-50 dark:bg-sky-500/10 text-sky-800 dark:text-sky-300">
                               来源已变化
                             </Badge>
                           ) : null}
                         </div>
-                        <p className="mt-2 text-sm font-semibold leading-6 text-[#3f423d]">
+                        <p className="mt-2 text-sm font-semibold leading-6 text-ink">
                           {shot.action || shot.frame_description || "尚未填写镜头动作"}
                         </p>
                         {boundAssets.length ? (
@@ -1078,7 +1110,7 @@ export function ShotsPage() {
                     </div>
 
                     <section
-                      className="border-b border-line bg-[#f7f4ed] px-5 py-4"
+                      className="border-b border-line bg-canvas/70 px-5 py-4"
                       aria-label={`分镜 ${shot.shot_no} 已绑定素材`}
                     >
                       <div className="mb-3 flex items-center justify-between gap-3">
@@ -1118,7 +1150,7 @@ export function ShotsPage() {
                                 key={`${role}-${assetId}`}
                                 className="w-28 shrink-0"
                               >
-                                <div className="aspect-[4/3] overflow-hidden rounded-md border border-line bg-[#252925]">
+                                <div className="aspect-[4/3] overflow-hidden rounded-xl border border-line bg-[#0b0b0d]">
                                   {imageUrl ? (
                                     <ImagePreview
                                       src={imageUrl}
@@ -1139,7 +1171,7 @@ export function ShotsPage() {
                                     </div>
                                   )}
                                 </div>
-                                <p className="mt-2 truncate text-xs font-semibold text-[#3f423d]" title={assetName}>
+                                <p className="mt-2 truncate text-xs font-semibold text-ink" title={assetName}>
                                   {assetName}
                                 </p>
                                 <p className="mt-0.5 text-[10px] text-muted">
@@ -1163,7 +1195,7 @@ export function ShotsPage() {
                           <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
                             镜头执行
                           </p>
-                          <p className="mt-2 text-xs leading-5 text-[#454842]">
+                          <p className="mt-2 text-xs leading-5 text-muted">
                             {shot.camera_angle || "未定角度"} ·{" "}
                             {shot.camera_move || "未定运镜"}
                           </p>
@@ -1173,7 +1205,7 @@ export function ShotsPage() {
                             <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
                               站位 / 视线
                             </p>
-                            <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+                            <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-muted">
                               {positions.join("\n")}
                             </p>
                           </div>
@@ -1183,7 +1215,7 @@ export function ShotsPage() {
                             <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
                               人物表情
                             </p>
-                            <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+                            <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-muted">
                               {expressions.join("\n")}
                             </p>
                           </div>
@@ -1192,7 +1224,7 @@ export function ShotsPage() {
                           <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">
                             对白 / 旁白
                           </p>
-                          <p className="mt-2 line-clamp-4 whitespace-pre-wrap text-xs leading-5 text-[#454842]">
+                          <p className="mt-2 line-clamp-4 whitespace-pre-wrap text-xs leading-5 text-muted">
                             {dialogue
                               .map(formatDialogue)
                               .filter(Boolean)
@@ -1225,7 +1257,7 @@ export function ShotsPage() {
                             </Button>
                           </div>
                           {shot.director_plan ? (
-                            <div className="mt-2 space-y-1 text-xs leading-5 text-[#454842]">
+                            <div className="mt-2 space-y-1 text-xs leading-5 text-muted">
                               {directorPlanSummary(shot.director_plan).map(
                                 (line, lineIndex) => (
                                   <p key={lineIndex} className="break-words">
@@ -1306,7 +1338,7 @@ export function ShotsPage() {
                       </div>
                     ) : null}
 
-                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-line bg-white/35 px-5 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-line bg-paper/35 px-5 py-3 dark:bg-white/[0.04]">
                       <div className="flex flex-wrap gap-1">
                         <Button
                           variant="ghost"
@@ -1368,7 +1400,7 @@ export function ShotsPage() {
                         <Button
                           variant="ghost"
                           size="sm"
-                          className="text-[#9b342c]"
+                          className="text-[#c93c30] dark:text-red-400"
                           busy={
                             structureMutation.isPending &&
                             structureMutation.variables?.action === "delete" &&
@@ -1393,7 +1425,7 @@ export function ShotsPage() {
                       </div>
                     </div>
 
-                    <div className="grid gap-4 border-t border-line bg-[#f7f4ed] p-4 2xl:grid-cols-2">
+                    <div className="grid gap-4 border-t border-line bg-canvas/70 p-4 2xl:grid-cols-2">
                       <ShotMediaCard
                         shot={shot}
                         kind="keyframe"
@@ -1520,7 +1552,7 @@ export function ShotsPage() {
             <div className="grid gap-5 lg:grid-cols-2">
               <div>
                 <Label>出场角色</Label>
-                <div className="grid max-h-40 gap-2 overflow-y-auto rounded-md border border-line bg-white p-3 sm:grid-cols-2">
+                <div className="grid max-h-40 gap-2 overflow-y-auto rounded-xl border border-line bg-paper p-3 sm:grid-cols-2">
                   {assets
                     .filter((asset) => asset.asset_type === "character")
                     .map((asset) => {
@@ -1559,7 +1591,7 @@ export function ShotsPage() {
               </div>
               <div>
                 <Label>使用物品</Label>
-                <div className="grid max-h-40 gap-2 overflow-y-auto rounded-md border border-line bg-white p-3 sm:grid-cols-2">
+                <div className="grid max-h-40 gap-2 overflow-y-auto rounded-xl border border-line bg-paper p-3 sm:grid-cols-2">
                   {assets
                     .filter((asset) => asset.asset_type === "prop")
                     .map((asset) => {
