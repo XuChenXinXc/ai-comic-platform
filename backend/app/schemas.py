@@ -93,6 +93,7 @@ class NovelAnalysisOutput(OutputModel):
     worldview: str
     main_characters: list[str]
     character_relations: list[dict[str, Any]]
+    key_props: list[str] = Field(default_factory=list)
     core_conflict: str
     plot_structure: dict[str, Any]
     emotion_curve: list[dict[str, Any]]
@@ -122,16 +123,18 @@ class ScreenplayDialogue(OutputModel):
 
 
 class ScreenplayScene(OutputModel):
-    scene_no: int
-    scene_name: str
-    time_weather: str
-    characters: list[str]
-    objective: str
-    action: str
+    scene_no: int = Field(ge=1)
+    scene_name: NonEmptyText
+    time_weather: NonEmptyText
+    characters: list[NonEmptyText]
+    props: list[NonEmptyText] = Field(default_factory=list)
+    source_refs: list[NonEmptyText] = Field(default_factory=list)
+    objective: NonEmptyText
+    action: NonEmptyText
     dialogue: list[ScreenplayDialogue]
-    narration: list[str]
-    emotion: str
-    transition_to_next: str
+    narration: list[NonEmptyText]
+    emotion: NonEmptyText
+    transition_to_next: NonEmptyText
     # 本场预估成片时长（秒）：由剧本阶段按台词量与动作密度估算，
     # 分镜阶段据此换算每场镜头数上限，从源头控制分镜总量。
     target_duration_sec: int | None = Field(default=None, ge=15, le=600)
@@ -186,11 +189,45 @@ class ScreenplayScene(OutputModel):
             normalized.pop(alias, None)
         return normalized
 
+    @model_validator(mode="after")
+    def validate_scene_contract(self) -> ScreenplayScene:
+        # 重复项去重并保留首个，而不是整批抛错：模型偶发重复不应让整份剧本保存失败。
+        self.characters = list(dict.fromkeys(self.characters))
+        self.props = list(dict.fromkeys(self.props))
+        self.source_refs = list(dict.fromkeys(self.source_refs))
+        undeclared_speakers = sorted(
+            {item.speaker for item in self.dialogue if item.speaker not in self.characters}
+        )
+        if undeclared_speakers:
+            self.characters.extend(undeclared_speakers)
+        if self.target_duration_sec is None:
+            dialogue_chars = sum(len(item.text) for item in self.dialogue)
+            narration_chars = sum(len(item) for item in self.narration)
+            action_units = [
+                item
+                for item in re.split(r"[。！？；;\n]", self.action)
+                if item.strip()
+            ]
+            estimated = math.ceil((dialogue_chars + narration_chars) / 2.5)
+            estimated += min(30, len(action_units) * 3)
+            self.target_duration_sec = max(15, min(600, estimated))
+        return self
+
 
 class ScreenplayOutput(OutputModel):
-    title: str
-    logline: str
-    scenes: list[ScreenplayScene]
+    title: NonEmptyText
+    logline: NonEmptyText
+    scenes: list[ScreenplayScene] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_scene_sequence(self) -> ScreenplayOutput:
+        scene_numbers = [scene.scene_no for scene in self.scenes]
+        expected = list(range(1, len(self.scenes) + 1))
+        if scene_numbers != expected:
+            raise ValueError(
+                f"场次编号必须从 1 开始连续且按顺序排列，当前为 {scene_numbers}"
+            )
+        return self
 
 
 class AssetVisualPromptFields(OutputModel):
@@ -472,6 +509,61 @@ class AssetExtractionOutput(OutputModel):
     scenes: list[SceneAssetOutput]
     props: list[PropAssetOutput]
 
+    @model_validator(mode="after")
+    def validate_catalog_contract(self) -> AssetExtractionOutput:
+        for asset_type, items in (
+            ("角色", self.characters),
+            ("场景", self.scenes),
+            ("物品", self.props),
+        ):
+            labels: dict[str, str] = {}
+            for item in items:
+                canonical = re.sub(r"[\W_]+", "", item.name.casefold())
+                if canonical in labels:
+                    raise ValueError(
+                        f"{asset_type}素材名称重复：{item.name} 与 {labels[canonical]}"
+                    )
+                labels[canonical] = item.name
+                for alias in item.aliases:
+                    normalized = re.sub(r"[\W_]+", "", alias.casefold())
+                    if not normalized:
+                        continue
+                    owner = labels.get(normalized)
+                    if owner is not None and owner != item.name:
+                        raise ValueError(
+                            f"{asset_type}素材名称或别名冲突：{alias} 同时指向 "
+                            f"{owner} 与 {item.name}"
+                        )
+                    labels[normalized] = item.name
+        members_by_family: dict[str, int] = {}
+        anchors_by_family: dict[str, int] = {}
+        for scene in self.scenes:
+            family = scene.scene_family.strip()
+            if not family:
+                continue
+            members_by_family[family] = members_by_family.get(family, 0) + 1
+            if scene.family_anchor:
+                anchors_by_family[family] = anchors_by_family.get(family, 0) + 1
+        duplicated_anchors = [
+            family for family, count in anchors_by_family.items() if count > 1
+        ]
+        if duplicated_anchors:
+            raise ValueError(
+                "同一场景族只能有一个锚点："
+                + "、".join(sorted(duplicated_anchors))
+            )
+        missing_anchors = [
+            family
+            for family, member_count in members_by_family.items()
+            if member_count > 1 and anchors_by_family.get(family, 0) == 0
+        ]
+        if missing_anchors:
+            raise ValueError(
+                "同批次包含多个场景族成员时必须指定一个锚点："
+                + "、".join(sorted(missing_anchors))
+            )
+        return self
+
 
 class MissingAsset(OutputModel):
     """分镜提取时发现素材库中不存在的角色/场景/道具，交由补素材流程处理。"""
@@ -548,6 +640,9 @@ class ShotOutput(OutputModel):
     shot_no: int
     scene_no: int | None = None
     source_ref: str = ""
+    # 临时剧情覆盖契约：分镜提取阶段由模型声明本镜承接的剧本节拍，
+    # 后端验证完整性后写入 source_ref；无需新增数据库列。
+    coverage_refs: list[NonEmptyText] = Field(default_factory=list)
     scene_name: NonEmptyText
     # 允许为空：剧情发生地无法对应素材库中任何场景时留空，并通过
     # missing_assets 报告缺失，由后端补素材后重新绑定，禁止强行绑定近似素材。
@@ -559,18 +654,19 @@ class ShotOutput(OutputModel):
     # 素材库中不存在的角色/场景/道具：不得静默错误绑定，必须列出供补素材流程使用。
     missing_assets: list[MissingAsset] = Field(default_factory=list)
     positions: list[ShotPosition]
-    start_state: str
-    action: str
+    start_state: NonEmptyText
+    action: NonEmptyText
     expressions: list[ShotExpression]
     dialogue: list[ScreenplayDialogue]
     narration: str = ""
-    shot_type: str
-    camera_angle: str
-    camera_move: str
+    shot_type: NonEmptyText
+    camera_angle: NonEmptyText
+    # 机位固定/末镜等场景下模型常输出空值，允许为空以免整批提取失败。
+    camera_move: str = ""
     duration_sec: int = Field(ge=MIN_SHOT_DURATION_SEC, le=MAX_SHOT_DURATION_SEC)
-    end_state: str
-    next_hook: str
-    frame_description: str
+    end_state: str = ""
+    next_hook: str = ""
+    frame_description: NonEmptyText
     image_prompt: NonEmptyText
     video_prompt: NonEmptyText
     negative_prompt: NonEmptyText
@@ -758,6 +854,28 @@ class ShotOutput(OutputModel):
                 return "video_prompt 出现多套时间轴或时间分段重叠，请统一为单套覆盖全程的连续时间轴"
         return ""
 
+    def timeline_contract_warning(self) -> str:
+        """校验视频提示词只有一套从 0 秒连续覆盖到镜头时长的时间轴。"""
+        matches = list(self._TIMELINE_PATTERN.finditer(self.video_prompt or ""))
+        if not matches:
+            return "video_prompt 缺少从 0 秒开始的连续时间轴"
+        segments = [
+            (float(match.group(1)), float(match.group(2))) for match in matches
+        ]
+        if abs(segments[0][0]) > 0.01:
+            return "video_prompt 时间轴必须从 0 秒开始"
+        for index, (start, end) in enumerate(segments):
+            if end <= start:
+                return "video_prompt 时间分段结束时间必须大于开始时间"
+            if index > 0 and abs(start - segments[index - 1][1]) > 0.01:
+                return "video_prompt 时间分段必须连续且不得重叠或留空档"
+        if abs(segments[-1][1] - float(self.duration_sec)) > 0.01:
+            return (
+                "video_prompt 时间轴末段必须结束于 duration_sec "
+                f"({self.duration_sec} 秒)"
+            )
+        return ""
+
     def end_state_warning(self) -> str:
         """end_state 的姿态变化在 video_prompt 时间轴里是否有对应调度。
 
@@ -799,13 +917,14 @@ class ShotOutput(OutputModel):
                 self.end_state_warning(),
                 self.dialogue_duration_warning(),
                 self.timeline_conflict_warning(self.video_prompt),
+                self.timeline_contract_warning(),
             )
             if warning
         ]
 
 
 class ShotExtractionOutput(OutputModel):
-    shots: list[ShotOutput]
+    shots: list[ShotOutput] = Field(min_length=1)
 
 
 class ShotImagePromptOutput(OutputModel):

@@ -15,7 +15,11 @@ from app.db import Database, migrate_schema
 from app.dependencies import get_setting_service
 from app.models.tables import platform_setting, project
 from app.services.errors import ServiceError
-from app.services.setting_service import SettingService
+from app.services.setting_service import (
+    SettingService,
+    get_provider_allow_private_hosts,
+    set_provider_allow_private_hosts,
+)
 from app.services.utils import utc_now
 
 
@@ -353,4 +357,84 @@ def test_camera_policy_rejects_unknown_value(tmp_path: Path) -> None:
 
     # 拒绝后仍保持默认克制
     assert client.get("/api/settings/camera-policy").json()["policy"] == "克制"
+    database.dispose()
+
+
+def test_provider_allow_private_hosts_default_returns_default_source(tmp_path: Path) -> None:
+    database = _create_database(tmp_path)
+    service = SettingService(database, settings=_create_settings(tmp_path))
+
+    with _create_client(service) as client:
+        response = client.get("/api/settings/provider-allow-private-hosts")
+
+    assert response.status_code == 200
+    assert response.json() == {"enabled": False, "source": "default"}
+    database.dispose()
+
+
+def test_provider_allow_private_hosts_environment_true_returns_environment_source(
+    tmp_path: Path,
+) -> None:
+    """环境变量兼容：.env 里设置过放行开关时，页面应显示 environment 来源。"""
+    database = _create_database(tmp_path)
+    settings = Settings(
+        _env_file=None,
+        workspace_dir=tmp_path / "workspace",
+        provider_allow_private_hosts=True,
+    )
+    service = SettingService(database, settings=settings)
+
+    with _create_client(service) as client:
+        response = client.get("/api/settings/provider-allow-private-hosts")
+
+    assert response.json() == {"enabled": True, "source": "environment"}
+    database.dispose()
+
+
+def test_provider_allow_private_hosts_roundtrip_persists_database_value(
+    tmp_path: Path,
+) -> None:
+    database = _create_database(tmp_path)
+    service = SettingService(database, settings=_create_settings(tmp_path))
+
+    with _create_client(service) as client:
+        enable = client.post(
+            "/api/settings/provider-allow-private-hosts",
+            json={"enabled": True},
+        )
+        assert enable.status_code == 200
+        assert enable.json() == {"enabled": True, "source": "database"}
+        assert client.get("/api/settings/provider-allow-private-hosts").json() == {
+            "enabled": True,
+            "source": "database",
+        }
+        disable = client.post(
+            "/api/settings/provider-allow-private-hosts",
+            json={"enabled": False},
+        )
+        assert disable.json() == {"enabled": False, "source": "database"}
+
+    with database.engine.connect() as connection:
+        value = connection.scalar(
+            select(platform_setting.c.value).where(
+                platform_setting.c.key == "provider_allow_private_hosts"
+            )
+        )
+    assert value == "0"
+    assert get_provider_allow_private_hosts(database) is False
+    database.dispose()
+
+
+def test_provider_allow_private_hosts_setter_writes_truthy_flag(tmp_path: Path) -> None:
+    database = _create_database(tmp_path)
+
+    assert set_provider_allow_private_hosts(database, True) is True
+    assert get_provider_allow_private_hosts(database) is True
+    with database.engine.connect() as connection:
+        value = connection.scalar(
+            select(platform_setting.c.value).where(
+                platform_setting.c.key == "provider_allow_private_hosts"
+            )
+        )
+    assert value == "1"
     database.dispose()

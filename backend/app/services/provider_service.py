@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 import requests
-from sqlalchemy import delete, insert, or_, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db import Database, db
@@ -21,15 +21,24 @@ from app.models.tables import (
 )
 from app.providers.base import (
     ProviderConfigurationError,
+    ProviderError,
     redact_provider_base_url,
+    request_with_redirect_guard,
     resolve_provider_url,
+    set_provider_allow_private_hosts_override,
     validate_api_key_env,
     validate_custom_headers,
     validate_provider_base_url,
+    validate_provider_base_url_network,
 )
 from app.providers.registry import provider_registry
 from app.services.errors import bad_request, conflict, not_found
-from app.services.secret_service import SecretServiceError, decrypt_secret, encrypt_secret
+from app.services.secret_service import (
+    SecretServiceError,
+    decrypt_secret,
+    delete_secret,
+    encrypt_secret,
+)
 from app.services.utils import (
     json_dumps,
     json_loads,
@@ -174,6 +183,7 @@ class ProviderService:
     ) -> None:
         try:
             validate_provider_base_url(str(config.get("base_url", "")))
+            validate_provider_base_url_network(str(config.get("base_url", "")))
             validate_api_key_env(str(config["kind"]), str(config.get("api_key_env", "")))
         except ProviderConfigurationError as exc:
             raise bad_request(str(exc)) from exc
@@ -202,6 +212,49 @@ class ProviderService:
             ).first()
             is not None
         )
+
+    def _sync_allow_private_hosts(self) -> None:
+        """把平台设置里的本地 Provider 开关同步到 Provider 层。
+
+        每次解析、保存、测试前读一次（单行查询），避免 Provider 构造时再查库；
+        未设置时回退环境变量语义（override=None），.env 的
+        APP_PROVIDER_ALLOW_PRIVATE_HOSTS=1 仍然生效。
+        """
+        from app.services.setting_service import get_provider_allow_private_hosts
+
+        set_provider_allow_private_hosts_override(
+            get_provider_allow_private_hosts(self.database)
+        )
+
+    @staticmethod
+    def _reset_other_defaults(
+        connection: Any,
+        kind: str,
+        provider_id: str | None,
+    ) -> int:
+        """同一事务内清空同类其它默认 Provider，返回受影响行数。"""
+        statement = update(api_provider).where(
+            api_provider.c.kind == kind,
+            api_provider.c.is_default.is_(True),
+        )
+        if provider_id is not None:
+            statement = statement.where(api_provider.c.id != provider_id)
+        result = connection.execute(statement.values(is_default=False))
+        return int(result.rowcount or 0)
+
+    @staticmethod
+    def _assert_single_default(connection: Any, kind: str) -> None:
+        """校验同类默认 Provider 不超过一个；并发或脏数据在此被拦截。"""
+        count = connection.scalar(
+            select(func.count())
+            .select_from(api_provider)
+            .where(
+                api_provider.c.kind == kind,
+                api_provider.c.is_default.is_(True),
+            )
+        )
+        if int(count or 0) > 1:
+            raise conflict("同一类型只能有一个默认 Provider")
 
     def list(self, kind: str | None = None) -> list[dict[str, Any]]:
         statement = select(api_provider)
@@ -238,6 +291,7 @@ class ProviderService:
         return self._get_config(provider_id, redact_base_url=True)
 
     def create(self, values: dict[str, Any]) -> dict[str, Any]:
+        self._sync_allow_private_hosts()
         values = dict(values)
         now = utc_now()
         params = values.pop("params", {})
@@ -263,15 +317,15 @@ class ProviderService:
             raise bad_request(str(exc)) from exc
         with self.database.engine.begin() as connection:
             if record["is_default"]:
-                connection.execute(
-                    update(api_provider)
-                    .where(api_provider.c.kind == record["kind"])
-                    .values(is_default=False)
-                )
-            connection.execute(insert(api_provider).values(**record))
+                self._reset_other_defaults(connection, record["kind"], None)
+            result = connection.execute(insert(api_provider).values(**record))
+            if not result.rowcount:
+                raise conflict("创建 Provider 失败")
+            self._assert_single_default(connection, record["kind"])
         return self.get(record["id"])
 
     def update(self, provider_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        self._sync_allow_private_hosts()
         current = self._get_config(
             provider_id,
             redact_base_url=False,
@@ -281,18 +335,37 @@ class ProviderService:
             if self._has_active_job(connection, provider_id):
                 raise conflict("Provider 存在进行中的任务，不能更新或停用")
         changes = dict(values)
+        # Key 管理契约：字段缺失 = 保持不变；显式 null = 保持不变（沿用
+        # 「显式 null 视为不修改」约定）；显式空串 = 清空已保存的 API Key。
+        api_key_provided = "api_key" in changes
         api_key = changes.pop("api_key", None)
-        if api_key:
-            try:
-                changes["api_key_ciphertext"] = encrypt_secret(str(api_key))
-            except SecretServiceError as exc:
-                raise bad_request(str(exc)) from exc
         # 显式传 null 的字段视为「保持不变」：这些列 NOT NULL，
-        # 裸写 None 会触发 IntegrityError 500。
+        # 裸写 None 会触发 IntegrityError 500。过滤放在 Key 处理之前，
+        # 让空串清空语义不被 None 过滤吞掉。
         changes = {key: value for key, value in changes.items() if value is not None}
+        old_ciphertext = str(current.get("_api_key_ciphertext") or "")
+        clears_api_key = False
+        if api_key_provided and api_key is not None:
+            if str(api_key):
+                try:
+                    changes["api_key_ciphertext"] = encrypt_secret(
+                        str(api_key),
+                        replaces=old_ciphertext,
+                    )
+                except SecretServiceError as exc:
+                    raise bad_request(str(exc)) from exc
+            else:
+                # 显式空串：清空密文并删除 Keychain 条目（DPAPI 无独立条目）。
+                delete_secret(old_ciphertext)
+                changes["api_key_ciphertext"] = None
+                clears_api_key = True
         if "params" in changes:
             changes["params_json"] = json_dumps(changes.pop("params"))
         candidate = {**current, **changes}
+        if clears_api_key:
+            # _runtime_config 在 api_key_ciphertext 为空时会回退读取
+            # _api_key_ciphertext，必须同步清空，否则清空后仍能用旧 Key 发出请求。
+            candidate["_api_key_ciphertext"] = ""
         candidate["params"] = json_loads(
             changes.get("params_json", json_dumps(current["params"])), {}
         )
@@ -306,17 +379,13 @@ class ProviderService:
             if self._has_active_job(connection, provider_id):
                 raise conflict("Provider 存在进行中的任务，不能更新或停用")
             if changes.get("is_default"):
-                connection.execute(
-                    update(api_provider)
-                    .where(
-                        api_provider.c.kind == current["kind"],
-                        api_provider.c.id != provider_id,
-                    )
-                    .values(is_default=False)
-                )
-            connection.execute(
+                self._reset_other_defaults(connection, current["kind"], provider_id)
+            result = connection.execute(
                 update(api_provider).where(api_provider.c.id == provider_id).values(**changes)
             )
+            if not result.rowcount:
+                raise conflict("Provider 不存在或已被删除")
+            self._assert_single_default(connection, current["kind"])
         return self.get(provider_id)
 
     def delete(self, provider_id: str) -> None:
@@ -376,6 +445,7 @@ class ProviderService:
         kind: str,
         provider_id: str | None = None,
     ) -> tuple[Any, dict[str, Any]]:
+        self._sync_allow_private_hosts()
         if provider_id:
             config = self._get_config(
                 provider_id,
@@ -419,6 +489,7 @@ class ProviderService:
         return self.resolve(kind="tts", provider_id=provider_id)
 
     def test(self, provider_id: str) -> dict[str, Any]:
+        self._sync_allow_private_hosts()
         config = self._get_config(
             provider_id,
             redact_base_url=False,
@@ -465,18 +536,31 @@ class ProviderService:
         else:
             path = str(params.get("test_path", ""))
         url = resolve_provider_url(config["base_url"], path)
+        # 连接测试的目标由配置控制（base_url + test_path），不校验就成了现成的
+        # 内网探测接口；这里校验实际请求 URL，_probe 用返回值而非异常报告失败。
+        try:
+            validate_provider_base_url_network(url)
+        except ProviderConfigurationError as exc:
+            return False, str(exc)
         headers = validate_custom_headers(params)
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        # 连接测试只允许幂等的 GET/HEAD，避免把无鉴权接口变成任意方法/内网
+        # 探测原语；verify_ssl 固定开启，不允许通过配置关闭 TLS 校验。
+        method = str(params.get("test_method", "GET")).strip().upper()
+        if method not in {"GET", "HEAD"}:
+            return False, "连接测试仅支持 GET/HEAD 方法"
         try:
-            response = requests.request(
-                str(params.get("test_method", "GET")),
+            response = request_with_redirect_guard(
+                method,
                 url,
                 headers=headers,
                 timeout=min(config["timeout_sec"], 10),
-                verify=bool(params.get("verify_ssl", True)),
+                verify=True,
             )
             response.raise_for_status()
+        except ProviderError as exc:
+            return False, f"连接测试失败：{sanitize_error_message(exc)}"
         except requests.RequestException as exc:
             return False, f"连接测试失败：{sanitize_error_message(exc)}"
         return True, f"连接测试通过（HTTP {response.status_code}）"

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,8 @@ from app.services.file_service import FileService
 from app.services.job_service import JobService
 from app.services.natural_video_prompt import (
     _FORBIDDEN_TEMPLATE_WORDS,
+    _dedupe_composition_clauses,
+    _match_tokens_by_names,
     parse_reference_anchors,
     render_natural_video_prompt,
     validate_natural_style,
@@ -472,6 +475,31 @@ def test_style_prompt_with_trailing_period_has_no_double_suffix() -> None:
     assert "。的风格" not in prompt
 
 
+def test_video_prompt_locks_physical_prop_contact_and_stable_lighting() -> None:
+    """防电灯频闪与道具悬空飞行回归测试。"""
+    prompt = _render(
+        props=["手电筒", "文件袋"],
+        video_prompt="他将文件袋递给对方。",
+    )
+
+    # 1. 道具段明确要求全程手部抓握接触，严禁脱手悬空飞行或隔空移物
+    assert "必须全程由手部手指实体握持接触" in prompt
+    assert "随手臂伸展与动作路径自然位移" in prompt
+    assert "严禁道具脱手悬空飞行、严禁隔空移物" in prompt
+
+    # 2. 光线段明确要求场景照明恒定稳定，无频闪无闪烁
+    assert "场景照明与环境光线保持恒定稳定" in prompt
+    assert "光源无频闪、无忽明忽暗、画面无闪烁跳变" in prompt
+
+    # 3. 负向协议行明确加入防频闪与防悬空飞行的硬规则
+    assert "道具脱手悬空飞行" in prompt
+    assert "隔空移物" in prompt
+    assert "灯光频闪" in prompt
+    assert "画面闪烁" in prompt
+    assert "光线忽明忽暗" in prompt
+
+
+
 def test_optimize_identity_validation_accepts_same_reference_set() -> None:
     original = (
         "以 @Image1 作为起始画面。徐尘心沿用 @Image2 的参考素材。"
@@ -730,3 +758,114 @@ def test_半写实电影感视频光影与负向不互斥() -> None:
     # 二维防漂移运动锁保留，节奏锁为电影感版本
     assert "Motion style lock:" in prompt
     assert "Animation cadence lock:" in prompt
+
+
+def test_构图去重切断括号说明时不残留孤立括号() -> None:
+    """子句去重把「（说明，补充）」从中间切开时，孤立的右/左括号必须被清理。"""
+    ref = "苏棠盘腿坐在茶几旁的地毯上，屏幕上刚弹出一枚红色提醒标记，画面不出现任何文字"
+    # 右括号孤立：括号前半段与起始状态重合被删，后半段保留
+    result = _dedupe_composition_clauses(
+        "苏棠盘腿坐在地毯上，屏幕上刚弹出一枚红色提醒标记（画面不出现任何文字，提示内容与手机界面由后期叠加），她眼眶泛红",
+        ref,
+    )
+    assert result.count("）") == result.count("（")
+    assert "提示内容与手机界面由后期叠加" in result
+    assert "她眼眶泛红" in result
+    # 左括号孤立：括号后半段被删，前半段保留
+    result2 = _dedupe_composition_clauses(
+        "构图偏右（提示内容与手机界面由后期叠加，屏幕上刚弹出一枚红色提醒标记）",
+        ref,
+    )
+    assert result2.count("）") == result2.count("（")
+    assert "构图偏右" in result2
+
+
+def test_素材名歧义时跳过绑定并记警告(caplog: pytest.LogCaptureFixture) -> None:
+    """双向包含可能把「林」误配到多个角色，候选不唯一时不绑定。"""
+    tokens = parse_reference_anchors(
+        [
+            "@Image1：林舟，锁定角色身份与服装。",
+            "@Image2：林雪，锁定角色身份与服装。",
+        ]
+    )
+    diagnostics: list[str] = []
+    with caplog.at_level(logging.WARNING, logger="app.services.natural_video_prompt"):
+        matched = _match_tokens_by_names(
+            tokens, "character_identity", ["林"], diagnostics=diagnostics
+        )
+
+    assert matched == {}
+    assert diagnostics and "多个相近参考锚点" in diagnostics[0]
+    assert "林" in caplog.text
+
+
+def test_素材名精确匹配优先于包含匹配() -> None:
+    tokens = parse_reference_anchors(
+        [
+            "@Image1：徐尘，锁定角色身份与服装。",
+            "@Image2：徐尘心，锁定角色身份与服装。",
+        ]
+    )
+
+    matched = _match_tokens_by_names(tokens, "character_identity", ["徐尘心"])
+
+    assert matched["徐尘心"].token == "@Image2"
+
+
+def test_素材名唯一候选时允许包含匹配() -> None:
+    tokens = parse_reference_anchors(["@Image1：徐尘心，锁定角色身份与服装。"])
+
+    matched = _match_tokens_by_names(tokens, "character_identity", ["徐尘"])
+
+    assert matched["徐尘"].token == "@Image1"
+
+
+def test_无法解析的锚点行记警告(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="app.services.natural_video_prompt"):
+        tokens = parse_reference_anchors(["这是一行没有编号的锚点", "@Image2：徐尘心。"])
+
+    assert [token.token for token in tokens] == ["@Image2"]
+    assert "无法解析" in caplog.text
+
+
+def test_对白条目缺键时跳过而不报错() -> None:
+    prompt = render_natural_video_prompt(
+        style_prompt=_STYLE,
+        aspect_ratio="16:9",
+        duration_sec=6,
+        action_flow="他推门进入。",
+        shot_context={"scene_name": "办公楼大厅", "characters": ["徐尘心"]},
+        dialogue_entries=[{"speaker": "徐尘心"}, {"text": "走吧。"}],
+        tokens=(),
+        negative_prompt="",
+    )
+
+    assert "本镜没有画内对白，人物全程不开口" in prompt
+    assert "说：“”" not in prompt
+
+
+def test_道具引用拼接不产生标点接缝() -> None:
+    prompt = _render(
+        props=["工位仙人掌"],
+        anchors=[
+            "@Image1：当前分镜关键帧。",
+            "@Image3：中关村办公区，锁定场景空间结构和光线。",
+            "@Image4：工位仙人掌，锁定物品外观、材质和结构。",
+        ],
+    )
+
+    assert "。；" not in prompt
+    assert "本镜道具：工位仙人掌；工位仙人掌沿用 @Image4 的外观与材质。" in prompt
+
+
+def test_构图去重保留比例层级焦点维度() -> None:
+    """比例/层级/焦点是必须保留的构图维度，即使与起始状态文字重合也不删除。"""
+    ref = "苏棠盘腿坐在地毯上"
+    result = _dedupe_composition_clauses(
+        "画面比例为16:9，前中后景层级递进，焦点落在桌面的信纸上",
+        ref,
+    )
+
+    assert "画面比例为16:9" in result
+    assert "层级递进" in result
+    assert "焦点落在桌面的信纸上" in result

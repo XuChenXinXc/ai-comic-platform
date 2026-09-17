@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import subprocess
+import tempfile
 import threading
 import time
 from io import BytesIO
@@ -32,6 +33,29 @@ from app.schemas import (
 from app.services.file_service import atomic_copy, atomic_write_bytes
 
 from .base import ProviderError
+
+# Mock 视频单镜时长上限：分镜本身最长 15 秒，60 秒已足以覆盖测试与补偿场景，
+# 同时避免伪造的 task 记录触发超长 FFmpeg 渲染。
+_MAX_MOCK_VIDEO_DURATION_SEC = 60.0
+
+
+def _resolve_workspace_path(value: str, *, label: str) -> Path:
+    """解析 Provider 运行期路径并限制在平台工作区或系统临时目录内。
+
+    `task_store_dir` / `ffmpeg_path` 属于运行期覆盖，正常只能由内部代码或测试
+    构造；这里做纵深防御，避免伪造配置把任务文件写到任意目录或执行任意二进制。
+    """
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = get_settings().workspace_dir / candidate
+    resolved = candidate.resolve()
+    allowed_roots = (
+        get_settings().workspace_dir.resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+    )
+    if not any(resolved.is_relative_to(root) for root in allowed_roots):
+        raise ProviderError(f"{label}必须位于平台工作区或系统临时目录内")
+    return resolved
 
 
 class MockTextProvider:
@@ -115,6 +139,7 @@ class MockTextProvider:
                         "scene_name": "主要场景",
                         "time_weather": "白天，晴",
                         "characters": ["主角"],
+                        "source_refs": ["P001"],
                         "objective": "找到目标",
                         "action": "主角走入场景并观察四周。",
                         "dialogue": [{"character": "主角", "text": "就是这里。"}],
@@ -196,6 +221,25 @@ class MockTextProvider:
         if schema is ShotExtractionOutput:
             catalog: list[dict[str, Any]] = []
             source_dialogue: list[dict[str, Any]] = []
+            coverage_refs: list[str] = []
+            coverage_marker = (
+                "本场剧情覆盖节拍（每项都必须由至少一个分镜的 "
+                "coverage_refs 引用）：\n"
+            )
+            if coverage_marker in user_prompt:
+                coverage_text = user_prompt.split(coverage_marker, 1)[1].split(
+                    "\n当前项目可用素材目录", 1
+                )[0]
+                try:
+                    parsed_coverage = json.loads(coverage_text)
+                    if isinstance(parsed_coverage, list):
+                        coverage_refs = [
+                            str(item.get("ref"))
+                            for item in parsed_coverage
+                            if isinstance(item, dict) and item.get("ref")
+                        ]
+                except json.JSONDecodeError:
+                    coverage_refs = []
             marker = "当前项目可用素材目录：\n"
             if marker in user_prompt:
                 catalog_text = (
@@ -251,6 +295,7 @@ class MockTextProvider:
                         "shot_no": 1,
                         "scene_no": 1,
                         "source_ref": "开场",
+                        "coverage_refs": coverage_refs,
                         "scene_name": "主要场景",
                         "scene_asset_id": catalog_id("scene", "主要场景", "mock-scene-id"),
                         "character_names": ["主角"],
@@ -414,19 +459,20 @@ class MockVideoProvider:
         settings = get_settings()
         configured_store = config.params.get("task_store_dir")
         store = (
-            Path(configured_store)
+            _resolve_workspace_path(str(configured_store), label="Mock 视频任务目录")
             if configured_store
             else settings.workspace_dir / "provider_tasks"
         )
-        if not store.is_absolute():
-            store = settings.workspace_dir / store
         self.task_dir = (store / "mock_video").resolve()
         self.result_dir = self.task_dir / "results"
         self.temp_dir = self.task_dir / "temp"
         self.task_dir.mkdir(parents=True, exist_ok=True)
         self.result_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.ffmpeg_path = str(config.params.get("ffmpeg_path", settings.ffmpeg_path))
+        configured_ffmpeg = config.params.get("ffmpeg_path")
+        if configured_ffmpeg:
+            _resolve_workspace_path(str(configured_ffmpeg), label="Mock 视频 FFmpeg 路径")
+        self.ffmpeg_path = str(configured_ffmpeg or settings.ffmpeg_path)
         self._lock = threading.Lock()
 
     async def prepare_input_image(self, local_file: Path) -> dict[str, Any]:
@@ -444,6 +490,10 @@ class MockVideoProvider:
     ) -> ProviderSubmission:
         if duration_sec <= 0:
             raise ProviderError("视频时长必须大于 0")
+        if duration_sec > _MAX_MOCK_VIDEO_DURATION_SEC:
+            raise ProviderError(
+                f"Mock 视频时长不能超过 {_MAX_MOCK_VIDEO_DURATION_SEC:g} 秒"
+            )
         task_id = f"mock-video-{uuid4().hex}"
         delay = max(0.0, float(params.get("delay_sec", self.config.params.get("delay_sec", 0.1))))
         record = {
@@ -538,7 +588,12 @@ class MockVideoProvider:
         task_id = record["task_id"]
         target = self.result_dir / f"{task_id}.mp4"
         temporary = self.temp_dir / f"{uuid4().hex}.part.mp4"
-        duration = max(0.1, float(record["duration_sec"]))
+        duration = float(record["duration_sec"])
+        if duration <= 0 or duration > _MAX_MOCK_VIDEO_DURATION_SEC:
+            raise ProviderError(
+                f"Mock 视频时长必须在 0 到 {_MAX_MOCK_VIDEO_DURATION_SEC:g} 秒之间"
+            )
+        duration = max(0.1, duration)
         input_path = Path(record.get("input_image", {}).get("local_file", ""))
         if input_path.is_file():
             input_args = ["-loop", "1", "-i", str(input_path)]

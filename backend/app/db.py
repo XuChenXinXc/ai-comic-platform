@@ -6,11 +6,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import Engine, create_engine, event, func, insert, select
 from sqlalchemy.pool import StaticPool
 
-from alembic import command
-from alembic.config import Config
 from app.config import BACKEND_DIR, get_settings
 from app.models.tables import api_provider, metadata
 

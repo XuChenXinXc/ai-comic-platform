@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -42,6 +43,8 @@ _MEDIA_TARGET_TABLES = {
     "keyframe": keyframe_version,
     "video": video_version,
 }
+
+logger = logging.getLogger(__name__)
 
 
 def _hide_sensitive_result(value: Any) -> Any:
@@ -210,7 +213,7 @@ class JobService:
         target_id = record["target_id"]
         media_table = _MEDIA_TARGET_TABLES.get(target_type)
         if media_table is not None and target_id:
-            connection.execute(
+            result = connection.execute(
                 update(media_table)
                 .where(
                     media_table.c.id == target_id,
@@ -218,6 +221,14 @@ class JobService:
                 )
                 .values(status="queued", error="")
             )
+            if result.rowcount < 1:
+                # 目标可能已被并发重试/状态已变化：记录告警而不是静默失配。
+                logger.warning(
+                    "任务 %s 重试时未能同步目标 %s(%s) 状态为 queued",
+                    record["id"],
+                    target_type,
+                    target_id,
+                )
 
     def _sync_cancelled_target(
         self,
@@ -229,7 +240,7 @@ class JobService:
         target_id = record["target_id"]
         media_table = _MEDIA_TARGET_TABLES.get(target_type)
         if media_table is not None and target_id:
-            connection.execute(
+            result = connection.execute(
                 update(media_table)
                 .where(
                     media_table.c.id == target_id,
@@ -237,6 +248,13 @@ class JobService:
                 )
                 .values(status="failed", error=_CANCELLED_TARGET_ERROR)
             )
+            if result.rowcount < 1:
+                logger.warning(
+                    "任务 %s 取消时未能同步目标 %s(%s) 状态为 failed",
+                    record["id"],
+                    target_type,
+                    target_id,
+                )
             return
 
         if record["job_type"] == "analyze_novel":
@@ -280,7 +298,7 @@ class JobService:
             ).first()
             if other_active:
                 continue
-            connection.execute(
+            result = connection.execute(
                 update(table)
                 .where(
                     table.c.chapter_id == chapter_id,
@@ -292,6 +310,13 @@ class JobService:
                     updated_at=utc_now(),
                 )
             )
+            if result.rowcount < 1:
+                # 目标可能已不是 generating（例如已并发完成）：记录告警便于排查。
+                logger.warning(
+                    "任务 %s 取消时未能同步章节 %s 的写作目标状态为 failed",
+                    record["id"],
+                    chapter_id,
+                )
 
     def cleanup_old_jobs(
         self,

@@ -8,9 +8,8 @@ Create Date: 2026-08-05
 这里把默认值写入表默认约束，并回填历史项目中仍为空的画风。
 """
 
-from sqlalchemy import inspect
-
 from alembic import op
+from sqlalchemy import inspect
 
 revision: str = "20260805_0007"
 down_revision: str | None = "20260803_0006"

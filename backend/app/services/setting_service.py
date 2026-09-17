@@ -164,7 +164,7 @@ class SettingService:
 IMGBB_API_KEY_SETTING = "imgbb_api_key"
 
 
-def get_imagbb_api_key_override(database: Database) -> str:
+def get_imgbb_api_key_override(database: Database) -> str:
     """从平台设置中读取已加密的 ImgBB Key；解密失败或未配置时返回空字符串。"""
     from app.services.secret_service import SecretServiceError, decrypt_secret
 
@@ -185,8 +185,12 @@ def get_imagbb_api_key_override(database: Database) -> str:
         return ""
 
 
-def set_imagbb_api_key(database: Database, plaintext: str) -> None:
-    """加密后写入平台设置；空字符串视为清除。"""
+get_imagbb_api_key_override = get_imgbb_api_key_override
+
+
+def set_imgbb_api_key(database: Database, plaintext: str) -> None:
+    """加密后写入平台设置；空字符串视为清除。同时热更新运行时内存覆盖。"""
+    from app.providers.base import set_imgbb_api_key_override
     from app.services.secret_service import SecretServiceError, encrypt_secret
 
     if plaintext:
@@ -208,6 +212,10 @@ def set_imagbb_api_key(database: Database, plaintext: str) -> None:
     )
     with database.engine.begin() as connection:
         connection.execute(statement)
+    set_imgbb_api_key_override(plaintext)
+
+
+set_imagbb_api_key = set_imgbb_api_key
 
 
 # 运镜策略：平台级设置，控制「加不加运镜」的激进程度。
@@ -259,6 +267,64 @@ def set_default_style_prompt(database: Database, value: str) -> str:
     except SQLAlchemyError as exc:
         raise ServiceError(500, "保存默认画风失败，请重试") from exc
     return normalized
+
+
+# 本地/内网 Provider 放行开关：平台级设置。此前只能改 .env 重启，存量
+# Ollama/ComfyUI 用户在升级后 Provider 解析会全线失败；这里提供页面开关，
+# 值存 "1"/"0"，未设置时回退环境变量语义。
+PROVIDER_ALLOW_PRIVATE_HOSTS_SETTING = "provider_allow_private_hosts"
+_PRIVATE_HOSTS_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def get_provider_allow_private_hosts(database: Database) -> bool | None:
+    """读取本地 Provider 开关；未设置或读取失败时返回 None（回退环境变量）。"""
+    try:
+        with database.engine.connect() as connection:
+            stored = connection.scalar(
+                select(platform_setting.c.value).where(
+                    platform_setting.c.key == PROVIDER_ALLOW_PRIVATE_HOSTS_SETTING
+                )
+            )
+    except SQLAlchemyError:
+        return None
+    if stored is None or str(stored).strip() == "":
+        return None
+    return str(stored).strip().lower() in _PRIVATE_HOSTS_TRUE_VALUES
+
+
+def set_provider_allow_private_hosts(database: Database, enabled: bool) -> bool:
+    """写入本地 Provider 开关（"1"/"0"）。"""
+    value = "1" if enabled else "0"
+    now = utc_now()
+    statement = sqlite_insert(platform_setting).values(
+        key=PROVIDER_ALLOW_PRIVATE_HOSTS_SETTING,
+        value=value,
+        updated_at=now,
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=[platform_setting.c.key],
+        set_={"value": value, "updated_at": now},
+    )
+    try:
+        with database.engine.begin() as connection:
+            connection.execute(statement)
+    except SQLAlchemyError as exc:
+        raise ServiceError(500, "保存本地 Provider 开关失败，请重试") from exc
+    return enabled
+
+
+def get_provider_allow_private_hosts_setting(
+    database: Database,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """返回生效值与来源（database/environment/default），供 API 展示。"""
+    stored = get_provider_allow_private_hosts(database)
+    if stored is not None:
+        return {"enabled": stored, "source": "database"}
+    effective_settings = settings or get_settings()
+    if effective_settings.provider_allow_private_hosts:
+        return {"enabled": True, "source": "environment"}
+    return {"enabled": False, "source": "default"}
 
 
 def get_camera_policy(database: Database) -> str:

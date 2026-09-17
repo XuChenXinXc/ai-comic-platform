@@ -8,7 +8,13 @@ from typing import Any
 
 import requests
 
-from app.providers.base import ProviderError, validate_custom_headers, validate_provider_base_url
+from app.providers.base import (
+    ProviderError,
+    post_with_redirect_guard,
+    validate_custom_headers,
+    validate_provider_base_url,
+    validate_provider_base_url_network,
+)
 from app.schemas import ProviderConfig
 from app.services.constants import MAX_AUDIO_SIZE
 from app.services.utils import sanitize_error_message
@@ -38,8 +44,9 @@ class OpenAITTSProvider:
         self.config = config
         self.api_key = api_key
         # B-H/TTS：构造时校验 base_url，与 HttpProviderBase 一致，
-        # 拒绝 userinfo / 敏感查询参数等不安全配置。
+        # 拒绝 userinfo / 敏感查询参数等不安全配置，并拒绝内网地址。
         validate_provider_base_url(config.base_url)
+        validate_provider_base_url_network(config.base_url)
         self.base_url = config.base_url.rstrip("/") if config.base_url else "https://api.openai.com/v1"
         self.model = config.model or "tts-1"
         self.timeout = config.timeout_sec or 120
@@ -88,10 +95,11 @@ class OpenAITTSProvider:
                 raise ProviderError("TTS speed 参数必须是数字") from exc
 
         try:
-            # B-H/TTS：synthesize 是 async 函数，同步 requests.post 会阻塞事件
-            # 循环；移入线程执行，保持函数签名与返回契约不变。
+            # B-H/TTS：synthesize 是 async 函数，同步请求会阻塞事件循环；移入
+            # 线程执行并逐跳校验重定向目标（防 30x 跳转到内网），保持函数签名
+            # 与返回契约不变。
             response = await asyncio.to_thread(
-                requests.post,
+                post_with_redirect_guard,
                 url,
                 headers=headers,
                 json=payload,

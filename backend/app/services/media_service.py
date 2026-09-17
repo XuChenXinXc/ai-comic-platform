@@ -16,7 +16,8 @@ from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import delete, exists, func, insert, or_, select, update
+from sqlalchemy import and_, delete, exists, func, insert, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.db import Database, db
@@ -41,6 +42,7 @@ from app.models.tables import (
     workflow_stage,
 )
 from app.prompts import load_prompt
+from app.providers.base import ProviderError
 from app.schemas import KeyframeQaOutput, ProviderPollResult
 from app.services.constants import MAX_IMAGE_SIZE, MAX_VIDEO_SIZE
 from app.services.director_plan import (
@@ -109,7 +111,11 @@ class MediaDependencyError(ServiceError):
 
 
 class ProviderPollTimeoutError(RuntimeError):
-    """Provider 轮询超时：上游任务可能仍在生成，不应判定为最终失败。"""
+    """Provider 轮询无法继续但上游并非确认失败（超时，或任务已不存在）。
+
+    两种情况都不应判定为最终失败：超时任务可能仍在生成；任务不存在时结果可能
+    早已产出。调用方统一转入可重试的 interrupted 状态。
+    """
 
 
 _MEDIA_TABLES = {
@@ -126,6 +132,19 @@ _KEYFRAME_QA_PROVENANCE_KEY = "keyframe_qa"
 
 _DELETED_MEDIA_ERROR = "__deleted_by_user__"
 _ACTIVE_MEDIA_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+# 允许被「提交前抢占」的媒体状态：queued 是首次提交，waiting_provider/downloading
+# 是可重入的恢复态（重试继续轮询/下载，不重新提交 Provider）。
+# 刻意不含 running：running 表示该版本已被某个执行流持有。
+_CLAIMABLE_MEDIA_STATUSES = {"queued", "waiting_provider", "downloading"}
+# gpt-image-2 及其已知渠道衍生模型前缀（不包含官方 gpt-image-1/-mini）。
+_GPT_IMAGE_2_MODEL_PREFIXES = ("gpt-image-2",)
+# 单个父级的媒体版本列表上限：列表用于版本切换，无需返回全部历史版本。
+_MEDIA_VERSION_LIST_LIMIT = 200
+# 动态依赖唤醒的单次扫描上限（该表当前无写入方的死路径，仅作防御）。
+_DYNAMIC_DEPENDENT_QUERY_LIMIT = 500
+# 「上游任务不存在」判定标记：适配器把 HTTP 失败统一包装为 ProviderError，
+# 文本形如 "Provider 请求失败（HTTP 404）..."，据此降级为可重试状态。
+_PROVIDER_TASK_MISSING_MARKERS = ("http 404", "http 410", "not found", "任务不存在")
 _TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 _DYNAMIC_PROTECTED_STATUSES = {
     "blocked",
@@ -136,6 +155,27 @@ _DYNAMIC_PROTECTED_STATUSES = {
     "stale",
 }
 _MEDIA_VERSION_FILE_LOCK = RLock()
+
+
+class _MediaSignaturePrefetch:
+    """媒体版本列表签名计算的共享数据缓存。
+
+    列表接口的签名需要项目记录、Job 输入快照和 Provider 参数，这些数据在同一
+    父级下对所有版本行是共享的。逐行查询会产生 N+1；这里在列表开始时一次性
+    预取，签名计算只做纯函数运算。
+    """
+
+    def __init__(self, project_record: dict[str, Any] | None) -> None:
+        self.project_record = project_record
+        self.job_inputs: dict[str, dict[str, Any]] = {}
+        self.provider_params: dict[str, dict[str, Any]] = {}
+        self.provider_records: dict[str, tuple[str, str]] = {}
+        # 关键帧列表：分镜维度的有效签名与版本行无关，预取一次即可。
+        self.shot_signature: str | None = None
+        # 素材列表：场景族锚点路径与版本行无关，预取一次即可。
+        self.family_anchor_resolved = False
+        self.family_anchor_path: str | None = None
+
 _GPT_IMAGE_2_SIZES = {
     # apib 按分辨率档位出图：这些像素尺寸只作为比例提示，
     # resolution=2k 时实际输出 2048 宽（3:2 / 16:9 保持）。
@@ -186,6 +226,18 @@ class MediaService:
         self.providers = ProviderService(self.database)
 
     @staticmethod
+    def _is_gpt_image_2_model(model: str) -> bool:
+        """是否为 gpt-image-2 系（含渠道衍生名，如 gpt-image-2.5-sunburst）。
+
+        刻意不使用宽泛的 "gpt-image" 前缀：官方 gpt-image-1 / gpt-image-1-mini
+        走的是通用响应格式，套用 gpt-image-2 的 size/协议适配会产生错误请求。
+        """
+        normalized = model.strip().lower()
+        return any(
+            normalized.startswith(prefix) for prefix in _GPT_IMAGE_2_MODEL_PREFIXES
+        )
+
+    @staticmethod
     def _image_generation_params(
         model: str,
         target_type: str,
@@ -194,7 +246,9 @@ class MediaService:
         provider_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         result = dict(params)
-        if model.strip().lower() == "gpt-image-2":
+        # gpt-image-2 系列（含渠道衍生名如 gpt-image-2.5-sunburst）共用尺寸档位适配，
+        # 与 http_image 适配器的 _is_gpt_image_model 判定保持一致。
+        if MediaService._is_gpt_image_2_model(model):
             size = _GPT_IMAGE_2_SIZES.get(target_type)
             if size:
                 result["size"] = (
@@ -699,7 +753,9 @@ class MediaService:
                     )
                 )
                 if stage_result.rowcount != 1:
-                    return
+                    # stage 状态已并发变化：抛错回滚整个事务，避免 stage 已更新
+                    # 而 run 未更新的半提交状态（外层 except 兜底返回）。
+                    raise RuntimeError("workflow stage 状态已变化，放弃失败汇总更新")
                 run_result = connection.execute(
                     update(workflow_run)
                     .where(
@@ -716,7 +772,8 @@ class MediaService:
                     )
                 )
                 if run_result.rowcount != 1:
-                    return
+                    # run 状态已并发变化：回滚已执行的 stage 更新，避免半提交。
+                    raise RuntimeError("workflow run 状态已变化，放弃失败汇总更新")
         except Exception:
             # 媒体 Job 的原始失败仍由 Runner 记录；状态汇总失败不能掩盖原始错误。
             return
@@ -728,11 +785,22 @@ class MediaService:
             return
         try:
             with self.database.engine.connect() as connection:
+                project_id = connection.scalar(
+                    select(job.c.project_id).where(job.c.id == completed_job_id)
+                )
+                if not project_id:
+                    return
                 rows = connection.execute(
-                    select(job).where(
+                    select(job)
+                    .where(
                         job.c.workflow_run_id.is_not(None),
+                        # 依赖唤醒只需要看同一项目：全表扫描会跨项目拉取，
+                        # 项目多时是明显的无用负载。
+                        job.c.project_id == project_id,
                         job.c.status.in_(tuple(_ACTIVE_MEDIA_STATUSES | {"queued"})),
                     )
+                    .order_by(job.c.created_at.desc())
+                    .limit(_DYNAMIC_DEPENDENT_QUERY_LIMIT)
                 ).all()
             for row in rows:
                 record = row_dict(row) or {}
@@ -982,11 +1050,14 @@ class MediaService:
         if not self._provider_url_usable(url):
             return
         with self.database.engine.begin() as connection:
-            connection.execute(
+            result = connection.execute(
                 update(table)
                 .where(table.c.id == version_id)
                 .values(provider_url=str(url))
             )
+        if result.rowcount != 1:
+            # 版本行可能已被并发删除：不能静默丢弃，记录后由调用方继续。
+            logger.warning("媒体版本 provider_url 写入未命中：version=%s", version_id)
 
     def _resolve_shot_reference_bindings(
         self,
@@ -1012,11 +1083,12 @@ class MediaService:
             role = str(binding.get("role", ""))
             asset_id = binding.get("asset_id")
             key = (role, asset_id)
-            if (
-                asset_id
-                and role != "previous_keyframe"
-                and key not in requested_keys
-            ):
+            # 只排除 previous_keyframe：上一镜末帧由连续性单独管理，不属于素材绑定。
+            # 其余 role 必须保留（即使不在 scene_asset_id/character_ids/prop_ids 中）：
+            # 那是用户的人工绑定，丢弃后会被 _refresh_shot_reference_bindings 落库删除，
+            # 且不再参与媒体签名，导致素材改名后媒体不再标记 stale。
+            # 重复项按 (role, asset_id) 去重，已有绑定不重复追加。
+            if asset_id and role != "previous_keyframe" and key not in requested_keys:
                 requested.append((asset_id, role))
                 requested_keys.add(key)
 
@@ -1111,21 +1183,9 @@ class MediaService:
     ) -> Any | None:
         """返回分镜生成关键帧时应使用的素材参考图记录。
 
-        优先最新完成的干净参考图（reference_purpose='clean_reference'），
-        避免把带文字、宫格、多视图的设定展板当作图生图参考污染分镜画面；
-        没有干净参考图时退回当前图（is_current=1，可能是设定稿）。
+        统一使用当前素材图（is_current=1 的最新完成版本）作为图生图参考，
+        不再区分设定展板与干净参考图。
         """
-        preferred = connection.execute(
-            select(asset_image.c.id, asset_image.c.file_path)
-            .where(
-                asset_image.c.asset_id == asset_id,
-                asset_image.c.reference_purpose == "clean_reference",
-                asset_image.c.status == "completed",
-            )
-            .order_by(asset_image.c.version_no.desc())
-        ).first()
-        if preferred is not None:
-            return preferred
         return connection.execute(
             select(asset_image.c.id, asset_image.c.file_path)
             .where(
@@ -1173,15 +1233,34 @@ class MediaService:
             if item
         ]
         names: dict[str, str] = {}
+        character_costumes: dict[str, str] = {}
         if asset_ids:
             with self.database.engine.connect() as connection:
-                names = {
-                    row.id: row.name
-                    for row in connection.execute(
-                        select(asset.c.id, asset.c.name).where(asset.c.id.in_(asset_ids))
-                    )
-                }
-        return shot_template_context(current, names, prev_end_state)
+                for row in connection.execute(
+                    select(
+                        asset.c.id,
+                        asset.c.name,
+                        asset.c.asset_type,
+                        asset.c.profile_json,
+                    ).where(asset.c.id.in_(asset_ids))
+                ):
+                    names[row.id] = row.name
+                    if row.asset_type == "character":
+                        profile = json_loads(row.profile_json, {})
+                        costume = str(profile.get("costume") or "").strip()
+                        main_color = str(
+                            profile.get("main_color") or profile.get("color") or ""
+                        ).strip()
+                        parts = []
+                        if costume:
+                            parts.append(f"身穿{costume}")
+                        if main_color:
+                            parts.append(f"服装主色调为{main_color}")
+                        if parts:
+                            character_costumes[row.name] = "，".join(parts)
+        return shot_template_context(
+            current, names, prev_end_state, character_costumes=character_costumes
+        )
 
     @staticmethod
     def _decode_version(record: dict[str, Any], project_id: str) -> dict[str, Any]:
@@ -1198,8 +1277,56 @@ class MediaService:
             result["media_url"] = result["file_url"]
         return result
 
+    def _build_signature_prefetch(
+        self,
+        connection: Any,
+        project_id: str,
+        records: list[dict[str, Any]],
+    ) -> _MediaSignaturePrefetch:
+        """一次性预取列表签名所需的共享数据（项目、Job 输入、Provider 参数）。"""
+        prefetch = _MediaSignaturePrefetch(
+            row_dict(
+                connection.execute(select(project).where(project.c.id == project_id)).first()
+            )
+        )
+        version_ids = [str(record["id"]) for record in records]
+        if version_ids:
+            # 同一 version 可能有多次任务（重试）：按 created_at 升序覆盖，
+            # 保留最后一次入队的 input_json，与 _job_input 的 desc+limit(1) 等价。
+            for row in connection.execute(
+                select(job.c.target_id, job.c.input_json)
+                .where(job.c.target_id.in_(version_ids))
+                .order_by(job.c.created_at.asc())
+            ):
+                prefetch.job_inputs[str(row.target_id)] = json_loads(row.input_json, {})
+        provider_ids = sorted(
+            {str(record["provider_id"]) for record in records if record.get("provider_id")}
+        )
+        if provider_ids:
+            for row in connection.execute(
+                select(
+                    api_provider.c.id,
+                    api_provider.c.model,
+                    api_provider.c.updated_at,
+                    api_provider.c.params_json,
+                ).where(api_provider.c.id.in_(provider_ids))
+            ):
+                key = str(row.id)
+                prefetch.provider_records[key] = (
+                    str(row.model or ""),
+                    str(row.updated_at or ""),
+                )
+                prefetch.provider_params[key] = json_loads(row.params_json, {})
+        return prefetch
+
     @staticmethod
-    def _job_input(connection: Any, version_id: str) -> dict[str, Any]:
+    def _job_input(
+        connection: Any,
+        version_id: str,
+        prefetch: _MediaSignaturePrefetch | None = None,
+    ) -> dict[str, Any]:
+        if prefetch is not None:
+            return prefetch.job_inputs.get(str(version_id), {})
         raw = connection.execute(
             select(job.c.input_json)
             .where(job.c.target_id == version_id)
@@ -1213,14 +1340,21 @@ class MediaService:
         connection: Any,
         input_data: dict[str, Any],
         provider_id: str | None,
+        prefetch: _MediaSignaturePrefetch | None = None,
     ) -> dict[str, Any]:
         overrides = input_data.get("params", {})
         if not provider_id:
             return overrides
-        provider_params = connection.execute(
-            select(api_provider.c.params_json).where(api_provider.c.id == provider_id)
-        ).scalar()
-        return {**json_loads(provider_params, {}), **overrides}
+        if prefetch is not None:
+            provider_params = prefetch.provider_params.get(str(provider_id), {})
+        else:
+            provider_params = json_loads(
+                connection.execute(
+                    select(api_provider.c.params_json).where(api_provider.c.id == provider_id)
+                ).scalar(),
+                {},
+            )
+        return {**provider_params, **overrides}
 
     def _provider_model_value(
         self,
@@ -1229,9 +1363,21 @@ class MediaService:
         fallback: str,
         input_data: dict[str, Any],
         created_at: str,
+        prefetch: _MediaSignaturePrefetch | None = None,
     ) -> str:
         if not provider_id:
             return fallback
+        if prefetch is not None:
+            cached = prefetch.provider_records.get(str(provider_id))
+            if cached is None:
+                return fallback
+            return self._provider_model_value_from_record(
+                cached[0],
+                cached[1],
+                fallback,
+                input_data,
+                created_at,
+            )
         provider_record = connection.execute(
             select(api_provider.c.model, api_provider.c.updated_at).where(
                 api_provider.c.id == provider_id
@@ -1239,28 +1385,47 @@ class MediaService:
         ).first()
         if provider_record is None:
             return fallback
+        return self._provider_model_value_from_record(
+            str(provider_record.model or ""),
+            str(provider_record.updated_at or ""),
+            fallback,
+            input_data,
+            created_at,
+        )
+
+    @staticmethod
+    def _provider_model_value_from_record(
+        model: str,
+        updated_at: str,
+        fallback: str,
+        input_data: dict[str, Any],
+        created_at: str,
+    ) -> str:
         queued_provider_updated_at = input_data.get("provider_updated_at")
         if isinstance(queued_provider_updated_at, str) and queued_provider_updated_at:
-            if provider_record.updated_at == queued_provider_updated_at:
+            if updated_at == queued_provider_updated_at:
                 return fallback
-            return str(provider_record.model or fallback)
-        if provider_record.updated_at > created_at:
-            return str(provider_record.model or fallback)
+            return str(model or fallback)
+        if updated_at > created_at:
+            return str(model or fallback)
         return fallback
 
     def _asset_expected_signature(
-        self, connection: Any, record: dict[str, Any], current: dict[str, Any]
+        self,
+        connection: Any,
+        record: dict[str, Any],
+        current: dict[str, Any],
+        prefetch: _MediaSignaturePrefetch | None = None,
     ) -> str:
-        input_data = self._job_input(connection, record["id"])
-        params = self._job_params(connection, input_data, record["provider_id"])
-        project_record = row_dict(
-            connection.execute(select(project).where(project.c.id == current["project_id"])).first()
-        )
-        if project_record is None:
-            raise not_found("项目")
+        input_data = self._job_input(connection, record["id"], prefetch)
+        params = self._job_params(connection, input_data, record["provider_id"], prefetch)
+        project_record = self._signature_project_record(connection, current, prefetch)
         # 场景族成员：期望参考按当前锚点图重算，锚点图重生成后成员图应标记 stale。
         reference_files = record["reference_files_json"]
-        family_anchor_path = self._expected_family_anchor_path(connection, record, current)
+        if prefetch is not None and prefetch.family_anchor_resolved:
+            family_anchor_path = prefetch.family_anchor_path
+        else:
+            family_anchor_path = self._expected_family_anchor_path(connection, record, current)
         if family_anchor_path is not None:
             reference_files = [family_anchor_path] if family_anchor_path else []
         return asset_image_signature(
@@ -1272,26 +1437,50 @@ class MediaService:
                 record["model"],
                 input_data,
                 record["created_at"],
+                prefetch,
             ),
             params,
             reference_files,
-            bool(input_data.get("reference_mode")),
         )
 
-    def _keyframe_expected_signature(
-        self, connection: Any, record: dict[str, Any], current: dict[str, Any]
-    ) -> str:
-        input_data = self._job_input(connection, record["id"])
-        params = self._job_params(connection, input_data, record["provider_id"])
-        project_record = row_dict(
-            connection.execute(select(project).where(project.c.id == current["project_id"])).first()
+    def _signature_project_record(
+        self,
+        connection: Any,
+        current: dict[str, Any],
+        prefetch: _MediaSignaturePrefetch | None,
+    ) -> dict[str, Any]:
+        project_record = (
+            prefetch.project_record
+            if prefetch is not None
+            else row_dict(
+                connection.execute(
+                    select(project).where(project.c.id == current["project_id"])
+                ).first()
+            )
         )
         if project_record is None:
             raise not_found("项目")
+        return project_record
+
+    def _keyframe_expected_signature(
+        self,
+        connection: Any,
+        record: dict[str, Any],
+        current: dict[str, Any],
+        prefetch: _MediaSignaturePrefetch | None = None,
+    ) -> str:
+        input_data = self._job_input(connection, record["id"], prefetch)
+        params = self._job_params(connection, input_data, record["provider_id"], prefetch)
+        project_record = self._signature_project_record(connection, current, prefetch)
+        effective_shot = (
+            prefetch.shot_signature
+            if prefetch is not None and prefetch.shot_signature is not None
+            else self._effective_shot_signature(current, project_record)
+        )
         # 参考绑定与入队口径一致，感知分镜绑定的真实变化。
         expected_bindings = current["reference_bindings"]
         return keyframe_signature(
-            self._effective_shot_signature(current, project_record),
+            effective_shot,
             expected_bindings,
             record["provider_id"] or "uploaded",
             self._provider_model_value(
@@ -1300,20 +1489,21 @@ class MediaService:
                 record["model"],
                 input_data,
                 record["created_at"],
+                prefetch,
             ),
             params,
         )
 
     def _video_expected_signature(
-        self, connection: Any, record: dict[str, Any], current: dict[str, Any]
+        self,
+        connection: Any,
+        record: dict[str, Any],
+        current: dict[str, Any],
+        prefetch: _MediaSignaturePrefetch | None = None,
     ) -> str:
-        input_data = self._job_input(connection, record["id"])
-        params = self._job_params(connection, input_data, record["provider_id"])
-        project_record = row_dict(
-            connection.execute(select(project).where(project.c.id == current["project_id"])).first()
-        )
-        if project_record is None:
-            raise not_found("项目")
+        input_data = self._job_input(connection, record["id"], prefetch)
+        params = self._job_params(connection, input_data, record["provider_id"], prefetch)
+        project_record = self._signature_project_record(connection, current, prefetch)
         # 参考绑定基于「当前分镜绑定」，感知分镜绑定变化。
         supports_multiple_input_images = bool(
             input_data.get("supports_multiple_input_images") is True
@@ -1328,6 +1518,7 @@ class MediaService:
             record["model"],
             input_data,
             record["created_at"],
+            prefetch,
         )
         effective_duration = self._effective_video_duration(
             current_model,
@@ -1417,18 +1608,7 @@ class MediaService:
 
     @staticmethod
     def _family_anchor_image_path(connection: Any, anchor_id: str) -> str | None:
-        """锚点场景的参考图路径：优先干净参考图，退回当前图。"""
-        preferred = connection.execute(
-            select(asset_image.c.file_path)
-            .where(
-                asset_image.c.asset_id == anchor_id,
-                asset_image.c.reference_purpose == "clean_reference",
-                asset_image.c.status == "completed",
-            )
-            .order_by(asset_image.c.version_no.desc())
-        ).scalar()
-        if preferred:
-            return preferred
+        """锚点场景的当前素材图路径。"""
         return connection.execute(
             select(asset_image.c.file_path)
             .where(
@@ -1584,6 +1764,8 @@ class MediaService:
     def list_asset_images(
         self,
         asset_id: str,
+        *,
+        limit: int = _MEDIA_VERSION_LIST_LIMIT,
     ) -> list[dict[str, Any]]:
         current = self._asset(asset_id)
         with self.database.engine.connect() as connection:
@@ -1595,10 +1777,28 @@ class MediaService:
                 )
                 .order_by(asset_image.c.version_no.desc())
             )
+            if limit > 0:
+                statement = statement.limit(limit)
+            raw_records = [dict(row._mapping) for row in connection.execute(statement)]
+            prefetch = self._build_signature_prefetch(
+                connection,
+                current["project_id"],
+                raw_records,
+            )
+            if raw_records:
+                # 场景族锚点路径只与当前素材有关，与具体版本行无关：预取一次。
+                prefetch.family_anchor_path = self._expected_family_anchor_path(
+                    connection,
+                    raw_records[0],
+                    current,
+                )
+                prefetch.family_anchor_resolved = True
             records = []
-            for row in connection.execute(statement):
-                record = self._decode_version(dict(row._mapping), current["project_id"])
-                expected = self._asset_expected_signature(connection, record, current)
+            for raw in raw_records:
+                record = self._decode_version(raw, current["project_id"])
+                expected = self._asset_expected_signature(
+                    connection, record, current, prefetch
+                )
                 record["is_stale"] = is_stale(record["input_signature"], expected)
                 record["stale_reason"] = (
                     "素材描述、提示词或 Provider 参数已变化" if record["is_stale"] else ""
@@ -1606,20 +1806,43 @@ class MediaService:
                 records.append(record)
         return records
 
-    def list_keyframes(self, shot_id: str) -> list[dict[str, Any]]:
+    def list_keyframes(
+        self,
+        shot_id: str,
+        *,
+        limit: int = _MEDIA_VERSION_LIST_LIMIT,
+    ) -> list[dict[str, Any]]:
         current = self._shot(shot_id)
         with self.database.engine.connect() as connection:
-            records = []
-            for row in connection.execute(
+            statement = (
                 select(keyframe_version)
                 .where(
                     keyframe_version.c.shot_id == shot_id,
                     keyframe_version.c.error != _DELETED_MEDIA_ERROR,
                 )
                 .order_by(keyframe_version.c.version_no.desc())
-            ):
-                record = self._decode_version(dict(row._mapping), current["project_id"])
-                expected = self._keyframe_expected_signature(connection, record, current)
+            )
+            if limit > 0:
+                statement = statement.limit(limit)
+            raw_records = [dict(row._mapping) for row in connection.execute(statement)]
+            prefetch = self._build_signature_prefetch(
+                connection,
+                current["project_id"],
+                raw_records,
+            )
+            if prefetch.project_record is not None:
+                # 分镜维度的有效签名对所有版本行相同：预取一次，避免逐行
+                # 重算 _shot_template_context / _binding_reference_items。
+                prefetch.shot_signature = self._effective_shot_signature(
+                    current,
+                    prefetch.project_record,
+                )
+            records = []
+            for raw in raw_records:
+                record = self._decode_version(raw, current["project_id"])
+                expected = self._keyframe_expected_signature(
+                    connection, record, current, prefetch
+                )
                 record["is_stale"] = is_stale(record["input_signature"], expected)
                 record["stale_reason"] = (
                     "分镜、提示词或参考图绑定已变化" if record["is_stale"] else ""
@@ -1627,26 +1850,48 @@ class MediaService:
                 records.append(record)
         return records
 
-    def list_videos(self, shot_id: str) -> list[dict[str, Any]]:
+    def list_videos(
+        self,
+        shot_id: str,
+        *,
+        limit: int = _MEDIA_VERSION_LIST_LIMIT,
+    ) -> list[dict[str, Any]]:
         current = self._shot(shot_id)
         with self.database.engine.connect() as connection:
-            records = []
-            for row in connection.execute(
+            statement = (
                 select(video_version)
                 .where(
                     video_version.c.shot_id == shot_id,
                     video_version.c.error != _DELETED_MEDIA_ERROR,
                 )
                 .order_by(video_version.c.version_no.desc())
-            ):
-                record = self._decode_version(dict(row._mapping), current["project_id"])
-                expected = self._video_expected_signature(connection, record, current)
+            )
+            if limit > 0:
+                statement = statement.limit(limit)
+            raw_records = [dict(row._mapping) for row in connection.execute(statement)]
+            prefetch = self._build_signature_prefetch(
+                connection,
+                current["project_id"],
+                raw_records,
+            )
+            records = []
+            for raw in raw_records:
+                record = self._decode_version(raw, current["project_id"])
+                expected = self._video_expected_signature(
+                    connection, record, current, prefetch
+                )
                 record["is_stale"] = is_stale(record["input_signature"], expected)
                 record["stale_reason"] = (
                     "关键帧、视频提示词、时长或 Provider 参数已变化" if record["is_stale"] else ""
                 )
                 records.append(record)
         return records
+
+    @staticmethod
+    def _is_version_no_conflict(error: IntegrityError) -> bool:
+        """仅识别 (parent_id, version_no) 唯一约束冲突，其他完整性错误照常抛出。"""
+        original = getattr(error, "orig", None)
+        return "version_no" in str(original if original is not None else error).lower()
 
     def _insert_version(
         self,
@@ -1663,22 +1908,34 @@ class MediaService:
             if table is keyframe_version
             else "video"
         )
-        with self.database.engine.begin() as connection:
-            version_no = (
-                connection.execute(
-                    select(func.max(table.c.version_no)).where(table.c[parent_column] == parent_id)
-                ).scalar()
-                or 0
-            ) + 1
-            record = {
-                "id": version_id,
-                parent_column: parent_id,
-                "version_no": version_no,
-                "created_at": utc_now(),
-                **values,
-            }
-            connection.execute(insert(table).values(**record))
-        return record
+        last_error: IntegrityError | None = None
+        # MAX(version_no)+1 在并发插入下可能重复；唯一约束冲突时重新取号重试，
+        # 保持既有 UNIQUE(parent_id, version_no) 语义不变。
+        for attempt in range(3):
+            try:
+                with self.database.engine.begin() as connection:
+                    version_no = (
+                        connection.execute(
+                            select(func.max(table.c.version_no)).where(
+                                table.c[parent_column] == parent_id
+                            )
+                        ).scalar()
+                        or 0
+                    ) + 1
+                    record = {
+                        "id": version_id,
+                        parent_column: parent_id,
+                        "version_no": version_no,
+                        "created_at": utc_now(),
+                        **values,
+                    }
+                    connection.execute(insert(table).values(**record))
+                return record
+            except IntegrityError as error:
+                if not self._is_version_no_conflict(error) or attempt == 2:
+                    raise
+                last_error = error
+        raise conflict("媒体版本号分配冲突，请稍后重试") from last_error
 
     def queue_asset_image(self, asset_id: str, options: dict[str, Any]) -> dict[str, Any]:
         current = self._asset(asset_id)
@@ -1721,7 +1978,6 @@ class MediaService:
                 negative_prompt=negative_prompt,
                 consistency_keywords=current["consistency_keywords"],
                 composition=current["composition"],
-                reference_mode=bool(options.get("reference_mode")),
                 visual_bible=parse_visual_bible(current_project),
             )
         if prompt_override:
@@ -1753,7 +2009,6 @@ class MediaService:
                         "完全一致，只改变空间结构与视角，不得重新设计建筑外观。",
                     ]
                 )
-        reference_mode = bool(options.get("reference_mode"))
         version_values: dict[str, Any] = {
             "file_path": None,
             "prompt_snapshot": prompt,
@@ -1764,16 +2019,12 @@ class MediaService:
             "provider_task_id": "",
             "status": "queued",
             "is_current": False,
-            # 标记图片用途：干净参考图（reference_mode）优先被分镜绑定；
-            # 设定展板含文字/宫格/多视图，不适合作为图生图参考。
-            "reference_purpose": "clean_reference" if reference_mode else "setting_sheet",
             "input_signature": asset_image_signature(
                 self._effective_asset_signature(current, current_project),
                 config["id"],
                 config["model"],
                 params,
                 references,
-                reference_mode,
             ),
             "source": "generated",
             "error": "",
@@ -1784,20 +2035,23 @@ class MediaService:
             parent_id=asset_id,
             values=version_values,
         )
-        return self.jobs.create(
-            project_id=current["project_id"],
-            job_type="generate_asset_image",
-            target_type="asset_image",
-            target_id=version["id"],
-            provider_kind="image",
-            provider_id=config["id"],
-            input_data={
-                "asset_id": asset_id,
-                "provider_updated_at": str(config.get("updated_at") or ""),
-                "params": request_params,
-                "reference_mode": reference_mode,
-            },
-            batch_id=options.get("_batch_id"),
+        return self._create_version_job_or_cleanup(
+            asset_image,
+            version["id"],
+            lambda: self.jobs.create(
+                project_id=current["project_id"],
+                job_type="generate_asset_image",
+                target_type="asset_image",
+                target_id=version["id"],
+                provider_kind="image",
+                provider_id=config["id"],
+                input_data={
+                    "asset_id": asset_id,
+                    "provider_updated_at": str(config.get("updated_at") or ""),
+                    "params": request_params,
+                },
+                batch_id=options.get("_batch_id"),
+            ),
         )
 
     def queue_asset_image_batch(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
@@ -1832,7 +2086,6 @@ class MediaService:
                         "provider_id": options.get("provider_id")
                         or current_project["default_image_provider_id"],
                         "params": options.get("params", {}),
-                        "reference_mode": bool(options.get("reference_mode")),
                         "_batch_id": batch_id,
                     },
                 )
@@ -1854,25 +2107,24 @@ class MediaService:
         image_prompt = image_prompt_override or str(current["image_prompt"] or "").strip()
         if not image_prompt:
             raise bad_request("分镜缺少明确的关键帧提示词")
-        current = self._refresh_shot_reference_bindings(current)
-        bindings = current["reference_bindings"]
-        # 缺干净参考图的前置拦截（显式开启）：auto_prepare_references=True 时，
-        # 绑定的素材只有设定稿（无干净参考图）则自动入队参考图模式生成并中止本次
-        # 关键帧入队；参考图完成后重试即可。默认关闭以保持存量项目行为不变，
-        # 一键全链编排路径由编排器统一补齐参考图并建立任务依赖。
+        # 缺素材图的前置拦截（显式开启）：auto_prepare_references=True 时，
+        # 绑定的素材没有任何已完成的当前素材图则自动入队素材图生成并中止本次
+        # 关键帧入队；素材图完成后重试即可。默认关闭以保持存量项目行为不变，
+        # 一键全链编排路径由编排器统一补齐素材图并建立任务依赖。
         if options.get("auto_prepare_references", False):
-            prepared = self._ensure_clean_references_for_bindings(
-                current["project_id"],
-                bindings,
+            prepared = self._ensure_asset_images_for_shot(
+                current,
                 image_provider_id=options.get("provider_id")
                 or current_project["default_image_provider_id"],
             )
             if prepared:
                 raise conflict(
-                    "以下素材缺少干净参考图，已自动入队参考图模式生成："
+                    "以下素材缺少素材图，已自动入队生成："
                     + "、".join(entry["name"] for entry in prepared)
-                    + "。参考图完成后请重新生成关键帧。"
+                    + "。素材图完成后请重新生成关键帧。"
                 )
+        current = self._refresh_shot_reference_bindings(current)
+        bindings = current["reference_bindings"]
         _, config = self.providers.resolve(
             kind="image",
             provider_id=options.get("provider_id") or current_project["default_image_provider_id"],
@@ -1933,22 +2185,53 @@ class MediaService:
                 "error": "",
             },
         )
-        return self.jobs.create(
-            project_id=current["project_id"],
-            chapter_id=current["chapter_id"],
-            job_type="generate_keyframe",
-            target_type="keyframe",
-            target_id=version["id"],
-            provider_kind="image",
-            provider_id=config["id"],
-            input_data={
-                "shot_id": shot_id,
-                "provider_updated_at": str(config.get("updated_at") or ""),
-                "params": request_params,
-            },
-            depends_on=options.get("depends_on") or None,
-            batch_id=options.get("_batch_id"),
+        return self._create_version_job_or_cleanup(
+            keyframe_version,
+            version["id"],
+            lambda: self.jobs.create(
+                project_id=current["project_id"],
+                chapter_id=current["chapter_id"],
+                job_type="generate_keyframe",
+                target_type="keyframe",
+                target_id=version["id"],
+                provider_kind="image",
+                provider_id=config["id"],
+                input_data={
+                    "shot_id": shot_id,
+                    "provider_updated_at": str(config.get("updated_at") or ""),
+                    "params": request_params,
+                },
+                depends_on=options.get("depends_on") or None,
+                batch_id=options.get("_batch_id"),
+            ),
         )
+
+    def _create_version_job_or_cleanup(
+        self,
+        table: Any,
+        version_id: str,
+        create_job: Any,
+    ) -> dict[str, Any]:
+        """建 Job 失败时清理刚插入的孤立版本行。
+
+        版本行与 Job 分属两个事务（Provider 调用与文件写入都在 Job 之后），
+        建 Job 失败会留下永远无人执行的 queued 版本；这里显式补偿删除。
+        """
+        try:
+            return create_job()
+        except Exception:
+            try:
+                with self.database.engine.begin() as connection:
+                    result = connection.execute(delete(table).where(table.c.id == version_id))
+                if result.rowcount != 1:
+                    logger.warning(
+                        "媒体任务创建失败后清理孤立版本未命中：version=%s", version_id
+                    )
+            except Exception:
+                logger.exception(
+                    "媒体任务创建失败后清理孤立版本出错：version=%s", version_id
+                )
+            raise
 
     def queue_keyframe_batch(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
         return self._queue_shot_media_batch(project_id, options, media_kind="keyframe")
@@ -2257,28 +2540,32 @@ class MediaService:
                 "error": "",
             },
         )
-        created_job = self.jobs.create(
-            project_id=current["project_id"],
-            chapter_id=current["chapter_id"],
-            job_type="generate_video",
-            target_type="video",
-            target_id=version["id"],
-            provider_kind="video",
-            provider_id=config["id"],
-            input_data={
-                "shot_id": shot_id,
-                "keyframe_version_id": keyframe["id"],
-                "reference_bindings": reference_bindings,
-                # 项目内相对路径；为空表示本镜不引用上一镜结束帧
-                "prev_end_frame_path": prev_end_frame_relative,
-                "prev_end_frame_first": prev_end_frame_first,
-                "supports_multiple_input_images": supports_multiple_input_images,
-                "depends_on": depends_on,
-                "provider_updated_at": str(config.get("updated_at") or ""),
-                "params": options.get("params", {}),
-            },
-            depends_on=depends_on,
-            batch_id=options.get("_batch_id"),
+        created_job = self._create_version_job_or_cleanup(
+            video_version,
+            version["id"],
+            lambda: self.jobs.create(
+                project_id=current["project_id"],
+                chapter_id=current["chapter_id"],
+                job_type="generate_video",
+                target_type="video",
+                target_id=version["id"],
+                provider_kind="video",
+                provider_id=config["id"],
+                input_data={
+                    "shot_id": shot_id,
+                    "keyframe_version_id": keyframe["id"],
+                    "reference_bindings": reference_bindings,
+                    # 项目内相对路径；为空表示本镜不引用上一镜结束帧
+                    "prev_end_frame_path": prev_end_frame_relative,
+                    "prev_end_frame_first": prev_end_frame_first,
+                    "supports_multiple_input_images": supports_multiple_input_images,
+                    "depends_on": depends_on,
+                    "provider_updated_at": str(config.get("updated_at") or ""),
+                    "params": options.get("params", {}),
+                },
+                depends_on=depends_on,
+                batch_id=options.get("_batch_id"),
+            ),
         )
         if consistency_issues:
             created_job["consistency_issues"] = consistency_issues
@@ -2478,7 +2765,11 @@ class MediaService:
                 "provider_id": None,
                 "model": "",
                 "provider_task_id": "",
-                "status": "completed",
+                # 上传版先落「进行中」：文件写入与激活成功后才由
+                # _activate_media_version(complete=True) 置 completed。
+                # 先落 completed(file_path=NULL) 会在写文件失败时留下
+                # 「已完成但没有文件」的坏版本。
+                "status": "running",
                 "is_current": False,
                 "input_signature": asset_image_signature(
                     self._effective_asset_signature(current, self._project(current["project_id"])),
@@ -2535,7 +2826,8 @@ class MediaService:
                 "provider_id": None,
                 "model": "",
                 "provider_task_id": "",
-                "status": "completed",
+                # 同 upload_asset_image：先「进行中」，写文件成功后再置 completed。
+                "status": "running",
                 "is_current": False,
                 "input_signature": keyframe_signature(
                     self._effective_shot_signature(current, self._project(current["project_id"])),
@@ -2604,7 +2896,8 @@ class MediaService:
                 "provider_id": None,
                 "model": "",
                 "provider_task_id": "",
-                "status": "completed",
+                # 同 upload_asset_image：先「进行中」，写文件成功后再置 completed。
+                "status": "running",
                 "is_current": False,
                 "input_signature": video_signature(
                     keyframe_id or "",
@@ -2794,10 +3087,12 @@ class MediaService:
         }
 
     def _media_view_condition(self, table: Any, record: Mapping[str, Any]):
-        """asset_image 的 current 分区条件。
+        """asset_image 的 current 分区条件（历史遗留，恒返回 None）。
 
         Scene Views 已移除：所有媒体版本均按「每父级一条当前记录」分区，
-        无需额外过滤条件。
+        无需额外过滤条件。调用方 _activate_media_version 已用
+        `if view_condition is not None` 守卫，保留此函数仅为兼容旧调用形状，
+        删除它需要同时去掉守卫并调整缩进，收益不足以触及 current 激活关键路径。
         """
         del table, record
         return None
@@ -3029,11 +3324,15 @@ class MediaService:
                     history_target,
                 )
                 with self.database.engine.begin() as connection:
-                    connection.execute(
+                    result = connection.execute(
                         update(table)
                         .where(table.c.id == version_id)
                         .values(file_path=history_relative, is_current=False)
                     )
+                if result.rowcount != 1:
+                    # 条件 UPDATE 未命中：文件已改名为历史版而数据库未更新，
+                    # 抛错触发下面的文件回滚，避免文件与数据库状态错位。
+                    raise FileServiceError("取消当前版本条件未命中")
             except Exception as exc:
                 if moved and history_target.exists():
                     try:
@@ -3076,12 +3375,17 @@ class MediaService:
                 complete=True,
                 actual_duration_sec=actual_duration_sec,
             )
-        except Exception:
+        except Exception as exc:
             self._delete_failed_target(project_id, working_target)
             if target_created:
                 self._delete_failed_target(project_id, target)
-            with self.database.engine.begin() as connection:
-                connection.execute(delete(table).where(table.c.id == version_id))
+            if not self._set_media_status(table, version_id, "failed", str(exc)):
+                # 版本已脱离在途态（例如已被并发激活为 completed）：不能删行，
+                # 也不能假装失败，记录告警后按原异常上抛。
+                logger.warning(
+                    "上传失败但媒体版本状态未更新（版本已非在途态）：version=%s",
+                    version_id,
+                )
             raise
         if kind == "asset_image":
             ShotService(self.database, self.jobs).sync_asset_image_binding(
@@ -3213,10 +3517,18 @@ class MediaService:
                 )
                 if result.rowcount != 1:
                     raise conflict("媒体版本状态已变化，请刷新后重试")
-                if project_id and record.get("file_path"):
-                    file_service.delete_file(project_id, record["file_path"])
-                if kind == "video" and project_id and record.get("end_frame_path"):
-                    file_service.delete_file(project_id, record["end_frame_path"])
+        if project_id and record.get("file_path"):
+            try:
+                file_service.delete_file(project_id, record["file_path"])
+            except Exception:
+                logger.warning("删除已停用版本文件失败（不影响状态）：%s", record["file_path"])
+        if kind == "video" and project_id and record.get("end_frame_path"):
+            try:
+                file_service.delete_file(project_id, record["end_frame_path"])
+            except Exception:
+                logger.warning(
+                    "删除已停用视频末帧文件失败（不影响状态）：%s", record["end_frame_path"]
+                )
 
     @staticmethod
     def _ensure_keyframe_not_referenced(connection: Any, keyframe_id: str) -> None:
@@ -3342,6 +3654,7 @@ class MediaService:
         target: Path | None = None
         working_target: Path | None = None
         target_created = False
+        media_completed = False
         temporary_references: list[str] = []
         input_data: dict[str, Any] = {}
         try:
@@ -3441,7 +3754,13 @@ class MediaService:
                 provider_config=config,
             )
             params = {**config["params"], **request_params}
-            self._set_media_status(table, version_id, "running")
+            replayed = self._claim_media_version_or_replay(
+                table, version_id, job_record, input_data
+            )
+            if replayed is not None:
+                # 版本已在别的执行流里完成：幂等返回既有产物，不向 Provider 二次提交。
+                self._cleanup_dynamic_reference_files(project_id, temporary_references)
+                return replayed
             if self._has_saved_result(job_record):
                 result = ProviderPollResult.model_validate(job_record["result_data"])
             elif job_record.get("provider_task_id") or version["provider_task_id"]:
@@ -3480,6 +3799,7 @@ class MediaService:
                 relative,
                 job_record=job_record,
             )
+            media_completed = True
             self._store_provider_url(table, version_id, result.result_url)
             if kind == "keyframe":
                 # 关键帧生成完成后自动视觉质检（文字 Provider 启用视觉能力时）；
@@ -3502,12 +3822,35 @@ class MediaService:
             if self._complete_dynamic_media_job(job_record, input_data, completed_result):
                 self._enqueue_dynamic_dependents(str(job_record["id"]))
             return completed_result
-        except Exception as exc:
-            self._delete_failed_target(project_id, working_target)
-            if target_created:
-                self._delete_failed_target(project_id, target)
+        except ProviderPollTimeoutError as exc:
+            # 轮询超时或上游任务已不存在：都不按最终失败处理。版本保留在
+            # waiting_provider，Job 置 interrupted（可手动重试）。上游任务不存在时
+            # _poll_existing 已清空 provider_task_id，重试会重新提交 Provider；
+            # 超时情况则保留 task_id，重试继续轮询原任务。
             self._cleanup_dynamic_reference_files(project_id, temporary_references)
-            self._set_media_status(table, version_id, "failed", str(exc))
+            self._set_media_status(table, version_id, "waiting_provider")
+            self._record_dynamic_media_failure(job_record, input_data, exc)
+            self.jobs.repository.interrupt(str(job_record["id"]), str(exc))
+            return {
+                "status": "interrupted",
+                "version_id": version_id,
+                "error": sanitize_error_message(exc),
+            }
+        except JobCancelledError:
+            # 用户取消不是生成失败：不改媒体状态、不删已产生的文件，原样穿透。
+            raise
+        except Exception as exc:
+            self._cleanup_dynamic_reference_files(project_id, temporary_references)
+            self._fail_media_version_cleanup(
+                table=table,
+                version_id=version_id,
+                project_id=project_id,
+                working_target=working_target,
+                target=target,
+                target_created=target_created,
+                completed=media_completed,
+                error=str(exc),
+            )
             self._record_dynamic_media_failure(job_record, input_data, exc)
             if isinstance(exc, MediaDependencyError):
                 self.jobs.repository.fail(str(job_record["id"]), str(exc))
@@ -3521,24 +3864,34 @@ class MediaService:
     def _resolve_binding_files(self, project_id: str, bindings: list[dict[str, Any]]) -> list[Path]:
         return [path for path, _ in self._binding_reference_items(project_id, bindings)]
 
-    def _ensure_clean_references_for_bindings(
+    def _shot_associated_asset_ids(self, current: dict[str, Any]) -> set[str]:
+        """收集分镜声明关联的所有素材 ID（场景、角色、道具及参考绑定）。"""
+        asset_ids = {
+            current.get("scene_asset_id"),
+            *(current.get("character_ids") or []),
+            *(current.get("prop_ids") or []),
+            *[
+                b.get("asset_id")
+                for b in (current.get("reference_bindings") or [])
+                if b.get("role") != "previous_keyframe"
+            ],
+        }
+        return {str(item) for item in asset_ids if item}
+
+    def _ensure_asset_images_for_asset_ids(
         self,
         project_id: str,
-        bindings: list[dict[str, Any]],
+        asset_ids: set[str],
         *,
         image_provider_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """为缺少干净参考图的绑定素材入队参考图模式生成。
+        """为缺少素材图的素材入队素材图生成。
 
-        返回本次补生成的条目列表 [{name, job_id}]；
-        已有完成或在途（queued/running/waiting_provider）的干净参考图时不重复入队；
+        素材图统一作为图生图参考，不再区分设定展板与干净参考图；
+        已有当前完成图（is_current=1 且 completed）或任意在途版本
+        （queued/running/waiting_provider/downloading）时不重复入队；
         入队失败只记录日志，不阻断调用方。
         """
-        asset_ids = {
-            str(binding["asset_id"])
-            for binding in bindings
-            if binding.get("asset_id") and binding.get("role") != "previous_keyframe"
-        }
         if not asset_ids:
             return []
         with self.database.engine.connect() as connection:
@@ -3551,9 +3904,16 @@ class MediaService:
                     select(asset_image.c.asset_id)
                     .where(
                         asset_image.c.asset_id.in_(asset_ids),
-                        asset_image.c.reference_purpose == "clean_reference",
-                        asset_image.c.status.in_(
-                            ("completed", "queued", "running", "waiting_provider")
+                        # 在途版本入队时写的是 is_current=False（只有完成激活才置
+                        # True），所以在途判定不能叠加 is_current 条件，否则同一素材
+                        # 的 queued/running 任务对后续调用不可见，会被重复入队并产生
+                        # 重复付费的生图调用（一章内多分镜共用同一素材时尤为明显）。
+                        or_(
+                            and_(
+                                asset_image.c.is_current.is_(True),
+                                asset_image.c.status == "completed",
+                            ),
+                            asset_image.c.status.in_(tuple(_ACTIVE_MEDIA_STATUSES)),
                         ),
                     )
                 )
@@ -3570,13 +3930,24 @@ class MediaService:
                     {
                         "provider_id": image_provider_id,
                         "params": {},
-                        "reference_mode": True,
                     },
                 )
                 prepared.append({"name": name, "job_id": job_record.get("id")})
             except Exception:
-                logger.exception("自动补生成干净参考图失败：asset=%s", asset_id)
+                logger.exception("自动补生成素材图失败：asset=%s", asset_id)
         return prepared
+
+    def _ensure_asset_images_for_shot(
+        self,
+        current: dict[str, Any],
+        *,
+        image_provider_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """为当前分镜声明关联的全部素材检查并补齐素材图。"""
+        asset_ids = self._shot_associated_asset_ids(current)
+        return self._ensure_asset_images_for_asset_ids(
+            current["project_id"], asset_ids, image_provider_id=image_provider_id
+        )
 
     def _current_shot_audio_paths(self, project_id: str, shot_id: str) -> list[Path]:
         """当前配音音频文件（按对白行顺序，最多 3 段）。
@@ -3625,7 +3996,7 @@ class MediaService:
         """一键全链编排入口：三步链式任务（提示词 → 关键帧 → 视频）。
 
         第一步补齐缺失的图/视频提示词与导演计划；第二步等待提示词完成后
-        补齐干净参考图并批量生成关键帧（依赖参考图任务）；第三步等待关键帧
+        补齐缺失素材图并批量生成关键帧（依赖素材图任务）；第三步等待关键帧
         完成后批量生成视频。
         """
         with self.database.engine.connect() as connection:
@@ -3637,6 +4008,24 @@ class MediaService:
         if chapter_record is None:
             raise not_found("章节")
         current_project = self._project(chapter_record["project_id"])
+        with self.database.engine.connect() as connection:
+            shot_ids = list(
+                connection.execute(
+                    select(shot.c.id).where(shot.c.chapter_id == chapter_id)
+                ).scalars()
+            )
+        continuity_job = ShotService(self.database, self.jobs).queue_continuity_check(
+            current_project["id"],
+            {
+                "ids": shot_ids,
+                "apply_fixes": True,
+                "insert_transitions": False,
+                "require_pass": True,
+                "provider_id": options.get("provider_id")
+                or current_project["default_text_provider_id"],
+                "params": options.get("params", {}),
+            },
+        )
         return self.jobs.create(
             project_id=current_project["id"],
             chapter_id=chapter_id,
@@ -3649,7 +4038,9 @@ class MediaService:
             input_data={
                 "chapter_id": chapter_id,
                 "params": options.get("params", {}),
+                "continuity_job_id": continuity_job["id"],
             },
+            depends_on=[continuity_job["id"]],
         )
 
     async def handle_shot_pipeline(self, job_record: dict[str, Any]) -> dict[str, Any]:
@@ -3739,7 +4130,7 @@ class MediaService:
     async def handle_shot_pipeline_media(
         self, job_record: dict[str, Any]
     ) -> dict[str, Any]:
-        """第二步：补齐干净参考图并批量生成关键帧，链式触发第三步。"""
+        """第二步：补齐缺失素材图并批量生成关键帧，链式触发第三步。"""
         input_data = dict(job_record.get("input_data") or {})
         chapter_id = str(input_data["chapter_id"])
         params = input_data.get("params") or {}
@@ -3767,9 +4158,8 @@ class MediaService:
                     skipped_keyframes += 1
                     continue
             current = self._shot(shot_id)
-            prepared = self._ensure_clean_references_for_bindings(
-                project_id,
-                current.get("reference_bindings") or [],
+            prepared = self._ensure_asset_images_for_shot(
+                current,
                 image_provider_id=current_project["default_image_provider_id"],
             )
             prepared_references += len(prepared)
@@ -4001,6 +4391,7 @@ class MediaService:
         target: Path | None = None
         working_target: Path | None = None
         target_created = False
+        media_completed = False
         temporary_references: list[str] = []
         input_data: dict[str, Any] = {}
         try:
@@ -4071,7 +4462,13 @@ class MediaService:
                 / "media-results"
                 / f"{self._safe_storage_token(version_id)}{target.suffix}",
             )
-            self._set_media_status(video_version, version_id, "running")
+            replayed = self._claim_media_version_or_replay(
+                video_version, version_id, job_record, input_data
+            )
+            if replayed is not None:
+                # 版本已在别的执行流里完成：幂等返回既有产物，不向 Provider 二次提交。
+                self._cleanup_dynamic_reference_files(project_id, temporary_references)
+                return replayed
             if self._has_saved_result(job_record):
                 result = ProviderPollResult.model_validate(job_record["result_data"])
             elif job_record.get("provider_task_id") or version["provider_task_id"]:
@@ -4232,6 +4629,7 @@ class MediaService:
                 actual_duration_sec=actual_duration_sec,
                 job_record=job_record,
             )
+            media_completed = True
 
             # 提取视频末帧，供下一镜衔接引用。失败不影响本次视频生成成功
             end_frame_working: Path | None = None
@@ -4297,12 +4695,21 @@ class MediaService:
                 "version_id": version_id,
                 "error": sanitize_error_message(exc),
             }
+        except JobCancelledError:
+            # 用户取消不是生成失败：不改媒体状态、不删已产生的文件，原样穿透。
+            raise
         except Exception as exc:
-            self._delete_failed_target(project_id, working_target)
-            if target_created:
-                self._delete_failed_target(project_id, target)
             self._cleanup_dynamic_reference_files(project_id, temporary_references)
-            self._set_media_status(video_version, version_id, "failed", str(exc))
+            self._fail_media_version_cleanup(
+                table=video_version,
+                version_id=version_id,
+                project_id=project_id,
+                working_target=working_target,
+                target=target,
+                target_created=target_created,
+                completed=media_completed,
+                error=str(exc),
+            )
             self._record_dynamic_media_failure(job_record, input_data, exc)
             if isinstance(exc, MediaDependencyError):
                 self.jobs.repository.fail(str(job_record["id"]), str(exc))
@@ -4369,6 +4776,26 @@ class MediaService:
                     if result.status == "failed":
                         raise RuntimeError(result.error or "Provider 任务失败")
                     await asyncio.sleep(settings.provider_poll_interval_sec)
+        except JobCancelledError:
+            # 取消是可恢复的用户意图，不是 Provider 失败：原样穿透，由调用方按
+            # 取消处理，不在这里改写媒体状态或让上层误记为 failed。
+            raise
+        except ProviderError as exc:
+            if not self._is_provider_task_missing_error(exc):
+                raise
+            # 上游任务已不存在（过期/被清理）：继续轮询永远拿不到结果，也不能
+            # 当作生成失败（结果可能早已产出）。降级为可重试状态：清掉已失效的
+            # task_id，交由调用方的 interrupted 分支收口；用户重试时会重新提交
+            # Provider（而不是继续轮询一个不存在的任务）。
+            logger.warning(
+                "Provider 轮询任务已不存在，转为可重试状态：version=%s task=%s",
+                version_id,
+                task_id,
+            )
+            self._clear_provider_task_reference(table, version_id, str(job_record["id"]))
+            raise ProviderPollTimeoutError(
+                "Provider 上游任务已不存在（可能已过期），可点击重试重新生成"
+            ) from exc
         except TimeoutError as exc:
             # 轮询超时不代表上游失败：任务可能仍在生成。保留 task_id 由调用方
             # 转入可恢复状态，重试时继续轮询原任务而不会重新提交计费。
@@ -4376,6 +4803,45 @@ class MediaService:
                 "Provider 轮询超时，任务可能仍在生成；"
                 "可稍后点击重试继续轮询原任务（不会重复提交计费）"
             ) from exc
+
+    @staticmethod
+    def _is_provider_task_missing_error(error: Exception) -> bool:
+        """判断轮询异常是否为「上游任务不存在」（404/410/not found）。
+
+        适配器把 HTTP 失败统一包成 ProviderError 并附带
+        「Provider 请求失败（HTTP 404）」前缀，因此这里按该文本判定。
+        """
+        text = str(error).lower()
+        return any(marker in text for marker in _PROVIDER_TASK_MISSING_MARKERS)
+
+    def _clear_provider_task_reference(
+        self,
+        table: Any,
+        version_id: str,
+        job_id: str,
+    ) -> None:
+        """清空版本与 Job 上已失效的 provider_task_id，使重试重新提交 Provider。"""
+        now = utc_now()
+        with self.database.engine.begin() as connection:
+            version_result = connection.execute(
+                update(table)
+                .where(table.c.id == version_id)
+                .values(provider_task_id="", updated_at=now)
+            )
+            job_result = connection.execute(
+                update(job)
+                .where(
+                    job.c.id == job_id,
+                    job.c.status.in_(tuple(_ACTIVE_MEDIA_STATUSES)),
+                )
+                .values(provider_task_id="", updated_at=now)
+            )
+        if version_result.rowcount != 1:
+            logger.warning(
+                "清理失效 provider_task_id 未命中媒体版本：version=%s", version_id
+            )
+        if job_result.rowcount != 1:
+            logger.warning("清理失效 provider_task_id 未命中任务：job=%s", job_id)
 
     def _raise_if_job_cancelled(self, job_id: str) -> None:
         record = self.jobs.repository.get(job_id)
@@ -4460,6 +4926,48 @@ class MediaService:
         except (FileServiceError, OSError):
             return
 
+    def _fail_media_version_cleanup(
+        self,
+        *,
+        table: Any,
+        version_id: str,
+        project_id: str,
+        working_target: Path | None,
+        target: Path | None,
+        target_created: bool,
+        completed: bool,
+        error: str,
+    ) -> None:
+        """媒体生成失败时的收尾：把版本置为 failed，并清理半成品文件。
+
+        ``completed=True`` 表示版本已经由 _complete_media 落库为 completed：
+        此时绝不能删除正式文件（否则 DB 记录 completed + file_path 而磁盘文件
+        消失，当前版本会变成坏图/坏视频），也不能把状态改回 failed（条件 UPDATE
+        命中不了终态行）。只记录告警，由调用方按失败收口 Job；用户重试时会走
+        _claim_media_version_or_replay 的重放路径，不会重复提交 Provider。
+        """
+        # 中间产物（temp 目录）无论成败都应清理；正式文件只在版本确实标为
+        # failed 后才删除。
+        self._delete_failed_target(project_id, working_target)
+        if completed:
+            logger.warning(
+                "媒体版本已落库 completed，后续步骤异常，保留正式文件不删除："
+                "version=%s error=%s",
+                version_id,
+                sanitize_error_message(error),
+            )
+            return
+        if not self._set_media_status(table, version_id, "failed", error):
+            # 条件 UPDATE 未命中：版本已被其他执行流推进到终态。删除正式文件会
+            # 与数据库记录错位，因此只记告警，保留文件交由恢复/人工确认。
+            logger.warning(
+                "媒体版本失败状态更新未命中（版本已非在途态），保留正式文件：version=%s",
+                version_id,
+            )
+            return
+        if target_created:
+            self._delete_failed_target(project_id, target)
+
     @staticmethod
     def _has_saved_result(job_record: dict[str, Any]) -> bool:
         result = job_record.get("result_data") or {}
@@ -4476,22 +4984,86 @@ class MediaService:
         error: str = "",
         *,
         provider_task_id: str | None = None,
-    ) -> None:
+        from_statuses: set[str] | None = None,
+    ) -> bool:
+        """把仍在途的媒体版本推进到新状态；返回是否真的命中了行。
+
+        条件 UPDATE 默认只命中 _ACTIVE_MEDIA_STATUSES。命中 0 行说明版本已脱离在途态
+        （completed/failed 等终态），调用方必须据此中止，否则会对已完成/已失败的
+        版本重复提交 Provider 任务，白花一次生成费用。
+
+        ``from_statuses`` 允许调用方收窄可命中的来源状态（如「提交前抢占」只允许
+        从 queued/可恢复态接管），使条件 UPDATE 成为真正的 CAS。
+        """
         values: dict[str, Any] = {
             "status": status,
             "error": sanitize_error_message(error),
         }
         if provider_task_id is not None:
             values["provider_task_id"] = provider_task_id
+        allowed = _ACTIVE_MEDIA_STATUSES if from_statuses is None else from_statuses
         with self.database.engine.begin() as connection:
-            connection.execute(
+            result = connection.execute(
                 update(table)
                 .where(
                     table.c.id == version_id,
-                    table.c.status.in_(tuple(_ACTIVE_MEDIA_STATUSES)),
+                    table.c.status.in_(tuple(allowed)),
                 )
                 .values(**values)
             )
+            return int(result.rowcount or 0) > 0
+
+    def _claim_media_version(self, table: Any, version_id: str) -> bool:
+        """提交 Provider 前抢占媒体版本（真 CAS）。
+
+        只允许从 queued 或明确可重入的恢复态（waiting_provider/downloading）
+        接管。running 表示该版本已被某个执行流持有：命中 0 行由调用方按冲突
+        处理，避免向 Provider 重复提交（重复计费）。
+        """
+        return self._set_media_status(
+            table,
+            version_id,
+            "running",
+            from_statuses=_CLAIMABLE_MEDIA_STATUSES,
+        )
+
+    def _claim_media_version_or_replay(
+        self,
+        table: Any,
+        version_id: str,
+        job_record: Mapping[str, Any],
+        input_data: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """提交 Provider 前抢占媒体版本；版本已终态时按重放处理，不重复付费提交。
+
+        返回 None 表示抢占成功（版本已推进到 running），调用方继续正常提交流程。
+        返回 dict 表示版本早已 completed：直接把既有产物当作本次结果返回，Job 正常
+        complete，不触发依赖级联失败。版本停在 failed 等其他终态（或已被其他执行流
+        置为 running）时抛 conflict——那是真实异常状态，不能静默当成功，更不能
+        重复提交 Provider。
+        """
+        if self._claim_media_version(table, version_id):
+            return None
+        with self.database.engine.connect() as connection:
+            row = connection.execute(
+                select(table.c.status, table.c.file_path).where(table.c.id == version_id)
+            ).first()
+        status = str((row.status if row is not None else "") or "")
+        if status != "completed":
+            raise conflict(
+                f"媒体版本已处于不可重入状态（{status or '记录缺失'}），拒绝重复提交生成任务"
+            )
+        file_path = str((row.file_path if row is not None else "") or "")
+        if not file_path:
+            raise conflict("媒体版本标记为已完成但缺少文件路径，请重新生成该版本")
+        logger.warning(
+            "媒体版本已完成，按幂等重放处理，跳过 Provider 提交：version=%s", version_id
+        )
+        replayed = {"version_id": version_id, "file_path": file_path}
+        # 动态管线的 stage 也要收口，否则 workflow_stage 会永远停在 queued。
+        if self._complete_dynamic_media_job(job_record, input_data, replayed):
+            self._enqueue_dynamic_dependents(str(job_record["id"]))
+        return replayed
 
     def _complete_media(
         self,

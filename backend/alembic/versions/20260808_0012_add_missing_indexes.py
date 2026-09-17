@@ -14,7 +14,6 @@ Create Date: 2026-08-08
 """
 
 import sqlalchemy as sa
-
 from alembic import op
 
 revision: str = "20260808_0012"

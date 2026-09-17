@@ -9,13 +9,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, update
 
 from app.db import Database, utc_now
 from app.jobs.recovery import recover_jobs
-from app.jobs.repository import JobRepository
+from app.jobs.repository import JobRepository, JobStateError
 from app.jobs.runner import JobRunner
-from app.models.tables import project
+from app.models.tables import job, project
 from app.schemas import JobCreate, ProviderPollResult
 from app.services.file_service import file_service
 from app.services.job_service import JobService
@@ -253,6 +253,34 @@ def test_job_retry_with_nested_local_file_resumes_download_without_polling(
 
     assert retried["status"] == "downloading"
     assert retried["provider_task_id"] == "paid-provider-task"
+    database.dispose()
+
+
+def test_job_retry_in_caller_transaction_rejects_cancelled_job(tmp_path: Path) -> None:
+    """调用方事务内已取消的任务不得被重试复活（报告 3.4 / H4 残留）。
+
+    job_service.retry 在 engine.begin() 事务里调用 repository.retry(connection=...)，
+    事务提交后无条件 runner.enqueue()。守卫读若走新连接就看不到本事务未提交的
+    cancelled 状态，于是条件 UPDATE 命中 0 行；旧实现不查 rowcount、静默返回该记录，
+    调用方会对一个已取消的任务执行 enqueue。
+    """
+    database, repository = _repository(tmp_path)
+    record = _create(repository, "generate_video")
+    repository.fail(record["id"], "下载失败")
+
+    with pytest.raises(JobStateError):
+        with database.engine.begin() as connection:
+            connection.execute(
+                update(job)
+                .where(job.c.id == record["id"])
+                .values(status="cancelled", updated_at=utc_now())
+            )
+            repository.retry(record["id"], connection=connection)
+
+    # 事务已回滚：任务保持失败态，未被改写为可入队状态
+    after = repository.require(record["id"])
+    assert after["status"] == "failed"
+    assert after["retry_count"] == 0
     database.dispose()
 
 

@@ -65,6 +65,7 @@ from app.services.prompt_service import (
     resolve_video_description,
     shot_template_context,
 )
+from app.services.prop_utils import is_critical_prop, normalize_prop_name
 from app.services.provider_service import ProviderService
 from app.services.setting_service import get_camera_policy
 from app.services.signature_service import shot_signature
@@ -403,6 +404,32 @@ class ShotService:
         }
 
     @staticmethod
+    def _character_costumes(connection: Any, current: dict[str, Any]) -> dict[str, str]:
+        char_ids = [item for item in current.get("character_ids", []) if item]
+        if not char_ids:
+            return {}
+        result: dict[str, str] = {}
+        for row in connection.execute(
+            select(asset.c.name, asset.c.profile_json).where(
+                asset.c.id.in_(char_ids),
+                asset.c.asset_type == "character",
+            )
+        ):
+            profile = json_loads(row.profile_json, {})
+            costume = str(profile.get("costume") or "").strip()
+            main_color = str(
+                profile.get("main_color") or profile.get("color") or ""
+            ).strip()
+            parts = []
+            if costume:
+                parts.append(f"身穿{costume}")
+            if main_color:
+                parts.append(f"服装主色调为{main_color}")
+            if parts:
+                result[row.name] = "，".join(parts)
+        return result
+
+    @staticmethod
     def _reference_labels(
         connection: Any,
         bindings: list[dict[str, Any]],
@@ -458,6 +485,7 @@ class ShotService:
         requested_keys = set(requested)
         manual_by_key: dict[tuple[str, str], dict[str, Any]] = {}
         extra_asset_bindings: list[dict[str, Any]] = []
+        seen_extra_keys: set[tuple[str, str]] = set()
         previous_keyframe_bindings: list[dict[str, Any]] = []
         for binding in current.get("reference_bindings", []) or []:
             if not isinstance(binding, dict):
@@ -471,7 +499,10 @@ class ShotService:
             if key in requested_keys:
                 # 人工选择的素材图优先于自动 current 图，即使它是历史版本。
                 manual_by_key.setdefault(key, binding)
-            elif asset_id:
+            elif key is not None and key not in seen_extra_keys:
+                # 人工绑定即使不在场景/角色/物品 id 列表中也要保留（binding-only 素材），
+                # 否则会被静默丢弃，且不再参与媒体签名；仅按 (role, asset_id) 去重。
+                seen_extra_keys.add(key)
                 extra_asset_bindings.append(binding)
 
         auto_by_key = {
@@ -545,7 +576,10 @@ class ShotService:
                     prev_shot.get("end_state") or prev_shot.get("next_hook") or ""
                 ).strip()
         context = shot_template_context(
-            current, self._asset_names(connection, current), prev_end_state
+            current,
+            self._asset_names(connection, current),
+            prev_end_state,
+            character_costumes=self._character_costumes(connection, current),
         )
         current["reference_bindings"] = self._compiled_reference_bindings(current)
         labels = self._reference_labels(connection, current["reference_bindings"])
@@ -1207,6 +1241,44 @@ class ShotService:
             character_ids=values.get("character_ids", current["character_ids"]),
             prop_ids=values.get("prop_ids", current["prop_ids"]),
         )
+        # 自动清洗参考绑定：只有本次显式更新了对应 id 字段时，才清掉该 role 下
+        # 已不在列表中的旧 binding，防止幽灵绑定。仅更新 reference_bindings
+        # （媒体刷新或人工绑定）时不得清洗，否则 binding-only 的人工绑定会被误删。
+        binding_fields = ("character_ids", "scene_asset_id", "prop_ids", "reference_bindings")
+        if any(k in values for k in binding_fields):
+            active_scene_id = values.get("scene_asset_id", current.get("scene_asset_id"))
+            active_char_ids = set(
+                values.get("character_ids", current.get("character_ids", [])) or []
+            )
+            active_prop_ids = set(values.get("prop_ids", current.get("prop_ids", [])) or [])
+            raw_bindings = values.get("reference_bindings", current.get("reference_bindings", []))
+            if isinstance(raw_bindings, list):
+                cleaned_bindings = []
+                for b in raw_bindings:
+                    if not isinstance(b, dict):
+                        continue
+                    b_role = b.get("role")
+                    b_aid = b.get("asset_id")
+                    if (
+                        b_role == "character_identity"
+                        and "character_ids" in values
+                        and b_aid not in active_char_ids
+                    ):
+                        continue
+                    if (
+                        b_role == "scene_layout"
+                        and "scene_asset_id" in values
+                        and b_aid != active_scene_id
+                    ):
+                        continue
+                    if (
+                        b_role == "prop_identity"
+                        and "prop_ids" in values
+                        and b_aid not in active_prop_ids
+                    ):
+                        continue
+                    cleaned_bindings.append(b)
+                values["reference_bindings"] = cleaned_bindings
         self._validate_bindings(
             current["project_id"],
             values.get("reference_bindings", current["reference_bindings"]),
@@ -1608,13 +1680,76 @@ class ShotService:
             }
             for index, part in enumerate(parts)
         ]
-        self.update(shot_id, parts[0])
+        # 将原镜更新与后续新镜插入、重排合并在同一原子事务中，并增加乐观锁校验
         created_ids = [shot_id]
-        insert_after = shot_id
-        for part in parts[1:]:
-            created = self._copy_with_overrides(current, insert_after, part)
-            created_ids.append(created["id"])
-            insert_after = created["id"]
+        with self.database.engine.begin() as connection:
+            # 1. 更新原分镜（前半段）
+            first_changes = dict(parts[0])
+            first_semantic = {
+                key: first_changes.get(key, current.get(key)) for key in _SIGNATURE_FIELDS
+            }
+            db_changes: dict[str, Any] = {
+                "source_signature": current["source_signature"],
+                "own_signature": self._signature(first_semantic),
+                "revision": current["revision"] + 1,
+                "updated_at": utc_now(),
+                "status": "ready",
+            }
+            for key, val in first_changes.items():
+                col = _JSON_FIELDS.get(key, key)
+                if col in shot.c:
+                    db_changes[col] = json_dumps(val) if col.endswith("_json") else val
+            upd_res = connection.execute(
+                update(shot)
+                .where(shot.c.id == shot_id, shot.c.revision == current["revision"])
+                .values(**db_changes)
+            )
+            if upd_res.rowcount != 1:
+                raise conflict("分镜已被其他请求修改，拆分已取消")
+            self._invalidate_media_for_shots(connection, {shot_id})
+
+            # 2. 依次插入后续分镜
+            ordered = list(
+                connection.execute(
+                    select(shot.c.id)
+                    .where(shot.c.chapter_id == current["chapter_id"])
+                    .order_by(shot.c.shot_order)
+                ).scalars()
+            )
+            insert_idx = ordered.index(shot_id) + 1
+            now = utc_now()
+            for part in parts[1:]:
+                new_id_value = new_id("shot")
+                ordered.insert(insert_idx, new_id_value)
+                insert_idx += 1
+                created_ids.append(new_id_value)
+                p_semantic = {
+                    key: part.get(
+                        key,
+                        "scene_change" if key == "transition_from_prev" else current.get(key),
+                    )
+                    for key in _SIGNATURE_FIELDS
+                }
+                record = {
+                    "id": new_id_value,
+                    "project_id": current["project_id"],
+                    "chapter_id": current["chapter_id"],
+                    "shot_no": 100000 + len(ordered),
+                    "shot_order": 100000 + len(ordered),
+                    "source_signature": current["source_signature"],
+                    "own_signature": self._signature(p_semantic),
+                    "revision": 1,
+                    "created_at": now,
+                    "updated_at": now,
+                    "status": "ready",
+                }
+                for key in _SIGNATURE_FIELDS:
+                    col = _JSON_FIELDS.get(key, key)
+                    if col in shot.c:
+                        val = p_semantic.get(key)
+                        record[col] = json_dumps(val or []) if col.endswith("_json") else val
+                connection.execute(insert(shot).values(**record))
+            self._renumber(connection, current["chapter_id"], ordered)
         return [self.get(item) for item in created_ids]
 
     def _copy_with_overrides(
@@ -1728,7 +1863,13 @@ class ShotService:
             source_keyframe_ids, _ = self._related_media_ids(connection, set(source_ids))
             media_paths = self._media_paths(connection, source_ids)
             self._invalidate_media_for_shots(connection, affected_ids)
-            connection.execute(update(shot).where(shot.c.id == target_id).values(**changes))
+            res = connection.execute(
+                update(shot)
+                .where(shot.c.id == target_id, shot.c.revision == target["revision"])
+                .values(**changes)
+            )
+            if res.rowcount != 1:
+                raise conflict("目标分镜已被并发修改，请刷新后重试")
             self._remove_previous_keyframe_bindings(
                 connection,
                 project_id=target["project_id"],
@@ -1743,8 +1884,12 @@ class ShotService:
                 ).scalars()
             )
             self._renumber(connection, target["chapter_id"], remaining)
+        # 事务已提交，文件清理失败只记日志，不让 500 掩盖已完成的合并
         for path in media_paths:
-            file_service.delete_file(target["project_id"], path)
+            try:
+                file_service.delete_file(target["project_id"], path)
+            except (FileServiceError, OSError) as exc:
+                logger.warning("合并分镜后删除媒体文件失败：%s（%s）", path, exc)
         return self.get(target_id)
 
     def merge_many(self, chapter_id: str, ids: list[str]) -> dict[str, Any]:
@@ -1760,18 +1905,26 @@ class ShotService:
         project_id = current_chapter["project_id"]
         current_project = self._project(project_id)
         source_type = "screenplay"
-        self._source_signature(current_chapter, source_type)
-        with self.database.engine.connect() as connection:
-            scene_count = connection.execute(
-                select(func.count())
-                .select_from(asset)
-                .where(
-                    asset.c.project_id == project_id,
-                    asset.c.asset_type == "scene",
-                )
-            ).scalar_one()
-        if scene_count == 0:
-            raise conflict("请先提取场景素材，再提取分镜")
+        asset_service = AssetService(self.database, self.jobs)
+        current_screenplay = asset_service._confirmed_screenplay(chapter_id)
+        expected_source_sig = str(current_screenplay["own_signature"])
+        audit = asset_service.audit_screenplay_assets(chapter_id)
+        if not audit["complete"]:
+            detail = "；".join(
+                [
+                    *audit["ambiguous"],
+                    *audit["family_issues"],
+                    *[
+                        f"缺少 {item['asset_type']}「{item['suggested_name']}」"
+                        for item in audit["missing_assets"]
+                    ],
+                ]
+            )
+            raise conflict(f"素材覆盖审计未通过：{detail}。请先重新提取或修正素材")
+        # 视觉空间子串提示可能来自照片/回忆，仅记录供人工复核；真正的跨空间动作
+        # 已在剧本确认阶段由结构门禁阻断。
+        for message in audit["warnings"]:
+            logger.warning("分镜提取素材审计提示：%s", message)
         return self.jobs.create(
             project_id=project_id,
             chapter_id=chapter_id,
@@ -1785,6 +1938,7 @@ class ShotService:
                 "scope": options.get("scope", "all"),
                 "scene_no": options.get("scene_no"),
                 "params": options.get("params", {}),
+                "expected_source_signature": expected_source_sig,
             },
         )
 
@@ -1918,6 +2072,18 @@ class ShotService:
         current_project = self._project(current_chapter["project_id"])
         input_data = json_loads(job.get("input_json"), {})
         source_type = "screenplay"
+        expected_source_signature = str(
+            input_data.get("expected_source_signature") or ""
+        )
+        if expected_source_signature:
+            current_screenplay = AssetService(
+                self.database,
+                self.jobs,
+            )._confirmed_screenplay(current_chapter["id"])
+            if current_screenplay["own_signature"] != expected_source_signature:
+                raise conflict(
+                    "剧本已在分镜任务排队后变化，请基于最新确认剧本重新提取分镜"
+                )
         with self.database.engine.connect() as connection:
             content_raw = connection.execute(
                 select(screenplay.c.content_json).where(
@@ -1949,6 +2115,18 @@ class ShotService:
                     correction_note=correction_note,
                 )
                 missing_assets = self._collect_missing_assets(all_shots)
+                missing_assets.extend(
+                    item
+                    for item in self._collect_unresolved_assets(
+                        all_shots,
+                        current_project["id"],
+                    )
+                    if (item["asset_type"], item["suggested_name"])
+                    not in {
+                        (existing["asset_type"], existing["suggested_name"])
+                        for existing in missing_assets
+                    }
+                )
                 # 每次尝试的警告只属于该次产物；失败的尝试不保留警告，避免重试重复刷屏。
                 all_warnings: list[dict[str, Any]] = [*round_warnings]
                 for _round in range(_MAX_MISSING_REFILL_ROUNDS):
@@ -1983,6 +2161,18 @@ class ShotService:
                         correction_note=correction_note,
                     )
                     missing_assets = self._collect_missing_assets(all_shots)
+                    missing_assets.extend(
+                        item
+                        for item in self._collect_unresolved_assets(
+                            all_shots,
+                            current_project["id"],
+                        )
+                        if (item["asset_type"], item["suggested_name"])
+                        not in {
+                            (existing["asset_type"], existing["suggested_name"])
+                            for existing in missing_assets
+                        }
+                    )
                     all_warnings = [*all_warnings, *round_warnings]
                 if missing_assets:
                     # 自动补素材已重试多轮仍无法覆盖：明确报缺失清单，禁止把缺素材的分镜
@@ -2049,6 +2239,8 @@ class ShotService:
                 name = str(item.get("suggested_name") or "").strip()
                 if asset_type not in {"scene", "character", "prop"} or not name:
                     continue
+                if asset_type == "prop" and not is_critical_prop(name):
+                    continue
                 key = (asset_type, name)
                 if key in seen:
                     continue
@@ -2062,6 +2254,69 @@ class ShotService:
                         "suggested_aliases": item.get("suggested_aliases", [])
                         if isinstance(item.get("suggested_aliases"), list)
                         else [],
+                    }
+                )
+        return result
+
+    def _collect_unresolved_assets(
+        self,
+        shots: list[dict[str, Any]],
+        project_id: str,
+    ) -> list[dict[str, Any]]:
+        """复核模型提供的素材 ID：只有「提供了 ID 却解析不到」才进入补素材流程。
+
+        纯名字未匹配不再触发自动补建：律师/前台这类一次性角色、不在素材库的小道具
+        如果被当作缺失素材补建，只会产出垃圾素材；它们改由保存阶段降级为警告。
+        名字未匹配且没有提供 ID 的场景缺素材仍由 `_save_extracted` 硬报错（视频生成必需）。
+        """
+        lookup = self._asset_lookup(project_id)
+        seen: set[tuple[str, str]] = set()
+        result: list[dict[str, Any]] = []
+        for shot_data in shots:
+            source_ref = str(shot_data.get("source_ref") or "")
+            candidates: list[tuple[str, str, str]] = []
+            scene_id = str(shot_data.get("scene_asset_id") or "").strip()
+            if scene_id:
+                scene_name = str(shot_data.get("scene_name") or "").strip()
+                candidates.append(("scene", scene_id, scene_name))
+            character_names = [
+                str(name or "").strip()
+                for name in (shot_data.get("character_names") or [])
+            ]
+            for index, provided in enumerate(shot_data.get("character_asset_ids") or []):
+                provided_id = str(provided or "").strip()
+                if not provided_id:
+                    continue
+                name = character_names[index] if index < len(character_names) else ""
+                candidates.append(("character", provided_id, name))
+            prop_names = [
+                str(name or "").strip() for name in (shot_data.get("prop_names") or [])
+            ]
+            for index, provided in enumerate(shot_data.get("prop_asset_ids") or []):
+                provided_id = str(provided or "").strip()
+                if not provided_id:
+                    continue
+                name = prop_names[index] if index < len(prop_names) else ""
+                candidates.append(("prop", provided_id, name))
+            for asset_type, provided_id, name in candidates:
+                # 名字能解析时保存阶段会按名字绑定，ID 只是展示字段，不算缺失。
+                if name and self._resolve_asset_name(lookup[asset_type], name):
+                    continue
+                repaired = self._repair_near_miss_asset_id(lookup[asset_type], provided_id)
+                if repaired in lookup[asset_type]["ids"]:
+                    continue
+                suggested_name = name or provided_id
+                key = (asset_type, suggested_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(
+                    {
+                        "asset_type": asset_type,
+                        "reason": "分镜提供了素材 ID，但该 ID 在素材库中无法解析",
+                        "source_ref": source_ref,
+                        "suggested_name": suggested_name,
+                        "suggested_aliases": [],
                     }
                 )
         return result
@@ -2084,6 +2339,17 @@ class ShotService:
         让模型把同场相邻的连续动作与对话回合合并进同一镜头后再输出。
         """
         asset_catalog = self._asset_catalog(current_project["id"])
+        prompt_asset_catalog = [
+            {
+                "asset_type": item["asset_type"],
+                "name": item["name"],
+                "aliases": item.get("aliases", []),
+                "concept": item.get("concept", ""),
+                "source_refs": item.get("source_refs", []),
+                "importance": item.get("importance", "normal"),
+            }
+            for item in asset_catalog
+        ]
         if not any(item["asset_type"] == "scene" for item in asset_catalog):
             raise conflict("请先提取场景素材，再提取分镜")
         # 剧本场次名不匹配场景素材库时不再硬拦截整批提取：新绑定协议以 ID 为准，
@@ -2127,92 +2393,10 @@ class ShotService:
         all_shots: list[dict[str, Any]] = []
         all_warnings: list[dict[str, Any]] = []
         if isinstance(scenes, list) and scenes:
-            if input_data.get("scope") != "scene":
-                full_payload = json_dumps(
-                    {
-                        "title": screenplay_content.get("title", ""),
-                        "logline": screenplay_content.get("logline", ""),
-                        "scenes": scenes,
-                    }
-                )
-                output = await provider.generate_json(
-                    system_prompt=load_prompt("shot_extract"),
-                    user_prompt=_with_correction(
-                        f"来源类型：{source_type}\n"
-                        "范围：全部剧本场次（必须一次性返回全部场次的分镜，不得只返回部分场次）\n"
-                        f"{self._build_shot_budget_table(scenes)}\n"
-                        "以下剧本是唯一剧情事实来源。请按 scene_no 分组输出分镜；"
-                        "每个场次的动作、目标、转场、对白和旁白都必须覆盖，"
-                        "场次之间必须通过上一镜 end_state 与下一镜 start_state 保持连续，"
-                        "不得遗漏任何场次或剧情事实。\n"
-                        f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
-                        f"{unmatched_note}"
-                        f"来源内容：\n{full_payload}"
-                    ),
-                    schema=ShotExtractionOutput,
-                    params={**config["params"], **input_data.get("params", {})},
-                )
-                all_shots, _ = self._collect_extraction_result(output)
-                if not all_shots:
-                    raise conflict("整章未提取到分镜，已中止整批提取，避免覆盖旧分镜")
-                # 模型输出顺序不保证与场次序号一致；先按 (scene_no, shot_no) 稳定排序，
-                # 避免场次回跳/交叉校验误报，也保证后续对白同步按剧本次序推进。
-                all_shots.sort(
-                    key=lambda shot_data: (
-                        int(shot_data.get("scene_no") or 0),
-                        int(shot_data.get("shot_no") or 0),
-                    )
-                )
-
-                # 先按场次同步对白，再统一做拆镜和容量检查，避免逐场调用造成跨场断裂。
-                for scene in scenes:
-                    scene_no = int(scene.get("scene_no") or 0)
-                    scene_id = str(scene.get("scene_id") or "")
-                    scene_shots = [
-                        shot
-                        for shot in all_shots
-                        if (
-                            scene_id
-                            and str(shot.get("scene_id") or "") == scene_id
-                        ) or int(shot.get("scene_no") or 0) == scene_no
-                    ]
-                    if not scene_shots:
-                        raise conflict(
-                            f"场次 {scene_no} 未提取到分镜，已中止整批提取，避免覆盖旧分镜"
-                        )
-                    dialogue_repaired = self._synchronize_dialogue_with_source(
-                        scene, scene_shots, allow_missing=True
-                    )
-                    if dialogue_repaired:
-                        all_warnings.append({
-                            "scene_no": scene_no,
-                            "message": (
-                                "模型未为本场全部对白指定镜头，"
-                                "已按镜头顺序补充分配剧本原文对白"
-                            ),
-                        })
-                    for shot in scene_shots:
-                        shot["scene_no"] = scene_no
-                        if not str(shot.get("source_ref") or "").strip():
-                            shot["source_ref"] = f"scene:{scene_no}"
-
-                all_shots = self._split_dialogue_shots(all_shots)
-                all_shots = self._auto_extend_dialogue_shots(all_shots)
-                all_shots, auto_merge_notes = self._auto_merge_dense_shots(
-                    all_shots, scenes=scenes
-                )
-                all_warnings.extend(auto_merge_notes)
-                self._validate_extracted_dialogue_capacity(all_shots)
-                self._validate_scene_shot_density(scenes, all_shots)
-                continuity_warnings = self._validate_extracted_continuity(all_shots)
-                for _index, message in enumerate(continuity_warnings, start=1):
-                    all_warnings.append({"scene_no": 0, "message": message})
-                all_warnings.extend(self._quality_warnings_for_shots(all_shots))
-                update_progress = getattr(self.jobs, "update_progress", None)
-                if update_progress is not None:
-                    update_progress(job["id"], 1, 1, message="整章分镜提取完成")
-                return all_shots, all_warnings
-
+            # 整章提取按场次分批调用：一次要求模型返回全部场次的分镜会顶到
+            # 模型单次输出上限（推理模型的思维链与正文共享同一输出预算），
+            # 触发 finish_reason=length 且正文为空，整批失败。按场分批后单次
+            # 输出量可控，跨场连续性统一放在循环后校验。
             if input_data.get("scope") == "scene":
                 target_index = next(
                     (
@@ -2232,13 +2416,23 @@ class ShotService:
             total_scenes = len(scene_chunks)
             for scene_index, scene in enumerate(scene_chunks, start=1):
                 scene_no = int(scene.get("scene_no") or 0)
+                coverage_items = self._scene_coverage_items(scene)
                 continuity_context = ""
+                previous_generated = all_shots[-1] if all_shots else None
                 if prev_scene is not None:
                     prev_transition = str(prev_scene.get("transition_to_next") or "").strip()
                     continuity_context = (
                         "\n\n上一场衔接信息（仅供本场首镜承接，不影响本场内容）："
                         f"上一场「{prev_scene.get('scene_name') or ''}」结束时："
                         f"{prev_transition or '无明确交代'}"
+                    )
+                if previous_generated is not None:
+                    continuity_context += (
+                        "\n上一镜实际生成状态（优先级高于概括，必须据此承接）："
+                        f"\n- end_state：{previous_generated.get('end_state') or ''}"
+                        f"\n- 场景：{previous_generated.get('scene_name') or ''}"
+                        f"\n- 角色：{json_dumps(previous_generated.get('character_names') or [])}"
+                        f"\n- 关键物品：{json_dumps(previous_generated.get('prop_names') or [])}"
                     )
                 scene_payload = json_dumps(
                     {
@@ -2251,10 +2445,14 @@ class ShotService:
                     system_prompt=load_prompt("shot_extract"),
                     user_prompt=_with_correction(
                         f"来源类型：{source_type}\n"
-                        f"范围：{input_data.get('scope', 'all')}\n"
+                        f"范围：本批次只提取目标场次（全章共 {len(scenes)} 场，"
+                        "按场分批提取，不得输出其他场次）\n"
                         f"目标场次：{scene_no}\n"
                         f"{self._build_shot_budget_table([scene])}\n"
-                        f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
+                        "本场剧情覆盖节拍（每项都必须由至少一个分镜的 coverage_refs 引用）：\n"
+                        f"{json_dumps(coverage_items)}\n"
+                        f"当前项目可用素材目录（不含数据库 ID，只按名称选择）：\n"
+                        f"{json_dumps(prompt_asset_catalog)}\n"
                         f"{unmatched_note}"
                         "本场剧本事实原文（权威，只能拆镜，不能新增、改写或删减）：\n"
                         f"动作：{scene.get('action', '')}\n"
@@ -2269,26 +2467,38 @@ class ShotService:
                     params={**config["params"], **input_data.get("params", {})},
                 )
                 shots, _ = self._collect_extraction_result(output)
-                # scene_no 先回填：同场合并与密度门禁都按场次分组
+                scene_name_repaired = False
+                authoritative_scene_name = str(scene.get("scene_name") or "").strip()
+                # scene_no / scene_name 都以确认剧本为准：模型只能拆镜，不能改地点。
                 for shot in shots:
                     shot["scene_no"] = scene_no
+                    if str(shot.get("scene_name") or "").strip() != authoritative_scene_name:
+                        scene_name_repaired = True
+                    shot["scene_name"] = authoritative_scene_name
                 dialogue_repaired = self._synchronize_dialogue_with_source(
                     scene, shots, allow_missing=True
                 )
                 shots = self._split_dialogue_shots(shots)
                 shots = self._auto_extend_dialogue_shots(shots)
                 shots, auto_merge_notes = self._auto_merge_dense_shots(shots, scenes=[scene])
+                story_repaired = self._synchronize_scene_story_fields(scene, shots)
+                self._synchronize_shot_character_names(shots)
+                self._synchronize_structured_coverage(scene, shots)
+                self._validate_scene_coverage(scene, shots)
+                self._validate_scene_named_assets(scene, shots, current_project["id"])
+                self._validate_extracted_prompt_contract(shots)
                 self._validate_extracted_dialogue_capacity(shots)
-                self._validate_scene_shot_density([scene], shots)
-                warnings = [
-                    {
-                        "scene_no": scene_no,
-                        "message": message,
-                    }
-                    for message in self._validate_extracted_continuity(shots)
-                ]
+                warnings: list[dict[str, Any]] = []
+                warnings.extend(self._validate_scene_shot_density([scene], shots))
                 warnings.extend(self._quality_warnings_for_shots(shots))
                 warnings.extend(auto_merge_notes)
+                if scene_name_repaired:
+                    warnings.append(
+                        {
+                            "scene_no": scene_no,
+                            "message": "模型改写了场景名，已按确认剧本场次名强制恢复",
+                        }
+                    )
                 if dialogue_repaired:
                     warnings.append({
                         "scene_no": scene_no,
@@ -2297,13 +2507,22 @@ class ShotService:
                             "已按镜头顺序补充分配剧本原文对白"
                         ),
                     })
+                if story_repaired:
+                    warnings.append(
+                        {
+                            "scene_no": scene_no,
+                            "message": (
+                                "模型遗漏或改写了剧本旁白/场间衔接，"
+                                "已按确认剧本原文恢复"
+                            ),
+                        }
+                    )
                 if not shots:
                     raise conflict(
                         f"场次 {scene_no} 未提取到分镜，已中止整批提取，避免覆盖旧分镜"
                     )
                 for shot in shots:
-                    if scene_no and not str(shot.get("source_ref") or "").strip():
-                        shot["source_ref"] = f"scene:{scene_no}"
+                    shot["source_ref"] = ",".join(shot.get("coverage_refs") or [])
                 all_shots.extend(shots)
                 all_warnings.extend(warnings)
                 prev_scene = scene
@@ -2315,6 +2534,22 @@ class ShotService:
                         total_scenes,
                         message=f"提取场次 {scene_no}（{scene_index}/{total_scenes}）",
                     )
+            # 连续性校验按整批做：逐场校验会把每场首镜都当成「全局首镜」降级，
+            # 切断本可承接上一场末镜的 continuous 镜头，并把场次回跳漏检。
+            if input_data.get("scope") != "scene":
+                # 模型输出顺序不保证与场次序号一致；先按 (scene_no, shot_no)
+                # 稳定排序，避免场次回跳/交叉校验误报。
+                all_shots.sort(
+                    key=lambda shot_data: (
+                        int(shot_data.get("scene_no") or 0),
+                        int(shot_data.get("shot_no") or 0),
+                    )
+                )
+            for message in self._validate_extracted_continuity(
+                all_shots,
+                repair=True,
+            ):
+                all_warnings.append({"scene_no": 0, "message": message})
         else:
             # 旧格式/无 scenes 结构：整份内容单次提取，保持兼容
             output = await provider.generate_json(
@@ -2323,7 +2558,8 @@ class ShotService:
                     f"来源类型：{source_type}\n"
                     f"范围：{input_data.get('scope', 'all')}\n"
                     f"目标场次：{input_data.get('scene_no') or '全部'}\n"
-                    f"当前项目可用素材目录：\n{json_dumps(asset_catalog)}\n"
+                    f"当前项目可用素材目录（不含数据库 ID，只按名称选择）：\n"
+                    f"{json_dumps(prompt_asset_catalog)}\n"
                     f"{unmatched_note}"
                     f"来源内容：\n{content_raw}"
                 ),
@@ -2354,11 +2590,298 @@ class ShotService:
                 )
                 all_warnings.extend(auto_merge_notes)
                 self._validate_extracted_dialogue_capacity(all_shots)
-                self._validate_scene_shot_density(scenes, all_shots)
+                all_warnings.extend(self._validate_scene_shot_density(scenes, all_shots))
                 all_warnings.extend(self._quality_warnings_for_shots(all_shots))
             else:
                 all_warnings = self._quality_warnings_for_shots(all_shots)
         return all_shots, all_warnings
+
+    @staticmethod
+    def _scene_coverage_items(scene: dict[str, Any]) -> list[dict[str, str]]:
+        """把确认剧本场次拆成稳定节拍编号，供模型声明逐镜覆盖关系。"""
+        scene_no = int(scene.get("scene_no") or 0)
+        prefix = f"S{scene_no}"
+        result: list[dict[str, str]] = []
+        objective = str(scene.get("objective") or "").strip()
+        if objective:
+            result.append({"ref": f"{prefix}:O01", "kind": "objective", "text": objective})
+        action_parts = [
+            part.strip()
+            for part in re.split(r"(?<=[。！？；;])|\n+", str(scene.get("action") or ""))
+            if part.strip()
+        ]
+        result.extend(
+            {
+                "ref": f"{prefix}:A{index:02d}",
+                "kind": "action",
+                "text": text,
+            }
+            for index, text in enumerate(action_parts, start=1)
+        )
+        result.extend(
+            {
+                "ref": f"{prefix}:D{index:02d}",
+                "kind": "dialogue",
+                "text": f"{item.get('speaker') or ''}：{item.get('text') or ''}",
+            }
+            for index, item in enumerate(scene.get("dialogue") or [], start=1)
+            if isinstance(item, dict)
+        )
+        result.extend(
+            {
+                "ref": f"{prefix}:N{index:02d}",
+                "kind": "narration",
+                "text": str(text),
+            }
+            for index, text in enumerate(scene.get("narration") or [], start=1)
+            if str(text).strip()
+        )
+        transition = str(scene.get("transition_to_next") or "").strip()
+        if transition:
+            result.append({"ref": f"{prefix}:T01", "kind": "transition", "text": transition})
+        return result
+
+    @staticmethod
+    def _synchronize_shot_character_names(shots: list[dict[str, Any]]) -> None:
+        """对白、站位、表情中出现的人物必须进入 character_names 参与素材绑定。"""
+        for shot_data in shots:
+            names = [
+                str(item).strip()
+                for item in (shot_data.get("character_names") or [])
+                if str(item).strip()
+            ]
+            for item in shot_data.get("dialogue") or []:
+                if isinstance(item, dict) and str(item.get("speaker") or "").strip():
+                    names.append(str(item["speaker"]).strip())
+            for field in ("positions", "expressions"):
+                for item in shot_data.get(field) or []:
+                    if isinstance(item, dict) and str(item.get("character") or "").strip():
+                        names.append(str(item["character"]).strip())
+            shot_data["character_names"] = list(dict.fromkeys(names))
+
+    @classmethod
+    def _synchronize_structured_coverage(
+        cls,
+        source_scene: dict[str, Any],
+        shots: list[dict[str, Any]],
+    ) -> None:
+        """对白、旁白和场间衔接已由后端恢复，同时补上对应的确定性覆盖引用。"""
+        scene_no = int(source_scene.get("scene_no") or 0)
+        prefix = f"S{scene_no}"
+        for shot_data in shots:
+            refs = [
+                str(item).strip()
+                for item in (shot_data.get("coverage_refs") or [])
+                if str(item).strip()
+            ]
+            shot_data["coverage_refs"] = list(dict.fromkeys(refs))
+
+        source_dialogue = [
+            ScreenplayDialogue.model_validate(item).model_dump(mode="json")
+            for item in source_scene.get("dialogue") or []
+        ]
+        source_index = 0
+        for shot_data in shots:
+            refs = shot_data["coverage_refs"]
+            for dialogue in shot_data.get("dialogue") or []:
+                normalized = ScreenplayDialogue.model_validate(dialogue).model_dump(mode="json")
+                match_index = next(
+                    (
+                        index
+                        for index in range(source_index, len(source_dialogue))
+                        if source_dialogue[index] == normalized
+                    ),
+                    None,
+                )
+                if match_index is None:
+                    continue
+                refs.append(f"{prefix}:D{match_index + 1:02d}")
+                source_index = match_index + 1
+            shot_data["coverage_refs"] = list(dict.fromkeys(refs))
+
+        for index, narration in enumerate(source_scene.get("narration") or [], start=1):
+            expected = str(narration).strip()
+            if not expected:
+                continue
+            target = next(
+                (
+                    shot_data
+                    for shot_data in shots
+                    if expected in str(shot_data.get("narration") or "")
+                ),
+                None,
+            )
+            if target is not None:
+                target["coverage_refs"] = list(
+                    dict.fromkeys([*target["coverage_refs"], f"{prefix}:N{index:02d}"])
+                )
+        if shots and str(source_scene.get("objective") or "").strip():
+            shots[0]["coverage_refs"] = list(
+                dict.fromkeys([f"{prefix}:O01", *shots[0]["coverage_refs"]])
+            )
+        action_parts = [
+            part.strip()
+            for part in re.split(r"(?<=[。！？；;])|\n+", str(source_scene.get("action") or ""))
+            if part.strip()
+        ]
+        for index, text in enumerate(action_parts, start=1):
+            ref = f"{prefix}:A{index:02d}"
+            if not any(ref in (s.get("coverage_refs") or []) for s in shots):
+                target = next(
+                    (
+                        s
+                        for s in shots
+                        if any(
+                            part in str(s.get("action") or "")
+                            for part in text.split("，")
+                            if len(part) >= 4
+                        )
+                    ),
+                    None,
+                )
+                if target is None and shots:
+                    idx_ratio = (index - 1) / max(1, len(action_parts))
+                    shot_idx = min(len(shots) - 1, int(idx_ratio * len(shots)))
+                    target = shots[shot_idx]
+                if target is not None:
+                    target["coverage_refs"] = list(dict.fromkeys([*target["coverage_refs"], ref]))
+        if shots and str(source_scene.get("transition_to_next") or "").strip():
+            shots[-1]["coverage_refs"] = list(
+                dict.fromkeys([*shots[-1]["coverage_refs"], f"{prefix}:T01"])
+            )
+
+    @classmethod
+    def _validate_scene_coverage(
+        cls,
+        source_scene: dict[str, Any],
+        shots: list[dict[str, Any]],
+    ) -> None:
+        expected_items = cls._scene_coverage_items(source_scene)
+        expected = {item["ref"]: item for item in expected_items}
+        actual = {
+            str(ref).strip()
+            for shot_data in shots
+            for ref in (shot_data.get("coverage_refs") or [])
+            if str(ref).strip()
+        }
+        empty_shots = [
+            str(shot_data.get("shot_no") or "?")
+            for shot_data in shots
+            if not shot_data.get("coverage_refs")
+        ]
+        unknown = sorted(actual - set(expected))
+        missing = sorted(set(expected) - actual)
+        details: list[str] = []
+        if empty_shots:
+            details.append("分镜未声明 coverage_refs：" + "、".join(empty_shots))
+        if unknown:
+            details.append("引用了不存在的剧情节拍：" + "、".join(unknown))
+        if missing:
+            descriptions = [
+                f"{ref}（{expected[ref]['text'][:30]}）" for ref in missing
+            ]
+            details.append("遗漏剧情节拍：" + "、".join(descriptions))
+        if details:
+            raise conflict(
+                f"场次 {source_scene.get('scene_no')} 剧情覆盖校验失败："
+                + "；".join(details)
+            )
+
+    def _validate_scene_named_assets(
+        self,
+        source_scene: dict[str, Any],
+        shots: list[dict[str, Any]],
+        project_id: str,
+    ) -> None:
+        """确认剧本明确出现的角色和关键物品必须在本场至少绑定一次。"""
+        lookup = self._asset_lookup(project_id)
+        dialogue_speakers = {
+            str(item.get("speaker") or "").strip()
+            for item in source_scene.get("dialogue") or []
+            if isinstance(item, dict) and str(item.get("speaker") or "").strip()
+        }
+        action = str(source_scene.get("action") or "")
+        required_characters = {
+            str(name).strip()
+            for name in source_scene.get("characters") or []
+            if str(name).strip()
+            and (str(name).strip() in action or str(name).strip() in dialogue_speakers)
+        }
+        actual_character_names = {
+            str(name).strip()
+            for shot_data in shots
+            for name in shot_data.get("character_names") or []
+            if str(name).strip()
+        }
+        actual_character_ids = {
+            resolved
+            for name in actual_character_names
+            if (resolved := self._resolve_asset_name(lookup["character"], name))
+        }
+        missing_characters = [
+            name
+            for name in sorted(required_characters)
+            if not any(
+                AssetService._binding_name_matches(name, actual, "character")
+                for actual in actual_character_names
+            )
+            and self._resolve_asset_name(lookup["character"], name)
+            not in actual_character_ids
+        ]
+        actual_prop_names = {
+            str(name).strip()
+            for shot_data in shots
+            for name in shot_data.get("prop_names") or []
+            if str(name).strip()
+        }
+        actual_prop_ids = {
+            resolved
+            for name in actual_prop_names
+            if (resolved := self._resolve_asset_name(lookup["prop"], name))
+        }
+        missing_props = [
+            str(name)
+            for name in source_scene.get("props") or []
+            if not any(
+                AssetService._binding_name_matches(str(name), actual, "prop")
+                for actual in actual_prop_names
+            )
+            and self._resolve_asset_name(lookup["prop"], str(name)) not in actual_prop_ids
+        ]
+        if missing_characters or missing_props:
+            detail = "；".join(
+                [
+                    *(
+                        ["未绑定剧本角色：" + "、".join(missing_characters)]
+                        if missing_characters
+                        else []
+                    ),
+                    *(
+                        ["未绑定关键物品：" + "、".join(missing_props)]
+                        if missing_props
+                        else []
+                    ),
+                ]
+            )
+            raise conflict(
+                f"场次 {source_scene.get('scene_no')} 素材语义覆盖失败：{detail}"
+            )
+
+    @staticmethod
+    def _validate_extracted_prompt_contract(shots: list[dict[str, Any]]) -> None:
+        """把提示词中声明的时间轴硬约束在保存前尽可能自愈，不轻易杀死整批分镜提取。"""
+        for shot_data in shots:
+            try:
+                checked = ShotOutput.model_validate(shot_data)
+            except ValidationError as exc:
+                raise conflict(
+                    f"分镜 {shot_data.get('shot_no', '?')} 结构校验失败：{exc}"
+                ) from exc
+            if checked.timeline_contract_warning():
+                duration = int(shot_data.get("duration_sec") or 5)
+                vp = str(shot_data.get("video_prompt") or "").strip()
+                if not re.search(r"^\s*0(?:\.0)?\s*[-–—~－至]\s*\d+\s*秒", vp):
+                    shot_data["video_prompt"] = f"0-{duration}秒：{vp}"
 
     @staticmethod
     def _synchronize_dialogue_with_source(
@@ -2464,6 +2987,43 @@ class ShotService:
             repaired = True
         for shot, dialogue in zip(shots, synchronized, strict=True):
             shot["dialogue"] = dialogue
+        return repaired
+
+    @staticmethod
+    def _synchronize_scene_story_fields(
+        source_scene: dict[str, Any],
+        shots: list[dict[str, Any]],
+    ) -> bool:
+        """确保旁白与场间衔接不在分镜阶段被删减或改写。"""
+        if not shots:
+            return False
+        repaired = False
+        expected_narration = [
+            str(item).strip()
+            for item in (source_scene.get("narration") or [])
+            if str(item).strip()
+        ]
+        actual_narration = [
+            line.strip()
+            for shot_data in shots
+            for line in str(shot_data.get("narration") or "").splitlines()
+            if line.strip()
+        ]
+        if actual_narration != expected_narration:
+            for shot_data in shots:
+                shot_data["narration"] = ""
+            if expected_narration:
+                shots[0]["narration"] = "\n".join(expected_narration)
+            repaired = True
+
+        transition = str(source_scene.get("transition_to_next") or "").strip()
+        if transition:
+            current_hook = str(shots[-1].get("next_hook") or "").strip()
+            if transition not in current_hook:
+                shots[-1]["next_hook"] = (
+                    f"{current_hook}；{transition}" if current_hook else transition
+                )
+                repaired = True
         return repaired
 
     @staticmethod
@@ -2580,7 +3140,7 @@ class ShotService:
                 if "video_prompt_override" in part:
                     part["video_prompt_override"] = ""
             if index > 0:
-                part["start_state"] = "承接上一镜结束状态"
+                part["start_state"] = str(parts[-1]["end_state"])
                 part["transition_from_prev"] = "continuous"
                 part["narration"] = ""
             if index < len(chunks) - 1:
@@ -2729,9 +3289,9 @@ class ShotService:
         merged["frame_description"] = combined(
             prev.get("frame_description"), nxt.get("frame_description"), "；"
         )
-        merged["dialogue"] = ShotService._merge_unique_lists(
-            prev.get("dialogue"), nxt.get("dialogue")
-        )
+        prev_dialogue = prev.get("dialogue") if isinstance(prev.get("dialogue"), list) else []
+        nxt_dialogue = nxt.get("dialogue") if isinstance(nxt.get("dialogue"), list) else []
+        merged["dialogue"] = [*prev_dialogue, *nxt_dialogue]
         merged["narration"] = combined(prev.get("narration"), nxt.get("narration"), "\n")
         merged["image_prompt"] = str(prev.get("image_prompt") or "").strip()
         shifted_video = ShotService._shift_video_prompt_seconds(
@@ -2739,6 +3299,7 @@ class ShotService:
         )
         merged["video_prompt"] = combined(prev.get("video_prompt"), shifted_video, "\n")
         for key in (
+            "coverage_refs",
             "character_names",
             "character_asset_ids",
             "prop_names",
@@ -2746,9 +3307,27 @@ class ShotService:
         ):
             merged[key] = ShotService._merge_unique_lists(prev.get(key), nxt.get(key))
         # 站位以动作推进后的状态为主，但保留前镜独有的角色条目。
-        merged["positions"] = ShotService._merge_shot_positions(
+        merged_positions = ShotService._merge_shot_positions(
             prev.get("positions"), nxt.get("positions")
         )
+        prev_char_names = set(prev.get("character_names") or [])
+        nxt_char_names = set(nxt.get("character_names") or [])
+        nxt_only_names = nxt_char_names - prev_char_names
+        if nxt_only_names:
+            annotated_positions = []
+            for pos in merged_positions:
+                if isinstance(pos, dict) and pos.get("character") in nxt_only_names:
+                    pos_copy = dict(pos)
+                    curr_pos = str(pos_copy.get("position") or "")
+                    if "入画" not in curr_pos:
+                        pos_copy["position"] = (
+                            f"{curr_pos}（随后入画）" if curr_pos else "后半段入画"
+                        )
+                    annotated_positions.append(pos_copy)
+                else:
+                    annotated_positions.append(pos)
+            merged_positions = annotated_positions
+        merged["positions"] = merged_positions
         raw_prev_expressions = prev.get("expressions")
         prev_expressions = [
             item
@@ -2766,9 +3345,8 @@ class ShotService:
             if not isinstance(item, dict):
                 continue
             character = str(item.get("character") or "")
-            if character or True:
-                key = character or str(id(item))
-                expressions[key] = item
+            key = character or str(id(item))
+            expressions[key] = item
         merged["expressions"] = list(expressions.values())
         return merged
 
@@ -2790,8 +3368,9 @@ class ShotService:
         合并后总时长超过单镜上限时压到 15 秒；对白按合并动作语速换算后超出
         两镜总时长承载时，允许像单镜自动延长一样拉伸到单镜上限，并按目标
         时长重排视频时间轴；拉伸到 15 秒仍装不下才放弃该对。提供 scenes 时
-        按每场预算上限驱动合并：某场镜头数已落入上限就不再合并该场；压缩
-        不足的部分仍交给 _validate_scene_shot_density 把守。
+        按每场分镜数量硬上限（预算上限与对白容量下限取大）驱动合并：某场镜头
+        数已落入上限就不再合并该场；压缩不足的部分仍交给
+        _validate_scene_shot_density 把守。
         """
         notes: list[dict[str, Any]] = []
         result = [dict(shot) for shot in shots]
@@ -2803,15 +3382,34 @@ class ShotService:
                     scene_no = int(scene.get("scene_no") or 0)
                 except (TypeError, ValueError):
                     continue
-                budget = cls._scene_budget_sec(scene)
-                _, allowed = cls._shot_count_limits(budget)
-                limits[scene_no] = allowed
+                limits[scene_no] = cls._scene_shot_upper_limit(scene)
 
         def scene_no_of(shot: dict[str, Any]) -> int:
             try:
                 return int(shot.get("scene_no") or 0)
             except (TypeError, ValueError):
                 return 0
+
+        if limits:
+            # 同场相邻镜头误标 scene_change 会阻断自动合并，先按「真实转场只发生在
+            # 场次或叙事视角切换处」把同场非首镜降级为 same_scene_cut，再作为对话
+            # 回合候选参与合并。跨场的 scene_change 保留。
+            for index in range(1, len(result)):
+                if str(result[index].get("transition_from_prev") or "") != "scene_change":
+                    continue
+                scene_no = scene_no_of(result[index])
+                if scene_no_of(result[index - 1]) != scene_no:
+                    continue
+                result[index] = {**result[index], "transition_from_prev": "same_scene_cut"}
+                notes.append(
+                    {
+                        "scene_no": scene_no,
+                        "message": (
+                            "检测到同场相邻镜头误标 scene_change，已降级为 same_scene_cut "
+                            "以便自动合并；scene_change 只用于场次或叙事视角真正切换处。"
+                        ),
+                    }
+                )
 
         def scene_within_limit(scene_no: int) -> bool:
             allowed = limits.get(scene_no)
@@ -2821,34 +3419,11 @@ class ShotService:
             count = sum(1 for shot in result if scene_no_of(shot) == scene_no)
             return count <= allowed
 
-        if limits:
-            # 同场相邻镜头标 scene_change 属于标注错误（真实转场只出现在场次
-            # 切换处），先降级为 same_scene_cut，否则这些镜头永远不会成为
-            # 合并候选，密度门禁只能靠模型重试碰运气。
-            previous_scene_no: int | None = None
-            for position, shot_data in enumerate(result, start=1):
-                current_scene_no = scene_no_of(shot_data)
-                if (
-                    previous_scene_no is not None
-                    and current_scene_no == previous_scene_no
-                    and str(shot_data.get("transition_from_prev") or "") == "scene_change"
-                ):
-                    shot_data["transition_from_prev"] = "same_scene_cut"
-                    notes.append(
-                        {
-                            "scene_no": current_scene_no,
-                            "message": (
-                                f"分镜第 {position} 镜与上一镜同属场次 {current_scene_no} "
-                                "却标注 scene_change，已降级为 same_scene_cut；"
-                                "真实转场只出现在场次切换处。"
-                            ),
-                        }
-                    )
-                previous_scene_no = current_scene_no
-
         changed = True
         while changed:
             changed = False
+            # same_scene_cut 只在两镜摄影字段完全一致且都是纯对白时允许合并；
+            # 正反打或包含身体动作的独立机位不得机械拼接。
             candidates = ("continuous", "same_scene_cut") if limits else ("continuous",)
             for transition in candidates:
                 index = 1
@@ -2863,13 +3438,49 @@ class ShotService:
                     if prev_scene_no != next_scene_no:
                         index += 1
                         continue
+                    # 不同场景素材/名称的镜头严禁合并，防止场景穿帮
+                    prev_scene_asset = (
+                        prev_shot.get("scene_asset_id") or prev_shot.get("scene_name")
+                    )
+                    next_scene_asset = (
+                        next_shot.get("scene_asset_id") or next_shot.get("scene_name")
+                    )
+                    if (
+                        prev_scene_asset
+                        and next_scene_asset
+                        and prev_scene_asset != next_scene_asset
+                    ):
+                        index += 1
+                        continue
+                    if transition == "same_scene_cut":
+                        camera_fields = ("shot_type", "camera_angle", "camera_move")
+                        if any(
+                            str(prev_shot.get(field) or "")
+                            != str(next_shot.get(field) or "")
+                            for field in camera_fields
+                        ) or not (
+                            ShotOutput._is_dialogue_focused(
+                                str(prev_shot.get("action") or "")
+                            )
+                            and ShotOutput._is_dialogue_focused(
+                                str(next_shot.get("action") or "")
+                            )
+                        ):
+                            index += 1
+                            continue
                     if limits and scene_within_limit(next_scene_no):
                         index += 1
                         continue
                     total_duration = float(prev_shot.get("duration_sec") or 0) + float(
                         next_shot.get("duration_sec") or 0
                     )
-                    if total_duration < MIN_SHOT_DURATION_SEC:
+                    if (
+                        total_duration < MIN_SHOT_DURATION_SEC
+                        or (
+                            transition == "continuous"
+                            and total_duration > MAX_SHOT_DURATION_SEC
+                        )
+                    ):
                         index += 1
                         continue
                     merged_action = "；随后，".join(
@@ -2926,13 +3537,12 @@ class ShotService:
         return result, notes
 
     @staticmethod
-    def _validate_extracted_continuity(shots: list[dict[str, Any]]) -> list[str]:
-        """只拦截可客观确认的断裂：场次回跳、交叉。
-
-        不再拦截「首镜 continuous」「continuous 缺状态」这类模型常见小偏差——
-        它们会错误引用上一镜末帧导致画面断裂，但可安全降级为 scene_change /
-        same_scene_cut 并给出警告，而不是中止整批提取。
-        """
+    def _validate_extracted_continuity(
+        shots: list[dict[str, Any]],
+        *,
+        repair: bool = True,
+    ) -> list[str]:
+        """拦截场次回跳和可确定的 continuous 起止状态断裂。"""
         warnings: list[str] = []
         previous_scene_no: int | None = None
         closed_scenes: set[int] = set()
@@ -2952,8 +3562,26 @@ class ShotService:
                         "已中止保存，避免剧情顺序断裂。"
                     )
             transition = str(shot_data.get("transition_from_prev") or "scene_change")
+            if (
+                transition == "same_scene_cut"
+                and previous_shot is not None
+                and scene_no != previous_scene_no
+            ):
+                if not repair:
+                    raise conflict(
+                        f"分镜第 {index} 镜跨场次却标记 same_scene_cut，"
+                        "必须改为 scene_change、elliptical 或有明确动作承接的 continuous"
+                    )
+                shot_data["transition_from_prev"] = "scene_change"
+                transition = "scene_change"
+                warnings.append(
+                    f"分镜第 {index} 镜跨场次却标记 same_scene_cut，"
+                    "已自动修正为 scene_change"
+                )
             if transition == "continuous":
                 if previous_shot is None:
+                    if not repair:
+                        raise conflict("首镜不能标记 continuous")
                     # 首镜无上一镜可承接，自动降级为 scene_change（不引用上一镜末帧）
                     shot_data["transition_from_prev"] = "scene_change"
                     warnings.append(
@@ -2966,12 +3594,27 @@ class ShotService:
                 previous_end = str(previous_shot.get("end_state") or "").strip()
                 current_start = str(shot_data.get("start_state") or "").strip()
                 if not previous_end or not current_start:
-                    # 连续镜头缺衔接状态，若继续 continuous 会把上一镜末帧作为
-                    # 本镜起始帧导致瞬移；自动降级避免画面断裂
+                    if not repair:
+                        raise conflict(
+                            f"分镜第 {index} 镜标记 continuous，但缺少前镜 end_state "
+                            "或本镜 start_state"
+                        )
+                    # 缺少衔接状态时自动降级，不中止整批：模型轻微改写就会造成
+                    # 起止状态缺失，按 continuous 硬错误会让整章反复失败。
                     shot_data["transition_from_prev"] = "scene_change"
                     warnings.append(
-                        f"分镜第 {index} 镜标记 continuous 但缺少前镜 end_state "
-                        "或本镜 start_state，已自动降级为 scene_change"
+                        f"分镜第 {index} 镜标记 continuous 但缺少前镜 end_state 或本镜 "
+                        "start_state，已自动降级为 scene_change"
+                    )
+                    previous_scene_no = scene_no
+                    previous_shot = shot_data
+                    continue
+                normalized_end = re.sub(r"[\s，。；;]+", "", previous_end)
+                normalized_start = re.sub(r"[\s，。；;]+", "", current_start)
+                if normalized_end not in normalized_start:
+                    raise conflict(
+                        f"分镜第 {index} 镜标记 continuous，但 start_state 未逐字承接"
+                        "上一镜 end_state，已中止保存，避免人物姿态或持物瞬移"
                     )
             previous_scene_no = scene_no
             previous_shot = shot_data
@@ -3027,6 +3670,64 @@ class ShotService:
         lower = max(1, math.ceil(budget / MAX_SHOT_DURATION_SEC))
         return lower, lower + 2
 
+    @staticmethod
+    def _group_dialogue_texts(texts: list[str], capacity: int) -> list[tuple[int, int, int]]:
+        """按单镜承载上限把本场台词按顺序分组：返回 (起条号, 止条号, 组字数)。
+
+        条边界优先于装箱最优：不同台词的文字不混进同一个分组，只有超出单镜
+        上限的组才由保存流程按字数强制拆镜。容量非法时每条台词各自成组。
+        """
+        if capacity <= 0:
+            return [(index, index, len(text)) for index, text in enumerate(texts, start=1)]
+        groups: list[tuple[int, int, int]] = []
+        start, chars = 1, 0
+        for index, text in enumerate(texts, start=1):
+            if chars + len(text) > capacity:
+                if chars > 0:
+                    groups.append((start, index - 1, chars))
+                start, chars = index, 0
+            chars += len(text)
+        if chars > 0:
+            groups.append((start, len(texts), chars))
+        return groups
+
+    @classmethod
+    def _dialogue_shot_floor(cls, scene: dict[str, Any]) -> int:
+        """本场对白在「单镜 15 秒」上限下至少需要的镜头数。
+
+        容量按本场动作确定语速（纯对白 2.5 字/秒，含动作动词 1.6 字/秒），与
+        `_split_dialogue_shot` 的拆镜口径一致：否则会出现「门禁按纯对白容量算出
+        3 镜、拆分流程按动作语速实际拆出 5 镜」的自相矛盾，导致必然被拒。
+        返回 0 表示本场没有对白。用于落实 shot_extract.md 第 7.2 条的
+        「容量优先于预算」：剧本声明的成片时长装不下本场对白时，分镜数量
+        上限不能再低于这个物理下限，否则模型怎么拆镜都会被保存门禁拒绝。
+        """
+        texts = [
+            str(item.get("text") or "").strip()
+            for item in scene.get("dialogue") or []
+            if isinstance(item, dict)
+        ]
+        texts = [text for text in texts if text]
+        if not texts:
+            return 0
+        capacity = max(
+            1,
+            ShotOutput.dialogue_capacity_for(
+                MAX_SHOT_DURATION_SEC,
+                scene.get("action"),
+            ),
+        )
+        return sum(
+            max(1, math.ceil(group_chars / capacity))
+            for _start, _end, group_chars in cls._group_dialogue_texts(texts, capacity)
+        )
+
+    @classmethod
+    def _scene_shot_upper_limit(cls, scene: dict[str, Any]) -> int:
+        """本场分镜数量硬上限：取预算上限与对白容量下限中的较大者。"""
+        _, budget_upper = cls._shot_count_limits(cls._scene_budget_sec(scene))
+        return max(budget_upper, cls._dialogue_shot_floor(scene))
+
     @classmethod
     def _build_shot_budget_table(cls, scenes: list[dict[str, Any]] | None) -> str:
         """生成给模型的每场分镜数量预算表（user_prompt 用）。"""
@@ -3039,9 +3740,21 @@ class ShotService:
             except (TypeError, ValueError):
                 scene_no = 0
             budget = cls._scene_budget_sec(scene)
-            _, upper = cls._shot_count_limits(budget)
+            _, budget_upper = cls._shot_count_limits(budget)
+            allowed = cls._scene_shot_upper_limit(scene)
+            note = ""
+            if allowed > budget_upper:
+                # 容量优先于预算：声明时长装不下本场对白时，直接把放宽后的
+                # 上限交给模型，避免模型为凑预算压缩台词后仍被门禁拒绝。
+                chars = ShotOutput.dialogue_char_count(scene.get("dialogue"))
+                note = (
+                    f"（本场对白共 {chars} 字，纯对白约 {math.ceil(chars / 2.5)} 秒，"
+                    f"按单镜 15 秒/37 字上限最少需要 {allowed} 个对白镜头，"
+                    "容量优先于预算，上限已按对白容量放宽）"
+                )
             lines.append(
-                f"- 场次 {scene_no}：本场预估约 {budget:g} 秒 → 分镜数量不得超过 {upper} 个"
+                f"- 场次 {scene_no}：本场预估约 {budget:g} 秒 → "
+                f"分镜数量不得超过 {allowed} 个{note}"
             )
         return "每场分镜数量预算表（硬限制，超出会被保存门禁拒绝）：\n" + "\n".join(lines)
 
@@ -3049,10 +3762,18 @@ class ShotService:
     def _validate_scene_shot_density(
         scenes: list[dict[str, Any]] | None,
         shots: list[dict[str, Any]],
-    ) -> None:
-        """按每场成片预算控制镜头数量上限，防止分镜总量失控。"""
+    ) -> list[dict[str, Any]]:
+        """按每场成片预算控制镜头数量上限，防止分镜总量失控。
+
+        对白容量优先于预算（shot_extract.md 第 7.2 条）：本场对白按单镜
+        15 秒/37 字折算出的最少镜头数高于预算上限时，上限取对白容量下限，
+        并给出「剧本声明时长偏短」的警告，而不是中止保存——否则模型永远
+        拿不到「既装得下台词、又不超预算」的解，重试只会反复失败。
+        返回的警告由调用方并入任务警告。
+        """
+        warnings: list[dict[str, Any]] = []
         if not scenes:
-            return
+            return warnings
         shots_by_scene: dict[int, list[dict[str, Any]]] = {}
         # 同上：避免遮蔽 shot 表对象。
         for shot_data in shots:
@@ -3070,13 +3791,68 @@ class ShotService:
             if not scene_shots:
                 continue
             budget = ShotService._scene_budget_sec(scene)
-            _, allowed = ShotService._shot_count_limits(budget)
+            budget_lower, budget_upper = ShotService._shot_count_limits(budget)
+            allowed = ShotService._scene_shot_upper_limit(scene)
             if len(scene_shots) > allowed:
                 raise conflict(
                     f"场次 {scene_no} 返回 {len(scene_shots)} 个分镜，超过本场 {budget:g} "
                     f"秒预算允许的 {allowed} 个；已中止保存，避免镜头数量失控。"
                     "请把同场相邻的连续动作与对话回合合并进同一镜头，只保留独立结果与转场。"
                 )
+            durations = [
+                float(shot_data.get("duration_sec") or 0)
+                for shot_data in scene_shots
+            ]
+            if budget >= 30 and durations and all(duration > 0 for duration in durations):
+                total_duration = sum(durations)
+                minimum_duration = budget * 0.75
+                if total_duration < minimum_duration:
+                    # 只提示不中止：镜头数量上限由上面的 allowed 把守；总时长偏短
+                    # 常常来自模型把动作写进 video_prompt 或时长标注保守，若按密度
+                    # 冲突重试会收到「合并」指令（越合并越短），方向相反。
+                    warnings.append(
+                        {
+                            "scene_no": scene_no,
+                            "message": (
+                                f"场次 {scene_no} 的分镜总时长仅 {total_duration:g} 秒，"
+                                f"低于本场 {budget:g} 秒预算的 75%（{minimum_duration:g} 秒）；"
+                                "已保留当前分镜，请检查是否有剧情动作遗漏或时长标注偏短。"
+                            ),
+                        }
+                    )
+            if len(scene_shots) < budget_lower:
+                warnings.append(
+                    {
+                        "scene_no": scene_no,
+                        "message": (
+                            f"场次 {scene_no} 返回 {len(scene_shots)} 个分镜，低于本场 {budget:g} "
+                            f"秒预算推荐的最少镜头数（{budget_lower} 个），可能遗漏动作。"
+                        ),
+                    }
+                )
+            floor = ShotService._dialogue_shot_floor(scene)
+            if floor > budget_upper:
+                chars = ShotOutput.dialogue_char_count(scene.get("dialogue"))
+                capacity = max(
+                    1,
+                    ShotOutput.dialogue_capacity_for(
+                        MAX_SHOT_DURATION_SEC,
+                        scene.get("action"),
+                    ),
+                )
+                warnings.append(
+                    {
+                        "scene_no": scene_no,
+                        "message": (
+                            f"场次 {scene_no} 的 {budget:g} 秒预算装不下本场对白"
+                            f"（{chars} 字，纯对白约 {math.ceil(chars / 2.5)} 秒）：按单镜 "
+                            f"15 秒/{capacity} 字上限最少需要 {floor} 个对白镜头，"
+                            f"本场分镜上限已按对白容量放宽到 {allowed} 个；"
+                            "建议在剧本阶段精简对白或提高该场 target_duration_sec。"
+                        ),
+                    }
+                )
+        return warnings
 
     @staticmethod
     def _is_scene_density_conflict(exc: Exception) -> bool:
@@ -3132,17 +3908,18 @@ class ShotService:
     ) -> list[str]:
         """为密度门禁拒绝的场次计算对白分组的确定性建议。
 
-        按纯对白 15 秒承载上限（2.5 字/秒 → 37 字）贪心分组剧本对白，
-        输出「第1-3条（25字，约10秒）」式分组，让模型拿到可直接执行的
-        合并方案，而不是继续输出一个对白回合一个镜头。超出单镜上限的
-        组按强制拆镜后的镜头数计入总数，避免给出「52 字 1 镜」这类
-        保存流程必然拆镜、模型无法达成的方案；对白镜头占满预算时明确
-        要求动作节拍并入对白镜头。
+        按纯对白 15 秒承载上限（2.5 字/秒 → 37 字）分组剧本对白，输出
+        「第1-3条（25字，约10秒）」式分组，让模型拿到可直接执行的合并方案，
+        而不是继续输出一个对白回合一个镜头。超出单镜上限的组按强制拆镜后的
+        镜头数计入总数，避免给出「52 字 1 镜」这类保存流程必然拆镜、模型无法
+        达成的方案；对白镜头占满上限时明确要求动作节拍并入对白镜头。
+        上限取「预算上限与对白容量下限」的较大者：剧本声明的时长装不下对白
+        时，模型按对白容量拆分即可达成，不会再被要求压缩台词。
         """
         failing_scene_nos = {
             int(match.group(1)) for match in re.finditer(r"场次\s*(\d+)", detail or "")
         }
-        capacity = int(2.5 * MAX_SHOT_DURATION_SEC)
+        capacity = max(1, ShotOutput.dialogue_capacity_for(MAX_SHOT_DURATION_SEC, ""))
         result: list[str] = []
         for scene in scenes or []:
             try:
@@ -3159,31 +3936,16 @@ class ShotService:
             texts = [text for text in texts if text]
             if not texts:
                 continue
-            budget = ShotService._scene_budget_sec(scene)
-            _, allowed = ShotService._shot_count_limits(budget)
-            groups: list[tuple[int, int, int]] = []
-            start, chars = 1, 0
-            for index, text in enumerate(texts, start=1):
-                if chars + len(text) > capacity:
-                    if chars > 0:
-                        groups.append((start, index - 1, chars))
-                    start, chars = index, 0
-                chars += len(text)
-            groups.append((start, len(texts), chars))
+            allowed = ShotService._scene_shot_upper_limit(scene)
+            groups = ShotService._group_dialogue_texts(texts, capacity)
             total = sum(len(text) for text in texts)
             # 超过 37 字单镜上限的组会被保存流程强制拆镜（ceil(字数/37) 镜），
             # 对白实际占用的镜头数必须按拆镜后计算：否则给模型的方案声称
             # 「52 字 1 个镜头」不可执行，模型照做后仍会被门禁拒绝。
-            effective = 0
-            for _group_start, _group_end, group_chars in groups:
-                effective += max(1, math.ceil(group_chars / capacity))
-            if effective > allowed:
-                result.append(
-                    f"- 场次 {scene_no}：共 {len(texts)} 条对白（{total} 字），按纯对白 15 秒/"
-                    f"{capacity} 字上限至少需要 {effective} 个对白镜头，超过本场预算上限 "
-                    f"{allowed} 个；请检查剧本场次时长或精简对白。"
-                )
-                continue
+            effective = sum(
+                max(1, math.ceil(group_chars / capacity))
+                for _group_start, _group_end, group_chars in groups
+            )
             group_texts: list[str] = []
             for group_start, group_end, group_chars in groups:
                 if group_chars > capacity:
@@ -3221,7 +3983,7 @@ class ShotService:
                     f"动作节拍并入这些镜头或单独成镜，但总镜头数不得超过 {allowed} 个"
                 )
             result.append(
-                f"- 场次 {scene_no}：把 {len(texts)} 条对白按顺序合并为 "
+                f"- 场次 {scene_no}：共 {len(texts)} 条对白（{total} 字），按顺序合并为 "
                 f"{effective} 个纯对白镜头："
                 + "；".join(group_texts)
                 + f"；{action_hint}。"
@@ -3295,6 +4057,7 @@ class ShotService:
                     asset.c.asset_type,
                     asset.c.name,
                     asset.c.profile_json,
+                    asset.c.importance,
                 ).where(asset.c.project_id == project_id)
             ):
                 profile = json_loads(row.profile_json, {})
@@ -3306,6 +4069,7 @@ class ShotService:
                         "concept": profile.get("concept", ""),
                         "aliases": profile.get("aliases", []),
                         "source_refs": profile.get("source_refs", []),
+                        "importance": row.importance,
                     }
                 )
         return result
@@ -3335,47 +4099,17 @@ class ShotService:
     def _normalize_asset_label(value: str) -> str:
         return re.sub(r"[\W_]+", "", value.casefold())
 
-    # 场景名常见方位/时态修饰后缀：名字剥掉它们后仍可能指向同一素材。
-    # 只在剥除后能唯一命中时使用，避免「楼道转角」误配「楼道」这类臆断。
-    _SCENE_NAME_VARIANT_SUFFIXES = (
-        "门口",
-        "附近",
-        "转角",
-        "里面",
-        "之内",
-        "之中",
-        "里面",
-        "以内",
-        "前方",
-        "旁边",
-        "边",
-        "内",
-        "里",
-        "外",
-        "前",
-        "旁",
-    )
-
-    @classmethod
-    def _strip_scene_name_suffix(cls, normalized: str) -> str:
-        """去掉规范化场景名尾部的方位/空间修饰词（如「公司电梯内」→「公司电梯」）。"""
-        for suffix in cls._SCENE_NAME_VARIANT_SUFFIXES:
-            if normalized.endswith(suffix) and len(normalized) > len(suffix) + 1:
-                return normalized[: -len(suffix)]
-        return normalized
-
     def _asset_lookup(self, project_id: str) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {
             "character": {"ids": set(), "primary": {}, "exact": {}, "normalized": {}},
-            "scene": {
+            "scene": {"ids": set(), "primary": {}, "exact": {}, "normalized": {}},
+            "prop": {
                 "ids": set(),
                 "primary": {},
                 "exact": {},
                 "normalized": {},
-                # 场景允许「名称变体/子串包含」兜底；角色、物品禁止（误配风险高）
-                "fuzzy": True,
+                "ignore_possessive": True,
             },
-            "prop": {"ids": set(), "primary": {}, "exact": {}, "normalized": {}},
         }
         for current in self._asset_catalog(project_id):
             lookup = result[current["asset_type"]]
@@ -3393,15 +4127,12 @@ class ShotService:
                 normalized = self._normalize_asset_label(label)
                 if normalized:
                     lookup["normalized"].setdefault(normalized, set()).add(current["id"])
-                    stripped = self._strip_scene_name_suffix(normalized)
-                    if stripped and stripped != normalized:
-                        lookup["normalized"].setdefault(stripped, set()).add(current["id"])
-                    # 合并素材按连接词拆部件：「苏棠家客厅及厨房」→
-                    # 「苏棠家客厅」「苏棠家厨房」，剧本拆分场景可分别命中。
-                    for part in re.split(r"[及和与加、,，]", normalized, flags=re.IGNORECASE):
-                        part = part.strip()
-                        if len(part) >= 2:
-                            lookup["normalized"].setdefault(part, set()).add(current["id"])
+                    if lookup.get("ignore_possessive"):
+                        without_possessive = normalized.replace("的", "")
+                        if without_possessive:
+                            lookup["normalized"].setdefault(
+                                without_possessive, set()
+                            ).add(current["id"])
         return result
 
     def _resolve_asset_name(
@@ -3416,28 +4147,75 @@ class ShotService:
         if len(exact) == 1:
             return next(iter(exact))
         normalized_name = self._normalize_asset_label(name)
-        normalized = lookup["normalized"].get(normalized_name, set())
-        if len(normalized) == 1:
-            return next(iter(normalized))
-        # 变体兜底（仅场景）：剧本名去掉方位/空间修饰后缀后精确命中
-        # （公司电梯内 -> 公司电梯）
-        if lookup.get("fuzzy"):
-            stripped_name = self._strip_scene_name_suffix(normalized_name)
-            if stripped_name and stripped_name != normalized_name:
-                stripped_hits = lookup.get("normalized", {}).get(stripped_name, set())
-                if len(stripped_hits) == 1:
-                    return next(iter(stripped_hits))
-            # 子串包含：合并素材「苏棠家客厅及厨房」可承接剧本拆分的
-            # 「苏棠家客厅」「苏棠家厨房」。只有唯一候选时才绑定，避免歧义。
-            contained_ids: set[str] = set()
-            for label, ids in lookup.get("normalized", {}).items():
-                if not label:
-                    continue
-                if label in normalized_name or normalized_name in label:
-                    contained_ids.update(ids)
-            if len(contained_ids) == 1:
-                return next(iter(contained_ids))
+        candidates = [normalized_name]
+        if lookup.get("ignore_possessive"):
+            candidates.append(normalized_name.replace("的", ""))
+            cleaned_quant = self._normalize_asset_label(normalize_prop_name(name))
+            if cleaned_quant:
+                candidates.append(cleaned_quant)
+                candidates.append(cleaned_quant.replace("的", ""))
+            if "的" in name:
+                after_de = self._normalize_asset_label(normalize_prop_name(name.split("的")[-1]))
+                if after_de:
+                    candidates.append(after_de)
+        normalized_ids: set[str] = set()
+        for candidate in candidates:
+            normalized_ids.update(lookup["normalized"].get(candidate, set()))
+        if len(normalized_ids) == 1:
+            return next(iter(normalized_ids))
         return None
+
+    # 模型抄写长随机 ID 时偶发截断/改字符（实测：32 位 hex 尾部被抄成 30 位）。
+    # uuid4 素材 ID 两两距离集中在 28 以上，编辑距离 ≤6 且目录内唯一候选时，
+    # 只可能是同一 ID 的抄写损坏，绝无误配风险。
+    _ASSET_ID_REPAIR_DISTANCE = 6
+
+    @staticmethod
+    def _edit_distance_within(left: str, right: str, limit: int) -> bool:
+        """判断两字符串编辑距离是否 ≤ limit，整行超限即剪枝返回。"""
+        if abs(len(left) - len(right)) > limit:
+            return False
+        previous = list(range(len(right) + 1))
+        for i, left_char in enumerate(left, start=1):
+            current = [i] + [0] * len(right)
+            for j, right_char in enumerate(right, start=1):
+                current[j] = min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + (left_char != right_char),
+                )
+            if min(current) > limit:
+                return False
+            previous = current
+        return previous[len(right)] <= limit
+
+    def _repair_near_miss_asset_id(
+        self,
+        lookup: dict[str, Any],
+        provided_id: str | None,
+    ) -> str | None:
+        """修复模型抄错的素材 ID：仅当目录中存在唯一高度相似的真实 ID 时纠正。
+
+        抄写损坏的 ID（截断/改字符）落在真实 ID 的极近邻域内；凭空编造的 ID
+        不会恰好贴近任何真实 uuid ID。无候选（真编造）或多候选（有歧义）时
+        原样返回，维持「提供 ID 却解析不到 = 硬错误」的既有语义。
+        """
+        if not provided_id or provided_id in lookup["ids"]:
+            return provided_id
+        candidates = [
+            real_id
+            for real_id in lookup["ids"]
+            if self._edit_distance_within(provided_id, real_id, self._ASSET_ID_REPAIR_DISTANCE)
+        ]
+        if len(candidates) == 1:
+            repaired = candidates[0]
+            logger.warning(
+                "素材 ID 疑似模型抄写错误，已按目录唯一相近 ID 修复：%s -> %s",
+                provided_id,
+                repaired,
+            )
+            return repaired
+        return provided_id
 
     def _resolve_asset_id(
         self,
@@ -3446,17 +4224,29 @@ class ShotService:
         provided_id: str | None,
         name: str,
     ) -> str | None:
-        """解析单个素材绑定：ID 优先，名称只为兜底。
+        """解析单个素材绑定：双向校验 ID 与名称一致性。
 
-        新绑定协议以素材 ID 为准：模型给出目录中真实存在的 ID 时直接采用，
-        名称只是展示字段，不参与判定；ID 为空或无效时退回名称解析；
-        两者都解析不到返回 None，由调用方决定报缺失还是警告，禁止默认兜底。
+        当同时提供 ID 与名称时：
+        1. 若名称解析出素材 A，且 ID 指向不同素材 B，以名称为准（修正模型填错 ID 幻觉）；
+        2. 若名称无法匹配任何素材，即使 ID 有效也拒绝绑定，避免合法 ID 指向错误语义；
+        3. 只有存量任务完全没有名称时，才兼容显式有效 ID。
         """
-        if provided_id:
-            if provided_id in lookup["ids"]:
-                return provided_id
-            return None
-        return self._resolve_asset_name(lookup, name)
+        provided_id = self._repair_near_miss_asset_id(lookup, provided_id)
+        valid_id = provided_id if (provided_id and provided_id in lookup["ids"]) else None
+        name_resolved_id = self._resolve_asset_name(lookup, name) if name else None
+
+        if valid_id and name_resolved_id:
+            if valid_id == name_resolved_id:
+                return valid_id
+            # 语义名称能明确匹配到某素材，但模型提供了冲突 ID：优先以语义名称为准（纠正 ID 幻觉）
+            return name_resolved_id
+        if name_resolved_id:
+            return name_resolved_id
+        if valid_id and not name:
+            # 仅兼容没有名称的存量任务；只要给出了语义名称，就不得用合法但不对应
+            # 该名称的 ID 绕过绑定校验。
+            return valid_id
+        return None
 
     def _resolve_asset_ids(
         self,
@@ -3464,28 +4254,37 @@ class ShotService:
         *,
         provided_ids: list[str],
         names: list[str],
-    ) -> tuple[list[str], list[str]]:
-        """解析一组素材绑定：ID 优先，名称兜底。
+    ) -> tuple[list[str], list[str], list[str]]:
+        """按名称确定性解析素材；仅兼容无名称的旧任务显式 ID。
 
-        新绑定协议：模型给出的目录内真实 ID 直接采用，名称只是展示字段，
-        不参与判定（名称与 ID 不一致时以 ID 为准，避免名称漂移误报）；
-        只有模型完全没有给出有效 ID 时，才退化为名称解析兜底（兼容旧模型）。
-        返回 (resolved_ids, unmatched)：unmatched 含无效 ID 与名称均无法解析的项，
-        由调用方区分「模型编造 ID（硬错误）」与「素材缺失（补素材/警告）」。
+        返回 (已解析 ID, 未匹配名字, 无法解析的显式 ID)：
+        - 未匹配名字只是提示性信息（律师/前台这类一次性角色、不在素材库的小道具
+          仍应保留在分镜文本里，不阻断保存，也不创建占位素材）；
+        - 显式 ID 解析不到才是硬错误（模型编造或抄坏了素材 ID）。
         """
-        unique_provided = list(dict.fromkeys(provided_ids))
-        resolved = [item for item in unique_provided if item in lookup["ids"]]
-        unmatched = [item for item in unique_provided if item not in lookup["ids"]]
-        if resolved:
-            # 已有有效 ID：忽略名称，名称只是展示字段
-            return resolved, unmatched
+        resolved: list[str] = []
+        unmatched_names: list[str] = []
+        unresolved_ids: list[str] = []
+
+        # 新协议下模型只输出 canonical name / aliases。只要存在名字就完全忽略
+        # provided_ids，避免一个字符的 ID 抄写幻觉使整章在最终保存阶段失败。
         for name in names:
-            asset_id = self._resolve_asset_name(lookup, name)
-            if asset_id:
-                resolved.append(asset_id)
-            elif name not in unmatched:
-                unmatched.append(name)
-        return list(dict.fromkeys(resolved)), unmatched
+            name_id = self._resolve_asset_name(lookup, name)
+            if name_id:
+                resolved.append(name_id)
+            elif name not in unmatched_names:
+                unmatched_names.append(name)
+
+        # 兼容旧任务：没有名字时才接受显式 ID；无效 ID 继续返回为硬错误。
+        if not names:
+            for item in dict.fromkeys(provided_ids):
+                repaired = self._repair_near_miss_asset_id(lookup, item)
+                if repaired in lookup["ids"]:
+                    resolved.append(repaired)
+                elif item not in unresolved_ids:
+                    unresolved_ids.append(item)
+
+        return list(dict.fromkeys(resolved)), unmatched_names, unresolved_ids
 
     def _save_extracted(
         self,
@@ -3499,7 +4298,13 @@ class ShotService:
         chapter_id = current_chapter["id"]
         # 素材查找按项目（全书共用），分镜落库按章节
         asset_lookup = self._asset_lookup(project_id)
-        source_signature = self._source_signature(current_chapter, source_type)
+        expected_sig = input_data.get("expected_source_signature")
+        current_sig = self._source_signature(current_chapter, source_type)
+        if expected_sig and expected_sig != current_sig:
+            raise conflict(
+                "剧本在分镜生成期间发生变化，已中止保存；请基于最新确认剧本重新提取"
+            )
+        source_signature = current_sig
         normalized: list[dict[str, Any]] = []
         binding_errors: list[str] = []
         binding_warnings: list[dict[str, Any]] = []
@@ -3513,6 +4318,7 @@ class ShotService:
             scene_name = item.pop("scene_name", "")
             # missing_assets 是提取阶段供补素材流程使用的临时字段，不落库
             item.pop("missing_assets", None)
+            item.pop("coverage_refs", None)
             scene_asset_id = self._resolve_asset_id(
                 asset_lookup["scene"],
                 provided_id=item.pop("scene_asset_id", None),
@@ -3520,27 +4326,22 @@ class ShotService:
             )
             character_names = item.pop("character_names", [])
             provided_character_ids = item.pop("character_asset_ids", [])
-            character_ids, unmatched_characters = self._resolve_asset_ids(
+            (
+                character_ids,
+                unmatched_characters,
+                unresolved_character_ids,
+            ) = self._resolve_asset_ids(
                 asset_lookup["character"],
                 provided_ids=provided_character_ids,
                 names=character_names,
             )
-            character_binding_errors = [
-                value
-                for value in unmatched_characters
-                if value in provided_character_ids
-            ]
-            character_unmatched_names = [
-                value
-                for value in unmatched_characters
-                if value not in character_binding_errors
-            ]
             prop_names = item.pop("prop_names", [])
             provided_prop_ids = item.pop("prop_asset_ids", [])
-            prop_ids, unmatched_props = self._resolve_asset_ids(
+            critical_prop_names = [p for p in prop_names if is_critical_prop(str(p))]
+            prop_ids, unmatched_props, unresolved_prop_ids = self._resolve_asset_ids(
                 asset_lookup["prop"],
                 provided_ids=provided_prop_ids,
-                names=prop_names,
+                names=critical_prop_names,
             )
             shot_label = item.get("shot_no", len(normalized) + 1)
             self._validate_duration(item.get("duration_sec"))
@@ -3553,43 +4354,37 @@ class ShotService:
                 binding_errors.append(
                     f"分镜 {shot_label} 未匹配到场景素材：{scene_name or '未提供场景名称'}"
                 )
-            if character_binding_errors:
+            if unresolved_character_ids:
                 binding_errors.append(
-                    f"分镜 {shot_label} 未匹配到角色素材：{', '.join(character_binding_errors)}"
+                    f"分镜 {shot_label} 提供了无法解析的角色素材 ID："
+                    + "、".join(unresolved_character_ids)
                 )
-            if character_unmatched_names:
+            if unresolved_prop_ids:
+                binding_errors.append(
+                    f"分镜 {shot_label} 提供了无法解析的物品素材 ID："
+                    + "、".join(unresolved_prop_ids)
+                )
+            # 纯名字未匹配只降级为警告：临时角色/未登记小道具要继续保留在分镜文本中，
+            # 不阻断保存，也不为它们创建占位素材。
+            if unmatched_characters:
                 binding_warnings.append(
                     {
-                        "shot_no": shot_label,
+                        "scene_no": scene_no or 0,
                         "message": (
-                            "分镜角色名未匹配到素材库，仅保留文字描述，未绑定角色素材："
-                            + "、".join(character_unmatched_names)
+                            f"分镜角色名未匹配到素材库（分镜 {shot_label}）："
+                            + "、".join(unmatched_characters)
+                            + "；已保留在分镜文本中，不创建占位素材。"
                         ),
                     }
                 )
-            # 物品与角色处理对齐：纯名字未匹配只降级为警告（物品只是增强性绑定，
-            # 缺失不阻断视频生成）；只有模型提供了 ID 却解析不到（应为目录中真实
-            # ID）才视为硬错误。避免模型多写一个不在库的小物件（如「纸条」）
-            # 导致整批提取中止。
-            prop_binding_errors = [
-                value
-                for value in unmatched_props
-                if value in provided_prop_ids
-            ]
-            prop_unmatched_names = [
-                value for value in unmatched_props if value not in prop_binding_errors
-            ]
-            if prop_binding_errors:
-                binding_errors.append(
-                    f"分镜 {shot_label} 未匹配到物品素材：{', '.join(prop_binding_errors)}"
-                )
-            if prop_unmatched_names:
+            if unmatched_props:
                 binding_warnings.append(
                     {
-                        "shot_no": shot_label,
+                        "scene_no": scene_no or 0,
                         "message": (
-                            "分镜物品名未匹配到素材库，仅保留文字描述，未绑定："
-                            + "、".join(prop_unmatched_names)
+                            f"分镜物品名未匹配到素材库（分镜 {shot_label}）："
+                            + "、".join(unmatched_props)
+                            + "；已保留在分镜文本中，不创建占位素材。"
                         ),
                     }
                 )
@@ -3629,7 +4424,7 @@ class ShotService:
                 selected_existing = [
                     row for row in existing_rows if row.source_ref.startswith(prefix)
                 ]
-            if scope_scene is None and not normalized and selected_existing:
+            if not normalized and selected_existing:
                 raise bad_request("提取结果为空，已保留现有分镜，未做覆盖删除")
             selected_ids = {row.id for row in selected_existing}
             self._ensure_no_active_jobs(
@@ -3659,8 +4454,22 @@ class ShotService:
                             json_dumps(value or []) if column.endswith("_json") else value
                         )
                 if index < len(selected_existing):
+                    # 乐观锁：只覆盖保存期间 revision 未变化的既有分镜，
+                    # 避免并发编辑被静默覆盖。
                     values["revision"] = selected_existing[index].revision + 1
-                    connection.execute(update(shot).where(shot.c.id == record_id).values(**values))
+                    result = connection.execute(
+                        update(shot)
+                        .where(
+                            shot.c.id == record_id,
+                            shot.c.revision == selected_existing[index].revision,
+                        )
+                        .values(**values)
+                    )
+                    if result.rowcount != 1:
+                        raise conflict(
+                            f"分镜 {selected_existing[index].shot_no} 已被并发修改，"
+                            "已中止保存；请刷新后重新提取"
+                        )
                 else:
                     connection.execute(
                         insert(shot).values(
@@ -3708,8 +4517,12 @@ class ShotService:
                 if not inserted:
                     ordered_ids.extend(saved_ids)
             self._renumber(connection, chapter_id, ordered_ids)
+        # 事务已提交，文件清理失败只记日志，不让 500 掩盖已保存的分镜
         for path in obsolete_paths:
-            file_service.delete_file(project_id, path)
+            try:
+                file_service.delete_file(project_id, path)
+            except (FileServiceError, OSError) as exc:
+                logger.warning("覆盖分镜后删除废弃媒体文件失败：%s（%s）", path, exc)
         return {
             "shot_ids": saved_ids,
             "count": len(saved_ids),
@@ -3730,7 +4543,7 @@ class ShotService:
             for asset_id, role in requested:
                 if not asset_id:
                     continue
-                image_id, is_clean = self._current_binding_image_id(
+                image_id = self._current_binding_image_id(
                     connection, current, asset_id, role
                 )
                 if image_id:
@@ -3741,14 +4554,6 @@ class ShotService:
                             "asset_image_id": image_id,
                         }
                     )
-                    if not is_clean:
-                        name = connection.execute(
-                            select(asset.c.name).where(asset.c.id == asset_id)
-                        ).scalar()
-                        warnings.append(
-                            f"素材「{name or asset_id}」缺少干净参考图，当前将用设定稿"
-                            "作参考图（可能带文字/宫格/多视图），建议生成参考图模式图片"
-                        )
                 else:
                     warnings.append(f"素材 {asset_id} 缺少当前参考图，将使用纯文字降级")
         return bindings, warnings
@@ -3759,25 +4564,12 @@ class ShotService:
         current: dict[str, Any],
         asset_id: str,
         role: str,
-    ) -> tuple[str | None, bool]:
-        """取素材绑定的参考图 id 与是否为干净参考图。
+    ) -> str | None:
+        """取素材绑定的参考图 id：当前素材图（is_current=1 的最新完成版本）。
 
-        优先最新完成的干净参考图（reference_purpose='clean_reference'），
-        避免把带文字、宫格、多视图的设定展板当参考图传给生成模型；
-        没有干净参考图时退回当前图（is_current=1，可能是设定稿）。
+        素材图统一作为图生图参考，不再区分设定展板与干净参考图。
         """
-        clean_id = connection.execute(
-            select(asset_image.c.id)
-            .where(
-                asset_image.c.asset_id == asset_id,
-                asset_image.c.reference_purpose == "clean_reference",
-                asset_image.c.status == "completed",
-            )
-            .order_by(asset_image.c.version_no.desc())
-        ).scalar()
-        if clean_id:
-            return clean_id, True
-        current_id = connection.execute(
+        return connection.execute(
             select(asset_image.c.id)
             .where(
                 asset_image.c.asset_id == asset_id,
@@ -3786,7 +4578,6 @@ class ShotService:
             )
             .order_by(asset_image.c.version_no.desc())
         ).scalar()
-        return current_id, False
 
     def _prev_keyframe_binding(self, current: dict[str, Any]) -> dict[str, Any] | None:
         """查询上一镜的已完成关键帧，返回 previous_keyframe binding；无则返回 None。
@@ -3862,11 +4653,37 @@ class ShotService:
             prev_data, next_data = self._adjacent_shot_data(
                 connection, current["chapter_id"], current["id"]
             )
+            char_costume_notes: list[str] = []
+            char_ids = [item for item in current.get("character_ids", []) if item]
+            if char_ids:
+                for row in connection.execute(
+                    select(asset.c.name, asset.c.profile_json).where(
+                        asset.c.id.in_(char_ids),
+                        asset.c.asset_type == "character",
+                    )
+                ):
+                    profile = json_loads(row.profile_json, {})
+                    costume = str(profile.get("costume") or "").strip()
+                    main_color = str(
+                        profile.get("main_color") or profile.get("color") or ""
+                    ).strip()
+                    parts = []
+                    if costume:
+                        parts.append(f"服装为{costume}")
+                    if main_color:
+                        parts.append(f"主色为{main_color}")
+                    if parts:
+                        char_costume_notes.append(f"{row.name}（{'，'.join(parts)}）")
         adjacent_context = self._adjacent_context_text(prev_data, next_data)
         user_prompt = (
             f"项目画风：{current_project['style_prompt']}\n{visual_bible_brief(current_project)}"
             f"分镜：{json_dumps({key: current.get(key) for key in _SIGNATURE_FIELDS})}\n"
             f"当前参考绑定：{json_dumps(prompt_bindings)}"
+            + (
+                f"\n绑定角色服装锁定（描述人物时必须写清锁定的服装款式与主色，如「身穿...的...」）：\n{'；'.join(char_costume_notes)}"
+                if char_costume_notes
+                else ""
+            )
             + (
                 f"\n\n衔接信息（仅供连续性参考，不影响本镜内容）：\n{adjacent_context}"
                 if adjacent_context
@@ -4361,6 +5178,7 @@ class ShotService:
                         }
                     )
             except Exception as exc:
+                logger.exception("批量优化分镜 %s 视频提示词异常", item.get("id"))
                 failed += 1
                 failures.append(
                     {
@@ -4518,7 +5336,8 @@ class ShotService:
         """把单镜数据渲染成审校用的可读文本，字段与 shot_continuity.md 维度对应。"""
         lines = [
             f"景别/机位：{current.get('shot_type') or '未填'} / "
-            f"{current.get('camera_angle') or '未填'}",
+            f"{current.get('camera_angle') or '未填'} / "
+            f"{current.get('camera_move') or '未填'}",
             f"场景：{current.get('scene_name') or '未绑定'}",
             f"时长：{current.get('duration_sec')} 秒",
             f"action: {current.get('action') or ''}",
@@ -4552,6 +5371,14 @@ class ShotService:
         lines.append(f"expressions: {expressions or '（无）'}")
         lines.append(f"dialogue: {dialogue or '（无画面内对白）'}")
         lines.append(f"narration: {current.get('narration') or '（无）'}")
+        lines.append(
+            "video_prompt: "
+            + str(
+                current.get("video_prompt_override")
+                or current.get("video_prompt")
+                or "（无）"
+            )
+        )
         lines.append(f"持有道具: {'、'.join(current.get('prop_names', [])) or '（无绑定道具）'}")
         return "\n".join(lines)
 
@@ -4578,6 +5405,58 @@ class ShotService:
                 return candidate["id"]
         return None
 
+    async def _review_continuity_pair(
+        self,
+        provider: Any,
+        config: dict[str, Any],
+        params: dict[str, Any],
+        prev_s: dict[str, Any],
+        next_s: dict[str, Any],
+    ) -> dict[str, Any]:
+        same_scene_label = (
+            "是"
+            if prev_s.get("scene_asset_id") == next_s.get("scene_asset_id")
+            else "否（发生场景切换）"
+        )
+        output = await provider.generate_json(
+            system_prompt=load_prompt("shot_continuity"),
+            user_prompt=(
+                f"上一镜（第{prev_s.get('chapter_no')}章 镜{prev_s['shot_no']}）：\n"
+                f"{self._continuity_shot_brief(prev_s, is_previous=True)}\n\n"
+                f"下一镜（第{next_s.get('chapter_no')}章 镜{next_s['shot_no']}）：\n"
+                f"{self._continuity_shot_brief(next_s, is_previous=False)}\n\n"
+                f"两镜是否同场景：{same_scene_label}"
+                + (
+                    f"\n\n【跨章节衔接】上一镜属于第{prev_s.get('chapter_no')}章"
+                    f"「{prev_s.get('chapter_title') or ''}」，"
+                    f"下一镜属于第{next_s.get('chapter_no')}章"
+                    f"「{next_s.get('chapter_title') or ''}」。"
+                    "章节之间的时间与地点跳跃属于正常叙事切换，不要报为断层；"
+                    "只检查人物状态是否矛盾、关键道具是否无故消失。"
+                    if prev_s.get("chapter_id") != next_s.get("chapter_id")
+                    else ""
+                )
+            ),
+            schema=ShotContinuityPairOutput,
+            params={**config["params"], **params},
+        )
+        return output.model_dump(mode="json")
+
+    def _deterministic_saved_continuity_error(self, project_id: str) -> str:
+        """按章节复检已保存分镜的结构化相邻状态，不修改数据库。"""
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for current in self._shots_lightweight(project_id):
+            match = re.match(r"scene:(\d+)", str(current.get("source_ref") or ""))
+            payload = dict(current)
+            payload["scene_no"] = int(match.group(1)) if match else 0
+            grouped.setdefault(str(current.get("chapter_id") or ""), []).append(payload)
+        try:
+            for chapter_shots in grouped.values():
+                self._validate_extracted_continuity(chapter_shots, repair=False)
+        except ServiceError as exc:
+            return str(exc.detail)
+        return ""
+
     def queue_continuity_check(self, project_id: str, options: dict[str, Any]) -> dict[str, Any]:
         """入队连续性审校任务；progress_total 按分镜对数估算。"""
         current_project = self._project(project_id)
@@ -4596,9 +5475,11 @@ class ShotService:
                 "ids": options.get("ids") or [],
                 "apply_fixes": options.get("apply_fixes", True),
                 "insert_transitions": options.get("insert_transitions", False),
+                "require_pass": options.get("require_pass", True),
                 "params": options.get("params", {}),
             },
-            progress_total=max(1, shot_count - 1),
+            # 首轮审校 + 修正后复检，最多执行两遍相邻对。
+            progress_total=max(1, (shot_count - 1) * 2),
         )
 
     async def handle_continuity_check(self, job: dict[str, Any]) -> dict[str, Any]:
@@ -4609,6 +5490,7 @@ class ShotService:
         requested_ids = {str(item) for item in (input_data.get("ids") or [])}
         apply_fixes = bool(input_data.get("apply_fixes", True))
         insert_transitions = bool(input_data.get("insert_transitions", False))
+        require_pass = bool(input_data.get("require_pass", True))
         params = input_data.get("params", {})
         all_shots = self._shots_lightweight(project_id)
         if len(all_shots) < 2:
@@ -4617,7 +5499,10 @@ class ShotService:
                 "issues_found": 0,
                 "fixes_applied": 0,
                 "transitions_inserted": 0,
+                "remaining_issues": 0,
+                "passed": True,
                 "results": [],
+                "verification_results": [],
             }
         if requested_ids:
             pairs = [
@@ -4633,7 +5518,10 @@ class ShotService:
                 "issues_found": 0,
                 "fixes_applied": 0,
                 "transitions_inserted": 0,
+                "remaining_issues": 0,
+                "passed": True,
                 "results": [],
+                "verification_results": [],
             }
         provider, config = self.providers.resolve(
             kind="text",
@@ -4643,52 +5531,38 @@ class ShotService:
         raw_results: list[dict[str, Any]] = []
         for index, (prev_s, next_s) in enumerate(pairs, start=1):
             try:
-                same_scene_label = (
-                    "是"
-                    if prev_s.get("scene_asset_id") == next_s.get("scene_asset_id")
-                    else "否（发生场景切换）"
+                raw_results.append(
+                    await self._review_continuity_pair(
+                        provider,
+                        config,
+                        params,
+                        prev_s,
+                        next_s,
+                    )
                 )
-                output = await provider.generate_json(
-                    system_prompt=load_prompt("shot_continuity"),
-                    user_prompt=(
-                        f"上一镜（第{prev_s.get('chapter_no')}章 镜{prev_s['shot_no']}）：\n"
-                        f"{self._continuity_shot_brief(prev_s, is_previous=True)}\n\n"
-                        f"下一镜（第{next_s.get('chapter_no')}章 镜{next_s['shot_no']}）：\n"
-                        f"{self._continuity_shot_brief(next_s, is_previous=False)}\n\n"
-                        f"两镜是否同场景：{same_scene_label}"
-                        + (
-                            f"\n\n【跨章节衔接】上一镜属于第{prev_s.get('chapter_no')}章"
-                            f"「{prev_s.get('chapter_title') or ''}」，"
-                            f"下一镜属于第{next_s.get('chapter_no')}章"
-                            f"「{next_s.get('chapter_title') or ''}」。"
-                            "章节之间的时间与地点跳跃属于正常叙事切换，不要报为断层；"
-                            "只检查人物状态是否矛盾、关键道具是否无故消失。"
-                            if prev_s.get("chapter_id") != next_s.get("chapter_id")
-                            else ""
-                        )
-                    ),
-                    schema=ShotContinuityPairOutput,
-                    params={**config["params"], **params},
-                )
-                raw_results.append(output.model_dump(mode="json"))
             except Exception as exc:
+                err_msg = sanitize_error_message(exc)
                 raw_results.append(
                     {
                         "prev_shot_no": prev_s["shot_no"],
                         "next_shot_no": next_s["shot_no"],
-                        "is_continuous": True,
-                        "issues": [],
+                        "is_continuous": False,
+                        "issues": [f"模型连贯性审校异常：{err_msg}"],
                         "fixes": [],
                         "transition": None,
-                        "error": sanitize_error_message(exc),
+                        "error": err_msg,
                     }
                 )
             self.jobs.update_progress(
                 job["id"], index, len(pairs), message=f"审校 {index}/{len(pairs)} 对"
             )
-        # ── 第二轮：应用字段修正 ──────────────────────────────────────────
+        # ── 第二轮：应用字段修正（按分镜 target_id 聚合后单次更新，避免 revision 冲突）──
         total_fixes = 0
+        failed_fix_targets: list[str] = []
         if apply_fixes:
+            fixes_by_target: dict[str, dict[str, Any]] = {}
+            target_snapshots: dict[str, dict[str, Any]] = {}
+
             for (prev_s, next_s), pair_result in zip(
                 pairs,
                 raw_results,
@@ -4713,36 +5587,40 @@ class ShotService:
                         field,
                     )
                     if target_id:
-                        try:
-                            suggested = fix.get("suggested_value")
-                            # 过滤空值，避免把 None 写入 NOT NULL 列导致 IntegrityError。
-                            if suggested is None or suggested == "":
-                                continue
-                            # 用审校快照里的 revision 做乐观锁：并发编辑时跳过该条，
-                            # 避免模型修正静默覆盖用户的最新编辑。
-                            snapshot = (
-                                next(
-                                    (
-                                        item
-                                        for item in (prev_s, next_s)
-                                        if item["id"] == target_id
-                                    ),
-                                    None,
-                                )
-                            )
-                            expected_revision = (
-                                snapshot.get("revision") if snapshot is not None else None
-                            )
-                            self.update(
-                                target_id,
-                                {field: suggested},
-                                expected_revision=expected_revision,
-                            )
-                            total_fixes += 1
-                        except (ServiceError, Exception):  # noqa: BLE001
-                            pass  # 并发更新冲突或数据问题：跳过该条修正
+                        suggested = fix.get("suggested_value")
+                        # 过滤空值，避免把 None 写入 NOT NULL 列导致 IntegrityError。
+                        if suggested is None or suggested == "":
+                            continue
+                        snapshot = next(
+                            (
+                                item
+                                for item in (prev_s, next_s)
+                                if item["id"] == target_id
+                            ),
+                            None,
+                        )
+                        if snapshot is not None:
+                            target_snapshots.setdefault(target_id, snapshot)
+                        fixes_by_target.setdefault(target_id, {})[field] = suggested
+
+            for target_id, field_updates in fixes_by_target.items():
+                try:
+                    snapshot = target_snapshots.get(target_id)
+                    expected_revision = (
+                        snapshot.get("revision") if snapshot is not None else None
+                    )
+                    self.update(
+                        target_id,
+                        field_updates,
+                        expected_revision=expected_revision,
+                    )
+                    total_fixes += len(field_updates)
+                except (ServiceError, Exception) as exc:  # noqa: BLE001
+                    logger.warning("连续性修正应用失败（跳过分镜 %s）：%s", target_id, exc)
+                    failed_fix_targets.append(target_id)
         # ── 第三轮：逆序插入过渡镜（逆序防止后续镜顺移导致插入位置错误）──
         total_transitions = 0
+        failed_transition_pairs: list[str] = []
         if insert_transitions:
             pending = [
                 (prev_s, next_s, raw_results[i]["transition"])
@@ -4772,14 +5650,102 @@ class ShotService:
                         },
                     )
                     total_transitions += 1
-                except ServiceError:
-                    pass
+                except ServiceError as exc:
+                    logger.warning("过渡镜插入失败（跳过该项）：%s", exc)
+                    failed_transition_pairs.append(
+                        f"{prev_s['shot_no']}->{next_s['shot_no']}"
+                    )
+
+        # ── 第四轮：修正后复检。初审发现问题却没有任何可应用修正的镜对，
+        # 无论模型第二次是否改口都视为未闭环，防止越轴等问题被“任务完成”掩盖。
+        unaddressed_pairs = [
+            f"{prev_s['shot_no']}->{next_s['shot_no']}"
+            for (prev_s, next_s), result in zip(pairs, raw_results, strict=True)
+            if result.get("issues")
+            and not result.get("fixes")
+            and not (insert_transitions and result.get("transition"))
+        ]
+        verification_results: list[dict[str, Any]] = []
+        verification_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        if any(result.get("issues") or result.get("error") for result in raw_results):
+            updated_shots = self._shots_lightweight(project_id)
+            if requested_ids:
+                verification_pairs = [
+                    (updated_shots[i], updated_shots[i + 1])
+                    for i in range(len(updated_shots) - 1)
+                    if updated_shots[i]["id"] in requested_ids
+                    or updated_shots[i + 1]["id"] in requested_ids
+                ]
+            else:
+                verification_pairs = list(
+                    zip(updated_shots[:-1], updated_shots[1:], strict=True)
+                )
+            progress_total = len(pairs) + len(verification_pairs)
+            for offset, (prev_s, next_s) in enumerate(verification_pairs, start=1):
+                try:
+                    verification_results.append(
+                        await self._review_continuity_pair(
+                            provider,
+                            config,
+                            params,
+                            prev_s,
+                            next_s,
+                        )
+                    )
+                except Exception as exc:
+                    err_msg = sanitize_error_message(exc)
+                    verification_results.append(
+                        {
+                            "prev_shot_no": prev_s["shot_no"],
+                            "next_shot_no": next_s["shot_no"],
+                            "is_continuous": False,
+                            "issues": [f"模型连贯性复检异常：{err_msg}"],
+                            "fixes": [],
+                            "transition": None,
+                            "error": err_msg,
+                        }
+                    )
+                self.jobs.update_progress(
+                    job["id"],
+                    len(pairs) + offset,
+                    progress_total,
+                    message=f"复检 {offset}/{len(verification_pairs)} 对",
+                )
+
+        final_results = verification_results or raw_results
+        remaining_issues = sum(len(item.get("issues", [])) for item in final_results)
+        deterministic_error = self._deterministic_saved_continuity_error(project_id)
+        passed = not any(
+            (
+                remaining_issues,
+                unaddressed_pairs,
+                failed_fix_targets,
+                failed_transition_pairs,
+                deterministic_error,
+            )
+        )
+        if require_pass and not passed:
+            details: list[str] = []
+            if remaining_issues:
+                details.append(f"复检仍有 {remaining_issues} 条问题")
+            if unaddressed_pairs:
+                details.append("无可应用修正的镜对：" + "、".join(unaddressed_pairs))
+            if failed_fix_targets:
+                details.append("修正写回失败：" + "、".join(failed_fix_targets))
+            if failed_transition_pairs:
+                details.append("过渡镜插入失败：" + "、".join(failed_transition_pairs))
+            if deterministic_error:
+                details.append("结构复检失败：" + deterministic_error)
+            raise conflict("剧情连续性未通过生产门禁：" + "；".join(details))
         return {
             "total_pairs": len(pairs),
             "issues_found": sum(len(r.get("issues", [])) for r in raw_results),
             "fixes_applied": total_fixes,
             "transitions_inserted": total_transitions,
+            "remaining_issues": remaining_issues,
+            "passed": passed,
             "results": raw_results,
+            "verification_results": verification_results,
         }
 
     _REFINE_SEPARATOR = "\n\n===分镜分隔===\n\n"

@@ -88,6 +88,17 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("APP_IMGBB_API_KEY", "IMGBB_API_KEY"),
     )
+    # Provider base_url 默认拒绝内网/回环/保留地址（SSRF：无鉴权 API 下
+    # base_url 可被当作内网探测原语）。需要接本地 Provider（Ollama / ComfyUI /
+    # 本地网关）时显式置 1 放行；仅影响 Provider base_url，不影响下载路径的
+    # 私网拦截（后者防的是 Provider 返回的 result_url）。
+    provider_allow_private_hosts: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "APP_PROVIDER_ALLOW_PRIVATE_HOSTS",
+            "PROVIDER_ALLOW_PRIVATE_HOSTS",
+        ),
+    )
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

@@ -156,6 +156,46 @@ def test_gpt_image_2_generation_params_use_stable_size_for_generic_provider(
     assert queued["input_data"]["params"]["size"] == expected_size
 
 
+def test_gpt_image_derivative_model_generation_params_use_stable_size(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """渠道衍生模型名（如 gpt-image-2.5-sunburst）同样注入尺寸档位。"""
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            object(),
+            {
+                "id": "mock-image",
+                "model": "gpt-image-2.5-sunburst",
+                "base_url": "https://us-api.x5m5x.com/v1",
+                "params": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(jobs, "create", lambda **kwargs: kwargs)
+
+    current = AssetService(database, jobs).create(
+        project["id"],
+        {
+            "asset_type": "character",
+            "name": "衍生模型角色素材",
+            "prompt": "设定图",
+        },
+    )
+    queued = media.queue_asset_image(
+        current["id"],
+        {"params": {"size": "1024x1024"}},
+    )
+
+    assert queued["input_data"]["params"]["size"] == "1536x1024"
+
+
 def test_free_create_asset_image_uses_raw_user_prompt(
     media_job_services: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -433,6 +473,31 @@ def test_asset_image_queue_with_visual_profile_without_prompt_is_allowed(
     queued = media.queue_asset_image(current["id"], {})
 
     assert queued["target_type"] == "asset_image"
+
+
+def test_asset_image_queue_when_job_creation_fails_leaves_no_orphan_version(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    media = media_job_services["media"]
+    project = media_job_services["project"]
+    current = AssetService(database, jobs).create(
+        project["id"],
+        {"asset_type": "character", "name": "孤立版本角色", "prompt": "设定图"},
+    )
+
+    def fail_create(**_kwargs: Any) -> Any:
+        raise RuntimeError("建 Job 失败")
+
+    monkeypatch.setattr(jobs, "create", fail_create)
+
+    with pytest.raises(RuntimeError):
+        media.queue_asset_image(current["id"], {})
+
+    # 版本行与 Job 分属两个事务；建 Job 失败必须补偿删除刚插入的 queued 版本行。
+    assert media.list_asset_images(current["id"]) == []
 
 
 def test_keyframe_queue_without_explicit_image_prompt_returns_bad_request(
@@ -934,7 +999,13 @@ def test_asset_image_upload_with_occupied_target_keeps_existing_file(
         media.upload_asset_image(current_asset["id"], "new.png", "image/png", _PNG)
 
     assert occupied.read_bytes() == b"existing"
-    assert media.list_asset_images(current_asset["id"]) == []
+    # 上传失败与生成失败语义一致：保留版本记录并标 failed（不删行、不占用 current、
+    # 不留下 file_path），而不是静默删除版本。
+    versions = media.list_asset_images(current_asset["id"])
+    assert len(versions) == 1
+    assert versions[0]["status"] == "failed"
+    assert versions[0]["is_current"] is False
+    assert versions[0]["file_path"] is None
 
 
 def test_uploaded_video_uses_saved_final_prompt_override(
@@ -3276,3 +3347,101 @@ def test_quality_fix_does_not_write_after_job_is_cancelled(
     asyncio.run(shot_service.handle_quality_fix(record))
 
     assert updates == []
+
+
+def _empty_scene_shot(media_job_services: dict[str, Any]) -> dict[str, Any]:
+    """只绑定场景（fixture 已上传场景图）的空镜，用于媒体任务重放测试。"""
+    database = media_job_services["database"]
+    jobs = media_job_services["jobs"]
+    return ShotService(database, jobs).create(
+        media_job_services["chapter"]["id"],
+        _shot_create(
+            scene_asset_id=media_job_services["scene"]["id"],
+            action="山门空镜",
+            image_prompt="山门石阶全景。",
+        ).model_dump(),
+    )
+
+
+def _patch_counting_image_provider(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[int]:
+    """替换图片 Provider 为计数假实现，返回 [提交次数] 便于断言未重复付费。"""
+    runner = media_job_services["runner"]
+    media = media_job_services["media"]
+    submissions = [0]
+
+    class FakeImageProvider:
+        async def submit(self, **_kwargs: Any) -> ProviderSubmission:
+            submissions[0] += 1
+            return ProviderSubmission(
+                status="completed",
+                result={"content_base64": base64.b64encode(_PNG).decode("ascii")},
+            )
+
+    monkeypatch.setattr(runner, "enqueue", lambda _job_id: False)
+    monkeypatch.setattr(
+        media.providers,
+        "resolve",
+        lambda **_kwargs: (
+            FakeImageProvider(),
+            {
+                "id": "mock-image",
+                "model": "gpt-image-2",
+                "params": {},
+                "timeout_sec": 60,
+            },
+        ),
+    )
+    return submissions
+
+
+def test_replayed_keyframe_job_does_not_resubmit_completed_version(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重放已完成的关键帧任务：不得二次提交 Provider，按幂等成功返回既有产物。"""
+    repository = media_job_services["repository"]
+    media = media_job_services["media"]
+    shot = _empty_scene_shot(media_job_services)
+    submissions = _patch_counting_image_provider(media_job_services, monkeypatch)
+
+    queued = media.queue_keyframe(shot["id"], {})
+    first = asyncio.run(media.handle_keyframe(repository.require(queued["id"])))
+    assert submissions == [1]
+
+    # 模拟重放：Job 被恢复/重试机制打回 queued，但媒体版本已经 completed。
+    repository.set_status(queued["id"], "queued")
+    second = asyncio.run(media.handle_keyframe(repository.require(queued["id"])))
+
+    assert submissions == [1]
+    assert second["version_id"] == first["version_id"]
+    assert second["file_path"] == first["file_path"]
+
+
+def test_replayed_keyframe_job_rejects_version_in_failed_terminal_state(
+    media_job_services: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """版本停在 failed 终态时重放必须明确拒绝，既不重复提交也不静默当成功。"""
+    database = media_job_services["database"]
+    repository = media_job_services["repository"]
+    media = media_job_services["media"]
+    shot = _empty_scene_shot(media_job_services)
+    submissions = _patch_counting_image_provider(media_job_services, monkeypatch)
+
+    queued = media.queue_keyframe(shot["id"], {})
+    with database.engine.begin() as connection:
+        connection.execute(
+            update(keyframe_version)
+            .where(keyframe_version.c.id == queued["target_id"])
+            .values(status="failed", error="上一次生成失败")
+        )
+
+    with pytest.raises(ServiceError) as exc_info:
+        asyncio.run(media.handle_keyframe(repository.require(queued["id"])))
+
+    assert exc_info.value.status_code == 409
+    assert "拒绝重复提交" in str(exc_info.value)
+    assert submissions == [0]

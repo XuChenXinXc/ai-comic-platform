@@ -47,12 +47,15 @@ def _screenplay_content() -> dict[str, Any]:
                 "scene_name": "青云山巅",
                 "time_weather": "清晨，晴",
                 "characters": ["少年"],
+                "props": [],
+                "source_refs": ["P001"],
                 "objective": "做出下山决定",
                 "action": "少年在山巅远望后转身。",
                 "dialogue": [],
                 "narration": [],
                 "emotion": "坚定",
                 "transition_to_next": "切到山门。",
+                "target_duration_sec": 15,
             }
         ],
     }
@@ -63,9 +66,10 @@ def _extracted_shot(scene_asset_id: str) -> dict[str, Any]:
         "shot_no": 1,
         "scene_no": 1,
         "source_ref": "决心下山",
+        "coverage_refs": ["S1:O01", "S1:A01", "S1:T01"],
         "scene_name": "青云山巅",
         "scene_asset_id": scene_asset_id,
-        "character_names": [],
+        "character_names": ["少年"],
         "character_asset_ids": [],
         "prop_names": [],
         "prop_asset_ids": [],
@@ -83,7 +87,7 @@ def _extracted_shot(scene_asset_id: str) -> dict[str, Any]:
         "next_hook": "准备迈步。",
         "frame_description": "少年站在山巅。",
         "image_prompt": "少年转身前的稳定首帧。",
-        "video_prompt": "0-3秒：少年转身并停稳。",
+        "video_prompt": "0-5秒：少年转身并停稳。",
         "negative_prompt": "身份漂移，场景变化。",
     }
 
@@ -101,7 +105,7 @@ def storyboard_services(
     )
     WritingService(database).update_screenplay(
         chapter["id"],
-        {"content": _screenplay_content()},
+        {"content": _screenplay_content(), "status": "confirmed"},
     )
     jobs = RecordingJobService()
     service = ShotService(database, jobs=jobs)  # type: ignore[arg-type]
@@ -117,6 +121,10 @@ def test_extract_queue_with_legacy_novel_source_uses_screenplay(
         chapter["project_id"],
         {"asset_type": "scene", "name": "青云山巅"},
     )
+    AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "character", "name": "少年"},
+    )
 
     service.queue_extract(
         chapter["id"],
@@ -129,7 +137,11 @@ def test_extract_queue_with_legacy_novel_source_uses_screenplay(
 def test_extract_queue_without_scene_assets_returns_conflict(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    _database, service, _jobs, chapter = storyboard_services
+    database, service, _jobs, chapter = storyboard_services
+    AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "character", "name": "少年"},
+    )
 
     with pytest.raises(ServiceError) as exc_info:
         service.queue_extract(
@@ -138,7 +150,58 @@ def test_extract_queue_without_scene_assets_returns_conflict(
         )
 
     assert exc_info.value.status_code == 409
-    assert exc_info.value.detail == "请先提取场景素材，再提取分镜"
+    assert "缺少 scene「青云山巅」" in exc_info.value.detail
+
+
+def test_extract_queue_allows_cross_scene_reference_after_core_prop_is_bound(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+) -> None:
+    """照片中提及其它地点只告警；确认剧本关键物品必须先完成绑定。"""
+    database, service, jobs, chapter = storyboard_services
+    assets = AssetService(database)
+    assets.create(chapter["project_id"], {"asset_type": "scene", "name": "青云山巅"})
+    assets.create(
+        chapter["project_id"],
+        {
+            "asset_type": "scene",
+            "name": "青云镇口牌坊",
+            "profile": {"aliases": ["青云镇口"]},
+        },
+    )
+    assets.create(chapter["project_id"], {"asset_type": "character", "name": "少年"})
+    assets.create(chapter["project_id"], {"asset_type": "prop", "name": "父亲笔记"})
+    WritingService(database).update_screenplay(
+        chapter["id"],
+        {
+            "content": {
+                "title": "下山",
+                "logline": "少年决定离开师门。",
+                "scenes": [
+                    {
+                        "scene_no": 1,
+                        "scene_name": "青云山巅",
+                        "time_weather": "清晨，晴",
+                        "characters": ["少年"],
+                        # 确认剧本中的关键物品已经在素材库绑定
+                        "props": ["父亲笔记"],
+                        "objective": "做出下山决定",
+                        # action 提到另一个场景素材名（此处是照片内容），只提示不阻断
+                        "action": "少年看着照片里的青云镇口，随后转身。",
+                        "dialogue": [],
+                        "narration": [],
+                        "emotion": "坚定",
+                        "transition_to_next": "切到山门。",
+                    }
+                ],
+            },
+            "status": "confirmed",
+        },
+    )
+
+    result = service.queue_extract(chapter["id"], {"scope": "all"})
+
+    assert result["job_type"] == "extract_shots"
+    assert jobs.created["job_type"] == "extract_shots"
 
 
 def test_extract_shots_with_catalog_asset_id_binds_scene(
@@ -186,17 +249,25 @@ def test_extract_shots_with_catalog_asset_id_binds_scene(
     asyncio.run(service.handle_extract(job))
 
     shots = service.list(chapter["id"])
-    assert scene["id"] in captured["user_prompt"]
+    assert scene["id"] not in captured["user_prompt"]
+    assert "不含数据库 ID" in captured["user_prompt"]
     assert "青云山巅" in captured["user_prompt"]
     assert shots[0]["scene_asset_id"] == scene["id"]
     assert shots[0]["source_type"] == "screenplay"
     assert shots[0]["duration_sec"] == 5
 
 
-def test_extract_shots_uses_one_full_chapter_request_for_multiple_scenes(
+def test_extract_shots_batches_multi_scene_chapter_per_scene(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """整章多场提取按场次分批调用，单次只输出本场分镜。
+
+    回归 2026-09 缺陷：整章一次要求返回全部分镜时，推理模型的思维链与正文
+    共享同一个单次输出预算（DeepSeek 为 64K），会触发 finish_reason=length
+    且正文为空（思维链吃满预算时不吐任何正文），整批提取必然失败；按场分批
+    后单次输出量可控。
+    """
     database, service, _jobs, chapter = storyboard_services
     scene = AssetService(database).create(
         chapter["project_id"],
@@ -214,21 +285,21 @@ def test_extract_shots_uses_one_full_chapter_request_for_multiple_scenes(
     WritingService(database).update_screenplay(chapter["id"], {"content": content})
     captured: list[str] = []
 
-    class FullChapterProvider:
+    class PerSceneProvider:
         async def generate_json(self, **values: Any) -> ExtractionOutput:
-            captured.append(str(values["user_prompt"]))
-            first = _extracted_shot(scene["id"])
-            second = _extracted_shot(scene["id"])
-            second["shot_no"] = 2
-            second["scene_no"] = 2
-            second["scene_name"] = "青云山巅"
-            return ExtractionOutput([first, second])
+            prompt = str(values["user_prompt"])
+            captured.append(prompt)
+            scene_no = 1 if "目标场次：1" in prompt else 2
+            shot = _extracted_shot(scene["id"])
+            shot["scene_no"] = scene_no
+            shot["scene_name"] = "青云山巅"
+            return ExtractionOutput([shot])
 
     monkeypatch.setattr(
         service.providers,
         "resolve",
         lambda **_kwargs: (
-            FullChapterProvider(),
+            PerSceneProvider(),
             {"id": "mock-text", "params": {}},
         ),
     )
@@ -249,11 +320,18 @@ def test_extract_shots_uses_one_full_chapter_request_for_multiple_scenes(
     result = asyncio.run(service.handle_extract(job))
     shots = service.list(chapter["id"])
 
-    assert len(captured) == 1
-    assert "范围：全部剧本场次" in captured[0]
+    # 每个场次一次请求，且单次请求只携带本场剧本（预算表只列本场）
+    assert len(captured) == 2
+    assert "目标场次：1" in captured[0]
+    assert "- 场次 1：" in captured[0]
+    assert "- 场次 2：" not in captured[0]
+    assert "目标场次：2" in captured[1]
+    assert "- 场次 2：" in captured[1]
     assert "来源内容" in captured[0]
-    # 整章模式必须携带每场分镜数量预算表（镜头密度治理的预测闸门）
-    assert "每场分镜数量预算表" in captured[0]
+    # 第二场起携带上一场衔接信息，保证跨场镜头连续
+    assert "上一场衔接信息" in captured[1]
+    # 每次请求都必须携带本场分镜数量预算表（镜头密度治理的预测闸门）
+    assert all("每场分镜数量预算表" in item for item in captured)
     assert len(shots) == 2
     assert {item["scene_no"] for item in shots} == {1, 2}
     assert result["count"] == 2
@@ -331,6 +409,94 @@ def test_extract_retries_with_merge_instruction_when_scene_density_rejected(
     assert len(service.list(chapter["id"])) == 3
 
 
+def test_extract_saves_dialogue_heavy_scene_with_relaxed_density_limit(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回归 2026-09 缺陷：65 秒预算装不下 256 字对白时不再中止保存。
+
+    模型按剧本如实返回 10 个对白镜头，长台词拆镜后由自动合并压回上限内；
+    门禁不能再按 7 镜硬拒（模型物理上做不到），而应放行并给出剧本时长偏短
+    的警告，且台词一字不丢。
+    """
+    database, service, _jobs, chapter = storyboard_services
+    scene_asset = AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "scene", "name": "小半咖啡店"},
+    )
+    screenplay_scene = {**_dialogue_heavy_scene(), "scene_no": 1}
+    WritingService(database).update_screenplay(
+        chapter["id"],
+        {
+            "content": {
+                "title": "预警",
+                "logline": "陌生号码的精准预警。",
+                "scenes": [screenplay_scene],
+            }
+        },
+    )
+
+    class DialogueDenseProvider:
+        async def generate_json(self, **_values: Any) -> ExtractionOutput:
+            shots = []
+            for index, line in enumerate(screenplay_scene["dialogue"], start=1):
+                item = _extracted_shot(scene_asset["id"])
+                item.update(
+                    {
+                        "shot_no": index,
+                        "scene_no": 7,
+                        "scene_name": "小半咖啡店",
+                        "duration_sec": 15,
+                        "transition_from_prev": (
+                            "scene_change" if index == 1 else "same_scene_cut"
+                        ),
+                        "action": f"{line['speaker']}开口回应",
+                        "dialogue": [line],
+                    }
+                )
+                shots.append(item)
+            return ExtractionOutput(shots)
+
+    monkeypatch.setattr(
+        service.providers,
+        "resolve",
+        lambda **_kwargs: (
+            DialogueDenseProvider(),
+            {"id": "mock-text", "params": {}},
+        ),
+    )
+    job = {
+        "project_id": chapter["project_id"],
+        "chapter_id": chapter["id"],
+        "provider_id": "mock-text",
+        "input_json": json_dumps(
+            {
+                "source_type": "screenplay",
+                "scope": "all",
+                "scene_no": None,
+                "params": {},
+            }
+        ),
+    }
+
+    result = asyncio.run(service.handle_extract(job))
+    saved = service.list(chapter["id"])
+
+    assert result["count"] == len(saved)
+    assert 7 <= len(saved) <= 10
+    # 台词逐字保留：拆镜产生的新条目拼接后必须与剧本原文完全一致
+    saved_text = "".join(
+        str(line.get("text") or "")
+        for item in saved
+        for line in (item.get("dialogue") or [])
+    )
+    assert saved_text == "".join(line["text"] for line in screenplay_scene["dialogue"])
+    assert any(
+        "上限已按对白容量放宽" in str(item.get("message") or "")
+        for item in result["warnings"]
+    )
+
+
 def test_scene_density_correction_note_includes_dialogue_grouping() -> None:
     """修正指令必须给出可直接执行的对白分组，而不是只喊合并口号。"""
     scene = {
@@ -399,9 +565,10 @@ def test_dialogue_grouping_splits_overlong_line_and_counts_effective_shots() -> 
     assert "不得超过 5 个" in note
 
 
-def test_dialogue_grouping_reports_script_conflict_when_over_budget() -> None:
-    # 三条 40 字台词各需拆为 2 镜，共 6 镜 > 30 秒预算上限 4：应直接报告
-    # 剧本问题，而不是给出不可执行的分组方案。
+def test_dialogue_grouping_uses_dialogue_capacity_when_budget_too_short() -> None:
+    # 三条 40 字台词各需拆为 2 镜，共 6 镜；30 秒预算的 4 镜上限低于这个物理
+    # 下限。容量优先于预算：建议必须给出放宽后的 6 镜可执行方案，而不是要求
+    # 精简或压缩台词。
     scene = {
         "scene_no": 1,
         "target_duration_sec": 30,
@@ -411,12 +578,102 @@ def test_dialogue_grouping_reports_script_conflict_when_over_budget() -> None:
             {"speaker": "丙", "text": "字" * 40},
         ],
     }
-    detail = "场次 1 返回 8 个分镜，超过本场 30 秒预算允许的 4 个"
+    detail = "场次 1 返回 8 个分镜，超过本场 30 秒预算允许的 6 个"
 
     note = ShotService._dialogue_grouping_suggestions(detail, [scene])[0]
 
-    assert "至少需要 6 个对白镜头" in note
-    assert "请检查剧本场次时长或精简对白" in note
+    assert "合并为 6 个纯对白镜头" in note
+    assert "自动拆为2镜" in note
+    # 对白已占满放宽后的上限：动作必须并入对白镜头，不得单独成镜
+    assert "必须并入上述对白镜头" in note
+    assert "不得超过 6 个" in note
+
+
+def _dialogue_heavy_scene() -> dict[str, Any]:
+    """复刻用户报错的剧本场次：65 秒声明预算，却写了 10 条 256 字对白。"""
+    return {
+        "scene_no": 7,
+        "scene_name": "小半咖啡店",
+        "time_weather": "夜晚十一点，店内灯光昏暗",
+        "characters": ["宋玫", "陆深"],
+        "objective": "陆深坦白预警的来源，把悬疑揭成一个人长期的注视。",
+        "action": "陆深推门进来，把鞋整齐塞进鞋柜，开始做咖啡，动作比平时更慢。",
+        "narration": [],
+        "emotion": "震动、心软与警惕交织",
+        "transition_to_next": "宋玫手里的咖啡已经凉了。",
+        "target_duration_sec": 65,
+        "dialogue": [
+            {"speaker": "陆深", "text": "您要坐到几点？"},
+            {"speaker": "宋玫", "text": "坐到你下班。"},
+            {"speaker": "宋玫", "text": "你每天都给我发消息，你怎么知道我每天会做什么？"},
+            {"speaker": "陆深", "text": "我不知道。我猜的。"},
+            {"speaker": "宋玫", "text": "猜这么准？"},
+            {
+                "speaker": "陆深",
+                "text": (
+                    "我没猜准过。看见物业在换合页，我才让您别走东门；看了天气预报，"
+                    "才让您带伞；您上周三三点二十在茶水间门口打翻过一杯美式，"
+                    "您同事发了朋友圈。"
+                ),
+            },
+            {"speaker": "宋玫", "text": "你怎么有我同事的微信？"},
+            {
+                "speaker": "陆深",
+                "text": (
+                    "我没有。我有个学生在您公司实习，叫周一。她把我加进你们公司的群，"
+                    "我只看过，没说过话。我没在您手机里装任何东西，也没监听您。"
+                ),
+            },
+            {"speaker": "宋玫", "text": "那你为什么——"},
+            {
+                "speaker": "陆深",
+                "text": (
+                    "您三个月前在这家店丢过一张便签。上面写“门口有免费 WiFi 信号”——"
+                    "那个“信”字，您写错了。我捡起来了，一直留着。"
+                ),
+            },
+        ],
+    }
+
+
+def test_scene_density_relaxes_limit_to_dialogue_capacity() -> None:
+    """回归 2026-09 缺陷：65 秒预算装不下 256 字对白时按对白容量放宽上限。
+
+    门禁曾按 7 镜硬拒，而 10 条对白在单镜 15 秒/37 字上限下最少需要 10 个
+    对白镜头（不切分台词也需 9-10 镜），模型无论如何都做不到 7 镜，任务必然
+    失败。修复后应放行并提示剧本声明的时长偏短。
+    """
+    scene = _dialogue_heavy_scene()
+    shots = [{"scene_no": 7} for _ in range(10)]
+
+    assert ShotService._dialogue_shot_floor(scene) == 10
+    assert ShotService._scene_shot_upper_limit(scene) == 10
+
+    warnings = ShotService._validate_scene_shot_density([scene], shots)
+
+    assert len(warnings) == 1
+    assert warnings[0]["scene_no"] == 7
+    assert "上限已按对白容量放宽到 10 个" in warnings[0]["message"]
+
+    # 无对白场次不受影响：上限仍由预算决定
+    plain = [{"scene_no": 1, "duration_sec": 30}]
+    assert ShotService._validate_scene_shot_density(
+        plain, [{"scene_no": 1} for _ in range(4)]
+    ) == []
+
+    # 真正失控（超过对白容量下限）的分镜仍要拒绝保存
+    with pytest.raises(ServiceError, match="超过本场 65 秒预算允许的 10 个"):
+        ShotService._validate_scene_shot_density(
+            [scene], [{"scene_no": 7} for _ in range(11)]
+        )
+
+
+def test_shot_budget_table_notes_relaxed_limit_for_dialogue_heavy_scene() -> None:
+    """预算表必须把放宽后的上限交给模型，否则模型仍会为凑 7 镜压缩台词。"""
+    table = ShotService._build_shot_budget_table([_dialogue_heavy_scene()])
+
+    assert "- 场次 7：本场预估约 65 秒 → 分镜数量不得超过 10 个" in table
+    assert "容量优先于预算，上限已按对白容量放宽" in table
 
 
 def test_scene_density_rejects_excessive_shots_before_save() -> None:
@@ -553,7 +810,7 @@ def test_auto_merge_combines_adjacent_continuous_shots() -> None:
     # 站位同角色取后镜状态，新增角色保留
     positions = {item["character"]: item for item in merged_shot["positions"]}
     assert positions["林舟"]["position"] == "画面左侧"
-    assert positions["苏晴"]["position"] == "画面右侧"
+    assert positions["苏晴"]["position"].startswith("画面右侧")
 
 
 def test_auto_merge_skips_non_continuous_transitions_and_capacity_overflow() -> None:
@@ -569,7 +826,7 @@ def test_auto_merge_skips_non_continuous_transitions_and_capacity_overflow() -> 
     assert len(merged) == 3
     assert notes == []
 
-    # 合并后总时长超过单镜上限时压到 15 秒；跨场的 continuous 不合并
+    # 合并后总时长超过单镜上限时不再压缩动作；跨场的 continuous 也不合并
     overflow = [
         {"scene_no": 1, "duration_sec": 9, "transition_from_prev": "scene_change", "dialogue": []},
         {"scene_no": 1, "duration_sec": 9, "transition_from_prev": "continuous", "dialogue": []},
@@ -582,10 +839,10 @@ def test_auto_merge_skips_non_continuous_transitions_and_capacity_overflow() -> 
         },
     ]
     merged, notes = ShotService._auto_merge_dense_shots(overflow)
-    assert len(merged) == 3
-    assert len(notes) == 1
-    assert merged[0]["duration_sec"] == 15
-    assert [item["scene_no"] for item in merged] == [1, 1, 2]
+    assert len(merged) == 4
+    assert notes == []
+    assert merged[0]["duration_sec"] == 9
+    assert [item["scene_no"] for item in merged] == [1, 1, 1, 2]
 
 
 def _dense_shot(
@@ -688,9 +945,9 @@ def test_auto_merge_skips_pair_when_compressed_capacity_insufficient() -> None:
     assert [len(item["dialogue"]) for item in merged] == [1, 1, 0, 0]
 
 
-def test_auto_merge_stretches_duration_to_carry_merged_dialogue() -> None:
-    # 模型常把薄台词镜头标成 5 秒：合并后对白在两镜总时长内装不下，但拉伸到
-    # 单镜上限以内即可承载。合并应允许拉伸而不是直接放弃该对。
+def test_auto_merge_does_not_merge_dialogue_cut_with_body_action() -> None:
+    # same_scene_cut 的后一镜包含抬头/看向身体动作，代表独立反应机位；
+    # 即使对白容量允许，也不得把它机械并入前一镜。
     scenes = [{"scene_no": 1, "duration_sec": 30}]
     shots = [
         _dense_shot(
@@ -714,15 +971,14 @@ def test_auto_merge_stretches_duration_to_carry_merged_dialogue() -> None:
 
     merged, notes = ShotService._auto_merge_dense_shots(shots, scenes=scenes)
 
-    # 合并后动作含动作动词（抬头/看向）按 1.6 字/秒，17 字台词需要 11 秒，
-    # 超过两镜总时长 10 秒但未超 15 秒单镜上限：应拉伸合并而非放弃。
+    # 前两镜（纯对白 + 身体动作反应机位）保持独立，只把后面的纯对白同机位压回上限。
     assert len(merged) == 4
     assert len(notes) == 1
-    assert merged[0]["duration_sec"] == 11
-    assert [item["speaker"] for item in merged[0]["dialogue"]] == ["林织", "男人"]
-    # 时间轴按 11 秒目标重排：两段都保留且末段落在 11 秒
-    assert "0-5.5秒" in merged[0]["video_prompt"]
-    assert "5.5-11秒" in merged[0]["video_prompt"]
+    assert merged[0]["duration_sec"] == 5
+    assert merged[1]["duration_sec"] == 5
+    assert [item["speaker"] for item in merged[0]["dialogue"]] == ["林织"]
+    assert [item["speaker"] for item in merged[1]["dialogue"]] == ["男人"]
+    assert merged[1]["action"] == "男人抬头看向她"
     assert all(5 <= item["duration_sec"] <= 15 for item in merged)
 
 
@@ -1387,12 +1643,12 @@ def test_extract_shots_with_unmatched_scene_raises_but_unmatched_prop_name_only_
     assert service.list(chapter["id"]) == []
 
 
-def test_resolve_scene_name_matches_suffix_variant(
+def test_resolve_scene_name_rejects_unregistered_suffix_variant(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    """方位修饰后缀变体：剧本「公司电梯内」应绑定素材「公司电梯」。"""
+    """场景空间修饰可能改变地点语义，未登记为别名时不得模糊绑定。"""
     database, service, _jobs, chapter = storyboard_services
-    scene = AssetService(database).create(
+    AssetService(database).create(
         chapter["project_id"],
         {"asset_type": "scene", "name": "公司电梯"},
     )
@@ -1400,22 +1656,22 @@ def test_resolve_scene_name_matches_suffix_variant(
 
     resolved = service._resolve_asset_name(lookup, "公司电梯内")
 
-    assert resolved == scene["id"]
+    assert resolved is None
 
 
-def test_resolve_scene_name_matches_containment_for_merged_asset(
+def test_resolve_scene_name_rejects_containment_without_explicit_alias(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    """合并素材：剧本「苏棠家客厅」应绑定合并素材「苏棠家客厅及厨房」。"""
+    """不同视觉空间不能仅凭子串包含关系共用同一场景素材。"""
     database, service, _jobs, chapter = storyboard_services
-    scene = AssetService(database).create(
+    AssetService(database).create(
         chapter["project_id"],
         {"asset_type": "scene", "name": "苏棠家客厅及厨房"},
     )
     lookup = service._asset_lookup(chapter["project_id"])["scene"]
 
-    assert service._resolve_asset_name(lookup, "苏棠家客厅") == scene["id"]
-    assert service._resolve_asset_name(lookup, "苏棠家厨房") == scene["id"]
+    assert service._resolve_asset_name(lookup, "苏棠家客厅") is None
+    assert service._resolve_asset_name(lookup, "苏棠家厨房") is None
 
 
 def test_resolve_scene_name_requires_unique_candidate(
@@ -1542,10 +1798,10 @@ def test_extract_shots_rejects_unresolvable_prop_id_but_allows_missing_name(
 def test_extract_shot_binds_by_scene_id_even_when_name_differs(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    """绑定以 scene_asset_id 为准：模型给出的 ID 合法时直接采用，
-    名称只是展示字段，名称与素材不一致不再报错（新绑定协议）。"""
+    """双向校验 ID 与名称：当模型给出的 ID 与剧本场景名冲突时，
+    优先以语义名称解析为准纠正 ID 幻觉。"""
     database, service, _jobs, chapter = storyboard_services
-    AssetService(database).create(
+    scene = AssetService(database).create(
         chapter["project_id"],
         {"asset_type": "scene", "name": "青云山巅"},
     )
@@ -1564,20 +1820,19 @@ def test_extract_shot_binds_by_scene_id_even_when_name_differs(
 
     assert result["count"] == 1
     saved = service.list(chapter["id"])
-    assert saved[0]["scene_asset_id"] == wrong_scene["id"]
+    assert saved[0]["scene_asset_id"] == scene["id"]
 
 
 def test_extract_shot_binds_by_character_id_even_when_name_differs(
     storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
 ) -> None:
-    """角色绑定以 character_asset_ids 为准，名称与 ID 不一致不再报错：
-    名称只作展示与兜底，ID 必须指向目录中真实素材。"""
+    """角色双向校验：当模型给出的角色 ID 与角色名严重冲突时，优先保证角色名对应的真实素材绑定。"""
     database, service, _jobs, chapter = storyboard_services
     scene = AssetService(database).create(
         chapter["project_id"],
         {"asset_type": "scene", "name": "青云山巅"},
     )
-    AssetService(database).create(
+    character = AssetService(database).create(
         chapter["project_id"],
         {"asset_type": "character", "name": "少年"},
     )
@@ -1598,7 +1853,90 @@ def test_extract_shot_binds_by_character_id_even_when_name_differs(
 
     assert result["count"] == 1
     saved = service.list(chapter["id"])
-    assert saved[0]["character_ids"] == [wrong_character["id"]]
+    assert saved[0]["character_ids"] == [character["id"]]
+
+
+def test_extract_shot_repairs_truncated_character_asset_id(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+) -> None:
+    """模型抄坏角色素材 ID（截断/改字符）时，按目录唯一相近 ID 修复绑定。
+
+    回归 2026-09 缺陷：模型把 asset_...c3842734 抄成 asset_...c382ff，
+    原逻辑把抄坏的 ID 当作编造素材，整批提取被硬错误中止。
+    """
+    database, service, _jobs, chapter = storyboard_services
+    scene = AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "scene", "name": "青云山巅"},
+    )
+    character = AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "character", "name": "少年"},
+    )
+    extracted = _extracted_shot(scene["id"])
+    extracted["character_names"] = ["少年"]
+    extracted["character_asset_ids"] = [character["id"][:-5] + "2ff"]
+
+    result = service._save_extracted(
+        chapter,
+        "screenplay",
+        {"scope": "all", "scene_no": None},
+        [extracted],
+    )
+
+    assert result["count"] == 1
+    saved = service.list(chapter["id"])
+    assert saved[0]["character_ids"] == [character["id"]]
+
+
+def test_extract_shot_repairs_corrupted_scene_asset_id_without_name(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+) -> None:
+    """场景 ID 被抄坏且无场景名可回退时，同样按目录唯一相近 ID 修复。"""
+    database, service, _jobs, chapter = storyboard_services
+    scene = AssetService(database).create(
+        chapter["project_id"],
+        {"asset_type": "scene", "name": "青云山巅"},
+    )
+    extracted = _extracted_shot(scene["id"][:-4] + "zzzz")
+    extracted["scene_name"] = ""
+
+    result = service._save_extracted(
+        chapter,
+        "screenplay",
+        {"scope": "all", "scene_no": None},
+        [extracted],
+    )
+
+    assert result["count"] == 1
+    saved = service.list(chapter["id"])
+    assert saved[0]["scene_asset_id"] == scene["id"]
+
+
+def test_repair_near_miss_asset_id_requires_unique_candidate(
+    storyboard_services: tuple[Database, ShotService, RecordingJobService, dict[str, Any]],
+) -> None:
+    """ID 修复只在目录内存在唯一相近候选时生效，编造/歧义 ID 原样保留。"""
+    _database, service, _jobs, _chapter = storyboard_services
+    id_a = "asset_" + "a" * 32
+    id_b = "asset_" + "a" * 31 + "b"
+    broken = "asset_" + "a" * 31 + "c"
+
+    # 两个候选都在修复距离内：有歧义，拒绝修复
+    ambiguous_lookup = {"ids": {id_a, id_b}}
+    assert service._repair_near_miss_asset_id(ambiguous_lookup, broken) == broken
+
+    # 唯一候选：修复为真实 ID
+    unique_lookup = {"ids": {id_a}}
+    assert service._repair_near_miss_asset_id(unique_lookup, broken) == id_a
+
+    # 与任何目录 ID 都不相近：视为编造，原样保留（后续仍走硬错误）
+    assert service._repair_near_miss_asset_id(unique_lookup, "asset-fabricated-id") == (
+        "asset-fabricated-id"
+    )
+
+    # 已有效 ID 不做改动
+    assert service._repair_near_miss_asset_id(unique_lookup, id_a) == id_a
 
 
 def test_resolve_asset_ids_with_duplicate_ids_returns_unique_ids(
@@ -1611,14 +1949,15 @@ def test_resolve_asset_ids_with_duplicate_ids_returns_unique_ids(
     )
     lookup = service._asset_lookup(chapter["project_id"])["character"]
 
-    resolved, unmatched = service._resolve_asset_ids(
+    resolved, unmatched_names, unresolved_ids = service._resolve_asset_ids(
         lookup,
         provided_ids=[character["id"], character["id"]],
         names=["少年"],
     )
 
     assert resolved == [character["id"]]
-    assert unmatched == []
+    assert unmatched_names == []
+    assert unresolved_ids == []
 
 
 
@@ -1846,6 +2185,7 @@ def test_extract_shots_missing_scene_triggers_refill_then_saves(
                 ]
                 return ExtractionOutput([shot])
             shot = _extracted_shot(refilled["asset_ids"][0])
+            shot["scene_name"] = "坐错桌"
             return ExtractionOutput([shot])
 
     provider = RefillProvider()
@@ -1937,6 +2277,7 @@ def test_extract_shots_last_round_refill_verified_before_failing(
                 return ExtractionOutput([shot])
             # 第三轮：补建已入库，按 ID 正常绑定
             shot = _extracted_shot(refilled["asset_ids"][-1])
+            shot["scene_name"] = f"坐错桌第{self.round - 1}别名"
             return ExtractionOutput([shot])
 
     provider = RefillProvider()
@@ -1980,3 +2321,27 @@ def test_extract_shots_last_round_refill_verified_before_failing(
     assert len(saved) == 1
     assert saved[0]["scene_asset_id"] == refilled["asset_ids"][-1]
     assert result["count"] == 1
+
+
+def test_shot_split_request_validation() -> None:
+    from pydantic import ValidationError
+
+    from app.api.schemas import ShotSplitPart, ShotSplitRequest
+
+    # 空列表允许自动二等分
+    req_auto = ShotSplitRequest(parts=[])
+    assert req_auto.parts == []
+
+    # 显式提供但只有 1 段应拒绝
+    with pytest.raises(ValidationError, match="parts 若提供则至少包含两段"):
+        ShotSplitRequest(parts=[ShotSplitPart(action="一段", duration_sec=5.0)])
+
+    # 显式提供 2 段及以上通过
+    req_custom = ShotSplitRequest(
+        parts=[
+            ShotSplitPart(action="前段", duration_sec=5.0),
+            ShotSplitPart(action="后段", duration_sec=5.0),
+        ]
+    )
+    assert len(req_custom.parts) == 2
+

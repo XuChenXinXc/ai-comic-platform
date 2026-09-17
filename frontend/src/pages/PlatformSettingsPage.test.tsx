@@ -38,6 +38,10 @@ describe("平台设置", () => {
     vi.spyOn(api.settings.defaultStylePrompt, "get").mockResolvedValue({
       style_prompt: "水墨国风画风",
     });
+    vi.spyOn(api.settings.providerAllowPrivateHosts, "get").mockResolvedValue({
+      enabled: false,
+      source: "default",
+    });
   });
 
   test("test_project_storage_load_displays_current_path_and_scope_notice", async () => {
@@ -173,5 +177,58 @@ describe("平台设置", () => {
       ),
     );
     expect(toast.success).toHaveBeenCalledWith("默认画风已更新");
+  });
+
+  test("test_provider_allow_private_hosts_load_displays_current_value", async () => {
+    vi.spyOn(api.settings.providerAllowPrivateHosts, "get").mockResolvedValue({
+      enabled: true,
+      source: "database",
+    });
+    renderPage();
+
+    expect(
+      await screen.findByLabelText("允许连接本地/内网 Provider"),
+    ).toBeChecked();
+  });
+
+  test("test_provider_allow_private_hosts_toggle_saves_and_shows_success", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api.settings.providerAllowPrivateHosts, "set").mockResolvedValue({
+      enabled: true,
+      source: "database",
+    });
+    renderPage();
+
+    const checkbox = await screen.findByLabelText(
+      "允许连接本地/内网 Provider",
+    );
+    expect(checkbox).not.toBeChecked();
+
+    await user.click(checkbox);
+
+    expect(await screen.findByLabelText("允许连接本地/内网 Provider")).toBeChecked();
+    expect(api.settings.providerAllowPrivateHosts.set).toHaveBeenCalledWith(
+      true,
+    );
+    expect(toast.success).toHaveBeenCalledWith("已允许连接本地/内网 Provider");
+  });
+
+  test("test_provider_allow_private_hosts_save_failure_shows_error", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api.settings.providerAllowPrivateHosts, "set").mockRejectedValue(
+      new Error("保存失败"),
+    );
+    renderPage();
+
+    await user.click(
+      await screen.findByLabelText("允许连接本地/内网 Provider"),
+    );
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("保存失败"),
+    );
+    expect(
+      screen.getByLabelText("允许连接本地/内网 Provider"),
+    ).not.toBeChecked();
   });
 });

@@ -5,6 +5,7 @@
 
 import json
 import logging
+import math
 import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -229,8 +230,13 @@ class CompositionService:
                     )
                     .values(status="processing", updated_at=utc_now())
                 )
-            if legacy_update.rowcount < 1 and job_id:
-                raise RuntimeError("Composition 置为 processing 条件更新未命中")
+            if legacy_update.rowcount < 1:
+                if job_id:
+                    raise RuntimeError("Composition 置为 processing 条件更新未命中")
+                # 无 job id 的直接调用可能没有对应合成记录，不能静默当作成功。
+                logger.warning(
+                    "章节 %s 合成缺少可置为 processing 的合成记录（无 job id）", chapter_id
+                )
 
         try:
             # 1. 获取所有分镜视频
@@ -356,8 +362,13 @@ class CompositionService:
                         chapter_composition.c.status == "processing",
                     )
                 legacy_update = connection.execute(legacy_statement.values(**values))
-                if legacy_update.rowcount < 1 and job_id:
-                    raise RuntimeError("Composition 完成条件更新未命中")
+                if legacy_update.rowcount < 1:
+                    if job_id:
+                        raise RuntimeError("Composition 完成条件更新未命中")
+                    logger.warning(
+                        "章节 %s 合成完成但未匹配到 processing 合成记录（无 job id）",
+                        chapter_id,
+                    )
 
             logger.info(f"章节 {chapter_id} 合成完成：{output_path}")
 
@@ -390,8 +401,13 @@ class CompositionService:
                         status="failed", error=error_text, updated_at=utc_now()
                     )
                 )
-                if legacy_failed_update.rowcount < 1 and job_id:
-                    raise RuntimeError("Composition 失败条件更新未命中") from exc
+                if legacy_failed_update.rowcount < 1:
+                    if job_id:
+                        raise RuntimeError("Composition 失败条件更新未命中") from exc
+                    logger.warning(
+                        "章节 %s 合成失败但未匹配到可标记失败的合成记录（无 job id）",
+                        chapter_id,
+                    )
             raise
 
     def _get_chapter_shots(
@@ -842,6 +858,28 @@ class CompositionService:
 
         return output
 
+    @staticmethod
+    def _coerce_bgm_volume(volume: Any) -> float:
+        """把 BGM 音量安全转换为 [0, 5] 区间内的浮点数。
+
+        音量会直接拼进 ffmpeg filter_complex，必须先转成数字再拼接，
+        否则字符串会被当作 filter 语法注入（或让 ffmpeg 直接崩溃）。
+        合法范围内的取值保持原样，越界值夹取并记录告警。
+        """
+        try:
+            value = float(volume)
+        except (TypeError, ValueError) as exc:
+            raise bad_request("BGM 音量必须是数字") from exc
+        if not math.isfinite(value):
+            raise bad_request("BGM 音量必须是有限数字")
+        if value < 0.0:
+            logger.warning("BGM 音量 %s 小于 0，已按 0 处理", value)
+            return 0.0
+        if value > 5.0:
+            logger.warning("BGM 音量 %s 超过上限 5，已按 5 处理", value)
+            return 5.0
+        return value
+
     def _add_bgm(
         self,
         video_path: Path,
@@ -851,6 +889,8 @@ class CompositionService:
         volume: float,
     ) -> Path:
         """添加 BGM 音轨"""
+        # 音量在拼入 ffmpeg filter 前必须完成类型转换与范围校验
+        volume = self._coerce_bgm_volume(volume)
         with self.database.engine.connect() as connection:
             # BGM 必须属于当前项目，防止跨项目引用其他项目的音频文件
             bgm_record = connection.execute(

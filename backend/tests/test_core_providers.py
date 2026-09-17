@@ -300,6 +300,119 @@ def test_http_provider_post_429_rate_limit_is_retried(
     assert response.status_code == 200
 
 
+def test_http_provider_post_ssl_error_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST 遇 SSLError 不自动重试：握手期与响应读取期无法区分，重发会重复计费。"""
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://provider.example/v1",
+            max_retries=2,
+        )
+    )
+    calls = 0
+
+    def fake_request(*_args: Any, **_kwargs: Any) -> requests.Response:
+        nonlocal calls
+        calls += 1
+        # UNEXPECTED_EOF_WHILE_READING 在握手期和读取期都会出现，
+        # 不能据错误串断定请求体未送达上游。
+        raise requests.exceptions.SSLError(
+            "HTTPSConnectionPool(host='provider.example', port=443): "
+            "Max retries exceeded (Caused by SSLError(SSLEOFError(8, "
+            "'[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation "
+            "of protocol (_ssl.c:1006)')))"
+        )
+
+    monkeypatch.setattr(requests, "request", fake_request)
+
+    with pytest.raises(ProviderError, match="Provider 请求失败"):
+        provider._request(
+            "POST",
+            "https://provider.example/v1/chat/completions",
+            options={},
+        )
+
+    assert calls == 1
+
+
+def test_http_provider_get_ssl_error_is_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET 等安全方法幂等，SSLError 维持照常重试。"""
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://provider.example/v1",
+            max_retries=1,
+        )
+    )
+    ok = requests.Response()
+    ok.status_code = 200
+    ok._content = b"{}"
+    calls = 0
+
+    def fake_request(*_args: Any, **_kwargs: Any) -> requests.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise requests.exceptions.SSLError("TLS handshake failed")
+        return ok
+
+    monkeypatch.setattr(requests, "request", fake_request)
+
+    response = provider._request(
+        "GET",
+        "https://provider.example/v1/tasks/task-1",
+        options={},
+    )
+
+    assert calls == 2
+    assert response.status_code == 200
+
+
+def test_http_provider_post_ssl_error_retried_when_unsafe_retry_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """显式开启 retry_unsafe_methods 的渠道自担重复提交风险，POST 的 SSLError 恢复重试。"""
+    provider = OpenAICompatibleTextProvider(
+        ProviderConfig(
+            id="text-real",
+            kind="text",
+            adapter="openai_compatible",
+            base_url="https://provider.example/v1",
+            max_retries=1,
+        )
+    )
+    ok = requests.Response()
+    ok.status_code = 200
+    ok._content = b"{}"
+    calls = 0
+
+    def fake_request(*_args: Any, **_kwargs: Any) -> requests.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise requests.exceptions.SSLError("TLS handshake failed")
+        return ok
+
+    monkeypatch.setattr(requests, "request", fake_request)
+
+    response = provider._request(
+        "POST",
+        "https://provider.example/v1/chat/completions",
+        options={"retry_unsafe_methods": True},
+    )
+
+    assert calls == 2
+    assert response.status_code == 200
+
+
 def test_http_provider_get_transient_5xx_keeps_retrying(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1589,6 +1702,45 @@ def test_x5m5x_jbb_image_protocol_uses_multipart_reference_defaults(base_url: st
         "response_format": "url",
         "output_format": "png",
     }
+
+
+def test_gpt_image_derivative_model_on_x5m5x_parses_data_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """渠道衍生模型名（如 gpt-image-2.5-sunburst）同样走 x5m5x 协议适配。
+
+    回归：模型名不精确等于 gpt-image-2 时 result_url_path 落回默认 result.url，
+    响应里明明有 data[0].url 也会报「Provider 结果不包含下载地址或文件内容」。
+    """
+    provider = HttpImageProvider(
+        ProviderConfig(
+            id="image-gpt-x5",
+            kind="image",
+            adapter="http_image",
+            base_url="https://us-api.x5m5x.com/v1",
+            model="gpt-image-2.5-sunburst",
+        )
+    )
+    options = provider._options()
+    assert options["mode"] == "sync"
+    assert options["result_url_path"] == "data.0.url"
+    assert options["reference_mode"] == "multipart"
+
+    async def fake_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        return {"created": 1789449790, "data": [{"url": "https://cdn.example/generated.png"}]}
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    submission = asyncio.run(
+        provider.submit(
+            prompt="角色基础设定图",
+            negative_prompt="",
+            reference_files=[],
+            params={"size": "2048x1360"},
+        )
+    )
+
+    assert submission.status == "completed"
+    assert submission.result["result_url"] == "https://cdn.example/generated.png"
 
 
 @pytest.mark.parametrize(

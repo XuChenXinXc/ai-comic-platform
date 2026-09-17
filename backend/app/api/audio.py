@@ -3,15 +3,16 @@
 包括配音生成、BGM 管理等。
 """
 
+import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, Response, UploadFile, status
 
-from app.api.schemas import ShotAudioGenerateRequest
+from app.api.schemas import AudioConfigUpdate, ShotAudioGenerateRequest
 from app.dependencies import get_audio_service
 from app.services.audio_service import AudioService
 from app.services.constants import MAX_BGM_SIZE
-from app.services.errors import bad_request
+from app.services.errors import ServiceError, bad_request
 
 router = APIRouter(prefix="/audio", tags=["audio"])
 
@@ -35,11 +36,11 @@ def get_audio_config(
 @router.put("/projects/{project_id}/config")
 def update_audio_config(
     project_id: str,
-    updates: dict[str, Any],
+    updates: AudioConfigUpdate,
     service: AudioService = Depends(get_audio_service),
 ) -> dict[str, Any]:
     """更新项目音频配置"""
-    return service.update_project_audio_config(project_id, updates)
+    return service.update_project_audio_config(project_id, updates.model_dump(exclude_unset=True))
 
 
 @router.get("/chapters/{chapter_id}/dialogues")
@@ -121,18 +122,30 @@ async def upload_bgm(
     service: AudioService = Depends(get_audio_service),
 ) -> dict[str, Any]:
     """上传 BGM 文件"""
-    from app.services.utils import json_loads
-
     # 有界读取：多读 1 字节即可判定超限，避免先把整个文件读进内存再检查大小。
     file_data = await file.read(MAX_BGM_SIZE + 1)
     if len(file_data) > MAX_BGM_SIZE:
-        raise bad_request(f"文件大小超过限制（最大 {MAX_BGM_SIZE // (1024 * 1024)}MB）")
+        # 与 media 上传一致使用 413，避免同类超限在不同接口返回不同状态码。
+        raise ServiceError(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"文件大小超过限制（最大 {MAX_BGM_SIZE // (1024 * 1024)}MB）",
+        )
 
     # 验证文件类型
     if file.content_type and not file.content_type.startswith("audio/"):
         raise bad_request(f"不支持的文件类型：{file.content_type}")
 
-    mood_tags_list = json_loads(mood_tags, [])
+    # mood_tags 必须是合法 JSON 数组：解析失败时显式报错，不再静默回退为空列表。
+    if not mood_tags.strip():
+        mood_tags_list: list[Any] = []
+    else:
+        try:
+            parsed_tags = json.loads(mood_tags)
+        except ValueError as exc:
+            raise bad_request("mood_tags 必须是合法的 JSON 数组字符串") from exc
+        if not isinstance(parsed_tags, list):
+            raise bad_request("mood_tags 必须是 JSON 数组")
+        mood_tags_list = parsed_tags
 
     return await service.save_bgm(project_id, name, file_data, mood_tags_list)
 

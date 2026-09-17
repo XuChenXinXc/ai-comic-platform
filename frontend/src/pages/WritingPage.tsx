@@ -681,8 +681,8 @@ export function WritingPage() {
     const previous = previousChapterIdRef.current;
     previousChapterIdRef.current = activeChapterId;
     if (!previous || previous === activeChapterId) return;
-    // 未保存的「小说原文」存回原章节，避免切章静默丢稿。
-    if (chapterSourceDirty && chapterSourceRef.current) {
+    // 未保存的「小说原文」存回原章节，避免切章静默丢稿（包含清空文本的合法修改）。
+    if (chapterSourceDirty) {
       void api.chapters
         .update(previous, { source_text: chapterSourceRef.current })
         .then(() =>
@@ -692,21 +692,20 @@ export function WritingPage() {
           toast.error(`章节正文保存失败：${formatError(error)}`),
         );
     }
-    const pendingTab: WritingTab | null = dirty.analysis
-      ? "analysis"
-      : dirty.screenplay
-        ? "screenplay"
-        : null;
-    if (pendingTab) {
+    const tabsToSave: WritingTab[] = [];
+    if (dirty.analysis) tabsToSave.push("analysis");
+    if (dirty.screenplay) tabsToSave.push("screenplay");
+
+    for (const tab of tabsToSave) {
       // 保持原章节原状态：confirmed 的剧本不被静默降级为 ready。
       const previousStatus =
-        statusByChapterRef.current[previous]?.[pendingTab] || "";
+        statusByChapterRef.current[previous]?.[tab] || "";
       saveMutation.mutate({
         chapterId: previous,
         status: previousStatus === "confirmed" ? "confirmed" : "ready",
-        contentType: pendingTab,
-        content: pendingTab === "analysis" ? analysis : screenplay,
-        editRevision: editRevision.current[pendingTab],
+        contentType: tab,
+        content: tab === "analysis" ? analysis : screenplay,
+        editRevision: editRevision.current[tab],
       });
     }
     // 无论是否保存，都把本地草稿清空，防止旧章节内容残留显示在新章节上。
@@ -938,31 +937,30 @@ export function WritingPage() {
     if (visualBibleMutation.isPending) return;
     if (!validateVisualBibleRealism(visualBible)) return;
     const payload = compactVisualBible(visualBible);
-    setVisualBibleDirty(false);
     try {
       await visualBibleMutation.mutateAsync({
         projectId: activeProjectId,
         value: payload,
       });
+      setVisualBibleDirty(false);
       toast.success(payload ? "视觉圣经已保存" : "已重置为自动推导");
     } catch {
       // 失败提示由 mutation 的 onError 统一处理；保留本地编辑等待重试。
-      setVisualBibleDirty(true);
     }
   };
 
   const resetVisualBible = async () => {
     if (visualBibleMutation.isPending) return;
-    setVisualBible(null);
-    setVisualBibleDirty(false);
     try {
       await visualBibleMutation.mutateAsync({
         projectId: activeProjectId,
         value: null,
       });
+      setVisualBible(null);
+      setVisualBibleDirty(false);
       toast.success("已重置为自动推导");
     } catch {
-      // 重置失败时恢复服务端值，避免界面与服务端状态不一致。
+      // 失败提示由 mutation 处理；重置失败时恢复服务端值，避免界面与服务端状态不一致。
       setVisualBible(activeProject?.visual_bible ?? null);
       setVisualBibleDirty(false);
     }
@@ -1614,8 +1612,11 @@ export function WritingPage() {
                                       scene_no: 1,
                                       scene_name: "新场次",
                                       characters: [],
+                                      props: [],
+                                      source_refs: [],
                                       dialogue: [],
                                       narration: [],
+                                      target_duration_sec: 15,
                                     },
                                   ],
                                 }))
@@ -1676,6 +1677,51 @@ export function WritingPage() {
                                   onChange={(event) =>
                                     updateScene(index, {
                                       characters: event.target.value
+                                        .split(/[、,，]/)
+                                        .map((item) => item.trim())
+                                        .filter(Boolean),
+                                    })
+                                  }
+                                />
+                              </div>
+                              <div>
+                                <Label>关键物品（用顿号或逗号分隔）</Label>
+                                <Input
+                                  value={(scene.props || []).join("、")}
+                                  onChange={(event) =>
+                                    updateScene(index, {
+                                      props: event.target.value
+                                        .split(/[、,，]/)
+                                        .map((item) => item.trim())
+                                        .filter(Boolean),
+                                    })
+                                  }
+                                />
+                              </div>
+                              <div>
+                                <Label>目标时长（秒）</Label>
+                                <Input
+                                  type="number"
+                                  min={15}
+                                  max={600}
+                                  value={scene.target_duration_sec || 15}
+                                  onChange={(event) =>
+                                    updateScene(index, {
+                                      target_duration_sec: Math.max(
+                                        15,
+                                        Math.min(600, Number(event.target.value) || 15),
+                                      ),
+                                    })
+                                  }
+                                />
+                              </div>
+                              <div className="sm:col-span-2">
+                                <Label>原文段落编号（用顿号或逗号分隔）</Label>
+                                <Input
+                                  value={(scene.source_refs || []).join("、")}
+                                  onChange={(event) =>
+                                    updateScene(index, {
+                                      source_refs: event.target.value
                                         .split(/[、,，]/)
                                         .map((item) => item.trim())
                                         .filter(Boolean),
@@ -1843,8 +1889,11 @@ export function WritingPage() {
                                 scene_no: current.scenes.length + 1,
                                 scene_name: "新场次",
                                 characters: [],
+                                props: [],
+                                source_refs: [],
                                 dialogue: [],
                                 narration: [],
+                                target_duration_sec: 15,
                               },
                             ],
                           }))

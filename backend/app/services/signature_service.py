@@ -151,7 +151,6 @@ def asset_image_signature(
     model: str,
     params: Mapping[str, Any],
     reference_files: Sequence[str | Path],
-    reference_mode: bool = False,
 ) -> str:
     return calculate_signature(
         asset_own_signature,
@@ -159,7 +158,11 @@ def asset_image_signature(
         model,
         params,
         _reference_fingerprints(reference_files),
-        "clean_reference" if reference_mode else "setting_sheet",
+        # 旧版签名的最后一个组件是 reference_mode 布尔值：
+        # True 表示干净参考图，False 表示设定展板。本平台现已不再生成干净参考图，
+        # 因此固定为 False，以与存量设定板版本的签名保持一致；
+        # 历史 reference_mode=True（干净参考图）版本仍会被判 stale，属预期结果。
+        False,
     )
 
 

@@ -169,3 +169,32 @@ def test_二维画风正文违规使用摄影级反射正确报错() -> None:
     assert len(diags) == 1
     assert "摄影级反射" in diags[0]["message"]
 
+
+def test_景深与写实摄影参数命中为_blocking() -> None:
+    """景深/大光圈/焦段/摄影机机型属越权写实摄影参数，必须能拦住。"""
+    diagnostics = _diagnostics(
+        "近景使用 50mm 定焦，f1.8 大光圈，浅景深虚化背景，Sony Venice 电影摄影机拍摄"
+    )
+    forbidden = next(
+        item for item in diagnostics if item["code"] == "visual_conflict_forbidden_term"
+    )
+    assert forbidden["level"] == "blocking"
+    terms = {str(term).casefold() for term in forbidden["details"]["terms"]}
+    assert {"浅景深", "f1.8", "50mm", "sony venice"} <= terms
+    # 「浅景深」已覆盖其中的「景深」，不重复报告
+    assert "景深" not in terms
+
+
+def test_景深否定语境与画风声明不误报() -> None:
+    # 否定语境：无景深模糊 / 无背景虚化
+    assert _diagnostics("全画面无景深模糊，无背景虚化。") == []
+    # 画风指纹自身的声明：景深逻辑 / 景深：启用|禁用
+    assert _diagnostics("渲染方式恒定：线稿强度、阴影软硬与景深逻辑保持不变。") == []
+    assert _diagnostics("结构化画风规范：景深：禁用；渲染方式锁定：二维国风线稿。") == []
+
+
+def test_二维画风与浅景深为同级语义冲突() -> None:
+    diagnostics = _diagnostics("浅景深虚化背景", style={"style_prompt": "二维水墨国漫"})
+    conflicts = [item for item in diagnostics if item["code"] == "visual_conflict_semantic"]
+    assert any(item["details"]["terms"] == ["二维", "浅景深"] for item in conflicts)
+

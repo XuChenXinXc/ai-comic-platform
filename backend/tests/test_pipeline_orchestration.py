@@ -2,7 +2,7 @@
 
 覆盖：
 - 第一步补齐缺失提示词/导演计划并链式触发媒体步骤；
-- 第二步补齐干净参考图、批量生成关键帧并链式触发视频步骤；
+- 第二步补齐缺失素材图、批量生成关键帧并链式触发视频步骤；
 - 第三步在关键帧完成后批量生成视频；
 - 已有当前关键帧/视频的分镜跳过，不重复生成。
 """
@@ -17,7 +17,8 @@ from app.models.tables import asset_image
 from app.services.shot_service import ShotService
 
 
-def _mark_scene_image_clean(media_job_services: dict[str, Any]) -> None:
+def _mark_scene_image_ready(media_job_services: dict[str, Any]) -> None:
+    """把夹具场景图标记为已完成（保持当前素材图可用，避免触发补图）。"""
     database = media_job_services["database"]
     with database.engine.begin() as connection:
         connection.execute(
@@ -52,7 +53,7 @@ def test_pipeline_step_one_queues_missing_prompts_and_chains_media(
     media = media_job_services["media"]
     repository = media_job_services["repository"]
     chapter = media_job_services["chapter"]
-    _mark_scene_image_clean(media_job_services)
+    _mark_scene_image_ready(media_job_services)
     # 不带 image/video_prompt 的分镜：第一步应补齐提示词与导演计划
     ShotService(media_job_services["database"], media_job_services["jobs"]).create(
         chapter["id"],
@@ -80,7 +81,7 @@ def test_pipeline_chain_queues_keyframes_then_videos(
     media = media_job_services["media"]
     repository = media_job_services["repository"]
     chapter = media_job_services["chapter"]
-    _mark_scene_image_clean(media_job_services)
+    _mark_scene_image_ready(media_job_services)
     _create_two_shots(media_job_services)
 
     queued = media.queue_shot_pipeline(chapter["id"], {})
@@ -121,7 +122,7 @@ def test_pipeline_skips_shots_with_current_media(
     media = media_job_services["media"]
     repository = media_job_services["repository"]
     chapter = media_job_services["chapter"]
-    _mark_scene_image_clean(media_job_services)
+    _mark_scene_image_ready(media_job_services)
     shots = _create_two_shots(media_job_services)
 
     # 先给第一个分镜生成完成关键帧

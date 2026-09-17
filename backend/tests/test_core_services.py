@@ -501,3 +501,103 @@ def test_first_chapter_inherits_project_source_text(tmp_path: Path) -> None:
         assert second["source_text"] == ""
     finally:
         database.dispose()
+
+
+def test_bgm_volume_is_coerced_and_clamped() -> None:
+    """BGM 音量在拼入 ffmpeg filter 前必须为数字，越界夹取、非法值 400。"""
+    from app.services.composition_service import CompositionService
+
+    assert CompositionService._coerce_bgm_volume("0.3") == 0.3
+    assert CompositionService._coerce_bgm_volume(2) == 2.0
+    assert CompositionService._coerce_bgm_volume(-1) == 0.0
+    assert CompositionService._coerce_bgm_volume(9) == 5.0
+    for bad in ("0.3,evil", "nan", "inf", None):
+        with pytest.raises(ServiceError):
+            CompositionService._coerce_bgm_volume(bad)
+
+
+def test_chapter_rejects_invalid_status_and_guards_concurrent_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """章节状态只允许合法枚举；修订号被并发推进后更新必须报冲突。"""
+    from sqlalchemy import update
+
+    from app.models.tables import chapter as chapter_table
+    from app.services.chapter_service import ChapterService
+
+    database = Database(f"sqlite:///{(tmp_path / 'chapter-guard.db').as_posix()}")
+    database.initialize(seed_mock_providers=True)
+    try:
+        project = ProjectService(database).create({"name": "并发守卫"})
+        service = ChapterService(database)
+
+        with pytest.raises(ServiceError) as create_error:
+            service.create(project["id"], {"title": "非法状态", "status": "bogus"})
+        assert create_error.value.status_code == 400
+
+        record = service.create(project["id"], {"title": "第一章", "source_text": "初始正文"})
+        with pytest.raises(ServiceError) as update_error:
+            service.update(record["id"], {"status": "bogus"})
+        assert update_error.value.status_code == 400
+
+        # 模拟并发编辑：服务读到旧修订号后，另一个写入者把修订号推进
+        stale = service.get(record["id"])
+        with database.engine.begin() as connection:
+            connection.execute(
+                update(chapter_table)
+                .where(chapter_table.c.id == record["id"])
+                .values(source_revision=stale["source_revision"] + 5)
+            )
+        monkeypatch.setattr(service, "get", lambda _chapter_id: stale)
+
+        with pytest.raises(ServiceError) as conflict_error:
+            service.update(record["id"], {"source_text": "并发后的正文"})
+        assert conflict_error.value.status_code == 409
+    finally:
+        database.dispose()
+
+
+def test_chapter_renumber_avoids_large_user_chapter_numbers(tmp_path: Path) -> None:
+    """用户可使用大编号章节，重排的临时区间不能与之碰撞。"""
+    database = Database(f"sqlite:///{(tmp_path / 'chapter-renumber.db').as_posix()}")
+    database.initialize(seed_mock_providers=True)
+    try:
+        from app.services.chapter_service import ChapterService
+
+        project = ProjectService(database).create({"name": "重排测试"})
+        service = ChapterService(database)
+        first = service.create(project["id"], {"title": "A", "chapter_no": 100000})
+        second = service.create(project["id"], {"title": "B", "chapter_no": 100001})
+
+        reordered = service.reorder(project["id"], [second["id"], first["id"]])
+
+        assert [(item["title"], item["chapter_no"]) for item in reordered] == [
+            ("B", 1),
+            ("A", 2),
+        ]
+    finally:
+        database.dispose()
+
+
+def test_request_schema_limits_reject_abuse_but_keep_valid_values() -> None:
+    """新增的请求上限只拦截异常输入，合法请求保持可用。"""
+    from pydantic import ValidationError
+
+    from app.api.schemas import GenerateRequest, ProjectCreate, SubtitleItem
+
+    nested: object = 1
+    for _ in range(20):
+        nested = {"k": nested}
+    with pytest.raises(ValidationError):
+        GenerateRequest(params={"deep": nested})
+    with pytest.raises(ValidationError):
+        GenerateRequest(params={"blob": "x" * (64 * 1024 + 1)})
+    with pytest.raises(ValidationError):
+        ProjectCreate(name="超长正文", source_text="a" * 5_000_001)
+
+    assert SubtitleItem(text="台词", start_time=0, end_time=1).style_preset == "default"
+    with pytest.raises(ValidationError):
+        SubtitleItem.model_validate(
+            {"text": "台词", "start_time": 0, "end_time": 1, "style_preset": "unknown"}
+        )

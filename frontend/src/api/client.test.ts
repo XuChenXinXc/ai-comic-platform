@@ -168,6 +168,34 @@ describe("API 契约适配", () => {
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: "POST" });
     expect(fetchMock.mock.calls[0][1].body).toBeUndefined();
   });
+
+  test("test_provider_allow_private_hosts_get_requests_settings_endpoint", async () => {
+    const payload = { enabled: true, source: "database" as const };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.settings.providerAllowPrivateHosts.get();
+
+    expect(result).toEqual(payload);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/settings/provider-allow-private-hosts",
+    );
+  });
+
+  test("test_provider_allow_private_hosts_set_posts_enabled_flag", async () => {
+    const payload = { enabled: false, source: "database" as const };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.settings.providerAllowPrivateHosts.set(false);
+
+    expect(result).toEqual(payload);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/settings/provider-allow-private-hosts",
+    );
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body).toEqual({ enabled: false });
+  });
 });
 
 describe("mediaUrl 路径构造", () => {

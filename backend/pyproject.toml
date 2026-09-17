@@ -54,6 +54,14 @@ line-length = 100
 select = ["E", "F", "I", "B", "UP"]
 ignore = ["B008"]
 
+[tool.ruff.lint.isort]
+# backend/alembic/ 是迁移脚本目录（无 __init__.py），会被 ruff 的 src 探测当成
+# 同名包：0.11 把 alembic 与 alembic.config 一起判为 first-party，0.16 只把裸
+# alembic 判为 first-party、alembic.config 判为 third-party，两版要求的空行位置
+# 互斥，同一份代码必然有一边报 I001（CI 装的是 ruff>=0.9,<1 的最新版）。
+# alembic 实际是 PyPI 包，显式钉死为 third-party，让分类结果与 ruff 版本无关。
+known-third-party = ["alembic"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"

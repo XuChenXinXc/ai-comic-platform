@@ -203,11 +203,17 @@ class JobRunner:
                 self._propagate_dependency_failure(job_id, error)
                 return
             if result_status == "interrupted":
+                err_msg = str(result_mapping.get("error") or result_status)
                 if current is not None and current["status"] in NON_TERMINAL_STATUSES:
                     self.repository.interrupt(
                         job_id,
-                        str(result_mapping.get("error") or result_status),
+                        err_msg,
                     )
+                # 刻意不传播依赖失败：interrupted 是可恢复状态（Provider 仍在生成、
+                # 服务重启未确认提交等），不等同于 failed。若在这里把下游标记为
+                # 失败，用户重试上游并成功后就无法把下游带回正轨（
+                # _enqueue_ready_dependents 只扫描非终态 job，failed 下游永不复活）。
+                # 下游保持 queued，由上游重试成功后的 _enqueue_ready_dependents 唤醒。
                 return
             if result_status in {"queued", "waiting_provider", "downloading"}:
                 current = self.repository.get(job_id)

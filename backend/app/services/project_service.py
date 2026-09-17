@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -13,6 +14,11 @@ from app.services.file_service import FileService, FileServiceError, derive_file
 from app.services.setting_service import get_default_style_prompt
 from app.services.signature_service import source_signature
 from app.services.utils import new_id, row_dict, utc_now
+
+logger = logging.getLogger(__name__)
+
+# 项目列表为全量返回；给一个宽松防御上限避免无界扫描，达到上限时告警。
+_MAX_PROJECT_LIST_LIMIT = 2000
 
 
 class ProjectService:
@@ -108,20 +114,42 @@ class ProjectService:
             with self.database.engine.begin() as connection:
                 connection.execute(insert(project).values(**record))
         except Exception:
-            self.storage.delete_reserved_project(storage_path.parent, storage_path)
+            # 清理预留目录本身失败时不能顶替原始异常：独立捕获并记录，
+            # 再抛回根因，便于定位真正的写入失败原因。
+            try:
+                self.storage.delete_reserved_project(storage_path.parent, storage_path)
+            except FileServiceError as cleanup_error:
+                logger.warning("项目记录创建失败后清理预留目录失败：%s", cleanup_error)
             raise
         return self.get(record["id"])
 
-    def list(self, kind: str | None = None) -> list[dict[str, Any]]:
-        statement = select(project).order_by(project.c.updated_at.desc())
+    def list(
+        self,
+        kind: str | None = None,
+        *,
+        limit: int = _MAX_PROJECT_LIST_LIMIT,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        statement = (
+            select(project)
+            .order_by(project.c.updated_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
         if kind == "free":
             statement = statement.where(project.c.is_free_create == 1)
         elif kind == "regular":
             statement = statement.where(project.c.is_free_create == 0)
         with self.database.engine.connect() as connection:
-            return [
+            records = [
                 self._public_record(dict(row._mapping)) for row in connection.execute(statement)
             ]
+        if len(records) >= limit:
+            logger.warning(
+                "项目列表达到上限 %d，可能存在未返回的项目",
+                limit,
+            )
+        return records
 
     def get(self, project_id: str) -> dict[str, Any]:
         with self.database.engine.connect() as connection:
@@ -166,7 +194,12 @@ class ProjectService:
         changes["updated_at"] = self._next_updated_at(current["updated_at"])
         with self.database.engine.begin() as connection:
             self._validate_provider_defaults(connection, changes)
-            connection.execute(update(project).where(project.c.id == project_id).values(**changes))
+            result = connection.execute(
+                update(project).where(project.c.id == project_id).values(**changes)
+            )
+            if result.rowcount != 1:
+                # 并发删除窗口内更新 0 行：不能静默当成功返回。
+                raise not_found("项目")
         return self.get(project_id)
 
     def delete(self, project_id: str) -> None:

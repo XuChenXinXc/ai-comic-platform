@@ -13,6 +13,7 @@ import type {
   ProjectInput,
   ProjectStorageSelection,
   ProjectStorageSetting,
+  ProviderAllowPrivateHostsSetting,
   ProviderInput,
   ScreenplayContent,
   Shot,
@@ -181,6 +182,13 @@ function shotPayload(body: Partial<Shot>, includeCreateFields: boolean) {
   return payload;
 }
 
+/**
+ * Provider 请求体组装。
+ *
+ * api_key 契约：字段省略 = 后端保持原密钥不变；显式空串 = 后端清空密钥。
+ * 当前表单把「留空」解释为不改动，因此这里仅在非空时附带 api_key；本页暂无
+ * 清空密钥入口，若要新增，需绕过本函数显式发送 `api_key: ""`。
+ */
 function providerPayload(body: Partial<ProviderInput>, includeKind: boolean) {
   const payload: Record<string, unknown> = {
     name: body.name,
@@ -198,7 +206,6 @@ function providerPayload(body: Partial<ProviderInput>, includeKind: boolean) {
   if (includeKind) payload.kind = body.kind;
   return payload;
 }
-
 export function mediaUrl(version?: MediaVersion | null) {
   const value = version?.media_url || version?.file_url || version?.file_path;
   if (!value) return "";
@@ -271,6 +278,10 @@ export const queryKeys = {
   projectStorage: ["settings", "project-storage"] as const,
   cameraPolicy: ["settings", "camera-policy"] as const,
   defaultStylePrompt: ["settings", "default-style-prompt"] as const,
+  providerAllowPrivateHosts: [
+    "settings",
+    "provider-allow-private-hosts",
+  ] as const,
   jobs: (projectId?: string) => ["jobs", projectId || "all"] as const,
 };
 
@@ -301,6 +312,17 @@ export const api = {
         request<DefaultStylePromptSetting>(
           "/settings/default-style-prompt",
           json("POST", { style_prompt }),
+        ),
+    },
+    providerAllowPrivateHosts: {
+      get: () =>
+        request<ProviderAllowPrivateHostsSetting>(
+          "/settings/provider-allow-private-hosts",
+        ),
+      set: (enabled: boolean) =>
+        request<ProviderAllowPrivateHostsSetting>(
+          "/settings/provider-allow-private-hosts",
+          json("POST", { enabled }),
         ),
     },
   },

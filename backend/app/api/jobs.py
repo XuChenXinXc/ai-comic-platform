@@ -1,3 +1,5 @@
+from typing import Literal
+
 from fastapi import APIRouter, Depends, Query, status
 
 from app.dependencies import get_job_service
@@ -5,11 +7,23 @@ from app.services.job_service import JobService
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
+# 合法任务状态：非法值应被请求校验拒绝，而不是静默返回空列表。
+JobStatus = Literal[
+    "queued",
+    "running",
+    "waiting_provider",
+    "downloading",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+]
+
 
 @router.get("")
 def list_jobs(
     project_id: str | None = Query(default=None),
-    status_value: str | None = Query(default=None, alias="status"),
+    status_value: JobStatus | None = Query(default=None, alias="status"),
     job_type: str | None = Query(default=None),
     batch_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),

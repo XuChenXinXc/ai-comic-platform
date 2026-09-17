@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import logging
 import os
 import re
 import shutil
-import socket
 from collections.abc import Mapping
 from pathlib import Path
 from threading import RLock
@@ -30,6 +28,12 @@ from app.models.tables import (
     video_version,
 )
 from app.services.constants import MAX_DOWNLOAD_SIZE
+from app.services.net_guard import (
+    LOCAL_HOSTNAME,
+    NO_HOST,
+    PRIVATE_DNS,
+    inspect_target_host,
+)
 from app.services.utils import sanitize_error_message
 
 logger = logging.getLogger(__name__)
@@ -39,7 +43,6 @@ class FileServiceError(RuntimeError):
     pass
 
 
-_TUN_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
 _INVALID_WINDOWS_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _MAX_PROJECT_STORAGE_NAME_UTF16_UNITS = 80
 _WINDOWS_MAX_PATH_UTF16_UNITS = 259
@@ -194,57 +197,20 @@ def atomic_copy(
 def _reject_private_download_host(url: str) -> None:
     """拒绝直接指向内网/保留地址的下载，防止恶意 Provider result_url 触发 SSRF。
 
-    仅拦截 IP 字面量（私网/链路本地/保留地址，含 169.254.169.254 云元数据端点
-    与 127.0.0.1）；主机名不做 DNS 解析预检：代理/离线环境下解析结果不可靠，
-    且逐解析仍有 TOCTOU，DNS 重绑定与 30x 跳转到内网属残余风险。
+    判定逻辑统一在 app.services.net_guard（与 Provider base_url 校验共用同一套
+    策略），此处只把原因码翻译成本模块的错误类型与文案。
     """
-    parsed = urlparse(str(url))
-    hostname = (parsed.hostname or "").strip("[]").lower()
-    if not hostname:
+    verdict = inspect_target_host(url)
+    if verdict is None:
+        return
+    code, detail = verdict
+    if code == NO_HOST:
         raise FileServiceError("下载地址缺少有效主机名")
-
-    if (
-        hostname in ("localhost", "ip6-localhost", "ip6-loopback")
-        or hostname.endswith(".localhost")
-        or hostname.endswith(".local")
-        or hostname.endswith(".internal")
-    ):
-        raise FileServiceError(f"下载地址指向本地或保留主机名，已拒绝：{hostname}")
-
-    try:
-        address = ipaddress.ip_address(hostname)
-        if (
-            address.is_loopback
-            or address.is_link_local
-            or address.is_private
-            or address.is_reserved
-        ):
-            raise FileServiceError(f"下载地址指向内网或保留地址，已拒绝：{hostname}")
-        return
-    except ValueError:
-        pass
-
-    # 单元测试与保留测试域名（RFC 2606 / RFC 6761）跳过解析，避免测试环境中假解析或解析超时
-    if hostname.endswith((".test", ".example", ".invalid")):
-        return
-
-    # 普通主机名：做 DNS 解析预检，拦截指向内网/保留地址的主机名（如 *.nip.io）
-    # 排除代理/TUN 模式的 fake-ip 实验网段（198.18.0.0/15），避免开发代理环境下误伤正常外部请求
-    try:
-        addrinfo = socket.getaddrinfo(hostname, None)
-        for entry in addrinfo:
-            sockaddr = entry[4]
-            ip_str = sockaddr[0]
-            addr = ipaddress.ip_address(ip_str)
-            if addr in _TUN_FAKE_IP_NET:
-                continue
-            if addr.is_loopback or addr.is_link_local or addr.is_private or addr.is_reserved:
-                raise FileServiceError(
-                    f"下载地址解析到内网或保留地址，已拒绝：{hostname} -> {ip_str}"
-                )
-    except (socket.gaierror, OSError):
-        # DNS 解析失败在后续请求中会由网络层报错，此处不阻断
-        pass
+    if code == LOCAL_HOSTNAME:
+        raise FileServiceError(f"下载地址指向本地或保留主机名，已拒绝：{detail}")
+    if code == PRIVATE_DNS:
+        raise FileServiceError(f"下载地址解析到内网或保留地址，已拒绝：{detail}")
+    raise FileServiceError(f"下载地址指向内网或保留地址，已拒绝：{detail}")
 
 
 def download_url_atomic(
@@ -285,9 +251,16 @@ def download_url_atomic(
             )
             if response.is_redirect or response.is_permanent_redirect:
                 location = response.headers.get("Location")
+                response.close()
                 if not location:
                     raise FileServiceError("下载重定向缺少 Location 头")
-                current_url = urljoin(current_url, location)
+                next_url = urljoin(current_url, location)
+                if urlparse(next_url).netloc.lower() != urlparse(current_url).netloc.lower():
+                    request_headers = {
+                        k: v for k, v in request_headers.items()
+                        if k.lower() not in ("authorization", "cookie")
+                    }
+                current_url = next_url
                 continue
             break
         else:
@@ -1089,23 +1062,28 @@ class FileService:
 
     def delete_file(self, project_id: str, relative_path: str | Path) -> bool:
         target = self.resolve_project_path(project_id, relative_path)
-        if not target.exists():
-            return False
-        if not target.is_file():
-            raise FileServiceError("只能删除文件")
-        target.unlink()
-        return True
+        # 与并发下载/迁移共用同一把媒体文件锁，避免 exists -> unlink 之间的
+        # TOCTOU：锁内目标可能已被并发操作移走或替换。
+        with _MEDIA_FILE_LOCK:
+            if not target.exists():
+                return False
+            if not target.is_file():
+                raise FileServiceError("只能删除文件")
+            target.unlink()
+            return True
 
     def clear_temp(self, project_id: str) -> None:
         """清空项目 temp 目录。
 
-        注意：temp 同时是原子写入的暂存区，调用方必须确保没有并发的
-        下载/生成任务正在进行，否则可能删除其尚未落盘的临时文件。
+        注意：temp 同时是原子写入的暂存区。这里用媒体文件锁与并发下载/迁移
+        互斥；调用方仍应尽量避免在有并发任务时清理，锁只能保证清理动作本身
+        不会与单次文件移动/删除交错。
         """
         temporary = self.resolve_project_path(project_id, "temp")
-        if temporary.exists():
-            shutil.rmtree(temporary)
-        temporary.mkdir(parents=True, exist_ok=True)
+        with _MEDIA_FILE_LOCK:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            temporary.mkdir(parents=True, exist_ok=True)
 
     def delete_project(self, project_id: str) -> None:
         target = self._project_target(project_id)

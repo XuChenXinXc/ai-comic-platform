@@ -11,7 +11,6 @@ CDN 地址需要随本地文件一起保存，视频生成时优先使用该地�
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-
 from alembic import op
 
 revision: str = "20260814_0014"

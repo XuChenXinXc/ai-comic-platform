@@ -152,7 +152,7 @@ export function ShotMediaCard({
       }
       return kind === "keyframe"
         ? api.shots.keyframes.generate(shot.id, {
-            // 缺干净参考图时自动入队参考图模式生成，避免设定展板污染分镜画面
+            // 缺素材图时自动入队素材图生成，避免纯文字降级出图
             auto_prepare_references: true,
           })
         : api.shots.videos.generate(shot.id);

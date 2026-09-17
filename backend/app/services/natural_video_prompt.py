@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -28,6 +29,8 @@ from app.dynamic_pipeline.visual_validator import (
     motion_style_lock_for,
     style_medium_of,
 )
+
+logger = logging.getLogger(__name__)
 
 _IMAGE_TOKEN_RE = re.compile(r"@Image(\d+)")
 _ANCHOR_LINE_RE = re.compile(r"^\s*@Image(\d+)\s*[:：]\s*(.*?)\s*$")
@@ -198,12 +201,14 @@ def parse_reference_anchors(anchors: Sequence[str | dict[str, Any]]) -> list[Ref
     支持两种输入：程序生成的锚点字符串（如
     ``@Image1：当前分镜关键帧，锁定构图、人物左右关系和起始站位。``），
     或已结构化的 dict（token/role/label/asset_id 等字段）。
+    无法解析的行不会静默丢弃，而是记 warning 便于排查编号错位。
     """
     tokens: list[ReferenceToken] = []
     for anchor in anchors or []:
         if isinstance(anchor, dict):
             token = str(anchor.get("token") or "").strip()
             if not token:
+                logger.warning("参考锚点缺少 token，已跳过：%s", anchor)
                 continue
             tokens.append(
                 ReferenceToken(
@@ -218,6 +223,7 @@ def parse_reference_anchors(anchors: Sequence[str | dict[str, Any]]) -> list[Ref
             continue
         match = _ANCHOR_LINE_RE.match(str(anchor))
         if not match:
+            logger.warning("参考锚点无法解析为 @ImageN 行，已跳过：%s", anchor)
             continue
         label = match.group(2).strip("。")
         tokens.append(
@@ -230,6 +236,15 @@ def parse_reference_anchors(anchors: Sequence[str | dict[str, Any]]) -> list[Ref
     return tokens
 
 
+def token_number(token: str | ReferenceToken | None) -> int:
+    """从 @ImageN 提取数字编号，用于数值大小比较（避免 '@Image10' < '@Image2' 字典序误判）。"""
+    if token is None:
+        return 0
+    token_str = token.token if isinstance(token, ReferenceToken) else str(token)
+    digits = "".join(ch for ch in token_str if ch.isdigit())
+    return int(digits) if digits else 0
+
+
 def _asset_name_from_label(token: ReferenceToken) -> str:
     """素材锚点的 label 形如「徐尘心，锁定角色身份与服装」，取逗号前的素材名。"""
     if token.role in {"keyframe", "prev_end_frame", "reference", "previous_keyframe"}:
@@ -238,24 +253,80 @@ def _asset_name_from_label(token: ReferenceToken) -> str:
     return name
 
 
+_ASSET_NAME_NOISE_RE = re.compile(r"[\s·・．.\-—_（）()【】\[\]]+")
+
+
+def _normalize_asset_name(value: str) -> str:
+    """素材名规范化：去掉空白与装饰符号，仅用于「唯一候选」比较。"""
+    return _ASSET_NAME_NOISE_RE.sub("", str(value or "")).casefold()
+
+
 def _match_tokens_by_names(
     tokens: Sequence[ReferenceToken],
     role: str,
     names: Sequence[str],
+    *,
+    diagnostics: list[str] | None = None,
 ) -> dict[str, ReferenceToken]:
+    """按素材名把参考锚点绑定到角色/道具。
+
+    匹配顺序：精确同名优先 → 规范化后唯一命中的双向包含。双向包含可能把一个
+    名字误配到更长的另一个名字（如「徐尘」误配「徐尘心」），因此只在候选唯一
+    时采用；无法唯一确定时不绑定，并记诊断由调用方展示。
+    """
     matched: dict[str, ReferenceToken] = {}
     pool = [token for token in tokens if token.role == role]
+    if not pool:
+        # 本镜没有任何该类参考锚点属于正常情况（纯文字降级），不产生诊断噪音。
+        return matched
+    used: set[str] = set()
     for name in names:
         if not name:
             continue
-        for token in pool:
-            if token.token in {item.token for item in matched.values()}:
-                continue
-            label_name = _asset_name_from_label(token)
-            if label_name and (label_name == name or name in label_name or label_name in name):
-                matched[name] = token
-                break
+        available = [token for token in pool if token.token not in used]
+        exact = [token for token in available if _asset_name_from_label(token) == name]
+        if len(exact) == 1:
+            matched[name] = exact[0]
+            used.add(exact[0].token)
+            continue
+        if len(exact) > 1:
+            _note_reference_match(
+                f"素材「{name}」匹配到多个同名参考锚点"
+                f"（{'、'.join(t.token for t in exact)}），已跳过绑定",
+                diagnostics,
+            )
+            continue
+        folded = _normalize_asset_name(name)
+        if not folded:
+            continue
+        candidates = [
+            token
+            for token in available
+            if (
+                (label_name := _normalize_asset_name(_asset_name_from_label(token)))
+                and (folded in label_name or label_name in folded)
+            )
+        ]
+        if len(candidates) == 1:
+            matched[name] = candidates[0]
+            used.add(candidates[0].token)
+            continue
+        if len(candidates) > 1:
+            _note_reference_match(
+                f"素材「{name}」匹配到多个相近参考锚点"
+                f"（{'、'.join(t.token for t in candidates)}），已跳过绑定",
+                diagnostics,
+            )
+            continue
+        _note_reference_match(f"素材「{name}」没有匹配到 {role} 参考锚点", diagnostics)
     return matched
+
+
+def _note_reference_match(message: str, diagnostics: list[str] | None) -> None:
+    """记录参考图绑定降级：同时写日志与可选出参，避免静默丢绑定。"""
+    logger.warning(message)
+    if diagnostics is not None:
+        diagnostics.append(message)
 
 
 def _split_person_parts(value: Any) -> list[tuple[str, str]]:
@@ -276,6 +347,22 @@ def _split_person_parts(value: Any) -> list[tuple[str, str]]:
             continue
         person = person.strip()
         details = details.strip(" ，,；;")
+        subparts = [p.strip() for p in re.split(r"[，,]", details) if p.strip()]
+        subparts = [
+            p
+            for p in subparts
+            if p not in {
+                "无",
+                "未提供",
+                "none",
+                "None",
+                "以素材为准",
+                "暂无",
+                "无明确方向",
+                "以当前场景为准",
+            }
+        ]
+        details = "，".join(subparts)
         if details:
             parts.append((person, details))
     return parts
@@ -382,10 +469,67 @@ def _normalize_timeline_flow(action_flow: str, duration_sec: float) -> str:
     return naturalize_timeline_flow(action_flow, duration_sec)
 
 
+# 与起始状态高度重合的构图子句才会被判定为重复删除；比例/层级/焦点等构图
+# 维度即使文字重合也必须保留，避免把有效构图信息一起删掉。
+_COMPOSITION_DUPLICATE_RATIO = 0.6
+_COMPOSITION_KEEP_MARKERS = ("比例", "层级", "焦点", "留白", "重心", "构图")
+
+
+def _is_kept_composition_clause(subpart: str) -> bool:
+    """构图维度白名单：命中比例/层级/焦点等关键词的子句不参与去重。"""
+    return any(marker in subpart for marker in _COMPOSITION_KEEP_MARKERS)
+
+
+def _dedupe_composition_clauses(comp: str, ref: str) -> str:
+    """过滤构图中与起始状态（opening_frame）高度重合的重复描述，保留构图比例与空间层级。"""
+    if not comp or not ref:
+        return comp
+    clauses = [c.strip() for c in re.split(r"[；;。]", comp) if c.strip()]
+    kept: list[str] = []
+    for c in clauses:
+        subparts = [sp.strip() for sp in re.split(r"[，,]", c) if sp.strip()]
+        kept_subparts: list[str] = []
+        for sp in subparts:
+            if _is_kept_composition_clause(sp):
+                kept_subparts.append(sp)
+                continue
+            if len(sp) >= 4 and sp in ref:
+                continue
+            common_chars = sum(1 for ch in sp if ch in ref)
+            if len(sp) >= 6 and (common_chars / len(sp)) > _COMPOSITION_DUPLICATE_RATIO:
+                continue
+            kept_subparts.append(sp)
+        if kept_subparts:
+            kept.append("，".join(kept_subparts))
+    result = "；".join(kept)
+    # 子句级去重可能把「（说明，补充）」从中间切断，残留孤立括号会形成
+    # 「…后期叠加），…」这类碎片句；这里只清理不成对的括号，不改写其余文本。
+    chars: list[str] = []
+    depth = 0
+    for ch in result:
+        if ch == "（":
+            depth += 1
+        elif ch == "）":
+            if depth == 0:
+                continue
+            depth -= 1
+        chars.append(ch)
+    if depth > 0:
+        # 仍有未闭合的左括号：从后往前移除多余的那个
+        for index in range(len(chars) - 1, -1, -1):
+            if chars[index] == "（":
+                del chars[index]
+                depth -= 1
+                if depth == 0:
+                    break
+    return "".join(chars)
+
+
 def _camera_sentence(camera_move: Any) -> str:
     raw = str(camera_move or "").strip()
     fixed_markers = ("固定", "不动", "静止", "机位不动", "无运镜")
     move_markers = ("推近", "推进", "横移", "摇镜", "跟随", "缓推", "移动", "升降", "环绕")
+    follow_markers = ("跟拍", "跟随", "跟移")
     is_fixed = any(marker in raw for marker in fixed_markers) or not raw
     has_move = any(marker in raw for marker in move_markers)
     if is_fixed and has_move:
@@ -393,9 +537,15 @@ def _camera_sentence(camera_move: Any) -> str:
         return f"机位基本固定，只在{move_word}方向上做幅度很小的调整。"
     if is_fixed:
         return "机位固定，画面变化由人物动作推动。"
-    if "跟随" in raw:
-        return f"镜头{raw}人物运动。"
-    return f"镜头{raw}，幅度小而明确，中间不调整速度。"
+    if any(marker in raw for marker in follow_markers):
+        # 「手持」措辞容易被视频模型放大成明显晃动，与负向的「禁止镜头抖动」
+        # 互相打架；跟拍统一渲染为平顺的稳定器式跟随，速度随人物自然变化。
+        cleaned = raw.replace("手持跟拍", "跟拍").replace("手持", "").strip("，, ")
+        return (
+            f"镜头{cleaned}；运动平顺连续，随人物移动速度自然跟随，"
+            "不突然加速或减速，保持稳定器式的平稳、无明显晃动。"
+        )
+    return f"镜头{raw}，幅度小而明确，运动平顺连续、不突然加速或减速。"
 
 
 def _environment_motion_sentence(shot_context: dict[str, Any]) -> str:
@@ -446,8 +596,24 @@ def continuity_opening_sentence(transition: str, prev_ending: str, scene_name: s
     return _continuity_sentence(transition, prev_ending, scene_name)
 
 
-def _negative_line(negative_prompt: str, dynamic_rules: Sequence[str] = ()) -> str:
-    base = "画面中不出现：人物变形或服装变化、新增人物、画面内文字或字幕、道具瞬移。"
+def _negative_line(
+    negative_prompt: str,
+    dynamic_rules: Sequence[str] = (),
+    *,
+    intentional_flicker: bool = False,
+) -> str:
+    base_items = [
+        "人物变形或服装变化",
+        "新增人物",
+        "画面内文字或字幕",
+        "道具瞬移",
+        "道具脱手悬空飞行",
+        "隔空移物",
+        "隔空取物",
+    ]
+    if not intentional_flicker:
+        base_items.extend(["灯光频闪", "画面闪烁", "光线忽明忽暗"])
+    base = f"画面中不出现：{'、'.join(base_items)}。"
     extra = re.sub(
         r"^禁止出现\s*[:：]\s*",
         "",
@@ -456,12 +622,29 @@ def _negative_line(negative_prompt: str, dynamic_rules: Sequence[str] = ()) -> s
     extra = extra.strip(" ，、；;")
     if not extra:
         return base
-    # 去掉与基础约束重复的词，避免越写越长
-    covered = ("人物变形", "服装变化", "新增人物", "文字", "字幕", "道具瞬移", "水印")
+    covered = (
+        "人物变形",
+        "服装变化",
+        "新增人物",
+        "文字",
+        "字幕",
+        "道具瞬移",
+        "悬空飞行",
+        "隔空移物",
+        "隔空取物",
+        "灯光频闪",
+        "画面闪烁",
+        "忽明忽暗",
+        "水印",
+    )
     clauses = [item.strip() for item in re.split(r"[，,；;、]", extra) if item.strip()]
     kept = [item for item in clauses if not any(word in item for word in covered)]
-    # 反动态写实化负向补齐：追加协议词表中尚不存在的条款（幂等：已存在不重复）。
-    # 条款集合由调用方按画风媒介传入，不再无条件注入写实化禁用词。
+    if intentional_flicker:
+        kept = [
+            item
+            for item in kept
+            if not any(k in item for k in ("灯光频闪", "画面闪烁", "光线忽明忽暗", "忽明忽暗"))
+        ]
     for rule in dynamic_rules:
         if rule not in base and not any(rule in item for item in kept):
             kept.append(rule)
@@ -515,8 +698,13 @@ def render_natural_video_prompt(
         (item for item in token_list if item.role == "previous_keyframe"), None
     )
     scene_token = next((item for item in token_list if item.role == "scene_layout"), None)
-    character_tokens = _match_tokens_by_names(token_list, "character_identity", characters)
-    prop_tokens = _match_tokens_by_names(token_list, "prop_identity", props)
+    reference_notes: list[str] = []
+    character_tokens = _match_tokens_by_names(
+        token_list, "character_identity", characters, diagnostics=reference_notes
+    )
+    prop_tokens = _match_tokens_by_names(
+        token_list, "prop_identity", props, diagnostics=reference_notes
+    )
     extra_tokens = [
         item
         for item in token_list
@@ -553,17 +741,44 @@ def render_natural_video_prompt(
 
     # 第二段：人物初始状态与起始画面
     start_lines: list[str] = []
-    if prev_end_frame and keyframe and prev_end_frame.token < keyframe.token:
+    position_parts = _split_person_parts(shot_context.get("positions"))
+    # 位置描述里标注「入画」的角色（如「仅在末段入画」）开场并不在画面里：
+    # 不能写进起始画面锁定句，否则模型会从第 0 秒就把该角色生成进画面。
+    late_entry_parts = {
+        person: next((part for part in re.split(r"[，,]", details) if "入画" in part), "")
+        for person, details in position_parts
+        if "入画" in details
+    }
+    continuity = _continuity_sentence(transition, prev_ending, scene_name)
+    if continuity:
+        start_lines.append(continuity)
+    if prev_end_frame and keyframe and token_number(prev_end_frame) < token_number(keyframe):
         start_lines.append(
             f"画面从 {prev_end_frame.token}（上一镜的结束画面）自然进入，"
             f"向 {keyframe.token} 展示的目标画面发展。"
         )
     elif keyframe:
-        subject = "、".join(characters) if characters else "人物"
-        start_lines.append(
-            f"以 {keyframe.token} 作为这一镜的起始画面，"
-            f"沿用其中{subject}的位置、朝向、服装以及人物与场景之间的空间关系。"
-        )
+        on_screen = [name for name in characters if name not in late_entry_parts]
+        if on_screen:
+            subject = "、".join(on_screen)
+            start_lines.append(
+                f"以 {keyframe.token} 作为这一镜的起始画面，"
+                f"沿用其中{subject}的位置、朝向、服装以及人物与场景之间的空间关系。"
+            )
+        elif characters:
+            start_lines.append(
+                f"以 {keyframe.token} 作为这一镜的起始画面，"
+                "沿用其中的场景结构、陈设与光线关系。"
+            )
+        else:
+            start_lines.append(
+                f"以 {keyframe.token} 作为这一镜的起始画面，"
+                "沿用其中人物与场景之间的位置、朝向、服装与空间关系。"
+            )
+        for name in characters:
+            timing = late_entry_parts.get(name, "").strip(" ，,")
+            if timing:
+                start_lines.append(f"{name}在起始画面中不出现，{timing}。")
         if prev_end_frame:
             start_lines.append(
                 f"上一镜的结束画面（{prev_end_frame.token}）仅用于衔接连贯，"
@@ -578,7 +793,6 @@ def render_natural_video_prompt(
         start_lines.append(_ensure_sentence_end(f"这一镜开始时，{cleaned_opening}"))
     if characters:
         start_lines.append(_ensure_sentence_end(f"画面中的角色只有{'、'.join(characters)}"))
-    position_parts = _split_person_parts(shot_context.get("positions"))
     if position_parts:
         start_lines.append(_ensure_sentence_end(f"开始时，{_position_sentence(position_parts)}"))
     expression_parts = _split_person_parts(shot_context.get("expressions"))
@@ -617,15 +831,26 @@ def render_natural_video_prompt(
                     "主体停住后短暂回稳。"
                 )
         if props:
-            prop_note = _ensure_sentence_end(f"本镜道具：{'、'.join(props)}")
+            prop_note = _strip_trailing_punct(f"本镜道具：{'、'.join(props)}")
             if prop_tokens:
-                prop_note += "；".join(
+                prop_references = "；".join(
                     f"{name}沿用 {token.token} 的外观与材质" for name, token in prop_tokens.items()
-                ) + "。"
-            prop_note += (
-                "道具被拿取、移动或放下时位置随动作自然变化，其余时间保持原位。"
+                )
+                if prop_references:
+                    # 句号必须留在最后：先补句号再追引用会拼出「。；」接缝。
+                    prop_note = f"{prop_note}；{prop_references}"
+            prop_note = _ensure_sentence_end(prop_note) + (
+                "道具被拿取、递出、接取或移动时，必须全程由手部手指实体握持接触，"
+                "随手臂伸展与动作路径自然位移，严禁道具脱手悬空飞行、严禁隔空移物；"
+                "未发生交互时道具保持原位，严禁悬空漂浮或瞬移。"
             )
             action_lines.append(prop_note)
+        elif any(kw in flow for kw in ("递给", "递出", "递到", "递向", "拿给", "交给", "递过")):
+            action_lines.append(
+                "物品被传递、递出或拿取时，必须全程由手部手指实体握持接触，"
+                "随手臂伸展与动作路径自然位移，严禁道具脱手悬空飞行、严禁隔空移物；"
+                "未发生交互时道具保持原位，严禁悬空漂浮或瞬移。"
+            )
         paragraphs.append("".join(action_lines))
 
     # 第四段：摄影机与构图
@@ -637,7 +862,9 @@ def render_natural_video_prompt(
         camera_lines.append(_ensure_sentence_end(framing))
     camera_lines.append(_camera_sentence(camera_move))
     if composition:
-        camera_lines.append(_ensure_sentence_end(f"构图方面，{composition}"))
+        cleaned_comp = _dedupe_composition_clauses(composition.rstrip("。"), cleaned_opening)
+        if cleaned_comp:
+            camera_lines.append(_ensure_sentence_end(f"构图方面，{cleaned_comp}"))
     if scene_name and composition:
         camera_lines.append(
             f"背景保持{scene_name}的环境细节，前景随人物动作自然形成层次。"
@@ -649,22 +876,35 @@ def render_natural_video_prompt(
     tail_lines: list[str] = []
     dialogue_entries = list(dialogue_entries)
     if dialogue_entries:
-        tail_lines.append("本镜对白按以下顺序进行：")
-        tail_lines.extend(
-            _ensure_sentence_end(f"第{index}句，{item['speaker']}说：“{item['text']}”")
-            for index, item in enumerate(dialogue_entries, start=1)
-        )
+        valid_entries: list[tuple[str, str]] = []
+        for item in dialogue_entries:
+            speaker = str(item.get("speaker") or "").strip()
+            text = str(item.get("text") or "").strip()
+            if not speaker or not text:
+                # 缺键条目不能抛 KeyError，也不能拼出空台词；跳过并记 warning。
+                logger.warning("对白条目缺少 speaker/text，已跳过：%s", item)
+                continue
+            valid_entries.append((speaker, text))
+        if valid_entries:
+            tail_lines.append("本镜对白按以下顺序进行：")
+            tail_lines.extend(
+                _ensure_sentence_end(f"第{index}句，{speaker}说：“{text}”")
+                for index, (speaker, text) in enumerate(valid_entries, start=1)
+            )
+        else:
+            tail_lines.append("本镜没有画内对白，人物全程不开口。")
+        # 「其余角色保持聆听」只在多角色镜头成立：单人镜头写入这句是模板冗余，
+        # 反而可能诱导模型在画面里补出第二个倾听者。
+        others_line = "，其余角色保持专注聆听与神态反应" if len(characters) > 1 else ""
         if audio_driven:
             # Provider 收到本镜配音音频，口型由音频驱动，可以要求自然配合。
-            tail_lines.append(
-                "说话人开口时口型与配音自然配合，其余角色在该时段保持安静，不抢话、不代说。"
-            )
+            tail_lines.append(f"说话人开口时口型与配音自然配合{others_line}。")
         else:
             # 无音频输入时模型只能凭空表演说话：要求嘴部动作克制、幅度轻微，
             # 避免夸张口型与后期配音严重错位；对白由后期配音与字幕呈现。
             tail_lines.append(
-                "说话人嘴部只做轻微启合、口型幅度克制（对白由后期配音与字幕呈现），"
-                "其余角色在该时段保持安静，不抢话、不代说。"
+                "说话人嘴部只做轻微启合、口型幅度克制（对白由后期配音与字幕呈现）"
+                f"{others_line}。"
             )
     else:
         no_dialogue = "本镜没有画内对白，人物全程不开口"
@@ -677,11 +917,9 @@ def render_natural_video_prompt(
     env_motion = _environment_motion_sentence(shot_context)
     if env_motion:
         tail_lines.append(env_motion)
-    tail_lines.append(_continuity_sentence(transition, prev_ending, scene_name))
     if ending:
         tail_lines.append(
-            f"接近结尾时，{_strip_trailing_punct(ending)}。"
-            "人物与道具的最终位置都停留在这个状态，便于下一镜衔接。"
+            f"接近结尾时，{_ensure_sentence_end(ending)}"
         )
     if extra_tokens:
         tail_lines.append(
@@ -709,6 +947,33 @@ def render_natural_video_prompt(
             "光线与阴影随人物与镜头运动保持真实光学规律一致，"
             "光源方向与明暗关系不漂移、不跳变。"
         )
+    intentional_flicker = any(
+        kw in str(action_flow)
+        or kw in str(opening)
+        or kw in str(shot_context.get("action", ""))
+        or kw in str(shot_context.get("lighting", ""))
+        for kw in (
+            "忽明忽暗",
+            "闪烁",
+            "频闪",
+            "电光",
+            "雷电",
+            "火光",
+            "摇曳",
+            "烛光",
+            "故障灯",
+            "跳动",
+        )
+    )
+    if medium in {"2d", "3d", "photoreal"}:
+        if not intentional_flicker:
+            tail_lines.append(
+                "场景照明与环境光线保持恒定稳定，光源无频闪、无忽明忽暗、画面无闪烁跳变。"
+            )
+        else:
+            tail_lines.append(
+                "场景明暗变化契合环境剧情氛围，过渡平滑自然。"
+            )
     paragraphs.append("".join(tail_lines))
 
     # 协议尾部：负向段与运动风格锁行均在渲染器出口注入，格式为
@@ -717,9 +982,12 @@ def render_natural_video_prompt(
     for term in visual_style_negative_terms(style_spec):
         if term not in str(negative or ""):
             negative = f"{negative or ''}、{term}"
-    paragraphs.append(
-        f"Negative: {_negative_line(negative, dynamic_negative_rules_for(style_spec))}"
+    neg_str = _negative_line(
+        negative,
+        dynamic_negative_rules_for(style_spec),
+        intentional_flicker=intentional_flicker,
     )
+    paragraphs.append(f"Negative: {neg_str}")
     motion_lock = motion_style_lock_for(style_spec)
     cadence_lock = animation_cadence_lock_for(style_spec)
     if motion_lock:
@@ -774,6 +1042,7 @@ __all__ = [
     "naturalize_timeline_flow",
     "parse_reference_anchors",
     "render_natural_video_prompt",
+    "token_number",
     "validate_natural_style",
     "validate_prompt_references",
     "_FORBIDDEN_TEMPLATE_WORDS",

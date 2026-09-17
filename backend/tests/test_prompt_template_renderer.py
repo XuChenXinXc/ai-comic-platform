@@ -26,7 +26,6 @@ def _compile(asset_type: str, *, profile: dict, **overrides: object) -> str:
         negative_prompt="文字水印，真人摄影",
         consistency_keywords=["固定服装", "固定发型"],
         composition="主体清晰居中",
-        reference_mode=False,
     )
     defaults.update(overrides)
     return compile_asset_prompt(**defaults)

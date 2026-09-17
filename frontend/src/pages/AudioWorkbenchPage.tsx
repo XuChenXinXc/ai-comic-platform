@@ -314,11 +314,13 @@ export default function AudioWorkbenchPage() {
       console.error(error);
       toast.error(`生成失败：${formatError(error)}`);
     } finally {
-      setGenerating(prev => {
-        const newSet = new Set(prev);
-        newSet.delete(dialogue.shot_no);
-        return newSet;
-      });
+      if (canCommit()) {
+        setGenerating(prev => {
+          const newSet = new Set(prev);
+          newSet.delete(dialogue.shot_no);
+          return newSet;
+        });
+      }
     }
   };
 

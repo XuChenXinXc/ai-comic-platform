@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from app.services.director_plan import (
     AudienceFocus,
+    ConsistencyIssue,
     DialogueBinding,
     DirectorPlan,
     DirectorTimelineSegment,
     MicroPerformance,
+    _hard_constraint_line,
     director_bundle_from_llm,
     normalize_voice_source,
     render_director_video_prompt,
@@ -317,6 +319,109 @@ def test_director_bundle_from_llm_camel_case() -> None:
     assert bundle.director_plan.composition == "negative-space"
     assert bundle.timeline[0].action == "站立"
     assert bundle.dialogue_bindings[0].requires_lip_sync is True
+
+
+def _llm_payload(**overrides) -> dict:
+    payload = {
+        "shotPurpose": "强调孤独",
+        "audienceFocus": {"first": "苏月"},
+        "composition": "negative-space",
+        "timeline": [{"start": 0, "end": 3, "action": "站立"}],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_director_bundle_drops_non_numeric_timeline_segment_with_diagnostic() -> None:
+    """单个非数值时间段只丢弃该段并记诊断，不让整个导演计划解析失败。"""
+    diagnostics: list[ConsistencyIssue] = []
+    bundle = director_bundle_from_llm(
+        _llm_payload(
+            timeline=[
+                {"start": 0, "end": 3, "action": "站立"},
+                {"start": "大约两秒", "end": 5, "action": "转身"},
+                {"start": 3, "end": 6, "action": "望向门口"},
+            ]
+        ),
+        diagnostics=diagnostics,
+    )
+
+    assert [segment.action for segment in bundle.timeline] == ["站立", "望向门口"]
+    assert [issue.code for issue in diagnostics] == ["director_timeline_value_invalid"]
+    assert diagnostics[0].severity == "warning"
+
+
+def test_director_bundle_drops_non_numeric_dialogue_time_with_diagnostic() -> None:
+    diagnostics: list[ConsistencyIssue] = []
+    bundle = director_bundle_from_llm(
+        _llm_payload(
+            dialogueBindings=[
+                {"speaker": "苏月", "text": "走吧。", "startTime": "开头", "endTime": 2.0},
+                {"speaker": "苏月", "text": "别回头。", "startTime": 0.5, "endTime": 2.0},
+            ]
+        ),
+        diagnostics=diagnostics,
+    )
+
+    assert [binding.text for binding in bundle.dialogue_bindings] == ["别回头。"]
+    assert [issue.code for issue in diagnostics] == ["director_dialogue_value_invalid"]
+
+
+def test_director_bundle_normalizes_illegal_voice_source_with_diagnostic() -> None:
+    diagnostics: list[ConsistencyIssue] = []
+    bundle = director_bundle_from_llm(
+        _llm_payload(
+            dialogueBindings=[
+                {
+                    "speaker": "苏月",
+                    "text": "走吧。",
+                    "startTime": 0.5,
+                    "endTime": 2.0,
+                    "voiceSource": "telepathy",
+                }
+            ]
+        ),
+        diagnostics=diagnostics,
+    )
+
+    assert bundle.dialogue_bindings[0].voice_source == "character"
+    assert [issue.code for issue in diagnostics] == ["director_voice_source_invalid"]
+
+
+def test_director_bundle_unknown_composition_falls_back_with_diagnostic() -> None:
+    diagnostics: list[ConsistencyIssue] = []
+    bundle = director_bundle_from_llm(
+        _llm_payload(composition="dutch-angle"),
+        diagnostics=diagnostics,
+    )
+
+    assert bundle.director_plan.composition == "centered"
+    assert [issue.code for issue in diagnostics] == ["director_composition_unknown"]
+
+
+def test_validate_shot_consistency_reports_non_numeric_timeline_mapping() -> None:
+    """外部传入的 mapping 时间轴含非数值项时给出明确 blocking 诊断而非抛异常。"""
+    issues = validate_shot_consistency(
+        shot={},
+        timeline=[{"start": "零秒", "end": 3, "action": "a"}],
+        dialogue_bindings=[],
+        duration_sec=3.0,
+    )
+
+    value_issues = [issue for issue in issues if issue.code == "timeline_value_invalid"]
+    assert value_issues and value_issues[0].severity == "blocking"
+
+
+def test_hard_constraint_line_flicker_words_follow_intentional_flag() -> None:
+    """频闪条款只由 intentional_flicker 决定，重复的硬约束不会二次插入。"""
+    auto_line = _hard_constraint_line([], intentional_flicker=False)
+    intentional_line = _hard_constraint_line([], intentional_flicker=True)
+
+    assert "灯光频闪" in auto_line
+    assert "灯光频闪" not in intentional_line
+    # 用户硬约束里的频闪描述被 _HARD_OVERLAP_RE 统一过滤，不会重复出现
+    duplicated = _hard_constraint_line(["灯光频闪、画面闪烁"], intentional_flicker=False)
+    assert duplicated.count("灯光频闪") == 1
 
 
 def test_compile_video_prompt_uses_director_plan_when_present() -> None:

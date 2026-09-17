@@ -1,6 +1,7 @@
+import logging
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from pydantic import ValidationError
@@ -22,8 +23,16 @@ from app.services.natural_video_prompt import (
     render_natural_video_prompt,
 )
 
+logger = logging.getLogger(__name__)
+
 STYLE_ANCHOR = "统一画风锚定（最高优先级）：全片所有画面严格采用下列画风要求"
 VISUAL_PROMPT_TEMPLATE_VERSION = "visual-prompt-v3.1"
+# 角色设定板面部特写数量兜底：表情组缺失或为空时按此数量排版。
+_DEFAULT_EXPRESSION_COUNT = 3
+# 素材档案无细节补充时的哨兵值：与真实细节区分，避免把兜底文案当成用户补充。
+_PROFILE_NO_DETAIL_SENTINEL = "以素材资料保持稳定一致"
+# 素材提示词负向段的统一标签（模板与内置两条路径共用，避免字面量漂移）。
+_NEGATIVE_PROMPT_LABEL = "negative prompt: "
 _FIXED_VISUAL_ASPECT_RATIOS = {
     "character": "3:2",
     "prop": "3:2",
@@ -31,14 +40,22 @@ _FIXED_VISUAL_ASPECT_RATIOS = {
     "keyframe": "16:9",
     "video": "16:9",
 }
+# 用户/模型可控字段拼进提示词前的清洗：换行与制表符会切断版面段落结构，
+# 书名号/尖括号/引号可被用来伪造标题或指令行；正常中文标点与圆括号保留。
+_FIELD_LINE_BREAK_RE = re.compile(r"[\r\n\t\u2028\u2029]+")
+_FIELD_UNSAFE_CHARS = "《》〈〉<>「」『』"
+_FIELD_ROLE_LABEL_RE = re.compile(r"(?i)\b(?:system|assistant|user)\s*[:：]")
 _NARRATION_CUE_PATTERN = re.compile(
     r"(?:画外旁白|画外音|旁白|内心独白|OS)"
     r"(?:低声)?(?:声音?|声)?(?:开始|起|响起|声中|中|收尾|同期收尾)?"
 )
 _SPEECH_CUE_PATTERN = re.compile(
-    r"(?:开口(?:说(?:出)?(?:台词)?)?|说出(?:台词)?|说道|回答|回应|反问|问道|"
+    r"(?:开口(?:说话|说(?:出)?(?:台词)?)?|说出(?:台词)?|说道|回答|回应|反问|问道|"
     r"质问|喊道|喊|低声(?:说)?|高声(?:说)?|轻声(?:说)?|自语|低语|说话)"
 )
+# 方式副词类 cue（低声/高声/轻声）单独出现时不是完整动词，
+# 裸 cue 成句时补「开口」构成自然谓语，避免「她低声，口型与…」这类断句。
+_MANNER_CUE_OPENINGS = {"低声": "低声开口", "高声": "高声开口", "轻声": "轻声开口"}
 _QUOTED_TEXT_PATTERN = re.compile(r"[“「\"](?P<text>.*?)[”」\"]")
 _TIMELINE_CLAUSE_PATTERN = re.compile(
     r"^\s*(?P<time>\d+(?:\.\d+)?\s*[-–—~－至]\s*\d+(?:\.\d+)?\s*秒\s*[:：，,])"
@@ -47,9 +64,11 @@ _TIMELINE_CLAUSE_PATTERN = re.compile(
 # source_ref 形如「scene:1|古寺门口」，前半截是程序内部占位符，
 # 直接写进画面提示词只会变成无意义 token。
 _SOURCE_REF_PREFIX_PATTERN = re.compile(r"^\s*(?:scene|场景)\s*[:：]?\s*\d+\s*[|｜]\s*")
-# 分镜提取残留的「场景1：动作＋旁白」类标签不属于可入画的地点表述。
-_SCENE_LABEL_PREFIX_PATTERN = re.compile(r"^\s*场景\s*\d+\s*[:：]\s*")
-_NON_PLACE_JUNK_PATTERN = re.compile(r"动作|旁白|对白|台词|景别|机位|运镜|镜头")
+# 分镜提取残留的「场景1：/场次1：动作＋旁白」类标签不属于可入画的地点表述。
+_SCENE_LABEL_PREFIX_PATTERN = re.compile(r"^\s*(?:场景|场次)\s*\d+\s*[:：\s]*")
+_NON_PLACE_JUNK_PATTERN = re.compile(
+    r"动作|旁白|对白|台词|景别|机位|运镜|镜头|节拍|剧本|分镜|吐槽|改稿"
+)
 _SCENE_CLAUSE_PATTERN = re.compile(r"[^。！？；;\n]+[。！？；;]?\s*")
 _SCENE_PERSON_MARKERS = (
     "人物",
@@ -112,8 +131,32 @@ _SAFETY_REPLACEMENTS = {
 }
 
 
+def _flatten_prompt_parts(value: Any) -> list[str]:
+    """把提示词片段规整为文本列表；容器只展开内容，不泄漏 dict/list 的 repr。"""
+    if not value:
+        return []
+    if isinstance(value, Mapping):
+        return [text for item in value.values() for text in _flatten_prompt_parts(item)]
+    if isinstance(value, list | tuple | set | frozenset):
+        return [text for item in value for text in _flatten_prompt_parts(item)]
+    text = str(value).strip()
+    return [text] if text else []
+
+
 def join_non_empty(parts: Iterable[Any]) -> str:
-    return "\n".join(str(part).strip() for part in parts if str(part or "").strip())
+    return "\n".join(text for part in parts for text in _flatten_prompt_parts(part))
+
+
+def _sanitize_prompt_field(value: Any) -> str:
+    """清洗用户/模型可控字段后再拼进提示词。
+
+    折叠换行与制表符、去掉可用来跳出标题包裹或伪造指令行的书名号/尖括号，
+    以及 system/user 之类角色标签；正常中文与圆括号保留，不改变正常取值。
+    """
+    text = _FIELD_LINE_BREAK_RE.sub(" ", str(value or ""))
+    text = text.translate({ord(char): None for char in _FIELD_UNSAFE_CHARS})
+    text = _FIELD_ROLE_LABEL_RE.sub("", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def resolve_visual_aspect_ratio(target_type: str, fallback: str) -> str:
@@ -213,10 +256,21 @@ def _clean_source_ref(source_ref: str) -> str:
 
 
 def _clean_time_place(source_ref: str) -> str:
-    """从 source_ref 提取可入画的地点表述，剥离「场景1：」占位标签与动作/旁白类残留。"""
+    """从 source_ref 提取可入画的地点表述，剥离「场景1：/场次1」占位标签与桥段描述残留。"""
     text = _SCENE_LABEL_PREFIX_PATTERN.sub("", _clean_source_ref(source_ref))
     if not text:
         return ""
+    # 若包含 ｜ 或 | 分割的桥段备注（如「苏棠的公寓｜凌晨改稿与吐槽段」），仅保留地点部分
+    if "｜" in text or "|" in text:
+        parts = re.split(r"[|｜]", text)
+        valid_parts = [
+            p.strip()
+            for p in parts
+            if p.strip()
+            and not p.strip().endswith(("段", "节拍", "戏", "回合"))
+            and not _NON_PLACE_JUNK_PATTERN.search(p)
+        ]
+        text = "，".join(valid_parts)
     pieces = [piece.strip(" 。") for piece in re.split(r"[，,、；;]", text) if piece.strip(" 。")]
     kept = [piece for piece in pieces if not _NON_PLACE_JUNK_PATTERN.search(piece)]
     return "，".join(kept)
@@ -237,7 +291,7 @@ def _asset_detail(prompt: str, profile: dict[str, Any]) -> str:
     if prompt.strip():
         return prompt.strip()
     values = [_value(value, "") for value in profile.values() if _value(value, "")]
-    return "；".join(values) or "以素材资料保持稳定一致"
+    return "；".join(values) or _PROFILE_NO_DETAIL_SENTINEL
 
 
 def _scene_environment_text(value: Any, fallback: str) -> str:
@@ -392,10 +446,10 @@ def _character_setting_sheet(
     expression_items = _expression_items(
         profile.get("expression_group") or profile.get("acting_traits")
     )
-    expression_count = len(expression_items) or 3
+    expression_count = len(expression_items) or _DEFAULT_EXPRESSION_COUNT
     anchors = "、".join(consistency_keywords)
     detail_clean = detail.rstrip("。") if detail else detail
-    has_detail = bool(detail_clean) and detail_clean != "以素材资料保持稳定一致"
+    has_detail = bool(detail_clean) and detail_clean != _PROFILE_NO_DETAIL_SENTINEL
     paragraphs = [
         f"《{name}・{concept} 角色基础设定稿》",
         "角色身份设定：\n"
@@ -455,8 +509,10 @@ def _character_setting_sheet(
         f"主人物立绘、三视图和{expression_count}个面部特写必须严格表现为同一个{name}。"
         "所有模块保持完全一致的脸型、五官比例、年龄感、肤色、身体比例、发型结构、发色、"
         "服装款式、服装颜色、材质和核心视觉识别点。\n"
-        "不得生成不同版本的角色，不得改变年龄、脸型、服装或发型，"
-        "不得随机增加或删除配饰。" + (f"一致性锚点：{anchors}。" if anchors else ""),
+        "不得生成不同版本的角色，不得改变年龄、脸型、服装或发型，不得随机增加或删除配饰。"
+        + f"三视图与特写小图必须严格保持主立绘的{costume}与{main_color}服装固有色，"
+        "严禁任何模块更换为白色或其他颜色服装，严禁脱去外搭或露异色内衬，整张设定板服装颜色绝对统一。"
+        + (f"一致性锚点：{anchors}。" if anchors else ""),
         f"【角色身份唯一性】整张设定板不是多个相似人物，而是同一人物{name}的多角度、"
         "多表情记录。所有模块共享同一角色身份编码。禁止因视角、表情或尺寸变化导致"
         "脸型重绘、年龄变化、美型程度变化、发量变化、发际线变化或服装重新设计。",
@@ -466,11 +522,13 @@ def _character_setting_sheet(
         "光影表达方式完全由项目统一画风决定。"
         f"角色固有色以{main_color}和{accent_color}为核心。",
         "画质与成图要求：\n"
-        "全画面保持清晰，无景深模糊，无低清缩略图感，无杂色噪点，无脏污背景。\n"
+        "全画面保持清晰，材质以二维笔触与色块概括，人物比例与五官结构遵循设定板；"
+        "发丝与织物以概括笔触表达，阴影通透干净，"
+        "避免阴影死黑、画面脏灰或塑料感。无景深模糊，无低清缩略图感，无杂色噪点，无脏污背景。\n"
         "无其他人物，无不同版本角色，无重复头部，无多余肢体，无手脚缺失，无错误手指，"
         "无肢体粘连，无五官错位，无年龄漂移，无比例失衡，无服装变化，无发型变化，"
         "无服装穿模。版面模块对齐，间距统一，信息完整但不拥挤，留白舒适，视觉层级明确。",
-        f"negative prompt: {negative_prompt}" if negative_prompt else "",
+        f"{_NEGATIVE_PROMPT_LABEL}{negative_prompt}" if negative_prompt else "",
     ]
     return "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
 
@@ -515,7 +573,7 @@ def _prop_setting_sheet(
     scale = _profile_value(profile, "scale_reference", fallback="与成年人手掌的比例以素材资料为准")
     anchors = "、".join(consistency_keywords)
     detail_clean = detail.rstrip("。") if detail else detail
-    has_detail = bool(detail_clean) and detail_clean != "以素材资料保持稳定一致"
+    has_detail = bool(detail_clean) and detail_clean != _PROFILE_NO_DETAIL_SENTINEL
     paragraphs = [
         f"《{name}・{concept} 完整道具设定稿》",
         "核心物品设定：\n"
@@ -586,11 +644,13 @@ def _prop_setting_sheet(
         "灯光与画质：\n"
         "灯光只用于清楚展示物品轮廓、厚度与材质等事实，光影表达方式完全由项目统一画风决定，"
         "不指定主光、轮廓光等布光方案。\n"
-        "画面整体清晰，无景深模糊，无低清区域，无多余物品，无不同型号，无重复部件，"
+        "画面整体清晰通透，材质以二维笔触与色块概括（金属、木质、皮革与晶石只用概括的线条"
+        "与色块表达质感），结构边缘受控明确，避免脏暗与死黑。"
+        "全画面无景深模糊，无低清区域，无多余物品，无不同型号，无重复部件，"
         "无结构错位，无悬浮零件，无错误透视，无材质混乱，无随机文字或品牌标志。"
         "整张设定面板背景底色保持统一（默认纯白；水墨、国画或古风类画风使用"
         "宣纸米白或留白底色），版面模块对齐，间距统一，留白舒适。",
-        f"negative prompt: {negative_prompt}" if negative_prompt else "",
+        f"{_NEGATIVE_PROMPT_LABEL}{negative_prompt}" if negative_prompt else "",
     ]
     return "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
 
@@ -737,121 +797,16 @@ def _scene_setting_sheet(
         "各视图保持一致的光照方向，画面清楚展示空间结构和材质事实，"
         "不让暗部吞没陈设结构。",
         "画质与成图要求：\n"
+        "全画面清晰通透，以二维笔触与色块表现空间纵深；"
+        "木材、石材、金属、玻璃等材质只以笔触与色块概括，环境光过渡自然，"
+        "暗部保留结构细节，避免画面脏暗或阴影死黑。"
         "全画面无景深模糊，无低清缩略图感，无脏污背景，无人物，无人体残影，"
         "无错误透视，无弯曲墙面，无悬浮家具。\n"
         "最终检查：所有面板均不得出现人物、人影、剪影、倒影中的人物或人体局部。"
         "版面模块对齐，间距统一，信息完整但不拥挤，留白舒适，视觉层级明确。",
-        f"negative prompt: {negative_prompt}" if negative_prompt else "",
+        f"{_NEGATIVE_PROMPT_LABEL}{negative_prompt}" if negative_prompt else "",
     ]
     return "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
-
-
-def _character_clean_reference(
-    *,
-    name: str,
-    profile: dict[str, Any],
-    detail: str,
-    consistency_keywords: list[str],
-    composition: str,
-    negative_prompt: str,
-) -> str:
-    """干净角色参考图：无文字、无边框、单一主体，专供图生图和视频引用。"""
-    age = _profile_value(profile, "age", fallback="年龄以素材资料为准")
-    gender = _profile_value(profile, "gender", fallback="性别以素材资料为准")
-    hair = _profile_value(profile, "hair", fallback="发型以素材资料为准")
-    appearance = _profile_value(profile, "appearance", "face", fallback="脸部特征以素材资料为准")
-    costume = _profile_value(profile, "costume", fallback="服装以素材资料为准")
-    main_color = _profile_value(profile, "main_color", "color", fallback="服装主色以素材资料为准")
-    immutable = _profile_value(profile, "immutable_features", fallback="固定识别特征以素材资料为准")
-    expression = _profile_value(
-        profile,
-        "normal_expression",
-        "acting_traits",
-        fallback="自然克制",
-    )
-    return join_non_empty(
-        [
-            f"《{name}・干净角色参考图》",
-            "用途：仅作为图生图与视频生成的参考图，不包含任何文字、资料卡、"
-            "边框、宫格、多视图或标注。",
-            f"画面内容：{name}，一位{age}的{gender}角色，{hair}，{appearance}；"
-            f"服装{costume}，主色{main_color}；表情{expression}。",
-            f"固定识别特征：{immutable}。",
-            f"细节补充：{detail}。" if detail and detail != "以素材资料保持稳定一致" else "",
-            "构图：全身立绘，正面微侧，人物完整居中，四肢与道具无遮挡；背景为纯白色，无任何环境陈设。",
-            f"negative prompt: {negative_prompt}" if negative_prompt else "",
-        ]
-    )
-
-
-def _prop_clean_reference(
-    *,
-    name: str,
-    profile: dict[str, Any],
-    detail: str,
-    consistency_keywords: list[str],
-    composition: str,
-    negative_prompt: str,
-) -> str:
-    """干净道具参考图：无文字、无边框、单件物品，专供图生图和视频引用。"""
-    description = _profile_value(profile, "description", fallback="外观以素材资料为准")
-    special_features = _profile_value(
-        profile, "special_features", fallback="关键结构以素材资料为准"
-    )
-    material = _profile_value(profile, "material", fallback="主体材质以素材资料为准")
-    color = _profile_value(profile, "color", "main_color", fallback="主色以素材资料为准")
-    scale = _profile_value(profile, "scale_reference", fallback="与成年人手掌的比例以素材资料为准")
-    return join_non_empty(
-        [
-            f"《{name}・干净道具参考图》",
-            "用途：仅作为图生图与视频生成的参考图，不包含任何文字、资料卡、"
-            "边框、尺寸标注、比例参考或多视图。",
-            f"画面内容：单件物品{name}，{description}；关键结构{special_features}；"
-            f"主体材质{material}，主色{color}；大小{scale}。",
-            f"细节补充：{detail}。" if detail and detail != "以素材资料保持稳定一致" else "",
-            "构图：物品完整居中，四十五度略俯视，无人物手部入镜；背景为纯白色，无任何环境陈设。",
-            f"negative prompt: {negative_prompt}" if negative_prompt else "",
-        ]
-    )
-
-
-def _scene_clean_reference(
-    *,
-    name: str,
-    profile: dict[str, Any],
-    detail: str,
-    consistency_keywords: list[str],
-    composition: str,
-    negative_prompt: str,
-) -> str:
-    """干净场景参考图：无文字、无边框、无人空镜，专供图生图和视频引用。"""
-    layout = _scene_profile_value(
-        profile,
-        "space_keywords",
-        "layout",
-        fallback="空间布局以素材资料为准",
-    )
-    architecture = _scene_profile_value(
-        profile, "architecture", fallback="建筑/室内风格以素材资料为准"
-    )
-    furnishings = _scene_profile_value(profile, "furnishings", fallback="固定陈设以素材资料为准")
-    color_mood = _scene_profile_value(profile, "color_mood", fallback="主色与点缀色以素材资料为准")
-    environment_detail = _scene_environment_text(detail, "")
-    return join_non_empty(
-        [
-            f"《{name}・干净场景参考图》",
-            "用途：仅作为图生图与视频生成的参考图，不包含任何文字、资料卡、"
-            "平面布局图、标注、边框或多视图。",
-            "【最高优先级：无人纯背景空镜】禁止出现人物、人群、路人、行人、人影、"
-            "人形、剪影、倒影中的人物或人体局部。",
-            f"画面内容：{name}，{architecture}，空间{layout}，固定陈设{furnishings}；"
-            f"配色{color_mood}。",
-            f"环境补充细节：{environment_detail}。" if environment_detail else "",
-            "构图：主场景全景透视图，机位与项目设定稿一致，画面完整居中；"
-            "背景为画面自身场景，不添加边框或文字。",
-            f"negative prompt: {negative_prompt}" if negative_prompt else "",
-        ]
-    )
 
 
 def compile_asset_prompt(
@@ -865,10 +820,13 @@ def compile_asset_prompt(
     negative_prompt: str,
     consistency_keywords: list[str],
     composition: str,
-    reference_mode: bool = False,
     use_template: bool = True,
     visual_bible: dict[str, Any] | None = None,
 ) -> str:
+    # 素材名与用户补充细节由用户/模型可控，拼进提示词前先清洗，
+    # 避免换行或书名号把内容顶出标题、伪造指令行（模板与内置两条路径共用清洗结果）。
+    asset_name = _sanitize_prompt_field(asset_name)
+    prompt = _sanitize_prompt_field(prompt)
     style_spec = compile_visual_bible(style_prompt, visual_bible)
     effective_negative_prompt = merge_visual_bible_negative(
         resolve_asset_negative_prompt(asset_type, negative_prompt, style_spec),
@@ -876,33 +834,6 @@ def compile_asset_prompt(
     )
     effective_aspect_ratio = resolve_visual_aspect_ratio(asset_type, aspect_ratio)
     detail = _asset_detail(prompt, profile)
-    if reference_mode:
-        reference_template = {
-            "character": _character_clean_reference,
-            "prop": _prop_clean_reference,
-            "scene": _scene_clean_reference,
-        }.get(asset_type)
-        if reference_template is not None:
-            body = reference_template(
-                name=asset_name,
-                profile=profile,
-                detail=detail,
-                consistency_keywords=consistency_keywords,
-                composition=composition,
-                negative_prompt=effective_negative_prompt,
-            )
-            return apply_content_safety(
-                join_non_empty(
-                    [
-                        style_anchor(
-                            style_prompt,
-                            effective_aspect_ratio,
-                            visual_bible=visual_bible,
-                        ),
-                        body,
-                    ]
-                )
-            )
     if use_template and asset_type in {"character", "prop", "scene"}:
         # 设定图正文优先由落盘模板渲染；内置函数保留为 use_template=False 的回退路径。
         # 延迟导入避免与 prompt_template_renderer 顶部的 prompt_service 导入成环。
@@ -935,7 +866,9 @@ def compile_asset_prompt(
         "scene": _scene_setting_sheet,
     }.get(asset_type)
     if template is None:
-        body = join_non_empty([detail, f"negative prompt: {effective_negative_prompt}"])
+        body = join_non_empty(
+            [detail, f"{_NEGATIVE_PROMPT_LABEL}{effective_negative_prompt}"]
+        )
     else:
         body = template(
             name=asset_name,
@@ -1011,12 +944,37 @@ def compile_keyframe_prompt(
             f"{subject}的完成精度保持统一，画面质感与渲染方式以【参考】段画风指纹为准，"
             "不叠加其他渲染质感。"
         )
+    raw_time_place = str(shot_context.get("time_place") or "").strip()
+    raw_scene_name = _value(shot_context.get("scene_name"), "当前分镜场景")
+    if (
+        raw_time_place
+        and raw_time_place != raw_scene_name
+        and raw_time_place not in {"以当前场景资料为准", "以当前场景为准", "无", "未提供"}
+    ):
+        time_place_clause = f"时间地点：{raw_time_place}。\n"
+    elif not shot_context.get("scene_name"):
+        time_place_clause = f"时间地点：{_value(raw_time_place, '当前场景')}。\n"
+    else:
+        time_place_clause = ""
+
     wide_shot_body_rule = (
         f"\n本镜为{shot_type}，人物仍需保持清晰可辨识的体量，约占画面高度的1/5至1/4，"
         "可明确识别其发型、服装与手持道具，不得缩成远景小黑点。"
         if not empty_shot
         and ("全景" in shot_type or "远景" in shot_type)
         and "大远景" not in shot_type
+        else ""
+    )
+    character_costumes = shot_context.get("character_costumes") or {}
+    costume_clauses: list[str] = []
+    if isinstance(character_costumes, dict):
+        for char_name, desc in character_costumes.items():
+            if desc:
+                costume_clauses.append(f"{char_name}（{desc}）")
+    costume_line = (
+        f"\n服装锁定：{'；'.join(costume_clauses)}。画面中人物必须严格穿着指定的服装，"
+        "主色调与款式保持一致，严禁出现异色服装、脱去外搭或服装变色。"
+        if costume_clauses
         else ""
     )
     paragraphs = [
@@ -1036,22 +994,29 @@ def compile_keyframe_prompt(
             "不得覆盖【参考】段画风指纹，最终画面严格按画风指纹渲染。"
             if anchors
             else ""
+        )
+        + (
+            "\n【角色参考图基准】：若绑定的角色素材图为包含三视图或表情特写的设定展板，"
+            "必须以左侧/主体区域的完整主立绘服装与固有颜色为唯一基准；"
+            "严禁参考特写小图、局部视图或底色中的浅色/异色服装，人物服装款式与颜色必须严格保持一致。"
+            if any(
+                "角色" in anchor or "character" in anchor or "五官" in anchor or "发型" in anchor
+                for anchor in anchors
+            )
+            else ""
         ),
         "【剧情时刻】\n"
         f"{image_prompt.rstrip('。')}。\n"
-        "画面只呈现该剧情时刻对应的单一关键瞬间，该瞬间必须是一个已经稳定达成的"
-        "静止状态，任何动作先后顺序、过程或进行中的变化都留给后续视频提示词。\n"
-        "本镜画面完全由【首帧关键构图】确定，剧情时刻中的完整行为链（先…再…、随后、"
-        "然后、正在…等）只作为剧情上下文，不得进入画面；本帧只允许描述："
+        "本镜画面完全由【首帧关键构图】确定，剧情时刻中的完整行为链（先…再…、随后、然后、正在…等）只作为剧情上下文，不得进入画面；"
         + (
-            "人物现在在哪里、现在什么姿势、现在看哪里、现在什么表情、现在手里有什么、"
+            "精确呈现人物现在在哪里、现在什么姿势、现在看哪里与此刻神态，时间过程留给后续视频。"
             if not empty_shot
-            else "场景此刻的空间结构、陈设与光线状态、"
-        )
-        + "镜头在哪里、灯怎么照，除此之外的时间过程全部删除。",
+            else "精确呈现场景此刻的空间结构、陈设与光线状态。"
+        ),
         "【人物与动作】\n"
         + (
             f"人物：{characters}。"
+            + costume_line
             + (
                 f"\n站位、朝向与视线：{positions}。画面中人物的左右位置关系、朝向与视线落点"
                 "必须与上述描述一致，不得左右颠倒或镜像翻转。"
@@ -1060,8 +1025,7 @@ def compile_keyframe_prompt(
             )
             + (
                 f"\n对白与口型状态：本镜对白为「{dialogue}」。"
-                "本帧锁定对白开始前的短暂停顿瞬间，画面中所有人物均闭口，"
-                "不呈现任何说话口型或半张嘴状态；对白只作为后续视频的表演依据。"
+                "本帧锁定对白开始前的短暂停顿瞬间，画面中所有人物均闭口，不呈现说话口型。"
                 if dialogue
                 else ""
             )
@@ -1076,8 +1040,8 @@ def compile_keyframe_prompt(
             "人物站位、朝向、表情、口型与手持道具等要求一律不适用。"
         ),
         "【场景与空间关系】\n"
-        f"时间地点：{_value(shot_context.get('time_place'), '以当前场景资料为准')}。\n"
-        f"场景：{_value(shot_context.get('scene_name'), '当前分镜场景')}。"
+        + time_place_clause
+        + f"场景：{raw_scene_name}。"
         + (
             "空间结构、门窗位置、家具摆放与陈设布局沿用绑定参考图，"
             "门窗开启方向、铰链侧、门锁侧与室内—走廊/室外的方位关系必须和参考图完全一致；"
@@ -1098,25 +1062,13 @@ def compile_keyframe_prompt(
         ),
         "【镜头构图】\n"
         f"景别{shot_type}，机位{camera_angle}。\n"
-        "景别只取单一确定值：若描述含多个候选景别，只采用第一个候选，其余忽略。\n"
         + (
             f"构图：{composition.rstrip('。')}。\n"
-            if composition
+            if composition and composition.rstrip("。") not in image_prompt
             else ""
         )
-        + (
-            "构图只描述静态空间关系：摄像机位置与朝向、人物在画面中的左右位置与前后景层次、"
-            "门框墙面等建筑结构如何切割画面、人物与关键物品的画面占比，"
-            "以及画面焦点落在哪个人物或物体上；不写动作过程、先后顺序、对白或镜头运动方式。\n"
-            if not empty_shot
-            else "构图只描述静态空间关系：摄像机位置与朝向、建筑结构与陈设在画面中的前后景层次、"
-            "门框墙面等建筑结构如何切割画面、关键陈设与物品的画面占比，"
-            "以及画面焦点落在哪个空间局部或物体上；不写动作过程、先后顺序、对白或镜头运动方式。\n"
-        )
         + f"首帧关键构图：{opening_frame.rstrip('。')}。\n"
-        "本帧只呈现首帧关键构图所描述的、已经稳定达成的这一个静态状态；"
-        "任何「先…再…」「随后」「然后」「正在…」等时间过程表述都不属于本帧画面，"
-        "全部留给后续视频提示词，不得提前呈现动作完成结果。"
+        "本帧只呈现首帧关键构图所描述的、已经稳定达成的这一个静态状态，不得提前呈现动作完成结果。"
         f"{wide_shot_body_rule}\n"
         "用途：生成当前分镜唯一的分镜图，并作为图生视频严格第0秒起始帧。",
         (
@@ -1127,8 +1079,6 @@ def compile_keyframe_prompt(
                 if expressions
                 else "人物表情自然克制，情绪强度适中，不使用夸张颜艺。"
             )
-            + "\n神态必须用可直接画出的面部与肢体特征表达（眉心、视线、唇部、下颌、肩颈、"
-            "手部等具体状态），不使用无法直接呈现的抽象情绪词。"
             if not empty_shot
             else ""
         ),
@@ -1171,11 +1121,11 @@ def compile_keyframe_prompt(
             else "本镜为无人空镜，不出现任何人物、行人、看客、路人或模糊人影。\n"
         )
         + "无人物漂浮，无物品漂浮，无穿模，无物品尺寸异常，无家具移动，无门窗错位，"
-        "无场景镜像翻转，无错误透视。\n"
+        "无场景镜像翻转，无错误透视，无服装变色，无不同颜色服装。\n"
         "画面中不出现字幕、对白、对话框、旁白文字、水印、品牌标志、"
         "文件文字、乱码或无意义符号。"
         + (
-            f"\nnegative prompt: {effective_negative_prompt}"
+            f"\n{_NEGATIVE_PROMPT_LABEL}{effective_negative_prompt}"
             if effective_negative_prompt.strip()
             else ""
         ),
@@ -1189,6 +1139,7 @@ def shot_template_context(
     current: dict[str, Any],
     asset_names: dict[str, str],
     prev_end_state: str = "",
+    character_costumes: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     dialogue_parts: list[str] = []
     dialogue_entries: list[dict[str, str]] = []
@@ -1236,6 +1187,21 @@ def shot_template_context(
             str(item.get("gaze") or item.get("look") or item.get("eye_line") or "").strip(),
             str(item.get("action_direction") or "").strip(),
         ]
+        details = [
+            d
+            for d in details
+            if d
+            and d not in {
+                "无",
+                "未提供",
+                "none",
+                "None",
+                "以素材为准",
+                "暂无",
+                "无明确方向",
+                "以当前场景为准",
+            }
+        ]
         details = list(dict.fromkeys(detail for detail in details if detail))
         if details:
             position_parts.append(f"{character}：{'，'.join(details)}")
@@ -1265,8 +1231,11 @@ def shot_template_context(
         "characters": [
             asset_names[item] for item in current.get("character_ids", []) if item in asset_names
         ],
+        "character_costumes": character_costumes or {},
         "scene_name": asset_names.get(current.get("scene_asset_id", ""), ""),
-        "props": [asset_names[item] for item in current.get("prop_ids", []) if item in asset_names],
+        "props": [
+            asset_names[item] for item in current.get("prop_ids", []) if item in asset_names
+        ],
         "shot_type": current.get("shot_type", ""),
         "camera_angle": current.get("camera_angle", ""),
         "camera_move": current.get("camera_move", ""),
@@ -1400,6 +1369,16 @@ def _replace_speech_clause(
     else:
         unconsumed.discard(selected)
         replacement = f"按第{selected + 1}句对白执行对应口型"
+    if not quoted and speech_match and selected is not None:
+        # 裸说话动词（无引号原文）：把动词本身保留成自然的开口动作，直接接在
+        # 主语前缀之后、其余动作用逗号衔接；否则分号会把句子切成
+        # 「她；口型与第1句对白同步；话」这类互相独立的碎片指令。
+        cue = _MANNER_CUE_OPENINGS.get(speech_match.group(0), speech_match.group(0))
+        suffix = re.sub(r"^[道话][，,]?", "", suffix)
+        result = f"{prefix}{cue}，{replacement}" if prefix else f"{cue}，{replacement}"
+        if suffix:
+            result = f"{result}，{suffix}"
+        return result
     if prefix.endswith(("：", ":")):
         result = f"{prefix}{replacement}"
     elif prefix:
@@ -1467,9 +1446,10 @@ def _render_with_director_plan(
 
     try:
         bundle = director_bundle_from_llm(director_plan)
-    except (ValidationError, ValueError, TypeError):
+    except (ValidationError, ValueError, TypeError) as exc:
         # 存储中的导演计划若结构非法（如时间轴段 end<=start、时间值不可解析），
-        # 回退旧版渲染而不是让分镜列表整体 500。
+        # 回退旧版渲染而不是让分镜列表整体 500；降级原因记日志便于排查。
+        logger.warning("导演计划解析失败，已回退自然语言渲染：%s", exc)
         return ""
     if not bundle.timeline:
         return ""
@@ -1502,6 +1482,8 @@ def _render_with_director_plan(
         ),
         prev_end_state=_value(shot_context.get("prev_end_state"), ""),
         scene_name=_value(shot_context.get("scene_name"), ""),
+        # 单角色镜头不渲染「其余角色保持聆听」，避免诱导模型补出第二个倾听者。
+        multi_character=len(shot_context.get("characters") or []) > 1,
     )
 
 

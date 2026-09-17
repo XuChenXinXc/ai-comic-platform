@@ -1,3 +1,4 @@
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -15,9 +16,27 @@ ContentStatus = Literal["draft", "ready", "confirmed", "failed"]
 ProviderKind = Literal["text", "image", "video", "tts"]
 ShotSourceType = Literal["novel", "screenplay"]
 ProjectStorageSource = Literal["database", "environment", "default"]
+# 合法字幕预设与 SubtitleService.get_subtitle_styles() 保持一致。
+SubtitleStylePreset = Literal["default", "top", "floating"]
 
 # 批量请求 ids 数量上限：防止一次性排队海量任务造成异常负载。
 _MAX_BATCH_IDS = 200
+
+# 小说正文上限：足够覆盖长篇连载（约 500 万字符），仅用于防滥用。
+_MAX_SOURCE_TEXT_LENGTH = 5_000_000
+# 项目画风上限：远大于平台默认画风（500 字符），只拦截异常超长文本。
+_MAX_STYLE_PROMPT_LENGTH = 2000
+# Provider params 体积与嵌套深度上限：避免把超大/深层结构带入任务载荷。
+_MAX_PARAMS_BYTES = 64 * 1024
+_MAX_PARAMS_DEPTH = 12
+
+
+def _params_container_depth(value: Any) -> int:
+    if isinstance(value, dict):
+        return 1 + max((_params_container_depth(item) for item in value.values()), default=0)
+    if isinstance(value, list):
+        return 1 + max((_params_container_depth(item) for item in value), default=0)
+    return 0
 
 
 def _sensitive_param_path(value: Any, path: str = "params") -> str | None:
@@ -40,9 +59,20 @@ def _sensitive_param_path(value: Any, path: str = "params") -> str | None:
 
 
 def _validate_public_params(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
     sensitive_path = _sensitive_param_path(value)
     if sensitive_path:
         raise ValueError(f"params 不能包含敏感凭据字段：{sensitive_path}")
+    depth = _params_container_depth(value)
+    if depth > _MAX_PARAMS_DEPTH:
+        raise ValueError(f"params 嵌套层级不能超过 {_MAX_PARAMS_DEPTH}")
+    try:
+        encoded = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("params 必须是可序列化的 JSON 对象") from exc
+    if len(encoded.encode("utf-8")) > _MAX_PARAMS_BYTES:
+        raise ValueError(f"params 体积不能超过 {_MAX_PARAMS_BYTES} 字节")
     return value
 
 
@@ -52,10 +82,10 @@ class ApiModel(BaseModel):
 
 class ProjectCreate(ApiModel):
     name: str = Field(min_length=1, max_length=200)
-    source_text: str = ""
+    source_text: str = Field(default="", max_length=_MAX_SOURCE_TEXT_LENGTH)
     # 统一画风：留空时由后端读取平台设置（platform_setting.default_style_prompt）回填；
     # 画风文本不写死在代码里，只作为数据库数据存在。
-    style_prompt: str = ""
+    style_prompt: str = Field(default="", max_length=_MAX_STYLE_PROMPT_LENGTH)
     # 结构化视觉圣经：为空时由 style_prompt 自动推导
     visual_bible: dict[str, Any] | None = None
     aspect_ratio: str = "16:9"
@@ -70,8 +100,8 @@ class ProjectCreate(ApiModel):
 
 class ProjectUpdate(ApiModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
-    source_text: str | None = None
-    style_prompt: str | None = None
+    source_text: str | None = Field(default=None, max_length=_MAX_SOURCE_TEXT_LENGTH)
+    style_prompt: str | None = Field(default=None, max_length=_MAX_STYLE_PROMPT_LENGTH)
     visual_bible: dict[str, Any] | None = None
     aspect_ratio: str | None = None
     image_size: str | None = None
@@ -121,11 +151,8 @@ class DefaultStylePromptUpdate(ApiModel):
 class GenerateRequest(ApiModel):
     provider_id: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
-    # 素材图生成为 true 时走干净参考图模式：单张设定图（无多视图展板、无资料卡文字），
-    # 适合写意水墨等与白底展板版式冲突的画风；其余请求类型忽略该字段。
-    reference_mode: bool = False
-    # 关键帧生成为 true 时：缺干净参考图则自动入队参考图模式生成并拦截本次关键帧入队，
-    # 避免设定展板污染分镜画面；仅关键帧相关接口生效，其余请求类型忽略该字段。
+    # 关键帧生成为 true 时：绑定素材缺当前素材图则自动入队素材图生成并拦截本次
+    # 关键帧入队，避免纯文字降级；仅关键帧相关接口生效，其余请求类型忽略该字段。
     auto_prepare_references: bool = False
 
     _validate_params = field_validator("params")(_validate_public_params)
@@ -410,8 +437,9 @@ class ShotSplitRequest(ApiModel):
 
     @model_validator(mode="after")
     def validate_parts(self) -> "ShotSplitRequest":
+        # parts 为空时走服务层基于时长的二等分自动拆镜；若显式指定则至少提供两段
         if self.parts and len(self.parts) < 2:
-            raise ValueError("parts 至少包含两段")
+            raise ValueError("parts 若提供则至少包含两段")
         return self
 
 
@@ -466,6 +494,7 @@ class ContinuityCheckRequest(GenerateRequest):
     ids: list[str] | None = None
     apply_fixes: bool = True
     insert_transitions: bool = False
+    require_pass: bool = True
 
     @model_validator(mode="after")
     def limit_batch_ids(self) -> "ContinuityCheckRequest":
@@ -577,13 +606,27 @@ class ShotAudioGenerateRequest(ApiModel):
     tts_provider_id: str | None = None
 
 
+class AudioConfigUpdate(ApiModel):
+    """项目音频配置更新请求。
+
+    字段均可选；数值范围、Provider 类型与音色映射在服务层统一校验，
+    这里只约束字段名与基础类型，非法字段直接 422 而不是被静默忽略。
+    """
+
+    tts_provider_id: str | None = None
+    bgm_volume: float | None = None
+    dialogue_volume: float | None = None
+    sound_effect_volume: float | None = None
+    voice_mapping: dict[str, str] | None = None
+
+
 class SubtitleItem(ApiModel):
     """字幕项"""
 
     text: str = Field(min_length=1)
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
-    style_preset: str = Field(default="default")
+    style_preset: SubtitleStylePreset = "default"
 
     @model_validator(mode="after")
     def validate_time_range(self) -> "SubtitleItem":

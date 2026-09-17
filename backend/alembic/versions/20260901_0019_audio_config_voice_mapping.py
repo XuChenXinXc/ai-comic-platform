@@ -22,7 +22,6 @@ Create Date: 2026-09-01
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-
 from alembic import op
 
 revision: str = "20260901_0019_audio_config_voice_mapping"

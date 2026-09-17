@@ -36,7 +36,9 @@ class SecretBackend(ABC):
 
 
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
-# DPAPI 附加熵：同一 Windows 用户下的无关进程拿到密文也无法直接解密。
+# DPAPI 附加熵。注意：熵硬编码在源码中、并非秘密，只能作为「防止同用户下
+# 碰巧拿到密文但与平台无关的进程直接解密」的弱隔离；真正的主防护是 DPAPI
+# 的当前用户作用域（换用户或换机器都无法解密）。不要把它当作额外的密钥强度。
 _DPAPI_ENTROPY = b"ai-comic-platform/api-key/v1"
 
 
@@ -157,7 +159,12 @@ class WindowsDPAPIBackend(SecretBackend):
             encrypted = base64.b64decode(ciphertext.encode("ascii"), validate=True)
         except (UnicodeEncodeError, binascii.Error) as exc:
             raise SecretServiceError("DPAPI 密文格式无效") from exc
-        # 新密文带附加熵；升级前保存的旧密文没有熵，必须仍能解开。
+        # 兼容回退：早期版本保存的密文没有附加熵（_DPAPI_ENTROPY 是后加的），
+        # 这些旧密文只能用「无熵」方式解开。该回退确实降低了熵的隔离强度——
+        # 但熵本就硬编码在源码中、不是秘密，主防护仍是 DPAPI 的用户作用域，
+        # 因此保留兼容不等于引入实际弱点。
+        # 移除条件：确认所有存量数据库都不再有「无熵可解、带熵失败」的密钥
+        # （可在迁移中标记/重加密），即可删除这里的 None 回退分支。
         for entropy in (_DPAPI_ENTROPY, None):
             plaintext = self._try_unprotect(encrypted, entropy)
             if plaintext is not None:

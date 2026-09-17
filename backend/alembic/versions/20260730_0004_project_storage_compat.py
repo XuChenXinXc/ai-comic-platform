@@ -7,8 +7,8 @@ Revises: 20260730_0003
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-
 from alembic import op
+
 from app.config import get_settings
 
 revision: str = "20260730_0004"

@@ -25,6 +25,25 @@ from app.services.utils import new_id, row_dict, utc_now
 logger = logging.getLogger(__name__)
 
 _ACTIVE_JOB_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
+# 与数据库 CHECK 约束保持一致，防止客户端写入任意状态值触发 500。
+_ALLOWED_CHAPTER_STATUSES = frozenset({"draft", "ready", "confirmed", "failed"})
+# 章节列表是全量返回（前端按章节选择），这里给一个宽松防御上限避免无界扫描；
+# 达到上限时告警而非静默截断。
+_MAX_CHAPTER_LIST_LIMIT = 2000
+
+
+def _chapter_integrity_detail(exc: IntegrityError) -> str:
+    """区分章节写入冲突：编号唯一冲突给业务提示，其他约束保留原始细节。"""
+    original = getattr(exc, "orig", None)
+    text = str(original if original is not None else exc)
+    lowered = text.lower()
+    if (
+        "uq_chapter_project_no" in lowered
+        or "unique constraint failed: chapter.project_id, chapter.chapter_no" in lowered
+    ):
+        return "章节编号已存在"
+    # 无法可靠归类时保留原始约束细节，便于排查而非统一误报为编号冲突。
+    return f"章节保存失败：{text}"
 
 
 class ChapterService:
@@ -68,13 +87,21 @@ class ChapterService:
             raise not_found("章节")
         return record
 
-    def list(self, project_id: str) -> list[dict[str, Any]]:
+    def list(
+        self,
+        project_id: str,
+        *,
+        limit: int = _MAX_CHAPTER_LIST_LIMIT,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         self._project(project_id)
         with self.database.engine.connect() as connection:
             rows = connection.execute(
                 select(chapter)
                 .where(chapter.c.project_id == project_id)
                 .order_by(chapter.c.chapter_no)
+                .limit(limit)
+                .offset(offset)
             ).all()
             counts = dict(
                 connection.execute(
@@ -82,6 +109,12 @@ class ChapterService:
                     .where(shot.c.project_id == project_id)
                     .group_by(shot.c.chapter_id)
                 ).all()
+            )
+        if len(rows) >= limit:
+            logger.warning(
+                "项目 %s 章节列表达到上限 %d，可能存在未返回的章节",
+                project_id,
+                limit,
             )
         records = []
         for row in rows:
@@ -109,6 +142,10 @@ class ChapterService:
                 ).first()
             if existing is None:
                 text = str(project_record["source_text"])
+        # 状态只允许数据库 CHECK 约束内的取值，内部调用绕过 API schema 时也拒绝非法值。
+        status = str(values.get("status") or "draft")
+        if status not in _ALLOWED_CHAPTER_STATUSES:
+            raise bad_request(f"不支持的章节状态：{status}")
         record: dict[str, Any] = {
             "id": new_id("chapter"),
             "project_id": project_id,
@@ -116,7 +153,7 @@ class ChapterService:
             "source_text": text,
             "source_signature": source_signature(text),
             "source_revision": 1,
-            "status": values.get("status") or "draft",
+            "status": status,
             "created_at": now,
             "updated_at": now,
         }
@@ -127,7 +164,7 @@ class ChapterService:
             try:
                 connection.execute(insert(chapter).values(**record))
             except IntegrityError as exc:
-                raise conflict("章节编号已存在") from exc
+                raise conflict(_chapter_integrity_detail(exc)) from exc
         return self.get(record["id"])
 
     def update(self, chapter_id: str, values: dict[str, Any]) -> dict[str, Any]:
@@ -135,6 +172,11 @@ class ChapterService:
         changes = {key: value for key, value in values.items() if value is not None}
         if not changes:
             return current
+        if "status" in changes:
+            status = str(changes["status"])
+            if status not in _ALLOWED_CHAPTER_STATUSES:
+                raise bad_request(f"不支持的章节状态：{status}")
+            changes["status"] = status
         if "source_text" in changes:
             signature = source_signature(changes["source_text"])
             changes["source_signature"] = signature
@@ -144,11 +186,20 @@ class ChapterService:
         changes["updated_at"] = utc_now()
         with self.database.engine.begin() as connection:
             try:
-                connection.execute(
-                    update(chapter).where(chapter.c.id == chapter_id).values(**changes)
+                result = connection.execute(
+                    update(chapter)
+                    .where(
+                        chapter.c.id == chapter_id,
+                        # 乐观锁：仅当读取到的修订号未被并发修改时才写入，
+                        # 避免两个并发编辑互相覆盖。
+                        chapter.c.source_revision == current["source_revision"],
+                    )
+                    .values(**changes)
                 )
             except IntegrityError as exc:
-                raise conflict("章节编号已存在") from exc
+                raise conflict(_chapter_integrity_detail(exc)) from exc
+            if result.rowcount != 1:
+                raise conflict("章节内容已被其他操作修改，请刷新后重试")
         return self.get(chapter_id)
 
     def _ensure_no_active_jobs(self, connection: Any, chapter_id: str) -> None:
@@ -324,7 +375,9 @@ class ChapterService:
         """按给定顺序重排章节号；先移到临时区间避免唯一约束冲突。"""
         if not ordered_ids:
             return
-        temporary_start = 100000
+        # 使用负数临时区间：合法章节号为正整数，负数不会与任何合法编号碰撞，
+        # 也避免了原先 100000 起点被用户设置的大编号占用。
+        temporary_start = -(len(ordered_ids) + 1)
         for offset, chapter_id in enumerate(ordered_ids):
             connection.execute(
                 update(chapter)

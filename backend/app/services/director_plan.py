@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -30,6 +32,8 @@ from app.services.camera_library import (
     is_static_camera,
     normalize_policy,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 结构定义
@@ -170,15 +174,74 @@ _COMPOSITION_ALIASES: dict[str, str] = {
 }
 
 
-def _coerce_composition(value: Any) -> Composition:
+def _coerce_composition(
+    value: Any,
+    diagnostics: list[ConsistencyIssue] | None = None,
+) -> Composition:
+    """构图别名归一；未知取值回退 centered 并记诊断（不静默丢弃）。"""
     text = _text(value).casefold()
-    return cast(Composition, _COMPOSITION_ALIASES.get(text, "centered"))
+    resolved = _COMPOSITION_ALIASES.get(text)
+    if resolved is None and text:
+        message = f"导演计划的构图取值「{_text(value)}」不在允许列表，已回退为「人物居中」"
+        logger.warning(message)
+        if diagnostics is not None:
+            diagnostics.append(
+                ConsistencyIssue(
+                    "director_composition_unknown",
+                    message,
+                    "warning",
+                    {"value": _text(value)},
+                )
+            )
+        return "centered"
+    return cast(Composition, resolved or "centered")
 
 
-def director_bundle_from_llm(output: Mapping[str, Any]) -> DirectorShotBundle:
+def _coerce_float(value: Any, default: float = 0.0) -> tuple[float, bool]:
+    """安全转换 LLM 时间值：返回 (数值, 是否可用)。
+
+    空值按默认值处理（兼容模型省略字段）；非数值或非有限值判定失败，
+    由调用方丢弃该项并记诊断，避免单个坏字段让整个导演计划解析失败。
+    """
+    if value is None or value == "":
+        return default, True
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default, False
+    if not math.isfinite(number):
+        return default, False
+    return number, True
+
+
+_VOICE_SOURCES: frozenset[str] = frozenset(
+    {"character", "device", "broadcast", "phone", "offscreen"}
+)
+
+
+def _coerce_voice_source(value: Any) -> tuple[VoiceSource, bool]:
+    """发声来源白名单归一：返回 (来源, 是否合法)。
+
+    空值按默认 ``character`` 处理；非法取值由调用方回退 ``character`` 并记诊断。
+    """
+    text = _text(value).casefold()
+    if not text:
+        return "character", True
+    if text in _VOICE_SOURCES:
+        return cast(VoiceSource, text), True
+    return "character", False
+
+
+def director_bundle_from_llm(
+    output: Mapping[str, Any],
+    *,
+    diagnostics: list[ConsistencyIssue] | None = None,
+) -> DirectorShotBundle:
     """把导演设计 LLM 输出（camelCase 契约）转换为运行时结构。
 
     兼容 camelCase（shotPurpose / audienceFocus / …）与 snake_case 两种键名。
+    单个时间字段不可解析时只丢弃该项并记诊断，不让整个导演计划解析失败；
+    ``diagnostics`` 为可选出参，调用方可据此把降级原因展示给用户。
     """
 
     def pick(*names: str, default: Any = None) -> Any:
@@ -186,6 +249,13 @@ def director_bundle_from_llm(output: Mapping[str, Any]) -> DirectorShotBundle:
             if name in output and output[name] not in (None, "", []):
                 return output[name]
         return default
+
+    def note(message: str, code: str, details: dict[str, Any] | None = None) -> None:
+        logger.warning(message)
+        if diagnostics is not None:
+            diagnostics.append(
+                ConsistencyIssue(code, message, "warning", details or {})
+            )
 
     focus_raw = pick("audienceFocus", "audience_focus") or {}
     focus = AudienceFocus(
@@ -208,7 +278,7 @@ def director_bundle_from_llm(output: Mapping[str, Any]) -> DirectorShotBundle:
     plan = DirectorPlan(
         shot_purpose=_text(pick("shotPurpose", "shot_purpose")) or "本镜叙事推进",
         audience_focus=focus,
-        composition=_coerce_composition(pick("composition", "composition")),
+        composition=_coerce_composition(pick("composition", "composition"), diagnostics),
         foreground=_text(pick("foreground", "foreground")),
         midground=_text(pick("midground", "midground")),
         background=_text(pick("background", "background")),
@@ -224,34 +294,72 @@ def director_bundle_from_llm(output: Mapping[str, Any]) -> DirectorShotBundle:
     )
 
     timeline_raw = pick("timeline", "timeline") or []
-    timeline = [
-        DirectorTimelineSegment(
-            start=float(item.get("start", 0.0) or 0.0),
-            end=float(item.get("end", 0.0) or 0.0),
-            action=_text(item.get("action", "")),
+    timeline: list[DirectorTimelineSegment] = []
+    for index, item in enumerate(timeline_raw):
+        if not isinstance(item, Mapping) or not _text(item.get("action", "")):
+            continue
+        start, start_ok = _coerce_float(item.get("start", item.get("start_time", 0.0)))
+        end, end_ok = _coerce_float(item.get("end", item.get("end_time", 0.0)))
+        if not (start_ok and end_ok):
+            note(
+                f"时间轴第 {index + 1} 段的 start/end 不是数值，已丢弃该段",
+                "director_timeline_value_invalid",
+                {
+                    "index": index,
+                    "start": str(item.get("start", item.get("start_time", ""))),
+                    "end": str(item.get("end", item.get("end_time", ""))),
+                },
+            )
+            continue
+        timeline.append(
+            DirectorTimelineSegment(
+                start=start,
+                end=end,
+                action=_text(item.get("action", "")),
+            )
         )
-        for item in timeline_raw
-        if isinstance(item, Mapping) and _text(item.get("action", ""))
-    ]
 
     dialogue_raw = pick("dialogueBindings", "dialogue_bindings") or []
-    dialogue_bindings = [
-        DialogueBinding(
-            speaker=_text(item.get("speaker", "")),
-            text=_text(item.get("text", "")),
-            start_time=float(item.get("startTime", item.get("start_time", 0.0)) or 0.0),
-            end_time=float(item.get("endTime", item.get("end_time", 0.0)) or 0.0),
-            requires_lip_sync=bool(
-                item.get("requiresLipSync", item.get("requires_lip_sync", True))
-            ),
-            voice_source=cast(
-                VoiceSource,
-                _text(item.get("voiceSource", item.get("voice_source", "character"))),
-            ),
+    dialogue_bindings: list[DialogueBinding] = []
+    for index, item in enumerate(dialogue_raw):
+        if not isinstance(item, Mapping) or not _text(item.get("text", "")):
+            continue
+        start_time, start_ok = _coerce_float(
+            item.get("startTime", item.get("start_time", 0.0))
         )
-        for item in dialogue_raw
-        if isinstance(item, Mapping) and _text(item.get("text", ""))
-    ]
+        end_time, end_ok = _coerce_float(item.get("endTime", item.get("end_time", 0.0)))
+        if not (start_ok and end_ok):
+            note(
+                f"对白第 {index + 1} 条的 startTime/endTime 不是数值，已丢弃该条",
+                "director_dialogue_value_invalid",
+                {
+                    "index": index,
+                    "startTime": str(item.get("startTime", item.get("start_time", ""))),
+                    "endTime": str(item.get("endTime", item.get("end_time", ""))),
+                },
+            )
+            continue
+        voice_raw = item.get("voiceSource", item.get("voice_source", "character"))
+        voice_source, voice_ok = _coerce_voice_source(voice_raw)
+        if not voice_ok:
+            note(
+                f"对白第 {index + 1} 条的 voiceSource「{_text(voice_raw)}」非法，"
+                "已回退为「character」",
+                "director_voice_source_invalid",
+                {"index": index, "voiceSource": _text(voice_raw)},
+            )
+        dialogue_bindings.append(
+            DialogueBinding(
+                speaker=_text(item.get("speaker", "")),
+                text=_text(item.get("text", "")),
+                start_time=start_time,
+                end_time=end_time,
+                requires_lip_sync=_safe_bool(
+                    item.get("requiresLipSync", item.get("requires_lip_sync", True))
+                ),
+                voice_source=voice_source,
+            )
+        )
 
     return DirectorShotBundle(
         director_plan=plan,
@@ -319,6 +427,21 @@ def _text(value: Any) -> str:
     return ""
 
 
+def _safe_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"false", "0", "no", "off", "f"}:
+        return False
+    if text in {"true", "1", "yes", "on", "t"}:
+        return True
+    return default
+
+
 def _has_word(text: str, *words: str) -> bool:
     return any(word and word in text for word in words)
 
@@ -358,9 +481,23 @@ def _timeline_issues(
     segments: list[tuple[float, float, str]] = []
     for index, item in enumerate(timeline):
         if isinstance(item, Mapping):
-            start = float(item.get("start", item.get("start_time", 0.0)) or 0.0)
-            end = float(item.get("end", item.get("end_time", 0.0)) or 0.0)
+            start, start_ok = _coerce_float(item.get("start", item.get("start_time", 0.0)))
+            end, end_ok = _coerce_float(item.get("end", item.get("end_time", 0.0)))
             action = _text(item.get("action", ""))
+            if not (start_ok and end_ok):
+                issues.append(
+                    ConsistencyIssue(
+                        "timeline_value_invalid",
+                        f"时间轴第 {index + 1} 段的 start/end 不是数值，无法校验时间轴",
+                        "blocking",
+                        {
+                            "index": index,
+                            "start": str(item.get("start", item.get("start_time", ""))),
+                            "end": str(item.get("end", item.get("end_time", ""))),
+                        },
+                    )
+                )
+                continue
         else:
             start, end, action = item.start, item.end, item.action
         if end <= start:
@@ -444,8 +581,22 @@ def _dialogue_issues(
     for index, item in enumerate(bindings):
         speaker = _text(item.get("speaker"))
         text = _text(item.get("text"))
-        start = float(item.get("start_time", 0.0) or 0.0)
-        end = float(item.get("end_time", 0.0) or 0.0)
+        start, start_ok = _coerce_float(item.get("start_time"))
+        end, end_ok = _coerce_float(item.get("end_time"))
+        if not (start_ok and end_ok):
+            issues.append(
+                ConsistencyIssue(
+                    "dialogue_value_invalid",
+                    f"对白「{text[:20]}」的 start_time/end_time 不是数值，无法校验对白时间",
+                    "blocking",
+                    {
+                        "index": index,
+                        "start_time": str(item.get("start_time", "")),
+                        "end_time": str(item.get("end_time", "")),
+                    },
+                )
+            )
+            continue
 
         if text and texts:
             normalized = re.sub(r"\s+", "", text)
@@ -825,8 +976,13 @@ def _timeline_density_issues(
     segments: list[tuple[float, float]] = []
     for item in timeline:
         if isinstance(item, Mapping):
-            start = float(item.get("start", item.get("start_time", 0.0)) or 0.0)
-            end = float(item.get("end", item.get("end_time", 0.0)) or 0.0)
+            start, start_ok = _coerce_float(item.get("start", item.get("start_time", 0.0)))
+            end, end_ok = _coerce_float(item.get("end", item.get("end_time", 0.0)))
+            if not (start_ok and end_ok):
+                # 同一段已在 _timeline_issues 记为 blocking 诊断，这里不重复上报，
+                # 只记日志说明该段未参与密度统计。
+                logger.warning("时间轴分段 start/end 不是数值，已跳过密度统计：%s", item)
+                continue
         else:
             start, end = item.start, item.end
         if end > start:
@@ -1080,7 +1236,9 @@ def validate_shot_consistency(
 # 自然语言最终提示词渲染器
 # ---------------------------------------------------------------------------
 
-_HARD_OVERLAP_RE = re.compile(r"身份|服装|场景结构|人物|文字|消失|关键帧锁定")
+_HARD_OVERLAP_RE = re.compile(
+    r"身份|服装|场景结构|人物|文字|消失|关键帧锁定|悬空|隔空|频闪|闪烁|忽明忽暗"
+)
 
 
 def _render_visual_tone(visual_tone: Sequence[str]) -> str:
@@ -1139,6 +1297,7 @@ def _render_dialogue(
     bindings: Sequence[DialogueBinding],
     *,
     audio_driven: bool = False,
+    multi_character: bool = True,
 ) -> list[str]:
     if not bindings:
         return ["本镜没有画内对白，人物全程不开口。"]
@@ -1152,15 +1311,18 @@ def _render_dialogue(
                 f"第{index}句是画外或设备发出的声音：“{_quote_text(item.text)}”，"
                 "画面人物不开口。"
             )
+    # 「其余角色保持聆听」只在多角色镜头成立：单人镜头写入这句是模板冗余，
+    # 反而可能诱导模型在画面里补出第二个倾听者。
+    others_line = "，其余角色保持专注聆听与神态反应" if multi_character else ""
     if audio_driven:
         # Provider 收到本镜配音音频，口型由音频驱动，可以要求自然配合。
-        lines.append("说话人开口时口型与配音自然配合，其余角色保持安静，不抢话、不代说。")
+        lines.append(f"说话人开口时口型与配音自然配合{others_line}。")
     else:
         # 无音频输入时模型只能凭空表演说话：要求嘴部动作克制、幅度轻微，
         # 避免夸张口型与后期配音严重错位；对白由后期配音与字幕呈现。
         lines.append(
-            "说话人嘴部只做轻微启合、口型幅度克制（对白由后期配音与字幕呈现），"
-            "其余角色保持安静，不抢话、不代说。"
+            "说话人嘴部只做轻微启合、口型幅度克制（对白由后期配音与字幕呈现）"
+            f"{others_line}。"
         )
     return lines
 
@@ -1172,19 +1334,32 @@ def _timeline_flow_text(timeline: Sequence[DirectorTimelineSegment]) -> str:
 def _hard_constraint_line(
     hard: Sequence[str],
     dynamic_rules: Sequence[str] = (),
+    *,
+    intentional_flicker: bool = False,
 ) -> str:
     """把硬约束渲染成一条简短的自然语言负面约束。
 
     dynamic_rules 由调用方按画风媒介传入（二维项目传反动态写实化条款，
     三维CG/真人写实项目传空），不再无条件注入写实化禁用词。
     """
-    base = (
-        "画面中不出现：人物身份或服装改变、场景结构被重构、"
-        "新增无关人物、画面内文字、道具凭空消失。"
-    )
+    base_items = [
+        "人物身份或服装改变",
+        "场景结构被重构",
+        "新增无关人物",
+        "画面内文字",
+        "道具凭空消失",
+        "道具脱手悬空飞行",
+        "隔空移物",
+    ]
+    if not intentional_flicker:
+        base_items.extend(["灯光频闪", "画面闪烁", "光线忽明忽暗"])
+    base = f"画面中不出现：{'、'.join(base_items)}。"
     extras: list[str] = []
     for item in hard:
         extra_text = _text(item)
+        # _HARD_OVERLAP_RE 已包含「频闪/闪烁/忽明忽暗」，这些词要么由 base 统一
+        # 承担，要么在 intentional_flicker 时整体不禁止，因此这里直接跳过，
+        # 不需要再按 intentional_flicker 二次过滤（原分支不可达，已删除）。
         if extra_text and extra_text not in extras and not _HARD_OVERLAP_RE.search(extra_text):
             extras.append(extra_text)
     # 反动态写实化负向补齐（幂等：base 或既有条款已包含时不重复追加）。
@@ -1199,7 +1374,7 @@ def _hard_constraint_line(
 
 def _reference_sentences(anchors: Sequence[str]) -> list[str]:
     """把程序生成好的 @ImageN 锚点自然嵌入句子（编号与含义由调用方决定）。"""
-    from app.services.natural_video_prompt import parse_reference_anchors
+    from app.services.natural_video_prompt import parse_reference_anchors, token_number
 
     tokens = parse_reference_anchors(anchors)
     lines: list[str] = []
@@ -1211,7 +1386,11 @@ def _reference_sentences(anchors: Sequence[str]) -> list[str]:
         for item in (keyframe, prev_end_frame, prev_keyframe)
         if item is not None
     }
-    if prev_end_frame and keyframe and prev_end_frame.token < keyframe.token:
+    if (
+        prev_end_frame
+        and keyframe
+        and token_number(prev_end_frame.token) < token_number(keyframe.token)
+    ):
         lines.append(
             f"画面从 {prev_end_frame.token}（上一镜的结束画面）自然进入，"
             f"向 {keyframe.token} 展示的目标画面发展。"
@@ -1269,6 +1448,7 @@ def render_director_video_prompt(
     transition_from_prev: str = "scene_change",
     prev_end_state: str = "",
     scene_name: str = "",
+    multi_character: bool = True,
 ) -> str:
     """把导演设计与已算好的时间轴 / 对白渲染成自然语言导演式视频提示词。
 
@@ -1347,6 +1527,15 @@ def render_director_video_prompt(
     )
     if flow:
         action_lines.append(f"从这一起始状态出发，{flow}")
+    if any(
+        kw in (flow or "") or any(kw in part for part in performance_parts)
+        for kw in ("递给", "递出", "递到", "递向", "拿给", "交给", "递过")
+    ):
+        action_lines.append(
+            "道具被拿取、递出、接取或移动时，必须全程由手部手指实体握持接触，"
+            "随手臂伸展与动作路径自然位移，严禁道具脱手悬空飞行、严禁隔空移物；"
+            "未发生交互时道具保持原位，严禁悬空漂浮或瞬移。"
+        )
     if action_lines:
         paragraphs.append("".join(action_lines))
 
@@ -1367,7 +1556,36 @@ def render_director_video_prompt(
     environment_motion = _text(plan.environment_motion).strip("。")
     if environment_motion:
         tail_lines.append(f"{environment_motion}。")
-    tail_lines.extend(_render_dialogue(dialogue_bindings, audio_driven=audio_driven))
+    tail_lines.extend(
+        _render_dialogue(
+            dialogue_bindings,
+            audio_driven=audio_driven,
+            multi_character=multi_character,
+        )
+    )
+    intentional_flicker = any(
+        kw in str(plan.performance)
+        or kw in str(plan.environment_motion)
+        or kw in str(initial_state)
+        or any(kw in str(seg.action) for seg in timeline)
+        or any(kw in str(t) for t in plan.visual_tone)
+        for kw in (
+            "忽明忽暗",
+            "闪烁",
+            "频闪",
+            "电光",
+            "雷电",
+            "火光",
+            "摇曳",
+            "烛光",
+            "故障灯",
+            "跳动",
+        )
+    )
+    if not intentional_flicker:
+        tail_lines.append("场景照明与环境光线保持恒定稳定，光源无频闪、无忽明忽暗、画面无闪烁跳变。")
+    else:
+        tail_lines.append("场景明暗变化契合环境剧情氛围，过渡平滑自然。")
     if _text(end_state):
         tail_lines.append(f"接近结尾时，{_text(end_state).rstrip('。')}。")
     paragraphs.append("".join(tail_lines))
@@ -1378,6 +1596,7 @@ def render_director_video_prompt(
     constraint_line = _hard_constraint_line(
         [*hard_constraints, *visual_style_negative_terms(style_spec)],
         dynamic_rules=dynamic_negative_rules_for(style_spec),
+        intentional_flicker=intentional_flicker,
     )
     paragraphs.append(f"Negative: {constraint_line}")
     motion_lock = motion_style_lock_for(style_spec)

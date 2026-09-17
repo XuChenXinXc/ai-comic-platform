@@ -604,13 +604,17 @@ class HttpVideoProvider(HttpProviderBase):
         def upload() -> dict[str, Any]:
             content = compress_reference_image(local_file)
             encoded = base64.b64encode(content).decode("ascii")
-            response = requests.post(
-                "https://api.imgbb.com/1/upload",
-                params={"key": imgbb_api_key, "expiration": 600},
-                files={"image": (None, encoded)},
-                timeout=60,
-            )
-            response.raise_for_status()
+            try:
+                response = requests.post(
+                    "https://api.imgbb.com/1/upload",
+                    params={"key": imgbb_api_key, "expiration": 600},
+                    files={"image": (None, encoded)},
+                    timeout=60,
+                )
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                clean_msg = re.sub(r"[?&]key=[^&\s'\"]+", "?key=[REDACTED]", str(exc))
+                raise ProviderError(f"ImgBB 上传 HTTP 错误：{clean_msg}") from None
             try:
                 payload = response.json()
             except requests.JSONDecodeError as exc:

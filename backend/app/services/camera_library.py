@@ -679,6 +679,114 @@ CAMERA_PRESETS: tuple[CameraPreset, ...] = (
     *_TRANSITION_PRESETS,
 )
 
+# 高级情绪化与复合运镜扩展库（参考电影级时序提示词与特效镜头库）
+EMOTIONAL_CAMERA_PRESETS: tuple[CameraPreset, ...] = (
+    _p(
+        "emotional-1",
+        "dynamic",
+        "动态运动类",
+        "慢推式微表情定格",
+        "镜头缓慢匀速向人物面部推进，全程对焦人物眼部与唇周，捕捉从平静隐忍到眼尾泛红、唇角微颤的情绪递进",
+        "镜头缓慢匀速向人物面部推进，全程对焦人物眼部与唇周，捕捉从平静隐忍到眼尾泛红、唇角微颤的情绪递进",
+        "深层情感表白、隐忍委屈、内心痛苦觉醒",
+        "video",
+        triggers=("委屈", "隐忍", "泪水", "哽咽", "动摇", "痛楚"),
+    ),
+    _p(
+        "emotional-2",
+        "dynamic",
+        "动态运动类",
+        "急拉式情绪反差",
+        "镜头从人物面部特写瞬间快速后拉至中景，捕捉人物从错愕震惊到身体僵住、防线崩溃的情绪转折",
+        "镜头从人物面部特写瞬间快速后拉至中景，捕捉人物从错愕震惊到身体僵住、防线崩溃的情绪转折",
+        "惊天真相揭开、突发噩耗、心碎防线崩塌",
+        "video",
+        triggers=("震惊", "错愕", "不敢置信", "晴天霹雳", "背叛"),
+    ),
+    _p(
+        "emotional-3",
+        "dynamic",
+        "动态运动类",
+        "跟拍式情绪爆发",
+        "镜头低速平稳跟拍人物面部前移，同步捕捉从压抑克制到下颌紧咬、眼眶发红的情绪爆发临界点",
+        "镜头低速平稳跟拍人物面部前移，同步捕捉从压抑克制到下颌紧咬、眼眶发红的情绪爆发临界点",
+        "步步紧逼质问、压迫感向前迈步、正义宣言",
+        "video",
+        triggers=("质问", "逼近", "夺回尊严", "下定决心", "决绝"),
+    ),
+    _p(
+        "emotional-4",
+        "dynamic",
+        "动态运动类",
+        "急停式情绪错愕",
+        "镜头快速推进后瞬间急停在人物面部特写，同步捕捉从从容淡定到瞳孔紧缩、嘴角僵住的突发错愕",
+        "镜头快速推进后瞬间急停在人物面部特写，同步捕捉从从容淡定到瞳孔紧缩、嘴角僵住的突发错愕",
+        "突发打脸反转、秘密被当面揭穿、底牌被看穿",
+        "video",
+        triggers=("打脸", "僵住", "慌张", "失算", "识破"),
+    ),
+    _p(
+        "emotional-5",
+        "dynamic",
+        "动态运动类",
+        "低机位仰拍情绪崩溃",
+        "低角度仰拍缓慢推进人物面部，同步捕捉从强撑镇定到喉结反复滚动、眼泪坠落的情绪崩溃过程",
+        "低角度仰拍缓慢推进人物面部，同步捕捉从强撑镇定到喉结反复滚动、眼泪坠落的情绪崩溃过程",
+        "绝境孤立无援、强撑尊严被击溃、悲情落泪",
+        "video",
+        triggers=("无助", "崩溃", "绝望", "落泪", "强撑"),
+    ),
+    _p(
+        "emotional-6",
+        "dynamic",
+        "动态运动类",
+        "急推式愤怒爆发",
+        "镜头极速向人物面部推进，同步捕捉从隐忍克制到眼神锋利、眉峰紧锁、牙关紧咬的愤怒爆发过程",
+        "镜头极速向人物面部推进，同步捕捉从隐忍克制到眼神锋利、眉峰紧锁、牙关紧咬的愤怒爆发过程",
+        "怒不可遏、反戈一击、杀意爆发、强势反击",
+        "video",
+        triggers=("暴怒", "杀意", "忍无可忍", "反击", "决裂"),
+    ),
+    _p(
+        "emotional-7",
+        "dynamic",
+        "动态运动类",
+        "变速环绕急推",
+        "环绕主体半周运镜，由慢速平稳旋转平滑过渡到加速，随即快速推进锁定主体核心动作或道具特写",
+        "环绕主体半周运镜，由慢速平稳旋转平滑过渡到加速，随即快速推进锁定主体核心动作或道具特写",
+        "高燃绝招蓄力、神兵出鞘、关键抉择定格",
+        "video",
+        triggers=("蓄力", "觉醒", "出鞘", "法宝", "神兵"),
+    ),
+    _p(
+        "emotional-8",
+        "dynamic",
+        "动态运动类",
+        "偏心环绕急推",
+        "以主体肩膀为支点做偏心环绕运镜，随后快速推进至面部特写，低角度仰拍增强压迫气势",
+        "以主体肩膀为支点做偏心环绕运镜，随后快速推进至面部特写，低角度仰拍增强压迫气势",
+        "王者登场、反派压迫感对峙、强者俯瞰",
+        "video",
+        triggers=("登场", "气场", "睥睨", "威压", "霸气"),
+    ),
+    _p(
+        "emotional-9",
+        "dynamic",
+        "动态运动类",
+        "希区柯克变焦推进",
+        "镜头推进同时做反向光学变焦，背景空间产生强烈的拉伸透视形变，主体比例相对稳定，凸显心神震颤",
+        "镜头推进同时做反向光学变焦，背景空间产生强烈的拉伸透视形变，主体比例相对稳定，凸显心神震颤",
+        "巨大心理震撼、天地异变、心魔入侵、时空扭曲",
+        "video",
+        triggers=("惊骇", "天地异变", "时空扭曲", "心神剧震", "眩晕"),
+    ),
+)
+
+ALL_CAMERA_PRESETS: tuple[CameraPreset, ...] = (
+    *CAMERA_PRESETS,
+    *EMOTIONAL_CAMERA_PRESETS,
+)
+
 _CATEGORY_LABELS = {
     "static": "基础固定类",
     "dynamic": "动态运动类",
@@ -699,7 +807,7 @@ def normalize_policy(value: Any) -> str:
 def presets_by_category() -> dict[str, list[CameraPreset]]:
     """按分类返回词库，供 API / 前端选择器使用。"""
     grouped: dict[str, list[CameraPreset]] = {}
-    for preset in CAMERA_PRESETS:
+    for preset in ALL_CAMERA_PRESETS:
         grouped.setdefault(preset.category, []).append(preset)
     return grouped
 
@@ -726,14 +834,14 @@ def find_preset(camera_move: Any) -> CameraPreset | None:
     if not text:
         return None
     normalized = _PAREN_RE.sub("", text).strip()
-    for preset in CAMERA_PRESETS:
+    for preset in ALL_CAMERA_PRESETS:
         if preset.category not in _DECISION_CATEGORIES:
             continue
         if normalized == preset.name or (
             normalized and preset.name.replace("（", "").replace("）", "") == normalized
         ):
             return preset
-    for preset in CAMERA_PRESETS:
+    for preset in ALL_CAMERA_PRESETS:
         if preset.category not in _DECISION_CATEGORIES:
             continue
         if preset.name and preset.name in text:
@@ -776,7 +884,7 @@ def best_camera_suggestion(shot_text: str) -> tuple[CameraPreset, tuple[str, ...
     if not shot_text.strip():
         return None
     best: tuple[CameraPreset, tuple[str, ...]] | None = None
-    for preset in _DYNAMIC_PRESETS:
+    for preset in (*_DYNAMIC_PRESETS, *EMOTIONAL_CAMERA_PRESETS):
         hits = _trigger_hits(preset, shot_text)
         if not hits:
             continue
@@ -870,10 +978,12 @@ def camera_decision_diagnostics(
 
 
 __all__ = [
+    "ALL_CAMERA_PRESETS",
     "CAMERA_PRESETS",
     "CameraPreset",
     "CameraSuggestion",
     "DEFAULT_CAMERA_POLICY",
+    "EMOTIONAL_CAMERA_PRESETS",
     "POLICY_CONSERVATIVE",
     "POLICY_RICH",
     "POLICY_STANDARD",

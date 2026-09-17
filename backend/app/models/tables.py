@@ -79,7 +79,6 @@ chapter = Table(
     CheckConstraint("status IN ('draft','ready','confirmed','failed')", name="status"),
     UniqueConstraint("project_id", "chapter_no", name="uq_chapter_project_no"),
 )
-Index("idx_chapter_project_no", chapter.c.project_id, chapter.c.chapter_no)
 
 
 workflow_run = Table(

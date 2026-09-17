@@ -10,9 +10,11 @@ import requests
 
 from app.providers.base import (
     ProviderError,
+    post_with_redirect_guard,
     resolve_provider_url,
     validate_custom_headers,
     validate_provider_base_url,
+    validate_provider_base_url_network,
 )
 from app.providers.tts.openai_tts import _error_message
 from app.schemas import ProviderConfig
@@ -28,8 +30,9 @@ class HttpTTSProvider:
         self.api_key = api_key
         if not config.base_url:
             raise ProviderError("HTTP TTS Provider 必须配置 base_url")
-        # B-H/TTS：构造时校验 base_url（拒绝 userinfo / 敏感查询参数）。
+        # B-H/TTS：构造时校验 base_url（拒绝 userinfo / 敏感查询参数 / 内网地址）。
         validate_provider_base_url(config.base_url)
+        validate_provider_base_url_network(config.base_url)
         self.base_url = config.base_url.rstrip("/")
         self.timeout = config.timeout_sec or 120
         self.custom_headers = validate_custom_headers(config.params)
@@ -79,10 +82,11 @@ class HttpTTSProvider:
                 **{key: value for key, value in params.items() if key != "endpoint"},
             }
 
-            # 发送请求：synthesize 是 async 函数，同步 requests.post 会阻塞
-            # 事件循环；移入线程执行，保持函数签名与返回契约不变。
+            # 发送请求：synthesize 是 async 函数，同步请求会阻塞事件循环；移入
+            # 线程执行并逐跳校验重定向目标（防 30x 跳转到内网），保持函数签名
+            # 与返回契约不变。
             response = await asyncio.to_thread(
-                requests.post,
+                post_with_redirect_guard,
                 url,
                 json=body,
                 headers=headers,

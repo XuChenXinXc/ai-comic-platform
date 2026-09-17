@@ -261,6 +261,7 @@ export function ShotsPage() {
   useEffect(() => {
     setSelected(new Set());
     setSceneNo("");
+    setEditing(null);
   }, [activeChapterId]);
 
   // 分镜列表重新加载（提取、编辑保存、章节或项目切换）后，
@@ -362,7 +363,7 @@ export function ShotsPage() {
       kind === "keyframe"
         ? api.shots.keyframes.batch(activeChapterId, {
             ids: batchIds,
-            // 缺干净参考图时自动入队参考图模式生成，避免设定展板污染分镜画面
+            // 缺素材图时自动入队素材图生成，避免纯文字降级出图
             auto_prepare_references: true,
           })
         : api.shots.videos.batch(activeChapterId, { ids: batchIds }),
@@ -427,7 +428,7 @@ export function ShotsPage() {
     promptBatchMutation.mutate();
   };
 
-  // 一键全链编排：三步链式任务（补提示词/导演计划 → 补干净参考图+批量关键帧
+  // 一键全链编排：三步链式任务（补提示词/导演计划 → 补缺失素材图+批量关键帧
   // → 关键帧完成后批量视频），已有当前媒体的分镜自动跳过。
   const pipelineMutation = useMutation({
     mutationFn: () => api.shots.pipeline(activeChapterId),
@@ -437,7 +438,7 @@ export function ShotsPage() {
       });
       toast.success("一键全链生成已入队", {
         description:
-          "任务将依次执行：补齐提示词与导演设计 → 参考图与关键帧（含自动视觉质检）→ 分镜视频；可在任务中心查看进度。",
+          "任务将依次执行：补齐提示词与导演设计 → 素材图与关键帧（含自动视觉质检）→ 分镜视频；可在任务中心查看进度。",
         duration: 8000,
       });
     },
@@ -564,6 +565,14 @@ export function ShotsPage() {
       return await api.shots.remove(id);
     },
     onSuccess: async (_, variables) => {
+      if (variables.action === "delete") {
+        setSelected((prev) => {
+          if (!prev.has(variables.id)) return prev;
+          const next = new Set(prev);
+          next.delete(variables.id);
+          return next;
+        });
+      }
       await invalidate();
       toast.success(
         variables.action === "split"
@@ -671,7 +680,7 @@ export function ShotsPage() {
                 variant="secondary"
                 busy={pipelineMutation.isPending}
                 disabled={!shots.length}
-                title="一键全链生成：自动补齐提示词与导演设计 → 干净参考图与关键帧（含自动视觉质检）→ 分镜视频；已有结果的镜自动跳过"
+                title="一键全链生成：自动补齐提示词与导演设计 → 素材图与关键帧（含自动视觉质检）→ 分镜视频；已有结果的镜自动跳过"
                 onClick={() => pipelineMutation.mutate()}
               >
                 <Rocket className="h-4 w-4" />

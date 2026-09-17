@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,11 @@ from ..base import (
     normalize_provider_status,
     reference_jpeg_part,
 )
+
+logger = logging.getLogger(__name__)
+
+# 像素尺寸换算比例时的容差：3840x2160 -> 16:9 的实际比值与标准值存在舍入差。
+_SIZE_RATIO_TOLERANCE = 0.02
 
 # B-M8：图片协议控制字段清单（参照视频适配器的 _VIDEO_PROTOCOL_CONTROL_FIELDS）。
 # 这些键只驱动 Provider 行为（提交路径、轮询、参考图编码方式、TLS/重试开关等），
@@ -73,12 +79,21 @@ class HttpImageProvider(HttpProviderBase):
     def __init__(self, config: ProviderConfig) -> None:
         super().__init__(config)
 
+    def _is_gpt_image_model(self) -> bool:
+        """gpt-image 系列（gpt-image-2 / gpt-image-2.5-sunburst 等渠道变体）共用适配。
+
+        渠道会在同一协议下上线衍生模型名（如 x5m5x 的 gpt-image-2.5-sunburst），
+        精确匹配 "gpt-image-2" 会让新模型落回通用默认值（result.url 解析路径），
+        导致响应里明明有 data[0].url 却报「结果不包含下载地址或文件内容」。
+        """
+        return self.config.model.strip().lower().startswith("gpt-image")
+
     def _options(self) -> dict[str, Any]:
         options = dict(self.config.params)
         # 未识别的图片模型也要有通用 OpenAI 兼容提交路径，避免 submit_path
         # 为空时把请求直接打到 base_url（网关返回 Invalid URL (POST /v1)）。
         options.setdefault("submit_path", "images/generations")
-        if self.config.model.strip().lower() == "gpt-image-2":
+        if self._is_gpt_image_model():
             # POST 提交允许重试：供应商瞬时错误（5xx/断连/限流）可自动重试，
             # 与 Provider 配置的 max_retries 配合；用户 params 显式传值可覆盖。
             options.setdefault("retry_unsafe_methods", True)
@@ -200,7 +215,7 @@ class HttpImageProvider(HttpProviderBase):
             payload[str(options.get("negative_prompt_field", "negative_prompt"))] = negative_prompt
         if (
             not multipart_references
-            and self.config.model.strip().lower() == "gpt-image-2"
+            and self._is_gpt_image_model()
             and not self._uses_apib_protocol(options)
         ):
             payload.setdefault("response_format", "url")
@@ -266,6 +281,9 @@ class HttpImageProvider(HttpProviderBase):
             width_text, height_text = size.lower().split("x")
             ratio = int(width_text) / int(height_text)
         except (ValueError, ZeroDivisionError):
+            # 尺寸不是可换算的像素写法时原样透传，但留下日志便于排查
+            # 「为什么这个尺寸没有被换算成比例」。
+            logger.warning("无法把尺寸换算为比例，按原值透传：%s", size)
             return size
         for label, value in (
             ("16:9", 16 / 9),
@@ -274,7 +292,7 @@ class HttpImageProvider(HttpProviderBase):
             ("2:3", 2 / 3),
             ("9:16", 9 / 16),
         ):
-            if abs(ratio - value) < 0.02:
+            if abs(ratio - value) < _SIZE_RATIO_TOLERANCE:
                 return label
         return size
 
@@ -338,10 +356,25 @@ class HttpImageProvider(HttpProviderBase):
             raise ProviderError("Provider 返回的任务 ID 不包含合法的 URL 字符")
         return segment
 
+    @staticmethod
+    def _render_poll_path(template: str, task_id: str) -> str:
+        """安全渲染轮询路径模板：只替换 {task_id}。
+
+        原实现用 str.format，模板多写一个占位符就会抛 KeyError（500）；
+        这里把未知占位符转成明确的 ProviderError（配置错误）。
+        """
+        path = str(template).replace("{task_id}", task_id)
+        if "{" in path or "}" in path:
+            raise ProviderError(f"poll_path 模板包含不支持的占位符：{template}")
+        return path
+
     async def poll(self, task_id: str) -> ProviderPollResult:
         options = self._options()
         safe_task_id = self._safe_task_segment(task_id)
-        path = str(options.get("poll_path", "tasks/{task_id}")).format(task_id=safe_task_id)
+        path = self._render_poll_path(
+            options.get("poll_path", "tasks/{task_id}"),
+            safe_task_id,
+        )
         method = str(options.get("poll_method", "GET"))
         kwargs: dict[str, Any] = {"headers": self._headers(options)}
         if method.upper() != "GET":

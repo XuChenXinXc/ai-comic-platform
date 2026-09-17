@@ -122,6 +122,16 @@ export interface DefaultStylePromptSetting {
   style_prompt: string;
 }
 
+export type ProviderAllowPrivateHostsSource =
+  | "database"
+  | "environment"
+  | "default";
+
+export interface ProviderAllowPrivateHostsSetting {
+  enabled: boolean;
+  source: ProviderAllowPrivateHostsSource;
+}
+
 export interface ContentRecord<T = Record<string, unknown>> {
   id: string;
   project_id: string;
@@ -143,12 +153,15 @@ export interface ScreenplayScene {
   scene_name: string;
   time_weather?: string;
   characters?: string[];
+  props?: string[];
+  source_refs?: string[];
   objective?: string;
   action?: string;
   dialogue?: DialogueLine[];
   narration?: string[];
   emotion?: string;
   transition_to_next?: string;
+  target_duration_sec?: number;
 }
 
 export type DialogueLine = Record<string, unknown> & {

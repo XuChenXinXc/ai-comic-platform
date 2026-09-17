@@ -8,7 +8,6 @@ Create Date: 2026-08-18
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-
 from alembic import op
 
 revision: str = "20260818_0017_dynamic_audio_current"

@@ -18,6 +18,8 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 NON_TERMINAL_STATUSES = {"queued", "running", "waiting_provider", "downloading"}
 # 非终态任务扫描的防御上限：本地平台正常不会达到，达到时必须告警而非静默截断。
 _LIST_NON_TERMINAL_LIMIT = 100_000
+# 批次任务查询的防御上限：API 侧单批次最多 200 个，这里给足余量并告警。
+_LIST_BATCH_LIMIT = 10_000
 
 logger = logging.getLogger(__name__)
 
@@ -267,10 +269,19 @@ class JobRepository:
 
     def list_batch(self, batch_id: str) -> list[dict[str, Any]]:
         statement = (
-            select(job).where(job.c.batch_id == batch_id).order_by(job.c.created_at, job.c.id)
+            select(job)
+            .where(job.c.batch_id == batch_id)
+            .order_by(job.c.created_at, job.c.id)
+            .limit(_LIST_BATCH_LIMIT)
         )
         with self.engine.connect() as connection:
             rows = connection.execute(statement).all()
+        if len(rows) >= _LIST_BATCH_LIMIT:
+            logger.warning(
+                "批次 %s 任务数达到防御上限 %d，可能存在未返回的任务",
+                batch_id,
+                _LIST_BATCH_LIMIT,
+            )
         return [record for row in rows if (record := self._decode(row)) is not None]
 
     def batch_summary(self, batch_id: str) -> BatchSummary:
@@ -493,16 +504,25 @@ class JobRepository:
     mark_failed = fail
 
     def interrupt(self, job_id: str, message: str) -> dict[str, Any]:
-        current = self.require(job_id)
-        if current["status"] not in NON_TERMINAL_STATUSES:
-            return current
-        return self.update(
-            job_id,
-            status="interrupted",
-            error=message,
-            message="任务因服务重启中断",
-            finished_at=utc_now(),
-        )
+        now = utc_now()
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(job)
+                .where(
+                    job.c.id == job_id,
+                    job.c.status.in_(NON_TERMINAL_STATUSES),
+                )
+                .values(
+                    status="interrupted",
+                    error=sanitize_error_message(message),
+                    message="任务因服务重启中断",
+                    finished_at=now,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                return self.require(job_id, connection=connection)
+        return self.require(job_id)
 
     mark_interrupted = interrupt
 
@@ -556,7 +576,9 @@ class JobRepository:
         *,
         connection: Any | None = None,
     ) -> dict[str, Any]:
-        current = self.require(job_id)
+        # 守卫读必须走调用方事务：读新连接会脱离调用方事务，
+        # 既看不到本事务未提交的写入，又放大 TOCTOU 窗口。
+        current = self.require(job_id, connection=connection)
         if current["status"] not in {"failed", "interrupted"}:
             raise JobStateError("只有失败或中断的任务可以重试")
         if current["status"] == "interrupted" and current["provider_task_id"]:
@@ -581,6 +603,7 @@ class JobRepository:
         values: dict[str, Any] = {
             "status": next_status,
             "provider_task_id": provider_task_id,
+            "progress_current": 0,
             "error": "",
             "message": "任务已重新入队",
             "retry_count": current["retry_count"] + 1,
@@ -588,11 +611,28 @@ class JobRepository:
             "finished_at": None,
             "updated_at": now,
         }
+        if next_status == "queued" and not has_download_source(current):
+            # 只有确认没有任何可复用下载来源时才丢弃旧结果：若失败发生在下载
+            # 阶段，result_json 里保存着 Provider 已产出（且可能已付费）的结果。
+            # 无条件清空会让 _has_saved_result 变为假，重试时被迫重新提交
+            # Provider（重复计费）并丢弃已付费结果。
+            values["result_json"] = ""
+        retry_stmt = (
+            update(job)
+            .where(job.c.id == job_id, job.c.status.in_(("failed", "interrupted")))
+            .values(**values)
+        )
         if connection is None:
             with self.engine.begin() as owned:
-                owned.execute(update(job).where(job.c.id == job_id).values(**values))
+                result = owned.execute(retry_stmt)
         else:
-            connection.execute(update(job).where(job.c.id == job_id).values(**values))
+            result = connection.execute(retry_stmt)
+        if result.rowcount != 1:
+            # 守卫读与写入之间状态被并发改变（如已取消、已被另一次重试复活）：
+            # 条件 UPDATE 未命中就必须显式报冲突。静默返回会让调用方
+            # （job_service.retry）对一个并未重新入队的任务执行 enqueue，
+            # 对外表现为“重试成功”，并可能复活已取消的任务。
+            raise JobStateError("任务状态已变化，重试已取消")
         return self.require(job_id, connection=connection)
 
     def cancel(

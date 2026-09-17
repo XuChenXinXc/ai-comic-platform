@@ -12,6 +12,7 @@ from app.models.tables import asset, novel_analysis
 from app.prompts import load_prompt
 from app.schemas import NovelAnalysisOutput, ScreenplayOutput
 from app.services.chapter_service import ChapterService
+from app.services.errors import ServiceError
 from app.services.file_service import FileService
 from app.services.project_service import ProjectService
 from app.services.utils import json_dumps, utc_now
@@ -95,12 +96,15 @@ def _screenplay_content(title: str, action: str = "主角拆开信封。") -> di
                 "scene_name": "雨夜旧屋",
                 "time_weather": "夜晚，暴雨",
                 "characters": ["主角"],
+                "props": ["旧信"],
+                "source_refs": ["P001"],
                 "objective": "确认信件内容",
                 "action": action,
                 "dialogue": [],
                 "narration": [],
                 "emotion": "紧张",
                 "transition_to_next": "镜头切到信纸特写。",
+                "target_duration_sec": 15,
             }
         ],
     }
@@ -146,6 +150,56 @@ def test_analysis_completed_after_manual_save_preserves_manual_content(
     assert current["content"] == manual_content
     assert current["status"] == "ready"
     assert current["revision"] == 1
+
+
+def test_manual_save_during_analysis_generation_keeps_generating_status(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+) -> None:
+    """生成中保存草稿：内容落库，但状态不能被抹成 ready（H1 残留 / 报告 3.8:210）。
+
+    旧实现把 status 强制写回 ready，「生成中」标记消失而任务仍在跑；生成结果随后
+    因修订号变化被跳过，也就没人再把状态收尾。
+    """
+    _database, service, jobs, project, chapter = writing_service
+    service.queue_analysis(chapter["id"], {})
+
+    service.update_analysis(chapter["id"], {"content": _analysis_content("生成中的人工修订")})
+
+    during = service.get_analysis(chapter["id"])
+    assert during["status"] == "generating"
+    assert during["content"]["summary"] == "生成中的人工修订"
+
+    result = asyncio.run(service.handle_analysis(_queued_job(chapter["id"], jobs)))
+
+    after = service.get_analysis(chapter["id"])
+    assert result["skipped"] is True
+    # 被跳过的生成任务负责把 generating 收尾，否则前端永久显示「生成中」
+    assert after["status"] == "ready"
+    assert after["content"]["summary"] == "生成中的人工修订"
+
+
+def test_manual_save_during_screenplay_generation_keeps_generating_status(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+) -> None:
+    """剧本与小说分析同时置 generating 时，草稿保存不得抹掉任一「生成中」标记。"""
+    _database, service, jobs, project, chapter = writing_service
+    service.queue_screenplay(chapter["id"], {})
+
+    service.update_screenplay(chapter["id"], {"content": _screenplay_content("生成中的人工剧本")})
+
+    assert service.get_screenplay(chapter["id"])["status"] == "generating"
+    assert service.get_analysis(chapter["id"])["status"] == "generating"
+
+    result = asyncio.run(service.handle_screenplay(_queued_job(chapter["id"], jobs)))
+
+    assert result["skipped"] is True
+    assert service.get_screenplay(chapter["id"])["status"] == "ready"
+    # 分析行无内容，按 _revert_generating_status 的既有口径回到 draft
+    assert service.get_analysis(chapter["id"])["status"] == "draft"
 
 
 def test_screenplay_queue_after_manual_save_records_current_revision(
@@ -397,8 +451,10 @@ def test_screenplay_generation_passes_existing_scene_asset_names_to_model(
     assert "已有场景素材名称" in screenplay_prompt
     assert "烧烤店" in screenplay_prompt
     assert "路边烧烤" in screenplay_prompt
-    # 只传场景素材，不混入角色
-    assert "林雪" not in screenplay_prompt
+    # 角色素材不应出现在剧本的场景名清单里
+    scene_names_json = screenplay_prompt.split("已有场景素材名称（scene_name 必须优先复用，不得改写）：")[1].split("\n")[0]
+    assert "林雪" not in scene_names_json
+    assert "林雪" in screenplay_prompt
 
 
 def test_screenplay_generation_warns_when_no_scene_assets_exist(
@@ -496,3 +552,104 @@ def test_scene_asset_names_returns_only_scene_assets_of_project(
     names = service._scene_asset_names(project["id"])
 
     assert names == [{"name": "出租车内", "aliases": []}]
+
+
+def test_screenplay_save_with_empty_required_field_returns_400(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+) -> None:
+    """清空「时间与天气」等必填字段应得到 400 与字段路径，而不是裸 500。"""
+    _database, service, _jobs, _project, chapter = writing_service
+    content = _screenplay_content("字段缺失的剧本")
+    content["scenes"][0]["time_weather"] = ""
+
+    with pytest.raises(ServiceError) as exc_info:
+        service.update_screenplay(chapter["id"], {"content": content})
+
+    assert exc_info.value.status_code == 400
+    assert "time_weather" in exc_info.value.detail
+
+
+def test_screenplay_confirm_during_generation_returns_conflict(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+) -> None:
+    """生成任务进行中确认应明确拒绝，而不是把 confirmed 静默改回 generating。"""
+    _database, service, _jobs, _project, chapter = writing_service
+    service.queue_screenplay(chapter["id"], {})
+
+    with pytest.raises(ServiceError) as exc_info:
+        service.update_screenplay(
+            chapter["id"],
+            {"content": _screenplay_content("生成期间的确认"), "status": "confirmed"},
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "生成中" in exc_info.value.detail
+    assert service.get_screenplay(chapter["id"])["status"] == "generating"
+
+
+def test_screenplay_confirm_single_passage_without_source_refs_backfills_reference(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+) -> None:
+    """唯一原文段落不存在归属歧义，确认时安全回填 P001。"""
+    _database, service, _jobs, _project, chapter = writing_service
+    content = _screenplay_content("存量无编号剧本")
+    content["scenes"][0].pop("source_refs")
+
+    saved = service.update_screenplay(
+        chapter["id"],
+        {"content": content, "status": "confirmed"},
+    )
+
+    assert saved["status"] == "confirmed"
+    assert saved["warnings"] == []
+    assert saved["content"]["scenes"][0]["source_refs"] == ["P001"]
+
+
+def test_screenplay_confirm_with_unknown_source_ref_is_rejected(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+) -> None:
+    """确认剧本不得用编造编号伪装原文覆盖。"""
+    _database, service, _jobs, _project, chapter = writing_service
+    content = _screenplay_content("错误编号")
+    content["scenes"][0]["source_refs"] = ["P999"]
+
+    with pytest.raises(ServiceError, match="剧本不能确认"):
+        service.update_screenplay(
+            chapter["id"],
+            {"content": content, "status": "confirmed"},
+        )
+
+
+def test_stale_screenplay_job_reverts_advanced_analysis_revision(
+    writing_service: tuple[
+        Database, WritingService, RecordingJobService, dict[str, Any], dict[str, Any]
+    ],
+) -> None:
+    """分析修订号在生成期间前移时，跳过分支仍须把 generating 收尾。
+
+    回归：旧实现只用带 expected_revision 的 _set_status 收尾，修订号不匹配时
+    命中 0 行，分析行永久停在 generating。
+    """
+    _database, service, jobs, _project, chapter = writing_service
+    service.queue_screenplay(chapter["id"], {})
+    service.update_analysis(chapter["id"], {"content": _analysis_content("生成期间的人工分析")})
+    service.update_screenplay(
+        chapter["id"],
+        {"content": _screenplay_content("生成期间的人工剧本")},
+    )
+    assert service.get_analysis(chapter["id"])["status"] == "generating"
+
+    result = asyncio.run(service.handle_screenplay(_queued_job(chapter["id"], jobs)))
+
+    assert result["skipped"] is True
+    # 分析行有内容：按 _revert_generating_status 的既有口径回到 ready
+    assert service.get_analysis(chapter["id"])["status"] == "ready"
+    assert service.get_screenplay(chapter["id"])["status"] == "ready"

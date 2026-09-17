@@ -7,10 +7,12 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from app.schemas import (
+    AssetExtractionOutput,
     AssetPromptOutput,
     CharacterAssetOutput,
     PropAssetOutput,
     SceneAssetOutput,
+    ScreenplayOutput,
     ShotImagePromptOutput,
     ShotOutput,
     ShotVideoPromptOutput,
@@ -78,6 +80,29 @@ def _valid_shot() -> dict[str, Any]:
         "image_prompt": "小明刚拿起旧怀表，动作尚未完成",
         "video_prompt": "0-3秒小明拿起怀表；3-5秒查看表盘并握紧怀表",
         "negative_prompt": "身份漂移，服装变化，道具结构错误，文字，水印",
+    }
+
+
+def _valid_screenplay() -> dict[str, Any]:
+    return {
+        "title": "旧信",
+        "logline": "主角在雨夜旧屋发现一封改变命运的信。",
+        "scenes": [
+            {
+                "scene_no": 1,
+                "scene_name": "雨夜旧屋",
+                "time_weather": "夜晚，暴雨",
+                "characters": ["主角"],
+                "props": ["旧信"],
+                "objective": "确认旧信内容",
+                "action": "主角关上房门，拆开旧信并读完。",
+                "dialogue": [{"speaker": "主角", "text": "原来真相一直在这里。"}],
+                "narration": [],
+                "emotion": "紧张后震惊",
+                "transition_to_next": "主角攥紧旧信，决定连夜出发。",
+                "target_duration_sec": 30,
+            }
+        ],
     }
 
 
@@ -341,6 +366,61 @@ def test_prop_asset_with_normal_importance_is_rejected() -> None:
         PropAssetOutput.model_validate(payload)
 
 
+def test_screenplay_scene_numbers_must_be_continuous_and_unique() -> None:
+    payload = _valid_screenplay()
+    payload["scenes"].append({**payload["scenes"][0], "scene_no": 1})
+
+    with pytest.raises(ValidationError):
+        ScreenplayOutput.model_validate(payload)
+
+
+def test_screenplay_dialogue_speaker_is_added_to_scene_characters() -> None:
+    payload = _valid_screenplay()
+    payload["scenes"][0]["dialogue"] = [{"speaker": "陌生人", "text": "开门。"}]
+
+    result = ScreenplayOutput.model_validate(payload)
+
+    assert result.scenes[0].characters == ["主角", "陌生人"]
+
+
+def test_screenplay_missing_duration_is_estimated_for_legacy_content() -> None:
+    payload = _valid_screenplay()
+    payload["scenes"][0].pop("target_duration_sec")
+
+    result = ScreenplayOutput.model_validate(payload)
+
+    assert result.scenes[0].target_duration_sec is not None
+    assert result.scenes[0].target_duration_sec >= 15
+
+
+def test_asset_extraction_rejects_duplicate_canonical_names() -> None:
+    scene = _valid_scene_asset()
+    payload = {"characters": [], "scenes": [scene, dict(scene)], "props": []}
+
+    with pytest.raises(ValidationError):
+        AssetExtractionOutput.model_validate(payload)
+
+
+def test_asset_extraction_rejects_multiple_anchors_in_same_new_family() -> None:
+    first = {
+        **_valid_scene_asset(),
+        "name": "旧剧院舞台",
+        "scene_family": "旧剧院",
+        "family_anchor": True,
+    }
+    second = {
+        **_valid_scene_asset(),
+        "name": "旧剧院后台",
+        "scene_family": "旧剧院",
+        "family_anchor": True,
+    }
+
+    with pytest.raises(ValidationError):
+        AssetExtractionOutput.model_validate(
+            {"characters": [], "scenes": [first, second], "props": []}
+        )
+
+
 def test_shot_dialogue_with_speaker_and_line_is_normalized() -> None:
     payload = _valid_shot()
     payload["dialogue"] = [{"speaker": "小明", "line": "时间不多了。"}]
@@ -400,6 +480,35 @@ def test_shot_with_blank_generation_prompt_is_rejected(field: str) -> None:
 
     with pytest.raises(ValidationError):
         ShotOutput.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["start_state", "action", "shot_type", "camera_angle"],
+)
+def test_shot_with_blank_story_field_is_rejected(field: str) -> None:
+    """叙事必填字段不得空白：它们是分镜语义的最小信息量。"""
+    payload = _valid_shot()
+    payload[field] = "   "
+
+    with pytest.raises(ValidationError):
+        ShotOutput.model_validate(payload)
+
+
+@pytest.mark.parametrize("field", ["camera_move", "end_state", "next_hook"])
+def test_shot_with_blank_continuity_field_is_accepted(field: str) -> None:
+    """机位/结束状态/下一镜钩子允许为空。
+
+    固定机位、末镜等场景模型常输出空值；空白 end_state 还需被
+    `_validate_extracted_continuity` 降级为 scene_change，因此 schema 层
+    必须接受空白，否则整批提取会因个别字段为空而失败。
+    """
+    payload = _valid_shot()
+    payload[field] = "   "
+
+    result = ShotOutput.model_validate(payload)
+
+    assert isinstance(result.model_dump(mode="json")[field], str)
 
 
 def test_shot_without_scene_asset_id_is_allowed_for_missing_scene() -> None:

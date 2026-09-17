@@ -36,7 +36,7 @@ from app.providers.base import set_imgbb_api_key_override
 from app.services.errors import ServiceError
 from app.services.ffmpeg_utils import shutdown_ffmpeg_executor
 from app.services.file_service import file_service, is_reparse_point
-from app.services.setting_service import get_imagbb_api_key_override
+from app.services.setting_service import get_imgbb_api_key_override
 from app.services.task_handlers import register_handlers
 from app.services.utils import utc_now
 
@@ -190,7 +190,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # ImgBB 是平台级辅助密钥，优先从加密的 platform_setting 读取，
     # 避免明文密钥在 .env 中长期存在。空值时回退到 settings.imgbb_api_key（环境变量）。
     # B-L10：写入独立的运行时覆盖变量，不再直接改写 lru_cache 单例 settings。
-    override_key = get_imagbb_api_key_override(db)
+    override_key = get_imgbb_api_key_override(db)
     if override_key:
         set_imgbb_api_key_override(override_key)
     file_service.migrate_categorized_media_layouts(strict=False)

@@ -5,8 +5,10 @@ from __future__ import annotations
 import pytest
 
 from app.services.camera_library import (
+    ALL_CAMERA_PRESETS,
     CAMERA_PRESETS,
     DEFAULT_CAMERA_POLICY,
+    EMOTIONAL_CAMERA_PRESETS,
     POLICY_CONSERVATIVE,
     POLICY_RICH,
     POLICY_STANDARD,
@@ -15,6 +17,7 @@ from app.services.camera_library import (
     find_preset,
     is_static_camera,
     normalize_policy,
+    presets_by_category,
 )
 
 
@@ -178,3 +181,27 @@ def test_命中触发词的镜头_克制策略默认固定无建议() -> None:
         policy=POLICY_CONSERVATIVE,
     )
     assert issues == []
+
+
+def test_情绪化与复合运镜库_合规与唯一性() -> None:
+    assert len(EMOTIONAL_CAMERA_PRESETS) == 9
+    ids = [preset.id for preset in EMOTIONAL_CAMERA_PRESETS]
+    assert len(set(ids)) == 9
+    names = [preset.name for preset in EMOTIONAL_CAMERA_PRESETS]
+    assert len(set(names)) == 9
+    # 全集不重复
+    all_names = [preset.name for preset in ALL_CAMERA_PRESETS]
+    assert len(all_names) == 59
+    assert len(set(all_names)) == 59
+
+    # 情绪镜头可通过 find_preset 查找到，且出现在 presets_by_category 中
+    emotional_preset = find_preset("慢推式微表情定格")
+    assert emotional_preset is not None
+    assert emotional_preset.id == "emotional-1"
+
+    categories = presets_by_category()
+    dynamic_names = [p.name for p in categories["dynamic"]]
+    assert "慢推式微表情定格" in dynamic_names
+    assert "低机位仰拍情绪崩溃" in dynamic_names
+
+

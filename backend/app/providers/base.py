@@ -28,6 +28,7 @@ from app.services.file_service import (
     download_url_atomic,
     file_service,
 )
+from app.services.net_guard import NO_HOST, inspect_target_host
 from app.services.utils import sanitize_error_message
 
 # Provider 结果 Base64 解码后的字节上限（与平台媒体上限对齐，防止解码耗尽内存/磁盘）。
@@ -36,6 +37,8 @@ _MAX_BASE64_DECODED_BYTES = 100 * 1024 * 1024  # 100 MB
 _MAX_BASE64_ENCODED_CHARS = (_MAX_BASE64_DECODED_BYTES * 4 // 3) + 64
 # data URL 允许的媒体 MIME 前缀；防止把任意文本伪装成媒体落盘。
 _ALLOWED_DATA_URL_MIMES = ("image/", "video/", "audio/", "application/octet-stream")
+# 手动逐跳跟随重定向的最大跳数。
+_MAX_REDIRECTS = 10
 
 
 class ProviderError(RuntimeError):
@@ -63,6 +66,26 @@ def set_imgbb_api_key_override(value: str) -> None:
 def get_imgbb_api_key() -> str:
     """ImgBB Key 读取优先级：运行时覆盖（数据库加密值）> settings 环境变量。"""
     return _imgbb_api_key_override or settings.imgbb_api_key
+
+
+# P1-3：本地/内网 Provider 放行开关的运行时覆盖。判定发生在每次 Provider
+# 构造时，而平台设置存在数据库里；ProviderService 在解析/保存/测试前把数据库
+# 值同步到该变量，避免每次请求都查库。None 表示未同步，按环境变量判定，
+# 因此 .env 的 APP_PROVIDER_ALLOW_PRIVATE_HOSTS=1 仍然生效。
+_provider_allow_private_hosts_override: bool | None = None
+
+
+def set_provider_allow_private_hosts_override(value: bool | None) -> None:
+    """写入本地/内网 Provider 放行开关的运行时覆盖；None 表示回退环境变量。"""
+    global _provider_allow_private_hosts_override
+    _provider_allow_private_hosts_override = value
+
+
+def provider_allow_private_hosts() -> bool:
+    """是否允许 Provider 连接内网/回环地址。"""
+    if _provider_allow_private_hosts_override is not None:
+        return _provider_allow_private_hosts_override
+    return settings.provider_allow_private_hosts
 
 
 def compress_reference_image(
@@ -208,6 +231,154 @@ def validate_provider_base_url(base_url: str) -> None:
     for name, _ in parse_qsl(urlsplit(base_url).query, keep_blank_values=True):
         if _is_sensitive_query_name(name):
             raise ProviderConfigurationError(f"Provider base_url 不能包含敏感查询参数：{name}")
+
+
+def _private_host_message(url: str) -> str | None:
+    """内网/保留目标的统一文案；放行或非内网返回 None。"""
+    verdict = inspect_target_host(url)
+    if verdict is None:
+        return None
+    code, detail = verdict
+    if code == NO_HOST:
+        # 不回显 URL：它可能带敏感查询参数。
+        return "Provider base_url 缺少有效主机名"
+    return (
+        f"Provider base_url 指向本地或内网地址，已拒绝：{detail}。"
+        "如需连接本地 Provider（Ollama/ComfyUI/本地网关），"
+        "请在平台设置页开启「允许连接本地/内网 Provider」，"
+        "或设置 APP_PROVIDER_ALLOW_PRIVATE_HOSTS=1 后重启"
+    )
+
+
+def ensure_public_network_target(url: str) -> None:
+    """重定向逐跳校验：目标为内网/保留地址时抛配置错误。
+
+    与 validate_provider_base_url_network 共用判定与放行开关，
+    供 request_with_redirect_guard 在每一跳调用。
+    """
+    if provider_allow_private_hosts():
+        return
+    message = _private_host_message(url)
+    if message:
+        raise ProviderConfigurationError(message)
+
+
+def validate_provider_base_url_network(base_url: str) -> None:
+    """拒绝 base_url 指向内网/回环/保留地址。
+
+    Provider 配置可通过无鉴权的 API 写入，base_url 不加网络策略就等于把后端
+    变成内网探测原语（2026-09-11 审查报告 H5 残留1 / 3.1）。
+
+    与 validate_provider_base_url 分开：后者同时被 provider_service 用来判断
+    base_url 是否需要脱敏，把网络策略混进去会让内网配置在 API 响应里被误脱敏。
+
+    需要接本地 Provider（Ollama / ComfyUI / 本地网关）时，可在平台设置页开启
+    「允许连接本地/内网 Provider」，或设置 APP_PROVIDER_ALLOW_PRIVATE_HOSTS=1。
+    """
+    if not base_url:
+        return
+    ensure_public_network_target(base_url)
+
+
+def request_with_redirect_guard(
+    method: str,
+    url: str,
+    *,
+    timeout: float,
+    verify: bool = True,
+    **kwargs: Any,
+) -> requests.Response:
+    """发送请求并手动逐跳跟随重定向，每一跳都校验目标主机。
+
+    requests 默认会跟随 30x 到任意目标，首跳校验挡不住
+    「公网 base_url 302 到 169.254.169.254 / 内网」的 SSRF 变体。
+    这里显式 allow_redirects=False，逐跳调用 ensure_public_network_target，
+    并在跨主机时剥离 Authorization/Cookie，与 file_service 下载路径口径一致。
+
+    通过 requests.request 发出（兼容既有对该入口的猴子补丁）。
+    """
+    return _follow_redirects(_default_sender, method, url, timeout=timeout, verify=verify, **kwargs)
+
+
+def post_with_redirect_guard(
+    url: str,
+    *,
+    timeout: float,
+    verify: bool = True,
+    **kwargs: Any,
+) -> requests.Response:
+    """POST 版本：首跳走 requests.post（TTS 等既有调用链依赖该入口）。
+
+    重定向改 GET 时自动回退到通用入口，避免用 POST 发出 GET。
+    """
+    return _follow_redirects(_post_sender, "POST", url, timeout=timeout, verify=verify, **kwargs)
+
+
+def _default_sender(method: str, url: str, **kwargs: Any) -> requests.Response:
+    return requests.request(method, url, **kwargs)
+
+
+def _post_sender(method: str, url: str, **kwargs: Any) -> requests.Response:
+    if method == "POST":
+        return requests.post(url, **kwargs)
+    return requests.request(method, url, **kwargs)
+
+
+def _follow_redirects(
+    send: Any,
+    method: str,
+    url: str,
+    *,
+    timeout: float,
+    verify: bool,
+    **kwargs: Any,
+) -> requests.Response:
+    current_method = method.strip().upper()
+    current_url = str(url)
+    current_kwargs = dict(kwargs)
+    # 重定向必须由本函数逐跳控制，忽略调用方传入的 allow_redirects。
+    current_kwargs.pop("allow_redirects", None)
+    headers = dict(current_kwargs.pop("headers", None) or {})
+    for _ in range(_MAX_REDIRECTS):
+        ensure_public_network_target(current_url)
+        request_kwargs = dict(current_kwargs)
+        if headers:
+            request_kwargs["headers"] = headers
+        response = send(
+            current_method,
+            current_url,
+            timeout=timeout,
+            verify=verify,
+            allow_redirects=False,
+            **request_kwargs,
+        )
+        if not (response.is_redirect or response.is_permanent_redirect):
+            return response
+        location = response.headers.get("Location")
+        response.close()
+        if not location:
+            raise ProviderError("Provider 重定向缺少 Location 头")
+        next_url = urljoin(current_url, location)
+        if urlsplit(next_url).netloc.lower() != urlsplit(current_url).netloc.lower():
+            headers = {
+                key: value
+                for key, value in headers.items()
+                if key.lower() not in ("authorization", "cookie")
+            }
+            current_kwargs.pop("auth", None)
+        # 对齐 requests 的重定向语义：301/302/303 对非 GET/HEAD 改为 GET
+        # 并丢弃请求体，307/308 保留方法与请求体。
+        if response.status_code in (301, 302, 303) and current_method not in ("GET", "HEAD"):
+            current_method = "GET"
+            for key in ("json", "data", "files"):
+                current_kwargs.pop(key, None)
+            headers = {
+                key: value
+                for key, value in headers.items()
+                if key.lower() not in ("content-length", "content-type", "transfer-encoding")
+            }
+        current_url = next_url
+    raise ProviderError("Provider 重定向次数过多")
 
 
 def redact_provider_base_url(base_url: str) -> str:
@@ -391,6 +562,9 @@ def normalize_provider_status(
 class HttpProviderBase:
     def __init__(self, config: ProviderConfig) -> None:
         validate_provider_base_url(config.base_url)
+        # 运行时同样校验网络策略：直接改库写入的内网 base_url 不能绕过
+        # provider_service._validate_config（配置保存入口）生效。
+        validate_provider_base_url_network(config.base_url)
         self.config = config
 
     @property
@@ -446,7 +620,7 @@ class HttpProviderBase:
         transient_statuses = {202, 429}
         for attempt in range(attempts):
             try:
-                response = requests.request(
+                response = request_with_redirect_guard(
                     method,
                     url,
                     timeout=self.config.timeout_sec,
@@ -474,6 +648,13 @@ class HttpProviderBase:
                     break
                 time.sleep(min(2**attempt * 0.25, 2))
             except requests.RequestException as exc:
+                # SSLError 走这里，不再单独放行：requests 默认 stream=False，
+                # 响应读取期的 SSL 断连（UNEXPECTED_EOF_WHILE_READING 等）同样
+                # 从 requests.request() 抛 SSLError，而该错误串在握手期和读取期
+                # 都会出现，无法据此判断请求体是否已送达上游。此时上游可能已经
+                # 建立计费任务，自动重发就是重复付费，因此与 5xx/Timeout 同口径：
+                # 非安全方法不自动重试，交给 Job 层的 interrupted/失败恢复语义。
+                # 确实需要吸收中转线路 TLS 抖动的渠道显式配 retry_unsafe_methods=True。
                 last_error = exc
                 if not safe_method:
                     break

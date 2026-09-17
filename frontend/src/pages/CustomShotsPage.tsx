@@ -555,6 +555,23 @@ function CustomShotsInner() {
   }, [imageProviders, imageProviderId]);
 
   useEffect(() => {
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      if (assetPollRef.current) {
+        clearInterval(assetPollRef.current);
+        assetPollRef.current = null;
+      }
+      if (composePollRef.current) {
+        clearInterval(composePollRef.current);
+        composePollRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (videoProviders.length === 0) return;
     if (
       videoProviderId &&
@@ -735,7 +752,7 @@ function CustomShotsInner() {
     );
     if (hasFilledDrafts) {
       const saved = await saveFilledDrafts();
-      if (!saved) {
+      if (saved.failedSlotNumbers.length > 0) {
         // 保存失败时明确告知将丢弃未保存草稿，由用户决定是否继续
         const discardConfirmed = window.confirm(
           "部分分镜草稿保存失败，切换项目将丢弃未保存的草稿。确定继续切换吗？",
@@ -973,7 +990,7 @@ function CustomShotsInner() {
       kind === "keyframe"
         ? api.shots.keyframes.generate(id, {
             provider_id: imageProviderId || undefined,
-            // 缺干净参考图时自动入队参考图模式生成，避免设定展板污染分镜画面
+            // 缺素材图时自动入队素材图生成，避免纯文字降级出图
             auto_prepare_references: true,
           })
         : api.shots.videos.generate(id, {
@@ -1078,7 +1095,7 @@ function CustomShotsInner() {
     try {
       // 草稿保存失败（含无对应分镜位记录的槽位）时停止合成，避免成片缺失最新草稿。
       const saved = await saveFilledDrafts();
-      if (!saved) {
+      if (saved.failedSlotNumbers.length > 0) {
         toast.error("部分分镜草稿保存失败，请修正后重新合成");
         return;
       }

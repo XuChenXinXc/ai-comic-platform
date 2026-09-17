@@ -39,6 +39,31 @@ FORBIDDEN_LATIN_TERMS: tuple[str, ...] = (
     "realistic fire",
     "realistic water",
     "realistic hair",
+    # 写实摄影参数：镜头焦段、大光圈与散景。二维画风锁要求景深/虚化由画风
+    # 指纹决定，下游提示词自带这些参数即属越权注入。
+    "bokeh",
+    "shallow depth of field",
+    "f1.8",
+    "f/1.8",
+    "f1.4",
+    "f/1.4",
+    "f0.95",
+    "f/0.95",
+    "24mm",
+    "35mm",
+    "50mm",
+    "85mm",
+    "105mm",
+    "135mm",
+    # 电影摄影机品牌与机型（不含裸品牌词 red/sony：会与普通英文词冲突，
+    # 机型统一用带修饰的完整写法覆盖）。
+    "sony venice",
+    "arri alexa",
+    "arri",
+    "red komodo",
+    "red camera",
+    "blackmagic",
+    "canon eos",
 )
 FORBIDDEN_CJK_TERMS: tuple[str, ...] = (
     "真实反射",
@@ -64,6 +89,12 @@ FORBIDDEN_CJK_TERMS: tuple[str, ...] = (
     "真实物理",
     "流体模拟",
     "摄影级反射",
+    # 写实摄影参数（景深/虚化/大光圈）：与二维画风锁直接冲突。
+    "浅景深",
+    "深景深",
+    "大光圈",
+    "背景虚化",
+    "景深",
 )
 _FORBIDDEN_LATIN_PATTERN = re.compile(
     r"\b(?:"
@@ -83,8 +114,11 @@ _SEMANTIC_CONFLICT_PAIRS: tuple[tuple[str, str], ...] = (
     ("粗笔", "纤细轮廓"),
     ("写意", "每根发丝"),
     ("二维", "真实空间体积感"),
+    ("二维", "浅景深"),
+    ("二维", "背景虚化"),
     ("无景深", "背景虚化"),
     ("无景深", "浅景深"),
+    ("无景深", "bokeh"),
     ("低饱和", "高饱和"),
     ("墨色明暗", "真实光影"),
     ("绘画概括", "逐根发丝"),
@@ -99,7 +133,7 @@ MOTION_STYLE_LOCK_TEXT = (
     "不得将人物、建筑、服装、器物、水体、雨水或光影重解释为真实摄影、三维渲染或 PBR 材质；"
     "运动过程中线条粗细、墨色浓度、上色方式与笔触质感保持稳定；"
     "人物面部不得因转头、眨眼或嘴部运动而提高写实程度；"
-    "雨、水、烟、火、光等动态元素继续采用二维写意动画表达，不做真实物理模拟。"
+    "画面中若出现雨、水、烟、火、光等动态元素，一律采用二维写意动画表达，不做真实物理模拟。"
 )
 
 # 视频负向补充：反动态写实化（追加到全局负向规则）。
@@ -121,7 +155,7 @@ MOTION_STYLE_LOCK_TEXT_3D = (
     "不得将人物、建筑、服装、器物、水体、雨水或光影重解释为二维手绘、平涂动漫或赛璐璐；"
     "运动过程中模型轮廓、PBR材质、反射与三维光影关系保持稳定；"
     "人物面部不得因转头、眨眼或嘴部运动而改变写实程度；"
-    "雨、水、烟、火、光等动态元素继续采用三维渲染表达，不做二维手绘式贴图或赛璐璐明暗。"
+    "画面中若出现雨、水、烟、火、光等动态元素，一律采用三维渲染表达，不做二维手绘式贴图或赛璐璐明暗。"
 )
 
 # 真人写实项目的运动风格锁：锁定写实影像属性，排除二维手绘与三维CG漂移。
@@ -130,7 +164,7 @@ MOTION_STYLE_LOCK_TEXT_PHOTOREAL = (
     "不得将人物、建筑、服装、器物、水体、雨水或光影重解释为二维手绘、三维CG或卡通渲染；"
     "运动过程中皮肤质感、面料纹理、光线与反射属性保持稳定；"
     "人物面部不得因转头、眨眼或嘴部运动而失真；"
-    "雨、水、烟、火、光等动态元素继续采用真实摄影质感表达，不做二维手绘或CG特效。"
+    "画面中若出现雨、水、烟、火、光等动态元素，一律保持真实摄影质感表达，不做二维手绘或CG特效。"
 )
 
 # 视频动画节奏锁协议（咨询建议：去视频 AI 味）。
@@ -159,14 +193,12 @@ ANIMATION_CADENCE_LOCK_TEXT_3D = (
     "除叙事必需元素外，背景与无戏元素保持相对静止。"
 )
 
-# 半写实电影感二维项目的动画节奏锁：保留关键姿势顿挫感与运动模糊表达，
-# 但不使用「手绘二维」「速度线」等措辞，避免与写实电影布光语义冲突。
+# 半写实电影感二维项目的动画节奏锁：保留快出慢收与关键姿势停留，
+# 人物面部微表情平滑过渡，不使用一拍二顿挫感或涂抹帧等粗糙二维动画特征。
 ANIMATION_CADENCE_LOCK_TEXT_2D_CINEMATIC = (
-    "动画节奏锁：运动采用关键姿势动画节奏（一拍二），关键姿势之间快速过渡，"
-    "姿势与姿势之间保留持帧停顿，画面呈现清晰的张数顿挫感；"
-    "快速动作的速度感交给运动模糊、涂抹帧与背景滚动表达，人物面部与身体保持关键帧画法；"
-    "动作遵循快出、慢收、短暂停住的节奏，头发与衣摆等附属物在主体停住后短暂过冲再回稳；"
-    "除叙事必需元素外，背景与无戏元素保持静止持帧。"
+    "动画节奏锁：动作遵循快出、慢收与关键姿势停留，人物面部微表情、眨眼与呼吸过渡平滑自然，"
+    "不出现机械卡顿或抽帧断续；快速动作的速度感交由运动模糊表达，人物面部与身体保持关键帧画法；"
+    "头发与衣摆等附属物在主体停住后短暂过冲再回稳；除叙事必需元素外，背景与无戏元素保持沉静稳定。"
 )
 
 # 真人写实项目不使用一拍二抽帧节奏：动作按真实物理规律过渡。
@@ -352,8 +384,11 @@ def _style_exemption_text(style: Any) -> str:
 def _cut_protocol_sections(prompt: str) -> str:
     """协议段（负向、运动风格锁、动画节奏锁）是约束文本而非内容，不参与正向扫描。"""
     body = prompt
-    for label in ("Negative", "Motion style lock", "Animation cadence lock"):
-        match = re.search(rf"^\s*{label}\s*:", body, re.MULTILINE)
+    for label in (
+        "Negative", "Motion style lock", "Animation cadence lock",
+        "负向提示", "负向提示词", "负向约束", "运动风格锁", "动画节奏锁", "禁止出现",
+    ):
+        match = re.search(rf"^\s*(?:【)?{label}(?:】)?\s*[:：]?", body, re.MULTILINE)
         if match:
             body = body[: match.start()]
     return body
@@ -372,10 +407,8 @@ _NEGATION_PREFIXES = (
     "排除",
     "禁用",
     "关闭",
-    "no",
-    "not",
-    "without",
 )
+_EN_NEGATION_RE = re.compile(r"\b(no|not|without)\b", re.IGNORECASE)
 _NEGATION_SUFFIXES = ("禁用", "关闭", "禁止")
 
 
@@ -391,7 +424,7 @@ def _is_negated(text: str, start: int, end: int) -> bool:
         raw_before.rfind("\n"),
     )
     before = raw_before[last_punct_before + 1 :] if last_punct_before >= 0 else raw_before
-    if any(prefix in before for prefix in _NEGATION_PREFIXES):
+    if any(prefix in before for prefix in _NEGATION_PREFIXES) or _EN_NEGATION_RE.search(before):
         return True
 
     raw_after = text[end : min(len(text), end + 10)]
@@ -414,24 +447,59 @@ def _is_negated(text: str, start: int, end: int) -> bool:
     return False
 
 
+# 画风指纹自身的景深声明（「景深逻辑」「景深：启用/禁用」）属于结构化画风
+# 的合法声明，不是下游越权注入；命中时按声明豁免，避免每条提示词都误报。
+_STYLE_DECLARATION_PATTERNS = (
+    re.compile(r"景深逻辑"),
+    re.compile(r"景深\s*[:：]\s*(?:启用|禁用|开启|关闭)"),
+)
+
+
+def _is_style_declaration(text: str, index: int, term: str) -> bool:
+    """判断命中词是否处于画风指纹的声明语境。"""
+    window = text[max(0, index - 4) : index + len(term) + 4]
+    return any(pattern.search(window) for pattern in _STYLE_DECLARATION_PATTERNS)
+
+
 def _forbidden_hits(text: str) -> list[str]:
-    hits: list[str] = []
+    hits: list[tuple[int, int, str]] = []
     for match in _FORBIDDEN_LATIN_PATTERN.finditer(text):
         if _is_negated(text, match.start(), match.end()):
             continue
-        term = match.group(0)
-        if term not in hits:
-            hits.append(term)
+        hits.append((match.start(), match.end(), match.group(0)))
     for term in FORBIDDEN_CJK_TERMS:
         start = 0
         while True:
             index = text.find(term, start)
             if index < 0:
                 break
-            if not _is_negated(text, index, index + len(term)) and term not in hits:
-                hits.append(term)
             start = index + len(term)
-    return hits
+            end = index + len(term)
+            if _is_negated(text, index, end):
+                continue
+            if _is_style_declaration(text, index, term):
+                continue
+            # 已被更长命中覆盖的短词（如「浅景深」中的「景深」）不重复报告
+            if any(start_at <= index and end_at >= end for start_at, end_at, _ in hits):
+                continue
+            hits.append((index, end, term))
+    ordered: list[str] = []
+    for _, _, term in hits:
+        if term not in ordered:
+            ordered.append(term)
+    return ordered
+
+
+def _contains_positive_claim(text: str, term: str) -> bool:
+    """文本中是否以正向陈述出现该词；否定语境（「无景深」「禁用浅景深」）不计入。"""
+    start = 0
+    while True:
+        index = text.find(term, start)
+        if index < 0:
+            return False
+        if not _is_negated(text, index, index + len(term)):
+            return True
+        start = index + len(term)
 
 
 def _conflict_hits(content: str, style_source: str) -> list[tuple[str, str]]:
@@ -441,13 +509,15 @@ def _conflict_hits(content: str, style_source: str) -> list[tuple[str, str]]:
         second_in_style = bool(style_source) and second in style_source
         if first_in_style and second_in_style:
             continue
-        if first in content and second in content:
+        first_in_content = _contains_positive_claim(content, first)
+        second_in_content = _contains_positive_claim(content, second)
+        if first_in_content and second_in_content:
             hits.append((first, second))
             continue
-        if first_in_style and second in content:
+        if first_in_style and second_in_content:
             hits.append((first, second))
             continue
-        if second_in_style and first in content:
+        if second_in_style and first_in_content:
             hits.append((first, second))
     return hits
 

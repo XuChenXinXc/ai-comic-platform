@@ -17,6 +17,13 @@ const CAMERA_POLICY_HINTS: Record<string, string> = {
   丰富: "倾向运镜：每镜默认带运镜，多插仅提醒、漏加主动补建议",
 };
 
+const PRIVATE_HOSTS_SOURCE_HINTS: Record<string, string> = {
+  database: "当前值来自平台设置页保存的配置。",
+  environment:
+    "当前值来自 .env 的 APP_PROVIDER_ALLOW_PRIVATE_HOSTS；在页面保存后会以页面配置为准。",
+  default: "当前使用默认值：禁止连接内网地址。",
+};
+
 export function PlatformSettingsPage() {
   const queryClient = useQueryClient();
   const query = useQuery({
@@ -30,6 +37,10 @@ export function PlatformSettingsPage() {
   const defaultStylePromptQuery = useQuery({
     queryKey: queryKeys.defaultStylePrompt,
     queryFn: () => api.settings.defaultStylePrompt.get(),
+  });
+  const allowPrivateHostsQuery = useQuery({
+    queryKey: queryKeys.providerAllowPrivateHosts,
+    queryFn: () => api.settings.providerAllowPrivateHosts.get(),
   });
   const [defaultStylePrompt, setDefaultStylePrompt] = useState("");
   const [isStylePromptDirty, setIsStylePromptDirty] = useState(false);
@@ -71,6 +82,19 @@ export function PlatformSettingsPage() {
       setDefaultStylePrompt(result.style_prompt || "");
       setIsStylePromptDirty(false);
       toast.success("默认画风已更新");
+    },
+    onError: (error) => toast.error(formatError(error)),
+  });
+  const allowPrivateHostsMutation = useMutation({
+    mutationFn: (enabled: boolean) =>
+      api.settings.providerAllowPrivateHosts.set(enabled),
+    onSuccess: (result) => {
+      queryClient.setQueryData(queryKeys.providerAllowPrivateHosts, result);
+      toast.success(
+        result.enabled
+          ? "已允许连接本地/内网 Provider"
+          : "已禁止连接本地/内网 Provider",
+      );
     },
     onError: (error) => toast.error(formatError(error)),
   });
@@ -208,6 +232,39 @@ export function PlatformSettingsPage() {
               仅对之后新建的项目生效；已有项目的画风请在各项目的【剧本生成】页面单独调整。
             </p>
           </div>
+        </Card>
+      ) : null}
+
+      {allowPrivateHostsQuery.isLoading ? (
+        <LoadingState label="正在读取本地 Provider 开关…" />
+      ) : null}
+      {allowPrivateHostsQuery.data ? (
+        <Card className="mt-6 max-w-3xl p-5 sm:p-6">
+          <h2 className="text-lg font-bold text-ink">本地 / 内网 Provider</h2>
+          <p className="mt-1 text-sm leading-6 text-muted">
+            默认拒绝 Provider 连接 127.0.0.1、局域网等内网地址，避免无鉴权的接口配置被当作内网探测入口。
+            需要在 Ollama、ComfyUI 等本机服务上使用时再开启；开启后下一次连接测试或生成即生效，无需重启。
+          </p>
+
+          <div className="mt-5 flex items-center gap-3">
+            <input
+              id="provider-allow-private-hosts"
+              type="checkbox"
+              className="h-4 w-4 accent-vermilion"
+              checked={allowPrivateHostsQuery.data.enabled}
+              disabled={allowPrivateHostsMutation.isPending}
+              onChange={(event) =>
+                allowPrivateHostsMutation.mutate(event.target.checked)
+              }
+            />
+            <Label htmlFor="provider-allow-private-hosts" className="mb-0">
+              允许连接本地/内网 Provider
+            </Label>
+          </div>
+          <p className="mt-2 text-xs leading-5 text-muted">
+            {PRIVATE_HOSTS_SOURCE_HINTS[allowPrivateHostsQuery.data.source] ??
+              PRIVATE_HOSTS_SOURCE_HINTS.default}
+          </p>
         </Card>
       ) : null}
     </div>

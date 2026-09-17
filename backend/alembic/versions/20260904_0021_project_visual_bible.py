@@ -11,7 +11,6 @@ Create Date: 2026-09-04
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-
 from alembic import op
 
 revision: str = "20260904_0021_project_visual_bible"

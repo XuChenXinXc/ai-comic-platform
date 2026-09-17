@@ -176,6 +176,17 @@ def _create_ready_scene(client: TestClient, project_id: str) -> dict[str, Any]:
     return scene
 
 
+def _confirm_screenplay(client: TestClient, chapter_id: str) -> None:
+    """按真实工作流确认当前剧本：素材提取只接受已确认剧本。"""
+    current = client.get(f"/api/chapters/{chapter_id}/screenplay").json()
+    response = client.put(
+        f"/api/chapters/{chapter_id}/screenplay",
+        json={"content": current["content"], "status": "confirmed"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "confirmed"
+
+
 def _create_text_provider(client: TestClient, name: str) -> dict[str, Any]:
     response = client.post(
         "/api/providers",
@@ -211,6 +222,7 @@ def test_manual_style_prompt_survives_screenplay_and_reaches_asset_prompts(
     assert updated_project.status_code == 200
     assert updated_project.json()["style_prompt"] == expected_style_prompt
 
+    _confirm_screenplay(api_client, chapter_id)
     extract_job = api_client.post(f"/api/chapters/{chapter_id}/assets/extract", json={})
     assert extract_job.status_code == 202
     assert _wait_job(api_client, extract_job.json()["id"])["status"] == "completed"
@@ -231,6 +243,7 @@ def test_mock_provider_full_workflow_returns_current_media_and_zip(
     assert screenplay_job.status_code == 202
     assert _wait_job(api_client, screenplay_job.json()["id"])["status"] == "completed"
 
+    _confirm_screenplay(api_client, chapter_id)
     extract_job = api_client.post(f"/api/chapters/{chapter_id}/assets/extract", json={})
     assert extract_job.status_code == 202
     assert _wait_job(api_client, extract_job.json()["id"])["status"] == "completed"
